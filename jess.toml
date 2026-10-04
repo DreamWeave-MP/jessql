@@ -1,0 +1,18 @@
+manifest_version = 1
+
+[package]
+id = "org.dreamweave.jessql"
+version = "0.1.4"
+jess_api = "1"
+include = ["src", "bench", "tests", "README.md"]
+tests = ["tests/run.luau"]
+
+[modules]
+"@jessql" = "src/init.luau"
+"@jessql/lexer" = "src/lexer.luau"
+"@jessql/parser" = "src/parser.luau"
+"@jessql/engine" = "src/engine.luau"
+
+[[layer]]
+id = "jessql.core"
+exports = ["@jessql", "@jessql/lexer", "@jessql/parser", "@jessql/engine"]
