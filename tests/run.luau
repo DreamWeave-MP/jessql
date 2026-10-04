@@ -314,4 +314,39 @@ suite.describe('streaming indexed joins', function()
   end)
 end)
 
+suite.describe('exact provider cardinality', function()
+  suite.it('answers trivial COUNT(*) without scanning the provider', function()
+    local db = sql.new()
+    local scanned = false
+    db:register('catalog', {
+      columns = { 'id' },
+      count = function() return 123456789 end,
+      scan = function(_request) scanned = true; error('exact count should not scan') end,
+    })
+    local plan = db:prepare('SELECT COUNT(*) AS n FROM catalog')
+    expect(plan:explain().providerCount).toBe(true)
+    expect(plan:run().rows[1].n).toBe(123456789)
+    expect(scanned).toBe(false)
+  end)
+
+  suite.it('does not use exact cardinality when SQL semantics need rows', function()
+    local db = sql.new()
+    local rows = { { id = 1 }, { id = 2 }, { id = 3 } }
+    local countCalls = 0
+    db:register('catalog', {
+      columns = { 'id' },
+      count = function() countCalls += 1; return #rows end,
+      scan = function(_request) return rows end,
+    })
+    expect(db:query('SELECT COUNT(*) AS n FROM catalog WHERE id >= 2').rows[1].n).toBe(2)
+    expect(countCalls).toBe(0)
+  end)
+
+  suite.it('gives db:table exact cardinality automatically', function()
+    local db = sql.new()
+    db:table('items', { { id = 1 }, { id = 2 }, { id = 3 }, { id = 4 } }, { 'id' })
+    expect(db:query('SELECT COUNT(*) AS n FROM items').rows[1].n).toBe(4)
+  end)
+end)
+
 return suite

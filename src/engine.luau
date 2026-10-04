@@ -579,6 +579,17 @@ local function prepare(db, sql)
 
     local aggregate = #ast.groupBy > 0 or #aggregateSpecs > 0
 
+    -- Exact provider cardinality can answer the simplest COUNT(*) without scanning any rows.
+    -- Keep this deliberately narrow: once WHERE/GROUP/HAVING/ORDER/LIMIT/OFFSET participates,
+    -- normal SQL execution owns the semantics.
+    local directProviderCount = false
+    if directSingle and ast.where == nil and #ast.groupBy == 0 and ast.having == nil
+        and #ast.orderBy == 0 and ast.limit == nil and ast.offset == 0 and #ast.select == 1
+        and type(sources[1].provider.count) == 'function' then
+        local expression = ast.select[1].expr
+        directProviderCount = expression.tag == 'call' and expression.name == 'COUNT' and expression.star == true
+    end
+
     -- Binding happened while compiling WHERE/select/etc.; extract safe provider hints now.
     local constraints, constraintsComplete = constraintFrom(ast.where)
 
@@ -618,6 +629,11 @@ local function prepare(db, sql)
     function plan.run(params)
         params = params or {}
         if #params < ast.params then error(string.format("jessql: query expects %d parameters, got %d", ast.params, #params), 0) end
+        if directProviderCount then
+            local row = {}
+            row[resultColumns[1]] = sources[1].provider.count()
+            return { columns=resultColumns, rows={row} }
+        end
 
         local rowsBySource = table.create(#sources)
         local rowIterators = table.create(#sources)
@@ -1358,7 +1374,7 @@ local function prepare(db, sql)
         for i, j in ast.joins do joins[i] = { kind=j.kind, table=j.source.name, alias=j.source.alias, strategy=joinPlans[i].strategy } end
         local scans = {}
         for i, source in sources do scans[i] = { table=source.name, alias=source.alias, columns=neededColumns[i] } end
-        return { scans=scans, joins=joins, grouped=aggregate, compactGroup=compactGroupColumn ~= nil, aggregateCount=#aggregateSpecs, parameterCount=ast.params }
+        return { scans=scans, joins=joins, grouped=aggregate, compactGroup=compactGroupColumn ~= nil, aggregateCount=#aggregateSpecs, providerCount=directProviderCount, parameterCount=ast.params }
     end
     return plan
 end
@@ -1378,6 +1394,7 @@ function M.new()
         columns = columns or schemaFromRows(rows)
         return self:register(name, {
             columns = columns,
+            count = function() return #rows end,
             scan = function(_request) return rows end,
         })
     end

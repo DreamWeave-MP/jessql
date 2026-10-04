@@ -6,7 +6,7 @@ providers without copying their domain semantics into JessQL.
 
 ## Package
 
-- package: `org.dreamweave.jessql` 0.1.4
+- package: `org.dreamweave.jessql` 0.1.6
 - layer: `jessql.core`
 - module: `@jessql`
 
@@ -49,6 +49,10 @@ db:register("objects", {
     end,
 })
 ```
+
+Providers that know their exact unfiltered cardinality may also expose `count = function() -> number`.
+JessQL uses it only for the exact trivial shape `SELECT COUNT(*) FROM source` with no filtering,
+grouping, ordering, limit, or offset; every other aggregate follows the normal execution path.
 
 Providers can opt into faster physical plans without changing SQL semantics:
 
@@ -113,3 +117,11 @@ silently fall back to retaining full joined contexts.
 These changes are semantic-preserving: ambiguous SQL that projects a non-grouped, non-aggregate
 column still keeps JessQL's existing first-row behavior. Tests cover both the compact and permissive
 paths, including indexed joins grouped by a value from the lookup side.
+
+
+## 0.1.6 exact-cardinality work
+
+0.1.6 adds the optional provider `count()` fast path for an unfiltered single-source `COUNT(*)`.
+`db:table()` exposes exact cardinality automatically. The optimization is intentionally narrow so a
+provider cannot accidentally claim it handled filtered/grouped SQL. This was added under MJ12/Gaia
+pressure: asking how many catalog rows exist should not decode a billion stars.

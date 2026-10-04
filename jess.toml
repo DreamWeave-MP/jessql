@@ -2,7 +2,7 @@ manifest_version = 1
 
 [package]
 id = "org.dreamweave.jessql"
-version = "0.1.5"
+version = "0.1.6"
 jess_api = "1"
 include = ["src", "bench", "tests", "README.md"]
 tests = ["tests/run.luau"]
