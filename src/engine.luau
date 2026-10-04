@@ -374,6 +374,14 @@ local function prepare(db, sql)
             end
         end
     end
+    local function sourceFilterScore(sourceIndex)
+        local score = 0
+        for _, term in whereTermPlans do
+            if term.sourceIndex == sourceIndex then score += if term.pushable then 2 else 1 end
+        end
+        return score
+    end
+
     local joinFns = {}
     local joinPlans = {}
     for i, j in ast.joins do
@@ -394,11 +402,17 @@ local function prepare(db, sql)
                 if #sources == 2 and #ast.joins == 1 and j.kind == "inner" then
                     local leftProvider = sources[leftCol.sourceIndex].provider
                     local rightProvider = sources[rightIndex].provider
-                    if leftCol.sourceIndex == 1 and type(leftProvider.lookup) == "function"
-                        and type(leftProvider.indexes) == "table" and leftProvider.indexes[leftCol.boundName] == true then
+                    local leftIndexed = leftCol.sourceIndex == 1 and type(leftProvider.lookup) == "function"
+                        and type(leftProvider.indexes) == "table" and leftProvider.indexes[leftCol.boundName] == true
+                    local rightIndexed = type(rightProvider.lookup) == "function"
+                        and type(rightProvider.indexes) == "table" and rightProvider.indexes[rightCol.boundName] == true
+                    if leftIndexed and rightIndexed then
+                        local leftScore = sourceFilterScore(leftCol.sourceIndex)
+                        local rightScore = sourceFilterScore(rightIndex)
+                        plan.strategy = if leftScore > rightScore then "index-right" else "index-left"
+                    elseif leftIndexed then
                         plan.strategy = "index-left"
-                    elseif type(rightProvider.lookup) == "function"
-                        and type(rightProvider.indexes) == "table" and rightProvider.indexes[rightCol.boundName] == true then
+                    elseif rightIndexed then
                         plan.strategy = "index-right"
                     end
                 end

@@ -178,6 +178,41 @@ suite.describe('direct LIMIT safety', function()
   end)
 end)
 
+suite.describe('indexed join driver selection', function()
+  suite.it('drives from the more constrained side when both join keys are indexed', function()
+    local db = sql.new()
+    local leftRows = { { id = 1, kind = 'hot' }, { id = 2, kind = 'cold' } }
+    local rightRows = { { id = 1, value = 10 }, { id = 2, value = 20 } }
+    local function provider(rows)
+      return {
+        columns = { 'id', 'kind', 'value' },
+        indexes = { id = true },
+        lookup = function(_column, id, _request)
+          for _, row in rows do if row.id == id then return { row } end end
+          return {}
+        end,
+        iterate = function(_request)
+          local i = 0
+          return {
+            _jessqlIter = 'v1', handledConstraints = false, handledWhere = false, ordered = false,
+            next = function() i += 1; return rows[i] end,
+          }
+        end,
+        scan = function(_request) return rows end,
+      }
+    end
+    db:register('left_rows', provider(leftRows))
+    db:register('right_rows', provider(rightRows))
+    local plan = db:prepare([[SELECT l.id, r.value
+      FROM left_rows l INNER JOIN right_rows r ON l.id = r.id
+      WHERE l.kind = 'hot']])
+    expect(plan.explain().joins[1].strategy).toBe('index-right')
+    local result = plan.run()
+    expect(#result.rows).toBe(1)
+    expect(result.rows[1].value).toBe(10)
+  end)
+end)
+
 suite.describe('indexed lookup bounds', function()
   suite.it('passes the remaining LIMIT budget to an indexed lookup when no residual filter can reject rows', function()
     local db = sql.new()
