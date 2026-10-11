@@ -8,16 +8,16 @@ local function streamingDb()
   db:register('numbers', {
     columns = { 'id', 'bucket', 'value' },
     iterate = function(_request)
-      local i = 0
+      local id = 0
       return {
         _jessqlIter = 'v1',
         handledConstraints = false,
         handledWhere = false,
         ordered = false,
         next = function()
-          i += 1
-          if i > 1000 then return nil end
-          return { id = i, bucket = i % 10, value = (i * 17) % 997 }
+          id += 1
+          if id > 1000 then return nil end
+          return { id = id, bucket = id % 10, value = (id * 17) % 997 }
         end,
       }
     end,
@@ -49,9 +49,9 @@ suite.describe('streaming single-source providers', function()
   suite.it('runs top-k ordering over streamed rows', function()
     local result = streamingDb():query('SELECT id, value FROM numbers ORDER BY value DESC, id ASC LIMIT 5')
     expect(#result.rows).toBe(5)
-    for i = 2, #result.rows do
-      local previous = result.rows[i - 1]
-      local current = result.rows[i]
+    for index = 2, #result.rows do
+      local previous = result.rows[index - 1]
+      local current = result.rows[index]
       expect(previous.value >= current.value).toBeTruthy()
     end
   end)
@@ -192,10 +192,13 @@ suite.describe('indexed join driver selection', function()
           return {}
         end,
         iterate = function(_request)
-          local i = 0
+          local index = 0
           return {
             _jessqlIter = 'v1', handledConstraints = false, handledWhere = false, ordered = false,
-            next = function() i += 1; return rows[i] end,
+            next = function()
+              index += 1
+              return rows[index]
+            end,
           }
         end,
         scan = function(_request) return rows end,
@@ -250,6 +253,7 @@ suite.describe('compact grouped indexed joins', function()
       end,
       scan = function(_request) error('indexed symbol side should not be scanned') end,
     })
+
     db:register('members', {
       columns = { 'symbol_id' },
       iterate = function(_request)
@@ -290,6 +294,7 @@ suite.describe('streaming indexed joins', function()
       end,
       scan = function(_request) error('indexed side should not be scanned') end,
     })
+
     db:register('join_keys', {
       columns = { 'id', 'bucket' },
       iterate = function(_request)
