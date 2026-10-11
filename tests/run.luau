@@ -354,4 +354,265 @@ suite.describe('exact provider cardinality', function()
   end)
 end)
 
+-- Twelve rows in three buckets of four, every `value` different, and labels that give bucket 0
+-- two rows and bucket 2 none: joining the two both multiplies rows and drops them.
+local NumberColumns, LabelColumns = { 'id', 'bucket', 'value' }, { 'bucket', 'label' }
+local Numbers = {}
+
+for id = 1, 12 do
+  Numbers[id] = { id = id, bucket = (id - 1) // 4, value = (id * 7) % 12 }
+end
+
+local Labels = {
+  { bucket = 0, label = 'none' },
+  { bucket = 0, label = 'zero' },
+  { bucket = 1, label = 'one' },
+}
+
+local Comparisons = { ['='] = true, ['<'] = true, ['<='] = true, ['>'] = true, ['>='] = true }
+
+--- A provider that never stops early: what every bounded one is compared with.
+local function unbounded(rows, columns)
+  return { columns = columns, scan = function(_request) return rows end }
+end
+
+--- A provider that hands over the first `request.limit` rows and reads nothing else of the
+--- request. `seen`, when given, collects the requests it was handed.
+local function stopsAtLimit(rows, columns, seen)
+  return {
+    columns = columns,
+    scan = function(request)
+      if seen then table.insert(seen, request) end
+
+      local out = {}
+
+      for index = 1, math.min(#rows, request.limit or #rows) do
+        out[index] = rows[index]
+      end
+
+      return out
+    end,
+  }
+end
+
+local function holds(row, constraint)
+  local cell, value = row[constraint.column], constraint.value
+  if constraint.op == '=' then return cell == value end
+  if constraint.op == '<' then return cell < value end
+  if constraint.op == '<=' then return cell <= value end
+  if constraint.op == '>' then return cell > value end
+
+  return cell >= value
+end
+
+--- A provider bounded the way dreamwind-sql's and openmw-workbench's are: it stops at
+--- `request.limitHint or request.limit`, and only when it took the whole WHERE itself and either
+--- no order was asked of it or it produced the one asked. `handles.where` makes it apply the
+--- pushed comparisons; `handles.order` makes it sort by a single requested column.
+local function stopsAtHint(rows, columns, handles)
+  return {
+    columns = columns,
+    scan = function(request)
+      local candidates = rows
+      local handledConstraints = #request.constraints == 0
+
+      if handles.where and not handledConstraints then
+        handledConstraints = true
+
+        for _, constraint in request.constraints do
+          if not Comparisons[constraint.op] then handledConstraints = false end
+        end
+      end
+
+      if handles.where and handledConstraints then
+        candidates = {}
+
+        for _, row in rows do
+          local kept = true
+
+          for _, constraint in request.constraints do
+            if not holds(row, constraint) then kept = false end
+          end
+
+          if kept then table.insert(candidates, row) end
+        end
+      end
+
+      local handledWhere = request.whereComplete == true and handledConstraints
+      local orderBy, ordered = request.orderBy, false
+
+      if handles.order and orderBy and #orderBy == 1 then
+        local column, descending = orderBy[1].column, orderBy[1].desc == true
+        candidates = table.clone(candidates)
+
+        table.sort(candidates, function(left, right)
+          if descending then return left[column] > right[column] end
+
+          return left[column] < right[column]
+        end)
+
+        ordered = true
+      end
+
+      local limit = if handledWhere and (not orderBy or ordered) then request.limitHint or request.limit else nil
+      local out = {}
+
+      for _, row in candidates do
+        if limit and #out >= limit then break end
+
+        table.insert(out, row)
+      end
+
+      return {
+        _jessqlScan = 'v1',
+        rows = out,
+        handledConstraints = handledConstraints,
+        handledWhere = handledWhere,
+        ordered = ordered,
+      }
+    end,
+  }
+end
+
+local BoundedNames = {
+  'stops at request.limit',
+  'stops at the hint',
+  'stops at the hint, applies the WHERE',
+  'stops at the hint, produces the order',
+  'stops at the hint, applies the WHERE and produces the order',
+}
+
+local function boundedProviders(rows, columns)
+  return {
+    stopsAtLimit(rows, columns),
+    stopsAtHint(rows, columns, {}),
+    stopsAtHint(rows, columns, { where = true }),
+    stopsAtHint(rows, columns, { order = true }),
+    stopsAtHint(rows, columns, { where = true, order = true }),
+  }
+end
+
+--- Runs a query over the numbers and the labels behind every kind of bounded provider, expects
+--- each to give the rows the unbounded providers give, and returns those rows.
+local function expectUnchanged(text, params)
+  local function rowsOver(numberProvider, labelProvider)
+    local db = sql.new()
+    db:register('numbers', numberProvider)
+    db:register('labels', labelProvider)
+    return db:query(text, params).rows
+  end
+
+  local expected = rowsOver(unbounded(Numbers, NumberColumns), unbounded(Labels, LabelColumns))
+  local numberProviders = boundedProviders(Numbers, NumberColumns)
+  local labelProviders = boundedProviders(Labels, LabelColumns)
+  local got, wanted = {}, {}
+
+  for index, name in BoundedNames do
+    got[name], wanted[name] = rowsOver(numberProviders[index], labelProviders[index]), expected
+  end
+
+  expect(got).toEqual(wanted)
+  return expected
+end
+
+--- The request the numbers provider is handed for a query.
+local function requestFor(text)
+  local seen = {}
+  local db = sql.new()
+  db:register('numbers', stopsAtLimit(Numbers, NumberColumns, seen))
+  db:register('labels', unbounded(Labels, LabelColumns))
+  db:query(text)
+  return seen[1]
+end
+
+suite.describe('provider row bounds', function()
+  suite.it('counts every row under COUNT(*) with LIMIT', function()
+    expect(expectUnchanged('SELECT COUNT(*) AS total FROM numbers LIMIT 1')).toEqual { { total = 12 } }
+    expect(expectUnchanged('SELECT SUM(value) AS total FROM numbers LIMIT 1')).toEqual { { total = 66 } }
+  end)
+
+  suite.it('groups every row under GROUP BY with LIMIT', function()
+    local text = 'SELECT bucket, COUNT(*) AS total FROM numbers GROUP BY bucket LIMIT 2'
+    expect(expectUnchanged(text)).toEqual { { bucket = 0, total = 4 }, { bucket = 1, total = 4 } }
+
+    local last = expectUnchanged('SELECT bucket, MAX(id) AS top FROM numbers GROUP BY bucket ORDER BY bucket DESC LIMIT 1')
+    expect(last).toEqual { { bucket = 2, top = 12 } }
+  end)
+
+  -- The engine has no DISTINCT; grouping by the column is how a query asks for distinct values.
+  suite.it('finds every distinct value under a GROUP BY standing in for DISTINCT, with LIMIT', function()
+    expect(expectUnchanged('SELECT bucket FROM numbers GROUP BY bucket LIMIT 2')).toEqual { { bucket = 0 }, { bucket = 1 } }
+  end)
+
+  suite.it('lets the provider go on through OFFSET under LIMIT with OFFSET', function()
+    expect(expectUnchanged('SELECT id FROM numbers LIMIT 2 OFFSET 3')).toEqual { { id = 4 }, { id = 5 } }
+    expect(expectUnchanged('SELECT id FROM numbers LIMIT 0 OFFSET 2')).toEqual {}
+  end)
+
+  suite.it('filters every row under LIMIT with a WHERE the provider leaves to the engine', function()
+    expect(expectUnchanged('SELECT id FROM numbers WHERE value % 2 = 0 LIMIT 3')).toEqual { { id = 2 }, { id = 4 }, { id = 6 } }
+    expect(expectUnchanged('SELECT id FROM numbers WHERE id > 8 AND value % 2 = 0 LIMIT 1')).toEqual { { id = 10 } }
+  end)
+
+  suite.it('filters every row under LIMIT with a WHERE the provider can apply', function()
+    expect(expectUnchanged('SELECT id FROM numbers WHERE value >= 9 LIMIT 2')).toEqual { { id = 3 }, { id = 5 } }
+    expect(expectUnchanged('SELECT id FROM numbers WHERE id > ? LIMIT 1 OFFSET 1', { 9 })).toEqual { { id = 11 } }
+  end)
+
+  suite.it('orders every row under LIMIT with an ORDER BY asked of the provider, produced or not', function()
+    local top = expectUnchanged('SELECT id, value FROM numbers ORDER BY value DESC LIMIT 3')
+    expect(top).toEqual { { id = 5, value = 11 }, { id = 10, value = 10 }, { id = 3, value = 9 } }
+    expect(expectUnchanged('SELECT value FROM numbers ORDER BY value LIMIT 2 OFFSET 1')).toEqual { { value = 1 }, { value = 2 } }
+  end)
+
+  suite.it('orders every row under LIMIT with an ORDER BY the provider is not asked for', function()
+    local top = expectUnchanged('SELECT id FROM numbers ORDER BY value * -1 LIMIT 3')
+    expect(top).toEqual { { id = 5 }, { id = 10 }, { id = 3 } }
+
+    local aliased = expectUnchanged('SELECT id, value % 5 AS rank FROM numbers ORDER BY rank DESC, id DESC LIMIT 2')
+    expect(aliased).toEqual { { id = 4, rank = 4 }, { id = 3, rank = 4 } }
+  end)
+
+  suite.it('joins every row under a two-table join with LIMIT', function()
+    local inner = expectUnchanged('SELECT n.id, l.label FROM numbers n JOIN labels l ON n.bucket = l.bucket LIMIT 3 OFFSET 7')
+    expect(inner).toEqual { { id = 4, label = 'zero' }, { id = 5, label = 'one' }, { id = 6, label = 'one' } }
+
+    local outer = expectUnchanged('SELECT n.id, l.label FROM numbers n LEFT JOIN labels l ON n.bucket = l.bucket ORDER BY n.id DESC LIMIT 2')
+    expect(outer).toEqual { { id = 12 }, { id = 11 } }
+  end)
+
+  suite.it('hands a single-table LIMIT to the provider, with OFFSET added', function()
+    local plain = requestFor('SELECT id FROM numbers LIMIT 3')
+    expect(plain.limit).toBe(3)
+    expect(plain.limitHint).toBe(3)
+
+    local offset = requestFor('SELECT id FROM numbers LIMIT 3 OFFSET 4')
+    expect(offset.limit).toBe(7)
+    expect(offset.limitHint).toBe(7)
+  end)
+
+  suite.it('hands only the hint under an ORDER BY asked of the provider', function()
+    local request = requestFor('SELECT id FROM numbers ORDER BY value DESC LIMIT 3 OFFSET 1')
+    expect(request.orderBy).toEqual { { column = 'value', desc = true } }
+    expect(request.limit).toBeNil()
+    expect(request.limitHint).toBe(4)
+  end)
+
+  suite.it('hands no bound when the engine has more to do after the scan', function()
+    local queries = {
+      'SELECT COUNT(*) AS total FROM numbers LIMIT 1',
+      'SELECT bucket FROM numbers GROUP BY bucket LIMIT 1',
+      'SELECT id FROM numbers WHERE value >= 9 LIMIT 1',
+      'SELECT id FROM numbers ORDER BY value * -1 LIMIT 1',
+      'SELECT n.id FROM numbers n JOIN labels l ON n.bucket = l.bucket LIMIT 1',
+      'SELECT id FROM numbers OFFSET 3',
+    }
+
+    for _, text in queries do
+      local request = requestFor(text)
+      expect({ text, request.limit, request.limitHint }).toEqual { text }
+    end
+  end)
+end)
+
 return suite

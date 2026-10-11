@@ -27,10 +27,15 @@ export type Order = { column: string, desc: boolean? }
 --- itself always fills in `columns`, `constraints`, `whereComplete` and `allowVolatileRows`.
 ---   columns            the columns the query reads from this table
 ---   constraints        the predicates on this table simple enough to push down
----   limit              the query's LIMIT as written, for a single-table query without a WHERE.
----                      It knows nothing of OFFSET, grouping or ordering: stop at `limitHint`
----   limitHint          how many rows are enough for the query, when no later filter can reject
----                      one
+---   limit              a number of rows the provider may stop after, whatever else it does with
+---                      the request, without changing the query's result: OFFSET + LIMIT. It is
+---                      there only when nothing after the scan can need another row: one table,
+---                      no WHERE, no grouping, aggregate or HAVING, and no ORDER BY
+---   limitHint          the same number, on one condition: when `orderBy` is set, the rows come
+---                      in that order. It is there whenever `limit` is, and also under an ORDER
+---                      BY that `orderBy` carries whole; a provider that does not produce that
+---                      order must not stop at it. On the request a `lookup` is handed, it is
+---                      how many more rows matching the key the query can still use
 ---   orderBy            the ordering the query wants, when this table alone decides it
 ---   whereComplete      whether `constraints` are the whole WHERE of a single-table query
 ---   allowVolatileRows  whether an iterator may hand out one reused row table
@@ -1110,6 +1115,19 @@ local function prepare(db: Database, sql: string): Plan
     if ok then providerOrder = pushed end
   end
 
+  -- How many rows a single table's provider may stop at: OFFSET + LIMIT, the rows the engine
+  -- skips included. `providerLimit` holds whatever else the provider does, so it is set only when
+  -- nothing after the scan can need another row: no join, no WHERE for the engine to apply, no
+  -- grouping, aggregate or HAVING, and no ORDER BY. `providerLimitHint` also holds under an
+  -- ORDER BY asked of the provider whole, for a provider that hands its rows over in that order.
+  local providerLimit, providerLimitHint = nil, nil
+
+  if directSingle and not aggregate and ast.limit ~= nil and ast.where == nil and ast.having == nil then
+    local enough = ast.offset + ast.limit
+    if #ast.orderBy == 0 then providerLimit = enough end
+    if #ast.orderBy == 0 or providerOrder ~= nil then providerLimitHint = enough end
+  end
+
   local indexedDriverSource = nil
   local indexedDriverOrder = nil
 
@@ -1186,8 +1204,8 @@ local function prepare(db: Database, sql: string): Plan
       local request = {
         columns = neededColumns[sourceIndex],
         constraints = sourceConstraints,
-        limit = if #sources == 1 and ast.where == nil then ast.limit else nil,
-        limitHint = if directSingle and not aggregate and ast.limit ~= nil and ast.where == nil then ast.offset + ast.limit else nil,
+        limit = providerLimit,
+        limitHint = providerLimitHint,
         orderBy = if directSingle and sourceIndex == 1 then providerOrder
           elseif indexedDriverSource == sourceIndex then indexedDriverOrder
           else nil,
