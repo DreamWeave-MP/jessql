@@ -18,13 +18,13 @@ export type SourceRows = { read [number]: SourceRow }
 --- parameter the query compared the column with.
 export type Constraint = { column: string, op: string, value: unknown }
 
---- One key of an ordering a provider is asked for. The engine always says which way; a request
---- written by hand may leave `desc` out for ascending.
-export type Order = { column: string, desc: boolean? }
+--- One key of an ordering a provider is asked for: the column, and whether it runs downwards.
+export type Order = { column: string, desc: boolean }
 
---- What a provider's `scan`, `iterate` and `lookup` are handed. Every field is a hint a provider
---- may ignore, and every field is optional, because providers are also called by hand; the engine
---- itself always fills in `columns`, `constraints`, `whereComplete` and `allowVolatileRows`.
+--- What a provider's `scan`, `iterate` and `lookup` are handed. Everything but `columns` is a
+--- hint a provider may ignore. The engine sets `columns`, `constraints`, `whereComplete` and
+--- `allowVolatileRows` on every request; `limit`, `limitHint` and `orderBy` are there only when
+--- they apply.
 ---   columns            the columns the query reads from this table
 ---   constraints        the predicates on this table simple enough to push down
 ---   limit              a number of rows the provider may stop after, whatever else it does with
@@ -40,24 +40,24 @@ export type Order = { column: string, desc: boolean? }
 ---   whereComplete      whether `constraints` are the whole WHERE of a single-table query
 ---   allowVolatileRows  whether an iterator may hand out one reused row table
 export type Request = {
-  columns: { string }?,
-  constraints: { Constraint }?,
+  columns: { string },
+  constraints: { Constraint },
   limit: number?,
   limitHint: number?,
   orderBy: { Order }?,
-  whereComplete: boolean?,
-  allowVolatileRows: boolean?,
+  whereComplete: boolean,
+  allowVolatileRows: boolean,
 }
 
---- A provider's answer to `scan` or `lookup` that says what it took care of.
----   _jessqlScan         the protocol tag. The engine honours `v1` and takes a table with any
----                       other tag for the rows themselves; it is typed as a string because that
----                       is what Luau infers for a table not written against this type
+--- A provider's answer to `scan` or `lookup` that says what it took care of. Write the table
+--- against this type, by annotating the function that returns it or the local that holds it:
+--- left to itself, Luau infers the tag as any string, and a provider returning that is refused.
+---   _jessqlScan         the protocol tag, `v1`. A table without it is taken for the rows
 ---   handledConstraints  every pushed constraint was applied to `rows`
 ---   handledWhere        the whole WHERE was, which only a request saying `whereComplete` allows
 ---   ordered             `rows` are in the order the request asked for
 export type ScanResult = {
-  read _jessqlScan: string,
+  read _jessqlScan: 'v1',
   read rows: SourceRows,
   read handledConstraints: boolean?,
   read handledWhere: boolean?,
@@ -65,11 +65,11 @@ export type ScanResult = {
 }
 
 --- A provider's lazy answer to `iterate`: `next` hands out rows until it returns nil. The tag is
---- `v1`, and the engine raises for any other. `volatileRows` says `next` reuses one row table,
---- which is allowed only when the request set `allowVolatileRows`; the other flags mean what they
---- do on a `ScanResult`.
+--- `v1`, and the engine raises for any other; like a `ScanResult`, the table is written against
+--- this type. `volatileRows` says `next` reuses one row table, which is allowed only when the
+--- request set `allowVolatileRows`; the other flags mean what they do on a `ScanResult`.
 export type Iterator = {
-  read _jessqlIter: string,
+  read _jessqlIter: 'v1',
   read next: () -> SourceRow?,
   read volatileRows: boolean?,
   read handledConstraints: boolean?,
