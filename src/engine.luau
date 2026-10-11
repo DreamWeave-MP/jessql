@@ -1152,7 +1152,8 @@ local function prepare(db: Database, sql: string): Plan
     local rowIterators = table.create(#sources)
     local scanMeta = table.create(#sources)
     local scanRequests = table.create(#sources)
-    local skipScan, lazyDriver = {}, {}
+    local skipScan = {}
+    local lazyDriver = {}
 
     if directSingle and type(sources[1].provider.iterate) == 'function' then
       skipScan[1] = true
@@ -1676,7 +1677,8 @@ local function prepare(db: Database, sql: string): Plan
     local orderAlreadySorted = false
 
     if aggregate then
-      local nilKey, order = {}, {}
+      local nilKey = {}
+      local order = {}
 
       local function newGroup(first, groupKey)
         if compactGroupColumn == nil and first ~= nil then first = retainContext(first) end
