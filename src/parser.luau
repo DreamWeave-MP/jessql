@@ -3,6 +3,65 @@
 
 local lexer = require('@jessql/lexer')
 
+--- A literal: a number, a string, TRUE or FALSE, or NULL, which is a nil `value` with `isNull` set.
+export type Literal = { tag: 'literal', value: (number | string | boolean)?, isNull: boolean? }
+
+--- The `index`th `?` of the statement, counting from one.
+export type Param = { tag: 'param', index: number }
+
+--- A column, as written. Preparing a query binds it: `sourceIndex` is then the position of its
+--- table among the statement's sources and `boundName` the column's name as that table spells it.
+export type Column = {
+  tag: 'column',
+  name: string,
+  qualifier: string?,
+  sourceIndex: number?,
+  boundName: string?,
+}
+
+--- `*`, or `qualifier.*`.
+export type Star = { tag: 'star', qualifier: string? }
+
+--- `NOT`, `-` or `+` in front of an expression.
+export type Unary = { tag: 'unary', op: string, expr: Expr }
+
+--- Two expressions and the operator between them: `OR`, `AND`, `LIKE`, a comparison, `||`, or
+--- arithmetic.
+export type Binary = { tag: 'binary', op: string, left: Expr, right: Expr }
+
+--- `expr IS NULL`, or `IS NOT NULL` when negated.
+export type IsNull = { tag: 'isnull', expr: Expr, negated: boolean }
+
+--- A function call, its name in capitals. `star` is the `*` of `COUNT(*)`, which has no arguments.
+export type Call = { tag: 'call', name: string, args: { Expr }, star: boolean }
+
+export type Expr = Literal | Param | Column | Star | Unary | Binary | IsNull | Call
+
+--- A table in FROM or JOIN. Its alias is the one written, or the last part of its name.
+export type Source = { name: string, alias: string }
+
+export type SelectItem = { expr: Expr, alias: string? }
+
+export type Join = { kind: 'inner' | 'left', source: Source, on: Expr }
+
+export type OrderItem = { expr: Expr, desc: boolean }
+
+--- A parsed SELECT statement. `params` counts its `?` placeholders; `offset` is 0 when none is
+--- written.
+export type Select = {
+  tag: 'select',
+  select: { SelectItem },
+  from: Source,
+  joins: { Join },
+  where: Expr?,
+  groupBy: { Expr },
+  having: Expr?,
+  orderBy: { OrderItem },
+  limit: number?,
+  offset: number,
+  params: number,
+}
+
 local parser = {}
 
 local ClauseKeywords = {
@@ -10,7 +69,7 @@ local ClauseKeywords = {
   JOIN = true, INNER = true, LEFT = true, RIGHT = true, FULL = true, ON = true,
 }
 
-local function parse(sql)
+local function parse(sql): Select
   local tokens = lexer.lex(sql)
   local position = 1
   local paramCount = 0

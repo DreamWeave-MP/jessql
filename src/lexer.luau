@@ -1,6 +1,18 @@
 --!strict
 --!native
 
+--- One token of SQL text. `text` is the token as written, a quoted string or identifier without
+--- its quotes and with its doubled quotes halved; the end of the input is `<eof>`. `value` is
+--- that same text for a string, an identifier, or a symbol, the number for a numeric literal,
+--- the word in capitals for a bare word, and nil for the end of the input. `at` is the byte the
+--- token starts on.
+export type Token = {
+  kind: 'string' | 'ident' | 'number' | 'word' | 'symbol' | 'eof',
+  text: string,
+  value: (string | number)?,
+  at: number,
+}
+
 local lexer = {}
 
 local function isSpace(byte)
@@ -23,7 +35,7 @@ local function fail(sql, at, message)
   error(string.format('jessql lexer at byte %d: %s near %q', at, message, string.sub(sql, at, math.min(#sql, at + 20))), 0)
 end
 
-function lexer.lex(sql)
+function lexer.lex(sql): { Token }
   local out = table.create(math.max(8, math.floor(#sql / 4)))
   local count = 0
   local position = 1

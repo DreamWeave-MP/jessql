@@ -3,6 +3,142 @@
 
 local parser = require('@jessql/parser')
 
+--- A row: its cells by column name, each holding whatever its source put there.
+export type Row = { [string]: unknown }
+
+--- A row as a provider hands it over. The engine only reads it, so any table keyed by column
+--- name is one, whatever its owner knows about its cells.
+export type SourceRow = { read [string]: unknown }
+
+--- The rows a provider hands over at once: an array the engine only reads.
+export type SourceRows = { read [number]: SourceRow }
+
+--- One predicate the engine pushed down to a provider: `column op value`, the column on the left.
+--- `op` is `=`, `!=`, `<>`, `<`, `<=`, `>`, `>=` or `LIKE`; `value` is the literal or the bound
+--- parameter the query compared the column with.
+export type Constraint = { column: string, op: string, value: unknown }
+
+--- One key of an ordering a provider is asked for. The engine always says which way; a request
+--- written by hand may leave `desc` out for ascending.
+export type Order = { column: string, desc: boolean? }
+
+--- What a provider's `scan`, `iterate` and `lookup` are handed. Every field is a hint a provider
+--- may ignore, and every field is optional, because providers are also called by hand; the engine
+--- itself always fills in `columns`, `constraints`, `whereComplete` and `allowVolatileRows`.
+---   columns            the columns the query reads from this table
+---   constraints        the predicates on this table simple enough to push down
+---   limit              the query's LIMIT as written, for a single-table query without a WHERE.
+---                      It knows nothing of OFFSET, grouping or ordering: stop at `limitHint`
+---   limitHint          how many rows are enough for the query, when no later filter can reject
+---                      one
+---   orderBy            the ordering the query wants, when this table alone decides it
+---   whereComplete      whether `constraints` are the whole WHERE of a single-table query
+---   allowVolatileRows  whether an iterator may hand out one reused row table
+export type Request = {
+  columns: { string }?,
+  constraints: { Constraint }?,
+  limit: number?,
+  limitHint: number?,
+  orderBy: { Order }?,
+  whereComplete: boolean?,
+  allowVolatileRows: boolean?,
+}
+
+--- A provider's answer to `scan` or `lookup` that says what it took care of.
+---   _jessqlScan         the protocol tag. The engine honours `v1` and takes a table with any
+---                       other tag for the rows themselves; it is typed as a string because that
+---                       is what Luau infers for a table not written against this type
+---   handledConstraints  every pushed constraint was applied to `rows`
+---   handledWhere        the whole WHERE was, which only a request saying `whereComplete` allows
+---   ordered             `rows` are in the order the request asked for
+export type ScanResult = {
+  read _jessqlScan: string,
+  read rows: SourceRows,
+  read handledConstraints: boolean?,
+  read handledWhere: boolean?,
+  read ordered: boolean?,
+}
+
+--- A provider's lazy answer to `iterate`: `next` hands out rows until it returns nil. The tag is
+--- `v1`, and the engine raises for any other. `volatileRows` says `next` reuses one row table,
+--- which is allowed only when the request set `allowVolatileRows`; the other flags mean what they
+--- do on a `ScanResult`.
+export type Iterator = {
+  read _jessqlIter: string,
+  read next: () -> SourceRow?,
+  read volatileRows: boolean?,
+  read handledConstraints: boolean?,
+  read handledWhere: boolean?,
+  read ordered: boolean?,
+}
+
+--- A table as the engine sees it: what a registering package implements. `columns` and `scan`
+--- are required; `scan` returns the rows, or a `ScanResult` around them.
+---   count    the exact number of rows, unfiltered: answers a bare `SELECT COUNT(*)`
+---   indexes  the columns `lookup` can find rows by
+---   lookup   the rows whose `column` equals `value`, for an indexed join
+---   iterate  a lazy scan, used in place of `scan` to drive a single-table query or an indexed join
+export type Provider = {
+  read columns: { string },
+  read scan: (request: Request) -> SourceRows | ScanResult,
+  read count: (() -> number)?,
+  read indexes: { [string]: boolean }?,
+  read lookup: ((column: string, value: unknown, request: Request) -> (SourceRows | ScanResult)?)?,
+  read iterate: ((request: Request) -> Iterator)?,
+}
+
+--- A query's answer: the result columns in SELECT order, and one row per result, keyed by them.
+--- A cell that is NULL is absent from its row.
+export type Result = { columns: { string }, rows: { Row } }
+
+--- One table of a prepared query, and the columns it is scanned for.
+export type ExplainedScan = { table: string, alias: string, columns: { string } }
+
+export type ExplainedJoin = {
+  kind: 'inner' | 'left',
+  table: string,
+  alias: string,
+  strategy: 'nested-loop' | 'hash' | 'index-left' | 'index-right',
+}
+
+--- How a prepared query will run: the columns each table is scanned for, each join's strategy,
+--- whether rows are grouped, whether a single grouping column stands in for the group's first row,
+--- the number of distinct aggregates, whether the provider's own `count` answers the query, and
+--- the number of parameters.
+export type Explanation = {
+  scans: { ExplainedScan },
+  joins: { ExplainedJoin },
+  grouped: boolean,
+  compactGroup: boolean,
+  aggregateCount: number,
+  providerCount: boolean,
+  parameterCount: number,
+}
+
+--- A prepared query. `run` takes the values for its `?` placeholders, in order, and may be called
+--- any number of times; `run` and `explain` are called with a dot.
+export type Plan = {
+  run: (params: { unknown }?) -> Result,
+  explain: () -> Explanation,
+  ast: parser.Select,
+  columns: { string },
+  parameterCount: number,
+}
+
+--- A registered table: its name in lower case, and its columns.
+export type TableInfo = { name: string, columns: { string } }
+
+--- A database: named providers, and queries over them. `_tables` is the engine's own registry,
+--- by lower-cased name.
+export type Database = {
+  _tables: { [string]: Provider },
+  register: (self: Database, name: string, provider: Provider) -> Database,
+  table: (self: Database, name: string, rows: SourceRows, columns: { string }?) -> Database,
+  prepare: (self: Database, sql: string) -> Plan,
+  query: (self: Database, sql: string, params: { unknown }?) -> Result,
+  tables: (self: Database) -> { TableInfo },
+}
+
 local engine = {}
 local AGG = { COUNT = true, SUM = true, AVG = true, MIN = true, MAX = true }
 
@@ -573,7 +709,7 @@ local function valueKey(value)
   return 'O' .. tostring(value) .. ';'
 end
 
-local function prepare(db, sql)
+local function prepare(db: Database, sql: string): Plan
   local ast = parser.parse(sql)
   local sources = { makeSource(db, ast.from, 1) }
   for index, join in ast.joins do sources[#sources + 1] = makeSource(db, join.source, index + 1) end
@@ -1931,10 +2067,10 @@ local function prepare(db, sql)
   return plan
 end
 
-function engine.new()
-  local db = { _tables = {} }
+function engine.new(): Database
+  local db = { _tables = {} :: { [string]: Provider } }
 
-  function db:register(name, provider)
+  function db.register(self: Database, name: string, provider: Provider): Database
     if type(name) ~= 'string' or name == '' then error('jessql: table name must be a string', 2) end
     if type(provider) ~= 'table' or type(provider.scan) ~= 'function' then error('jessql: provider needs scan(request)', 2) end
     if type(provider.columns) ~= 'table' then error('jessql: provider needs columns', 2) end
@@ -1942,7 +2078,7 @@ function engine.new()
     return self
   end
 
-  function db:table(name, rows, columns)
+  function db.table(self: Database, name: string, rows: SourceRows, columns: { string }?): Database
     columns = columns or schemaFromRows(rows)
 
     return self:register(name, {
@@ -1952,15 +2088,15 @@ function engine.new()
     })
   end
 
-  function db:prepare(sql)
+  function db.prepare(self: Database, sql: string): Plan
     return prepare(self, sql)
   end
 
-  function db:query(sql, params)
+  function db.query(self: Database, sql: string, params: { unknown }?): Result
     return prepare(self, sql).run(params)
   end
 
-  function db:tables()
+  function db.tables(self: Database): { TableInfo }
     local out = {}
     for name, provider in self._tables do out[#out + 1] = { name = name, columns = provider.columns } end
     table.sort(out, function(left, right) return left.name < right.name end)
