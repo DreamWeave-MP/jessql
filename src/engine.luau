@@ -588,9 +588,7 @@ local function prepare(db, sql)
         if hasAggregate(join.on) then error('jessql: aggregates are not allowed in JOIN ON', 0) end
     end
 
-    local aggregateIds = {}
-    local aggregateSpecs = {}
-    local aggregateByKey = {}
+    local aggregateIds, aggregateSpecs, aggregateByKey = {}, {}, {}
 
     local function exprKey(node)
         if node == nil then return 'nil' end
@@ -696,8 +694,7 @@ local function prepare(db, sql)
         return score
     end
 
-    local joinFns = {}
-    local joinPlans = {}
+    local joinFns, joinPlans = {}, {}
 
     for index, join in ast.joins do
         joinFns[index] = compileExpr(join.on, sources, directSingle, nil)
@@ -824,10 +821,7 @@ local function prepare(db, sql)
         end
     end
 
-    local selectors = {}
-    local resultColumns = {}
-    local selectorByAlias = {}
-    local selectorSource = {}
+    local selectors, resultColumns, selectorByAlias, selectorSource = {}, {}, {}, {}
 
     local function addSelector(name, selector, sourceInfo)
         selectors[#selectors + 1] = selector
@@ -879,8 +873,7 @@ local function prepare(db, sql)
         end
     end
 
-    local orderFns = {}
-    local orderSourceInfo = {}
+    local orderFns, orderSourceInfo = {}, {}
 
     for index, order in ast.orderBy do
         local evaluate = nil
@@ -1023,8 +1016,7 @@ local function prepare(db, sql)
         local rowIterators = table.create(#sources)
         local scanMeta = table.create(#sources)
         local scanRequests = table.create(#sources)
-        local skipScan = {}
-        local lazyDriver = {}
+        local skipScan, lazyDriver = {}, {}
 
         if directSingle and type(sources[1].provider.iterate) == 'function' then
             skipScan[1] = true
@@ -1234,8 +1226,7 @@ local function prepare(db, sql)
                 if joinIndex == 1 and not directSingle and joinPlan.strategy == 'index-left' then
                     local provider = sources[1].provider
                     local request = scanRequests[1]
-                    local cache = {}
-                    local missing = {}
+                    local cache, missing = {}, {}
                     local driverMeta = scanMeta[2]
                     local driverOrdered = #orderFns == 0 or (indexedDriverOrder ~= nil and driverMeta ~= nil and driverMeta.ordered == true)
                     local stopAfter = if driverOrdered and ast.limit ~= nil and not aggregate then ast.offset + ast.limit else nil
@@ -1300,8 +1291,7 @@ local function prepare(db, sql)
                 elseif joinIndex == 1 and not directSingle and joinPlan.strategy == 'index-right' then
                     local provider = sources[2].provider
                     local request = scanRequests[2]
-                    local cache = {}
-                    local missing = {}
+                    local cache, missing = {}, {}
                     local driverMeta = scanMeta[1]
                     local driverOrdered = #orderFns == 0 or (indexedDriverOrder ~= nil and driverMeta ~= nil and driverMeta.ordered == true)
                     local stopAfter = if driverOrdered and ast.limit ~= nil and not aggregate then ast.offset + ast.limit else nil
@@ -1364,8 +1354,7 @@ local function prepare(db, sql)
                     residualWhere = nil
                     if #orderFns > 0 and driverOrdered then orderHandled = true end
                 elseif joinIndex == 1 and not directSingle and joinPlan.strategy == 'hash' then
-                    local buckets = {}
-                    local duplicateBuckets = {}
+                    local buckets, duplicateBuckets = {}, {}
 
                     for _, right in rhs do
                         local key = right[joinPlan.rightColumn]
@@ -1420,8 +1409,7 @@ local function prepare(db, sql)
                         if not matched and join.kind == 'left' then nextContexts[#nextContexts + 1] = { leftRow } end
                     end
                 elseif joinPlan.strategy == 'hash' then
-                    local buckets = {}
-                    local duplicateBuckets = {}
+                    local buckets, duplicateBuckets = {}, {}
 
                     for _, right in rhs do
                         local key = right[joinPlan.rightColumn]
@@ -1555,8 +1543,7 @@ local function prepare(db, sql)
         local orderAlreadySorted = false
 
         if aggregate then
-            local nilKey = {}
-            local order = {}
+            local nilKey, order = {}, {}
 
             local function newGroup(first, groupKey)
                 if compactGroupColumn == nil and first ~= nil then first = retainContext(first) end
