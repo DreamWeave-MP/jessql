@@ -1,6 +1,6 @@
 --!native
 
-local parser = require("@jessql/parser")
+local parser = require('@jessql/parser')
 
 local M = {}
 local AGG = { COUNT=true, SUM=true, AVG=true, MIN=true, MAX=true }
@@ -9,10 +9,10 @@ local function lower(s) return string.lower(s) end
 
 local function hasAggregate(expr)
     if expr == nil then return false end
-    if expr.tag == "call" and AGG[expr.name] then return true end
-    if expr.tag == "binary" then return hasAggregate(expr.left) or hasAggregate(expr.right) end
-    if expr.tag == "unary" or expr.tag == "isnull" then return hasAggregate(expr.expr) end
-    if expr.tag == "call" then
+    if expr.tag == 'call' and AGG[expr.name] then return true end
+    if expr.tag == 'binary' then return hasAggregate(expr.left) or hasAggregate(expr.right) end
+    if expr.tag == 'unary' or expr.tag == 'isnull' then return hasAggregate(expr.expr) end
+    if expr.tag == 'call' then
         for _, a in expr.args do if hasAggregate(a) then return true end end
     end
     return false
@@ -26,11 +26,11 @@ local function like(value, pattern)
     local vi, pi, starVi, starPi = 1, 1, nil, nil
     while vi <= #value do
         local pc = string.sub(pattern, pi, pi)
-        if pc == "_" then
+        if pc == '_' then
             vi += 1; pi += 1
-        elseif pc == "%" then
+        elseif pc == '%' then
             starPi = pi + 1; starVi = vi; pi += 1
-        elseif pc ~= "" and string.sub(value, vi, vi) == pc then
+        elseif pc ~= '' and string.sub(value, vi, vi) == pc then
             vi += 1; pi += 1
         elseif starPi ~= nil then
             starVi += 1; vi = starVi; pi = starPi
@@ -38,14 +38,14 @@ local function like(value, pattern)
             return false
         end
     end
-    while string.sub(pattern, pi, pi) == "%" do pi += 1 end
+    while string.sub(pattern, pi, pi) == '%' do pi += 1 end
     return pi > #pattern
 end
 
 local function compileLiteralLike(pattern)
-    if type(pattern) ~= "string" then return nil end
-    local firstPercent = string.find(pattern, "%", 1, true)
-    local firstUnderscore = string.find(pattern, "_", 1, true)
+    if type(pattern) ~= 'string' then return nil end
+    local firstPercent = string.find(pattern, '%', 1, true)
+    local firstUnderscore = string.find(pattern, '_', 1, true)
     if firstUnderscore ~= nil then return nil end
     if firstPercent == nil then
         return function(value)
@@ -53,7 +53,7 @@ local function compileLiteralLike(pattern)
             return tostring(value) == pattern
         end
     end
-    local secondPercent = string.find(pattern, "%", firstPercent + 1, true)
+    local secondPercent = string.find(pattern, '%', firstPercent + 1, true)
     if secondPercent ~= nil then return nil end
     if firstPercent == #pattern then
         local prefix = string.sub(pattern, 1, -2)
@@ -84,16 +84,16 @@ local function bindColumn(expr, sources)
         for i, s in sources do
             if lower(s.alias) == q or lower(s.name) == q then sourceIndex = i; break end
         end
-        if sourceIndex == nil then error("jessql: unknown table/alias " .. expr.qualifier, 0) end
+        if sourceIndex == nil then error('jessql: unknown table/alias ' .. expr.qualifier, 0) end
     else
         local hit = nil
         for i, s in sources do
             if s.columnSet[name] then
-                if hit ~= nil then error("jessql: ambiguous column " .. expr.name, 0) end
+                if hit ~= nil then error('jessql: ambiguous column ' .. expr.name, 0) end
                 hit = i
             end
         end
-        if hit == nil then error("jessql: unknown column " .. expr.name, 0) end
+        if hit == nil then error('jessql: unknown column ' .. expr.name, 0) end
         sourceIndex = hit
     end
     expr.sourceIndex = sourceIndex
@@ -103,13 +103,13 @@ end
 
 local function compileExpr(expr, sources, directSingle, aggregateIds)
     local tag = expr.tag
-    if tag == "literal" then
+    if tag == 'literal' then
         local value = expr.value
         return function(_ctx, _group, _params) return value end
-    elseif tag == "param" then
+    elseif tag == 'param' then
         local index = expr.index
         return function(_ctx, _group, params) return params[index] end
-    elseif tag == "column" then
+    elseif tag == 'column' then
         local sourceIndex, boundName = bindColumn(expr, sources)
         local key = boundName
         local si = sourceIndex
@@ -120,61 +120,61 @@ local function compileExpr(expr, sources, directSingle, aggregateIds)
             local row = ctx[si]
             return if row == nil then nil else row[key]
         end
-    elseif tag == "unary" then
+    elseif tag == 'unary' then
         local f = compileExpr(expr.expr, sources, directSingle, aggregateIds)
-        if expr.op == "NOT" then return function(c,g,p) local v=f(c,g,p); return if v==nil then nil else not sqlTruthy(v) end end
-        if expr.op == "-" then return function(c,g,p) local v=f(c,g,p); return if v==nil then nil else -v end end
+        if expr.op == 'NOT' then return function(c,g,p) local v=f(c,g,p); return if v==nil then nil else not sqlTruthy(v) end end
+        if expr.op == '-' then return function(c,g,p) local v=f(c,g,p); return if v==nil then nil else -v end end
         return function(c,g,p) return f(c,g,p) end
-    elseif tag == "isnull" then
+    elseif tag == 'isnull' then
         local f = compileExpr(expr.expr, sources, directSingle, aggregateIds)
         if expr.negated then return function(c,g,p) return f(c,g,p) ~= nil end end
         return function(c,g,p) return f(c,g,p) == nil end
-    elseif tag == "binary" then
+    elseif tag == 'binary' then
         local a = compileExpr(expr.left, sources, directSingle, aggregateIds)
         local b = compileExpr(expr.right, sources, directSingle, aggregateIds)
         local op = expr.op
-        if op == "AND" then return function(c,g,p) local x=a(c,g,p); if x==false then return false end; local y=b(c,g,p); if y==false then return false end; if x==nil or y==nil then return nil end; return sqlTruthy(x) and sqlTruthy(y) end end
-        if op == "OR" then return function(c,g,p) local x=a(c,g,p); if sqlTruthy(x) then return true end; local y=b(c,g,p); if sqlTruthy(y) then return true end; if x==nil or y==nil then return nil end; return false end end
-        if op == "=" then return function(c,g,p) local x,y=a(c,g,p),b(c,g,p); if x==nil or y==nil then return nil end; return x==y end end
-        if op == "!=" or op == "<>" then return function(c,g,p) local x,y=a(c,g,p),b(c,g,p); if x==nil or y==nil then return nil end; return x~=y end end
-        if op == "<" then return function(c,g,p) local x,y=a(c,g,p),b(c,g,p); if x==nil or y==nil then return nil end; return x<y end end
-        if op == "<=" then return function(c,g,p) local x,y=a(c,g,p),b(c,g,p); if x==nil or y==nil then return nil end; return x<=y end end
-        if op == ">" then return function(c,g,p) local x,y=a(c,g,p),b(c,g,p); if x==nil or y==nil then return nil end; return x>y end end
-        if op == ">=" then return function(c,g,p) local x,y=a(c,g,p),b(c,g,p); if x==nil or y==nil then return nil end; return x>=y end end
-        if op == "+" then return function(c,g,p) local x,y=a(c,g,p),b(c,g,p); if x==nil or y==nil then return nil end; return x+y end end
-        if op == "-" then return function(c,g,p) local x,y=a(c,g,p),b(c,g,p); if x==nil or y==nil then return nil end; return x-y end end
-        if op == "*" then return function(c,g,p) local x,y=a(c,g,p),b(c,g,p); if x==nil or y==nil then return nil end; return x*y end end
-        if op == "/" then return function(c,g,p) local x,y=a(c,g,p),b(c,g,p); if x==nil or y==nil then return nil end; return x/y end end
-        if op == "%" then return function(c,g,p) local x,y=a(c,g,p),b(c,g,p); if x==nil or y==nil then return nil end; return x%y end end
-        if op == "||" then return function(c,g,p) local x,y=a(c,g,p),b(c,g,p); if x==nil or y==nil then return nil end; return tostring(x)..tostring(y) end end
-        if op == "LIKE" then
-            if expr.right.tag == "literal" then
+        if op == 'AND' then return function(c,g,p) local x=a(c,g,p); if x==false then return false end; local y=b(c,g,p); if y==false then return false end; if x==nil or y==nil then return nil end; return sqlTruthy(x) and sqlTruthy(y) end end
+        if op == 'OR' then return function(c,g,p) local x=a(c,g,p); if sqlTruthy(x) then return true end; local y=b(c,g,p); if sqlTruthy(y) then return true end; if x==nil or y==nil then return nil end; return false end end
+        if op == '=' then return function(c,g,p) local x,y=a(c,g,p),b(c,g,p); if x==nil or y==nil then return nil end; return x==y end end
+        if op == '!=' or op == '<>' then return function(c,g,p) local x,y=a(c,g,p),b(c,g,p); if x==nil or y==nil then return nil end; return x~=y end end
+        if op == '<' then return function(c,g,p) local x,y=a(c,g,p),b(c,g,p); if x==nil or y==nil then return nil end; return x<y end end
+        if op == '<=' then return function(c,g,p) local x,y=a(c,g,p),b(c,g,p); if x==nil or y==nil then return nil end; return x<=y end end
+        if op == '>' then return function(c,g,p) local x,y=a(c,g,p),b(c,g,p); if x==nil or y==nil then return nil end; return x>y end end
+        if op == '>=' then return function(c,g,p) local x,y=a(c,g,p),b(c,g,p); if x==nil or y==nil then return nil end; return x>=y end end
+        if op == '+' then return function(c,g,p) local x,y=a(c,g,p),b(c,g,p); if x==nil or y==nil then return nil end; return x+y end end
+        if op == '-' then return function(c,g,p) local x,y=a(c,g,p),b(c,g,p); if x==nil or y==nil then return nil end; return x-y end end
+        if op == '*' then return function(c,g,p) local x,y=a(c,g,p),b(c,g,p); if x==nil or y==nil then return nil end; return x*y end end
+        if op == '/' then return function(c,g,p) local x,y=a(c,g,p),b(c,g,p); if x==nil or y==nil then return nil end; return x/y end end
+        if op == '%' then return function(c,g,p) local x,y=a(c,g,p),b(c,g,p); if x==nil or y==nil then return nil end; return x%y end end
+        if op == '||' then return function(c,g,p) local x,y=a(c,g,p),b(c,g,p); if x==nil or y==nil then return nil end; return tostring(x)..tostring(y) end end
+        if op == 'LIKE' then
+            if expr.right.tag == 'literal' then
                 local fast = compileLiteralLike(expr.right.value)
                 if fast ~= nil then return function(c,g,p) return fast(a(c,g,p)) end end
             end
             return function(c,g,p) return like(a(c,g,p), b(c,g,p)) end
         end
-        error("jessql: unsupported operator " .. tostring(op), 0)
-    elseif tag == "call" then
+        error('jessql: unsupported operator ' .. tostring(op), 0)
+    elseif tag == 'call' then
         local name = expr.name
         if AGG[name] and aggregateIds ~= nil then
             local id = aggregateIds[expr]
-            if id == nil then error("jessql: aggregate expression was not planned", 0) end
+            if id == nil then error('jessql: aggregate expression was not planned', 0) end
             return function(_c, group, _p) return group[id] end
         elseif AGG[name] then
             local arg = nil
             if not expr.star then
-                if #expr.args ~= 1 then error("jessql: aggregate " .. name .. " needs one argument", 0) end
+                if #expr.args ~= 1 then error('jessql: aggregate ' .. name .. ' needs one argument', 0) end
                 arg = compileExpr(expr.args[1], sources, directSingle, aggregateIds)
             end
-            if name == "COUNT" then
+            if name == 'COUNT' then
                 if expr.star then return function(_c,g,_p) return #g end end
                 return function(_c,g,p) local n=0; for _,gc in g do if arg(gc,g,p)~=nil then n+=1 end end; return n end
-            elseif name == "SUM" then
+            elseif name == 'SUM' then
                 return function(_c,g,p) local total=nil; for _,gc in g do local v=arg(gc,g,p); if v~=nil then total=(total or 0)+v end end; return total end
-            elseif name == "AVG" then
+            elseif name == 'AVG' then
                 return function(_c,g,p) local total,n=0,0; for _,gc in g do local v=arg(gc,g,p); if v~=nil then total+=v; n+=1 end end; return if n==0 then nil else total/n end
-            elseif name == "MIN" then
+            elseif name == 'MIN' then
                 return function(_c,g,p) local best=nil; for _,gc in g do local v=arg(gc,g,p); if v~=nil and (best==nil or v<best) then best=v end end; return best end
             else
                 return function(_c,g,p) local best=nil; for _,gc in g do local v=arg(gc,g,p); if v~=nil and (best==nil or v>best) then best=v end end; return best end
@@ -182,28 +182,28 @@ local function compileExpr(expr, sources, directSingle, aggregateIds)
         end
         local args = table.create(#expr.args)
         for i, a in expr.args do args[i] = compileExpr(a, sources, directSingle, aggregateIds) end
-        if name == "LOWER" then
+        if name == 'LOWER' then
             return function(c,g,p) local v=args[1](c,g,p); return if v==nil then nil else string.lower(tostring(v)) end
-        elseif name == "UPPER" then
+        elseif name == 'UPPER' then
             return function(c,g,p) local v=args[1](c,g,p); return if v==nil then nil else string.upper(tostring(v)) end
-        elseif name == "LENGTH" then
+        elseif name == 'LENGTH' then
             return function(c,g,p) local v=args[1](c,g,p); return if v==nil then nil else #tostring(v) end
-        elseif name == "ABS" then
+        elseif name == 'ABS' then
             return function(c,g,p) local v=args[1](c,g,p); return if v==nil then nil else math.abs(v) end
-        elseif name == "COALESCE" then
+        elseif name == 'COALESCE' then
             return function(c,g,p) for _,f in args do local v=f(c,g,p); if v~=nil then return v end end return nil end
         else
-            error("jessql: unknown function " .. name, 0)
+            error('jessql: unknown function ' .. name, 0)
         end
     end
-    error("jessql: cannot compile expression " .. tostring(tag), 0)
+    error('jessql: cannot compile expression ' .. tostring(tag), 0)
 end
 
 local function schemaFromRows(rows)
     local columns, seen = {}, {}
     for i = 1, math.min(#rows, 32) do
         for k in rows[i] do
-            if type(k) == "string" and not seen[lower(k)] then seen[lower(k)] = true; columns[#columns+1] = k end
+            if type(k) == 'string' and not seen[lower(k)] then seen[lower(k)] = true; columns[#columns+1] = k end
         end
     end
     table.sort(columns)
@@ -212,7 +212,7 @@ end
 
 local function makeSource(db, spec, index)
     local provider = db._tables[lower(spec.name)]
-    if provider == nil then error("jessql: unknown table " .. spec.name, 0) end
+    if provider == nil then error('jessql: unknown table ' .. spec.name, 0) end
     local columns = provider.columns
     local cmap, cset = {}, {}
     for _, c in columns do cmap[lower(c)] = c; cset[lower(c)] = true end
@@ -223,18 +223,18 @@ local function constraintFrom(expr)
     if expr == nil then return {}, true end
     local out = {}
     local function walk(e)
-        if e.tag == "binary" and e.op == "AND" then return walk(e.left) and walk(e.right) end
-        if e.tag ~= "binary" then return false end
+        if e.tag == 'binary' and e.op == 'AND' then return walk(e.left) and walk(e.right) end
+        if e.tag ~= 'binary' then return false end
         local op = e.op
-        if op ~= "=" and op ~= "!=" and op ~= "<>" and op ~= "<" and op ~= "<=" and op ~= ">" and op ~= ">=" and op ~= "LIKE" then return false end
+        if op ~= '=' and op ~= '!=' and op ~= '<>' and op ~= '<' and op ~= '<=' and op ~= '>' and op ~= '>=' and op ~= 'LIKE' then return false end
         local col, lit = e.left, e.right
         local flip = false
-        if col.tag ~= "column" or (lit.tag ~= "literal" and lit.tag ~= "param") then
+        if col.tag ~= 'column' or (lit.tag ~= 'literal' and lit.tag ~= 'param') then
             col, lit = e.right, e.left; flip = true
         end
-        if col.tag ~= "column" or (lit.tag ~= "literal" and lit.tag ~= "param") or col.sourceIndex == nil then return false end
+        if col.tag ~= 'column' or (lit.tag ~= 'literal' and lit.tag ~= 'param') or col.sourceIndex == nil then return false end
         if flip then
-            if op == "<" then op = ">" elseif op == ">" then op = "<" elseif op == "<=" then op = ">=" elseif op == ">=" then op = "<=" end
+            if op == '<' then op = '>' elseif op == '>' then op = '<' elseif op == '<=' then op = '>=' elseif op == '>=' then op = '<=' end
         end
         out[#out+1] = { sourceIndex=col.sourceIndex, column=col.boundName, op=op, value=lit.value, param=lit.index }
         return true
@@ -246,7 +246,7 @@ end
 local function conjuncts(expr)
     local out = {}
     local function walk(e)
-        if e ~= nil and e.tag == "binary" and e.op == "AND" then
+        if e ~= nil and e.tag == 'binary' and e.op == 'AND' then
             walk(e.left); walk(e.right)
         elseif e ~= nil then
             out[#out+1] = e
@@ -261,16 +261,16 @@ local function singleSourceOf(expr)
     local mixed = false
     local function walk(e)
         if e == nil or mixed then return end
-        if e.tag == "column" then
+        if e.tag == 'column' then
             local si = e.sourceIndex
             if si ~= nil then
                 if source == nil then source = si elseif source ~= si then mixed = true end
             end
-        elseif e.tag == "binary" then
+        elseif e.tag == 'binary' then
             walk(e.left); walk(e.right)
-        elseif e.tag == "unary" or e.tag == "isnull" then
+        elseif e.tag == 'unary' or e.tag == 'isnull' then
             walk(e.expr)
-        elseif e.tag == "call" then
+        elseif e.tag == 'call' then
             for _, a in e.args do walk(a) end
         end
     end
@@ -279,12 +279,12 @@ local function singleSourceOf(expr)
 end
 
 local function valueKey(v)
-    if v == nil then return "N;" end
+    if v == nil then return 'N;' end
     local t = type(v)
-    if t == "string" then return "S" .. #v .. ":" .. v end
-    if t == "number" then return "D" .. tostring(v) .. ";" end
-    if t == "boolean" then return if v then "B1;" else "B0;" end
-    return "O" .. tostring(v) .. ";"
+    if t == 'string' then return 'S' .. #v .. ':' .. v end
+    if t == 'number' then return 'D' .. tostring(v) .. ';' end
+    if t == 'boolean' then return if v then 'B1;' else 'B0;' end
+    return 'O' .. tostring(v) .. ';'
 end
 
 local function prepare(db, sql)
@@ -293,32 +293,32 @@ local function prepare(db, sql)
     for i, j in ast.joins do sources[#sources+1] = makeSource(db, j.source, i+1) end
     local directSingle = #sources == 1
 
-    if hasAggregate(ast.where) then error("jessql: aggregates are not allowed in WHERE", 0) end
-    for _, e in ast.groupBy do if hasAggregate(e) then error("jessql: aggregates are not allowed in GROUP BY", 0) end end
-    for _, j in ast.joins do if hasAggregate(j.on) then error("jessql: aggregates are not allowed in JOIN ON", 0) end end
+    if hasAggregate(ast.where) then error('jessql: aggregates are not allowed in WHERE', 0) end
+    for _, e in ast.groupBy do if hasAggregate(e) then error('jessql: aggregates are not allowed in GROUP BY', 0) end end
+    for _, j in ast.joins do if hasAggregate(j.on) then error('jessql: aggregates are not allowed in JOIN ON', 0) end end
 
     local aggregateIds = {}
     local aggregateSpecs = {}
     local aggregateByKey = {}
     local function exprKey(e)
-        if e == nil then return "nil" end
-        if e.tag == "literal" then return "lit:" .. type(e.value) .. ":" .. tostring(e.value) end
-        if e.tag == "param" then return "param:" .. tostring(e.index) end
-        if e.tag == "column" then return "col:" .. lower(e.qualifier or "") .. "." .. lower(e.name) end
-        if e.tag == "star" then return "star:" .. lower(e.qualifier or "") end
-        if e.tag == "unary" then return "u:" .. e.op .. "(" .. exprKey(e.expr) .. ")" end
-        if e.tag == "isnull" then return "null:" .. tostring(e.negated) .. "(" .. exprKey(e.expr) .. ")" end
-        if e.tag == "binary" then return "b:" .. e.op .. "(" .. exprKey(e.left) .. "," .. exprKey(e.right) .. ")" end
-        if e.tag == "call" then
+        if e == nil then return 'nil' end
+        if e.tag == 'literal' then return 'lit:' .. type(e.value) .. ':' .. tostring(e.value) end
+        if e.tag == 'param' then return 'param:' .. tostring(e.index) end
+        if e.tag == 'column' then return 'col:' .. lower(e.qualifier or '') .. '.' .. lower(e.name) end
+        if e.tag == 'star' then return 'star:' .. lower(e.qualifier or '') end
+        if e.tag == 'unary' then return 'u:' .. e.op .. '(' .. exprKey(e.expr) .. ')' end
+        if e.tag == 'isnull' then return 'null:' .. tostring(e.negated) .. '(' .. exprKey(e.expr) .. ')' end
+        if e.tag == 'binary' then return 'b:' .. e.op .. '(' .. exprKey(e.left) .. ',' .. exprKey(e.right) .. ')' end
+        if e.tag == 'call' then
             local parts = table.create(#e.args)
             for i, a in e.args do parts[i] = exprKey(a) end
-            return "call:" .. e.name .. ":" .. tostring(e.star) .. "(" .. table.concat(parts, ",") .. ")"
+            return 'call:' .. e.name .. ':' .. tostring(e.star) .. '(' .. table.concat(parts, ',') .. ')'
         end
         return tostring(e.tag)
     end
     local function registerAggregates(e)
         if e == nil then return end
-        if e.tag == "call" and AGG[e.name] then
+        if e.tag == 'call' and AGG[e.name] then
             local key = exprKey(e)
             local id = aggregateByKey[key]
             if id == nil then
@@ -328,11 +328,11 @@ local function prepare(db, sql)
             end
             aggregateIds[e] = id
             return
-        elseif e.tag == "binary" then
+        elseif e.tag == 'binary' then
             registerAggregates(e.left); registerAggregates(e.right)
-        elseif e.tag == "unary" or e.tag == "isnull" then
+        elseif e.tag == 'unary' or e.tag == 'isnull' then
             registerAggregates(e.expr)
-        elseif e.tag == "call" then
+        elseif e.tag == 'call' then
             for _, a in e.args do registerAggregates(a) end
         end
     end
@@ -388,32 +388,32 @@ local function prepare(db, sql)
         joinFns[i] = compileExpr(j.on, sources, directSingle, nil)
         local rightIndex = i + 1
         local e = j.on
-        local plan = { strategy="nested-loop" }
-        if e.tag == "binary" and e.op == "=" and e.left.tag == "column" and e.right.tag == "column" then
+        local plan = { strategy='nested-loop' }
+        if e.tag == 'binary' and e.op == '=' and e.left.tag == 'column' and e.right.tag == 'column' then
             local leftCol, rightCol = e.left, e.right
             if leftCol.sourceIndex == rightIndex and rightCol.sourceIndex < rightIndex then leftCol, rightCol = rightCol, leftCol end
             if leftCol.sourceIndex < rightIndex and rightCol.sourceIndex == rightIndex then
                 plan = {
-                    strategy="hash",
+                    strategy='hash',
                     leftSourceIndex=leftCol.sourceIndex,
                     leftColumn=leftCol.boundName,
                     rightColumn=rightCol.boundName,
                 }
-                if #sources == 2 and #ast.joins == 1 and j.kind == "inner" then
+                if #sources == 2 and #ast.joins == 1 and j.kind == 'inner' then
                     local leftProvider = sources[leftCol.sourceIndex].provider
                     local rightProvider = sources[rightIndex].provider
-                    local leftIndexed = leftCol.sourceIndex == 1 and type(leftProvider.lookup) == "function"
-                        and type(leftProvider.indexes) == "table" and leftProvider.indexes[leftCol.boundName] == true
-                    local rightIndexed = type(rightProvider.lookup) == "function"
-                        and type(rightProvider.indexes) == "table" and rightProvider.indexes[rightCol.boundName] == true
+                    local leftIndexed = leftCol.sourceIndex == 1 and type(leftProvider.lookup) == 'function'
+                        and type(leftProvider.indexes) == 'table' and leftProvider.indexes[leftCol.boundName] == true
+                    local rightIndexed = type(rightProvider.lookup) == 'function'
+                        and type(rightProvider.indexes) == 'table' and rightProvider.indexes[rightCol.boundName] == true
                     if leftIndexed and rightIndexed then
                         local leftScore = sourceFilterScore(leftCol.sourceIndex)
                         local rightScore = sourceFilterScore(rightIndex)
-                        plan.strategy = if leftScore > rightScore then "index-right" else "index-left"
+                        plan.strategy = if leftScore > rightScore then 'index-right' else 'index-left'
                     elseif leftIndexed then
-                        plan.strategy = "index-left"
+                        plan.strategy = 'index-left'
                     elseif rightIndexed then
-                        plan.strategy = "index-right"
+                        plan.strategy = 'index-right'
                     end
                 end
             end
@@ -424,15 +424,15 @@ local function prepare(db, sql)
     for i, e in ast.groupBy do groupFns[i] = compileExpr(e, sources, directSingle, nil) end
     for _, spec in aggregateSpecs do
         if spec.star then
-            if spec.name ~= "COUNT" then error("jessql: only COUNT accepts *", 0) end
+            if spec.name ~= 'COUNT' then error('jessql: only COUNT accepts *', 0) end
         else
-            if #spec.expr.args ~= 1 then error("jessql: aggregate " .. spec.name .. " needs one argument", 0) end
+            if #spec.expr.args ~= 1 then error('jessql: aggregate ' .. spec.name .. ' needs one argument', 0) end
             spec.argFn = compileExpr(spec.expr.args[1], sources, directSingle, nil)
         end
     end
     local havingFn = if ast.having then compileExpr(ast.having, sources, directSingle, aggregateIds) else nil
     local hasAvg = false
-    for _, spec in aggregateSpecs do if spec.name == "AVG" then hasAvg = true; break end end
+    for _, spec in aggregateSpecs do if spec.name == 'AVG' then hasAvg = true; break end end
 
     -- A single simple GROUP BY column can carry its own representative value. If every
     -- non-aggregate column referenced after grouping is that same column, retaining the first
@@ -442,9 +442,9 @@ local function prepare(db, sql)
     local compactGroupColumn = nil
     if #ast.groupBy == 1 then
         local grouped = ast.groupBy[1]
-        local groupedSource = if grouped.tag == "column" then grouped.sourceIndex else nil
-        if groupedSource == nil and grouped.tag == "column" and directSingle then groupedSource = 1 end
-        if grouped.tag == "column" and groupedSource ~= nil then
+        local groupedSource = if grouped.tag == 'column' then grouped.sourceIndex else nil
+        if groupedSource == nil and grouped.tag == 'column' and directSingle then groupedSource = 1 end
+        if grouped.tag == 'column' and groupedSource ~= nil then
             local groupedName = grouped.boundName or grouped.name
             local selectAliases = {}
             for _, item in ast.select do
@@ -454,7 +454,7 @@ local function prepare(db, sql)
             local safe = true
             local function inspectPostAggregate(expr, insideAggregate)
                 if expr == nil or not safe then return end
-                if expr.tag == "column" then
+                if expr.tag == 'column' then
                     if not insideAggregate then
                         local aliasExpr = nil
                         if expr.qualifier == nil and expr.sourceIndex == nil then
@@ -469,12 +469,12 @@ local function prepare(db, sql)
                             if sourceIndex ~= groupedSource or columnName ~= groupedName then safe = false end
                         end
                     end
-                elseif expr.tag == "binary" then
+                elseif expr.tag == 'binary' then
                     inspectPostAggregate(expr.left, insideAggregate)
                     inspectPostAggregate(expr.right, insideAggregate)
-                elseif expr.tag == "unary" or expr.tag == "isnull" then
+                elseif expr.tag == 'unary' or expr.tag == 'isnull' then
                     inspectPostAggregate(expr.expr, insideAggregate)
-                elseif expr.tag == "call" then
+                elseif expr.tag == 'call' then
                     local aggregateCall = AGG[string.upper(expr.name)] == true
                     for _, argument in expr.args do inspectPostAggregate(argument, insideAggregate or aggregateCall) end
                 end
@@ -498,7 +498,7 @@ local function prepare(db, sql)
     end
     for _, item in ast.select do
         local e = item.expr
-        if e.tag == "star" then
+        if e.tag == 'star' then
             for si, s in sources do
                 if e.qualifier == nil or lower(e.qualifier) == lower(s.alias) or lower(e.qualifier) == lower(s.name) then
                     for _, c in s.columns do
@@ -510,19 +510,19 @@ local function prepare(db, sql)
                         else
                             fn = function(ctx) local r=ctx[idx]; return if r then r[key] else nil end
                         end
-                        addSelector(if directSingle then c else s.alias .. "." .. c, fn, { sourceIndex=si, column=c })
+                        addSelector(if directSingle then c else s.alias .. '.' .. c, fn, { sourceIndex=si, column=c })
                     end
                 end
             end
         else
             local name = item.alias
             if name == nil then
-                if e.tag == "column" then name = e.name
-                elseif e.tag == "call" then name = string.lower(e.name)
-                else name = "expr" .. tostring(#selectors + 1) end
+                if e.tag == 'column' then name = e.name
+                elseif e.tag == 'call' then name = string.lower(e.name)
+                else name = 'expr' .. tostring(#selectors + 1) end
             end
             local fn = compileExpr(e, sources, directSingle, aggregateIds)
-            local sourceInfo = if e.tag == "column" and e.sourceIndex ~= nil then { sourceIndex=e.sourceIndex, column=e.boundName } else nil
+            local sourceInfo = if e.tag == 'column' and e.sourceIndex ~= nil then { sourceIndex=e.sourceIndex, column=e.boundName } else nil
             addSelector(name, fn, sourceInfo)
         end
     end
@@ -531,14 +531,14 @@ local function prepare(db, sql)
     local orderSourceInfo = {}
     for i, o in ast.orderBy do
         local fn = nil
-        if o.expr.tag == "column" and o.expr.qualifier == nil then
+        if o.expr.tag == 'column' and o.expr.qualifier == nil then
             local key = lower(o.expr.name)
             fn = selectorByAlias[key]
             orderSourceInfo[i] = selectorSource[key]
         end
         if fn == nil then
             fn = compileExpr(o.expr, sources, directSingle, aggregateIds)
-            if o.expr.tag == "column" and o.expr.sourceIndex ~= nil then
+            if o.expr.tag == 'column' and o.expr.sourceIndex ~= nil then
                 orderSourceInfo[i] = { sourceIndex=o.expr.sourceIndex, column=o.expr.boundName }
             end
         end
@@ -549,19 +549,19 @@ local function prepare(db, sql)
     for i = 1, #sources do neededSets[i] = {} end
     local function markExpr(e)
         if e == nil then return end
-        if e.tag == "column" and e.sourceIndex ~= nil then
+        if e.tag == 'column' and e.sourceIndex ~= nil then
             neededSets[e.sourceIndex][e.boundName] = true
-        elseif e.tag == "star" then
+        elseif e.tag == 'star' then
             for si, source in sources do
                 if e.qualifier == nil or lower(e.qualifier) == lower(source.alias) or lower(e.qualifier) == lower(source.name) then
                     for _, c in source.columns do neededSets[si][c] = true end
                 end
             end
-        elseif e.tag == "binary" then
+        elseif e.tag == 'binary' then
             markExpr(e.left); markExpr(e.right)
-        elseif e.tag == "unary" or e.tag == "isnull" then
+        elseif e.tag == 'unary' or e.tag == 'isnull' then
             markExpr(e.expr)
-        elseif e.tag == "call" then
+        elseif e.tag == 'call' then
             for _, a in e.args do markExpr(a) end
         end
     end
@@ -611,8 +611,8 @@ local function prepare(db, sql)
     local indexedDriverSource = nil
     local indexedDriverOrder = nil
     if #sources == 2 and #joinPlans == 1 then
-        if joinPlans[1].strategy == "index-left" then indexedDriverSource = 2 end
-        if joinPlans[1].strategy == "index-right" then indexedDriverSource = 1 end
+        if joinPlans[1].strategy == 'index-left' then indexedDriverSource = 2 end
+        if joinPlans[1].strategy == 'index-right' then indexedDriverSource = 1 end
         if not aggregate and indexedDriverSource ~= nil and #ast.orderBy > 0 then
             local pushed = table.create(#ast.orderBy)
             local ok = true
@@ -628,7 +628,7 @@ local function prepare(db, sql)
     local plan = {}
     function plan.run(params)
         params = params or {}
-        if #params < ast.params then error(string.format("jessql: query expects %d parameters, got %d", ast.params, #params), 0) end
+        if #params < ast.params then error(string.format('jessql: query expects %d parameters, got %d', ast.params, #params), 0) end
         if directProviderCount then
             local row = {}
             row[resultColumns[1]] = sources[1].provider.count()
@@ -641,14 +641,14 @@ local function prepare(db, sql)
         local scanRequests = table.create(#sources)
         local skipScan = {}
         local lazyDriver = {}
-        if directSingle and type(sources[1].provider.iterate) == "function" then
+        if directSingle and type(sources[1].provider.iterate) == 'function' then
             skipScan[1] = true
             lazyDriver[1] = true
         end
         if #sources == 2 and #joinPlans == 1 then
-            if joinPlans[1].strategy == "index-left" then skipScan[1] = true end
-            if joinPlans[1].strategy == "index-right" then skipScan[2] = true end
-            if indexedDriverSource ~= nil and type(sources[indexedDriverSource].provider.iterate) == "function" then
+            if joinPlans[1].strategy == 'index-left' then skipScan[1] = true end
+            if joinPlans[1].strategy == 'index-right' then skipScan[2] = true end
+            if indexedDriverSource ~= nil and type(sources[indexedDriverSource].provider.iterate) == 'function' then
                 skipScan[indexedDriverSource] = true
                 lazyDriver[indexedDriverSource] = true
             end
@@ -674,14 +674,14 @@ local function prepare(db, sql)
             scanRequests[si] = request
             if lazyDriver[si] then
                 local iter = s.provider.iterate(request)
-                if type(iter) ~= "table" or iter._jessqlIter ~= "v1" or type(iter.next) ~= "function" then
-                    error("jessql: provider iterate(request) must return a v1 iterator", 0)
+                if type(iter) ~= 'table' or iter._jessqlIter ~= 'v1' or type(iter.next) ~= 'function' then
+                    error('jessql: provider iterate(request) must return a v1 iterator', 0)
                 end
                 rowIterators[si] = iter
                 scanMeta[si] = iter
             elseif not skipScan[si] then
                 local scanned = s.provider.scan(request)
-                if type(scanned) == "table" and scanned._jessqlScan == "v1" then
+                if type(scanned) == 'table' and scanned._jessqlScan == 'v1' then
                     rowsBySource[si] = scanned.rows
                     scanMeta[si] = scanned
                 else
@@ -732,8 +732,8 @@ local function prepare(db, sql)
         local indexedJoinIterator = nil
         if not directSingle and #ast.joins == 1 then
             local joinPlan = joinPlans[1]
-            if joinPlan.strategy == "index-left" or joinPlan.strategy == "index-right" then
-                local lookupSource = if joinPlan.strategy == "index-left" then 1 else 2
+            if joinPlan.strategy == 'index-left' or joinPlan.strategy == 'index-right' then
+                local lookupSource = if joinPlan.strategy == 'index-left' then 1 else 2
                 local driverSource = if lookupSource == 1 then 2 else 1
                 local lookupColumn = if lookupSource == 1 then joinPlan.leftColumn else joinPlan.rightColumn
                 local driverColumn = if driverSource == 1 then joinPlan.leftColumn else joinPlan.rightColumn
@@ -767,7 +767,7 @@ local function prepare(db, sql)
                     end
                     local looked = provider.lookup(lookupColumn, key, lookupRequest)
                     local rows = looked
-                    if type(looked) == "table" and looked._jessqlScan == "v1" then rows = looked.rows end
+                    if type(looked) == 'table' and looked._jessqlScan == 'v1' then rows = looked.rows end
                     if rows == nil then rows = {} end
                     lastKey = key
                     lastMatches = rows
@@ -810,7 +810,7 @@ local function prepare(db, sql)
             local on = joinFns[ji]
             local joinPlan = joinPlans[ji]
             local nextContexts = {}
-            if ji == 1 and not directSingle and joinPlan.strategy == "index-left" then
+            if ji == 1 and not directSingle and joinPlan.strategy == 'index-left' then
                 local provider = sources[1].provider
                 local request = scanRequests[1]
                 local cache = {}
@@ -831,7 +831,7 @@ local function prepare(db, sql)
                             end
                             local looked = provider.lookup(joinPlan.leftColumn, key, lookupRequest)
                             if looked ~= nil then
-                                leftRows = if type(looked) == "table" and looked._jessqlScan == "v1" then looked.rows else looked
+                                leftRows = if type(looked) == 'table' and looked._jessqlScan == 'v1' then looked.rows else looked
                             end
                             if leftRows == nil or #leftRows == 0 then missing[key] = true else cache[key] = leftRows end
                         end
@@ -861,7 +861,7 @@ local function prepare(db, sql)
                 end
                 residualWhere = nil
                 if #orderFns > 0 and driverOrdered then orderHandled = true end
-            elseif ji == 1 and not directSingle and joinPlan.strategy == "index-right" then
+            elseif ji == 1 and not directSingle and joinPlan.strategy == 'index-right' then
                 local provider = sources[2].provider
                 local request = scanRequests[2]
                 local cache = {}
@@ -882,7 +882,7 @@ local function prepare(db, sql)
                             end
                             local looked = provider.lookup(joinPlan.rightColumn, key, lookupRequest)
                             if looked ~= nil then
-                                rightRows = if type(looked) == "table" and looked._jessqlScan == "v1" then looked.rows else looked
+                                rightRows = if type(looked) == 'table' and looked._jessqlScan == 'v1' then looked.rows else looked
                             end
                             if rightRows == nil or #rightRows == 0 then missing[key] = true else cache[key] = rightRows end
                         end
@@ -912,7 +912,7 @@ local function prepare(db, sql)
                 end
                 residualWhere = nil
                 if #orderFns > 0 and driverOrdered then orderHandled = true end
-            elseif ji == 1 and not directSingle and joinPlan.strategy == "hash" then
+            elseif ji == 1 and not directSingle and joinPlan.strategy == 'hash' then
                 local buckets = {}
                 local duplicateBuckets = {}
                 for _, right in rhs do
@@ -938,7 +938,7 @@ local function prepare(db, sql)
                         else
                             nextContexts[#nextContexts+1] = { leftRow, first }
                         end
-                    elseif join.kind == "left" then
+                    elseif join.kind == 'left' then
                         nextContexts[#nextContexts+1] = { leftRow }
                     end
                 end
@@ -949,9 +949,9 @@ local function prepare(db, sql)
                         local ctx = { leftRow, right }
                         if sqlTruthy(on(ctx, nil, params)) then nextContexts[#nextContexts+1]=ctx; matched=true end
                     end
-                    if not matched and join.kind == "left" then nextContexts[#nextContexts+1] = { leftRow } end
+                    if not matched and join.kind == 'left' then nextContexts[#nextContexts+1] = { leftRow } end
                 end
-            elseif joinPlan.strategy == "hash" then
+            elseif joinPlan.strategy == 'hash' then
                 local buckets = {}
                 local duplicateBuckets = {}
                 for _, right in rhs do
@@ -983,7 +983,7 @@ local function prepare(db, sql)
                             local ctx = table.clone(left); ctx[sourceIndex] = right
                             nextContexts[#nextContexts+1] = ctx
                         end
-                    elseif join.kind == "left" then
+                    elseif join.kind == 'left' then
                         local ctx = table.clone(left); ctx[sourceIndex] = nil; nextContexts[#nextContexts+1] = ctx
                     end
                 end
@@ -994,7 +994,7 @@ local function prepare(db, sql)
                         local ctx = table.clone(left); ctx[sourceIndex] = right
                         if sqlTruthy(on(ctx, nil, params)) then nextContexts[#nextContexts+1]=ctx; matched=true end
                     end
-                    if not matched and join.kind == "left" then
+                    if not matched and join.kind == 'left' then
                         local ctx = table.clone(left); ctx[sourceIndex] = nil; nextContexts[#nextContexts+1]=ctx
                     end
                 end
@@ -1067,8 +1067,8 @@ local function prepare(db, sql)
                 if compactGroupColumn ~= nil then group.groupKey = groupKey end
                 if hasAvg then group.avgCounts = table.create(#aggregateSpecs) end
                 for i, spec in aggregateSpecs do
-                    if spec.name == "COUNT" or spec.name == "AVG" then group[i] = 0 end
-                    if spec.name == "AVG" then group.avgCounts[i] = 0 end
+                    if spec.name == 'COUNT' or spec.name == 'AVG' then group[i] = 0 end
+                    if spec.name == 'AVG' then group.avgCounts[i] = 0 end
                 end
                 return group
             end
@@ -1076,18 +1076,18 @@ local function prepare(db, sql)
             local function accumulate(g, ctx)
                 if compactGroupColumn == nil and g.first == nil then g.first = retainContext(ctx) end
                 for i, spec in aggregateSpecs do
-                    if spec.name == "COUNT" then
+                    if spec.name == 'COUNT' then
                         if spec.star or spec.argFn(ctx, nil, params) ~= nil then g[i] += 1 end
                     else
                         local v = spec.argFn(ctx, nil, params)
                         if v ~= nil then
-                            if spec.name == "SUM" then
+                            if spec.name == 'SUM' then
                                 g[i] = (g[i] or 0) + v
-                            elseif spec.name == "AVG" then
+                            elseif spec.name == 'AVG' then
                                 g[i] += v; g.avgCounts[i] += 1
-                            elseif spec.name == "MIN" then
+                            elseif spec.name == 'MIN' then
                                 if g[i] == nil or v < g[i] then g[i] = v end
-                            elseif spec.name == "MAX" then
+                            elseif spec.name == 'MAX' then
                                 if g[i] == nil or v > g[i] then g[i] = v end
                             end
                         end
@@ -1166,7 +1166,7 @@ local function prepare(db, sql)
 
             for _, g in order do
                 for i, spec in aggregateSpecs do
-                    if spec.name == "AVG" then
+                    if spec.name == 'AVG' then
                         local n = g.avgCounts[i]
                         g[i] = if n == 0 then nil else g[i] / n
                     end
@@ -1383,9 +1383,9 @@ function M.new()
     local db = { _tables = {} }
 
     function db:register(name, provider)
-        if type(name) ~= "string" or name == "" then error("jessql: table name must be a string", 2) end
-        if type(provider) ~= "table" or type(provider.scan) ~= "function" then error("jessql: provider needs scan(request)", 2) end
-        if type(provider.columns) ~= "table" then error("jessql: provider needs columns", 2) end
+        if type(name) ~= 'string' or name == '' then error('jessql: table name must be a string', 2) end
+        if type(provider) ~= 'table' or type(provider.scan) ~= 'function' then error('jessql: provider needs scan(request)', 2) end
+        if type(provider.columns) ~= 'table' then error('jessql: provider needs columns', 2) end
         self._tables[lower(name)] = provider
         return self
     end

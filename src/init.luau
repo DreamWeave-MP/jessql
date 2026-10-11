@@ -1,8 +1,8 @@
 --!native
 
-local engine = require("@jessql/engine")
-local parser = require("@jessql/parser")
-local lexer = require("@jessql/lexer")
+local engine = require('@jessql/engine')
+local parser = require('@jessql/parser')
+local lexer = require('@jessql/lexer')
 
 return {
     new = engine.new,

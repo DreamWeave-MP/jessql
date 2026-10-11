@@ -19,7 +19,7 @@ local function isIdent(b)
 end
 
 local function fail(sql, at, message)
-    error(string.format("jessql lexer at byte %d: %s near %q", at, message, string.sub(sql, at, math.min(#sql, at + 20))), 0)
+    error(string.format('jessql lexer at byte %d: %s near %q', at, message, string.sub(sql, at, math.min(#sql, at + 20))), 0)
 end
 
 function M.lex(sql)
@@ -46,7 +46,7 @@ function M.lex(sql)
             while i + 1 <= len and not (string.byte(sql, i) == 42 and string.byte(sql, i + 1) == 47) do
                 i += 1
             end
-            if i + 1 > len then fail(sql, at, "unterminated block comment") end
+            if i + 1 > len then fail(sql, at, 'unterminated block comment') end
             i += 2
         elseif b == 39 then
             local at = i
@@ -65,14 +65,14 @@ function M.lex(sql)
                         pn += 1; parts[pn] = string.sub(sql, start, i - 1)
                         i += 1
                         local value = table.concat(parts)
-                        push("string", value, value, at)
+                        push('string', value, value, at)
                         break
                     end
                 else
                     i += 1
                 end
             end
-            if out[n] == nil or out[n].at ~= at then fail(sql, at, "unterminated string") end
+            if out[n] == nil or out[n].at ~= at then fail(sql, at, 'unterminated string') end
         elseif b == 34 then
             local at = i
             i += 1
@@ -90,14 +90,14 @@ function M.lex(sql)
                         pn += 1; parts[pn] = string.sub(sql, start, i - 1)
                         i += 1
                         local value = table.concat(parts)
-                        push("ident", value, value, at)
+                        push('ident', value, value, at)
                         break
                     end
                 else
                     i += 1
                 end
             end
-            if out[n] == nil or out[n].at ~= at then fail(sql, at, "unterminated quoted identifier") end
+            if out[n] == nil or out[n].at ~= at then fail(sql, at, 'unterminated quoted identifier') end
         elseif isDigit(b) or (b == 46 and i < len and isDigit(string.byte(sql, i + 1))) then
             local at = i
             if b == 46 then
@@ -121,34 +121,34 @@ function M.lex(sql)
                     end
                     local digits = i
                     while i <= len and isDigit(string.byte(sql, i)) do i += 1 end
-                    if digits == i then fail(sql, e, "malformed exponent") end
+                    if digits == i then fail(sql, e, 'malformed exponent') end
                 end
             end
             local text = string.sub(sql, at, i - 1)
-            push("number", text, tonumber(text), at)
+            push('number', text, tonumber(text), at)
         elseif isIdentStart(b) then
             local at = i
             i += 1
             while i <= len and isIdent(string.byte(sql, i)) do i += 1 end
             local text = string.sub(sql, at, i - 1)
-            push("word", text, string.upper(text), at)
+            push('word', text, string.upper(text), at)
         else
             local at = i
             local c = string.sub(sql, i, i)
-            local two = if i < len then string.sub(sql, i, i + 1) else ""
-            if two == "<=" or two == ">=" or two == "<>" or two == "!=" or two == "||" then
-                push("symbol", two, two, at)
+            local two = if i < len then string.sub(sql, i, i + 1) else ''
+            if two == '<=' or two == '>=' or two == '<>' or two == '!=' or two == '||' then
+                push('symbol', two, two, at)
                 i += 2
-            elseif c == "(" or c == ")" or c == "," or c == "." or c == "*" or c == "+" or c == "-" or c == "/" or c == "%" or c == "=" or c == "<" or c == ">" or c == ";" or c == "?" then
-                push("symbol", c, c, at)
+            elseif c == '(' or c == ')' or c == ',' or c == '.' or c == '*' or c == '+' or c == '-' or c == '/' or c == '%' or c == '=' or c == '<' or c == '>' or c == ';' or c == '?' then
+                push('symbol', c, c, at)
                 i += 1
             else
-                fail(sql, i, "unexpected character")
+                fail(sql, i, 'unexpected character')
             end
         end
     end
 
-    push("eof", "<eof>", nil, len + 1)
+    push('eof', '<eof>', nil, len + 1)
     return out
 end
 
