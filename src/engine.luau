@@ -1231,7 +1231,7 @@ local function prepare(db, sql)
                     local stopAfter = if driverOrdered and ast.limit ~= nil and not aggregate then ast.offset + ast.limit else nil
                     local done = stopAfter == 0
 
-                    local function consumeRight(right: any)
+                    local function consumeRight(right)
                         local key = right[joinPlan.rightColumn]
                         if key == nil then return end
                         local leftRows = cache[key]
@@ -1295,7 +1295,7 @@ local function prepare(db, sql)
                     local stopAfter = if driverOrdered and ast.limit ~= nil and not aggregate then ast.offset + ast.limit else nil
                     local done = stopAfter == 0
 
-                    local function consumeLeft(leftRow: any)
+                    local function consumeLeft(leftRow)
                         local key = leftRow[joinPlan.leftColumn]
                         if key == nil then return end
                         local rightRows = cache[key]
