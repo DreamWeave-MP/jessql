@@ -1,3 +1,4 @@
+--!strict
 --!native
 
 local lexer = require('@jessql/lexer')

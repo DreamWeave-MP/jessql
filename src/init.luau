@@ -1,3 +1,4 @@
+--!strict
 --!native
 
 local engine = require('@jessql/engine')

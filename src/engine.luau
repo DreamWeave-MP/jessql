@@ -1,3 +1,4 @@
+--!strict
 --!native
 
 local parser = require('@jessql/parser')
