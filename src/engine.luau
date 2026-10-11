@@ -659,16 +659,15 @@ local function prepare(db, sql)
 
         for _, term in conjuncts(ast.where) do
             local sourceIndex = singleSourceOf(term)
-            if sourceIndex ~= nil then
-                local list = bySource[sourceIndex]
+            if sourceIndex == nil then continue end
+            local list = bySource[sourceIndex]
 
-                if list == nil then
-                    list = {}
-                    bySource[sourceIndex] = list
-                end
-
-                list[#list + 1] = compileExpr(term, sources, true, nil)
+            if list == nil then
+                list = {}
+                bySource[sourceIndex] = list
             end
+
+            list[#list + 1] = compileExpr(term, sources, true, nil)
         end
 
         for sourceIndex, list in bySource do
@@ -1234,37 +1233,36 @@ local function prepare(db, sql)
 
                     local function consumeRight(right: any)
                         local key = right[joinPlan.rightColumn]
-                        if key ~= nil then
-                            local leftRows = cache[key]
+                        if key == nil then return end
+                        local leftRows = cache[key]
 
-                            if leftRows == nil and not missing[key] then
-                                local lookupRequest = request
+                        if leftRows == nil and not missing[key] then
+                            local lookupRequest = request
 
-                                if stopAfter ~= nil and residualWhere == nil then
-                                    lookupRequest = table.clone(request)
-                                    lookupRequest.limitHint = stopAfter - #nextContexts
-                                end
-
-                                local looked = provider.lookup(joinPlan.leftColumn, key, lookupRequest)
-
-                                if looked ~= nil then
-                                    leftRows = if type(looked) == 'table' and looked._jessqlScan == 'v1' then looked.rows else looked
-                                end
-
-                                if leftRows == nil or #leftRows == 0 then missing[key] = true else cache[key] = leftRows end
+                            if stopAfter ~= nil and residualWhere == nil then
+                                lookupRequest = table.clone(request)
+                                lookupRequest.limitHint = stopAfter - #nextContexts
                             end
 
-                            if leftRows ~= nil then
-                                for _, leftRow in leftRows do
-                                    local context = { leftRow, right }
+                            local looked = provider.lookup(joinPlan.leftColumn, key, lookupRequest)
 
-                                    if not residualWhere or sqlTruthy(residualWhere(context, nil, params)) then
-                                        nextContexts[#nextContexts + 1] = context
+                            if looked ~= nil then
+                                leftRows = if type(looked) == 'table' and looked._jessqlScan == 'v1' then looked.rows else looked
+                            end
 
-                                        if stopAfter ~= nil and #nextContexts >= stopAfter then
-                                            done = true
-                                            break
-                                        end
+                            if leftRows == nil or #leftRows == 0 then missing[key] = true else cache[key] = leftRows end
+                        end
+
+                        if leftRows ~= nil then
+                            for _, leftRow in leftRows do
+                                local context = { leftRow, right }
+
+                                if not residualWhere or sqlTruthy(residualWhere(context, nil, params)) then
+                                    nextContexts[#nextContexts + 1] = context
+
+                                    if stopAfter ~= nil and #nextContexts >= stopAfter then
+                                        done = true
+                                        break
                                     end
                                 end
                             end
@@ -1299,37 +1297,36 @@ local function prepare(db, sql)
 
                     local function consumeLeft(leftRow: any)
                         local key = leftRow[joinPlan.leftColumn]
-                        if key ~= nil then
-                            local rightRows = cache[key]
+                        if key == nil then return end
+                        local rightRows = cache[key]
 
-                            if rightRows == nil and not missing[key] then
-                                local lookupRequest = request
+                        if rightRows == nil and not missing[key] then
+                            local lookupRequest = request
 
-                                if stopAfter ~= nil and residualWhere == nil then
-                                    lookupRequest = table.clone(request)
-                                    lookupRequest.limitHint = stopAfter - #nextContexts
-                                end
-
-                                local looked = provider.lookup(joinPlan.rightColumn, key, lookupRequest)
-
-                                if looked ~= nil then
-                                    rightRows = if type(looked) == 'table' and looked._jessqlScan == 'v1' then looked.rows else looked
-                                end
-
-                                if rightRows == nil or #rightRows == 0 then missing[key] = true else cache[key] = rightRows end
+                            if stopAfter ~= nil and residualWhere == nil then
+                                lookupRequest = table.clone(request)
+                                lookupRequest.limitHint = stopAfter - #nextContexts
                             end
 
-                            if rightRows ~= nil then
-                                for _, right in rightRows do
-                                    local context = { leftRow, right }
+                            local looked = provider.lookup(joinPlan.rightColumn, key, lookupRequest)
 
-                                    if not residualWhere or sqlTruthy(residualWhere(context, nil, params)) then
-                                        nextContexts[#nextContexts + 1] = context
+                            if looked ~= nil then
+                                rightRows = if type(looked) == 'table' and looked._jessqlScan == 'v1' then looked.rows else looked
+                            end
 
-                                        if stopAfter ~= nil and #nextContexts >= stopAfter then
-                                            done = true
-                                            break
-                                        end
+                            if rightRows == nil or #rightRows == 0 then missing[key] = true else cache[key] = rightRows end
+                        end
+
+                        if rightRows ~= nil then
+                            for _, right in rightRows do
+                                local context = { leftRow, right }
+
+                                if not residualWhere or sqlTruthy(residualWhere(context, nil, params)) then
+                                    nextContexts[#nextContexts + 1] = context
+
+                                    if stopAfter ~= nil and #nextContexts >= stopAfter then
+                                        done = true
+                                        break
                                     end
                                 end
                             end
@@ -1528,11 +1525,10 @@ local function prepare(db, sql)
             orderBefore = function(left, right)
                 for index, order in orderFns do
                     local leftKey, rightKey = left.order[index], right.order[index]
-                    if leftKey ~= rightKey then
-                        if leftKey == nil then return not order.desc end
-                        if rightKey == nil then return order.desc end
-                        if order.desc then return leftKey > rightKey else return leftKey < rightKey end
-                    end
+                    if leftKey == rightKey then continue end
+                    if leftKey == nil then return not order.desc end
+                    if rightKey == nil then return order.desc end
+                    if order.desc then return leftKey > rightKey else return leftKey < rightKey end
                 end
 
                 return false
