@@ -167,13 +167,7 @@ local function hasAggregate(expr)
   if expr.tag == 'binary' then return hasAggregate(expr.left) or hasAggregate(expr.right) end
   if expr.tag == 'unary' or expr.tag == 'isnull' then return hasAggregate(expr.expr) end
 
-  if expr.tag == 'call' then
-    for _, argument in expr.args do
-      if hasAggregate(argument) then return true end
-    end
-  end
-
-  return false
+  return expr.tag == 'call' and any[for argument in expr.args => hasAggregate(argument)]
 end
 
 local function sqlTruthy(value) return value ~= nil and value ~= false end
@@ -639,11 +633,7 @@ local function compileExpr(expr, sources, directSingle, aggregateIds)
       end
     end
 
-    local args = table.create(#expr.args)
-
-    for index, argument in expr.args do
-      args[index] = compileExpr(argument, sources, directSingle, aggregateIds)
-    end
+    local args = [for argument in expr.args => compileExpr(argument, sources, directSingle, aggregateIds)]
 
     if name == 'LOWER' then
       return function(context, group, params)
@@ -825,7 +815,7 @@ end
 --- anything but a number or NULL in a column. `finish` leaves `group` as a row at a time would
 --- have left it after the rows fed, for the results to be read or `accumulate` to go on from.
 local function columnAccumulator(group, aggregateSpecs, columns, retain)
-  local names = columns.names
+  local {names, wantsSum, wantsLeast, wantsGreatest} = columns
   local chunks = [for _ in names => buffer.create((AggregateChunk + 1) * 8)]
   local held = table.create(#names, 0)
   local counts = table.create(#names, 0)
@@ -840,13 +830,13 @@ local function columnAccumulator(group, aggregateSpecs, columns, retain)
     local chunk: buffer = chunks[slot]
     local numbers: dream_data_Kind_f64 = Numbers
 
-    if columns.summed[slot] then
+    if wantsSum[slot] then
       buffer.writef64(chunk, 0, sums[slot])
       local total = numbers:sum(chunk, 0, count + 1)
       sums[slot] = total
     end
 
-    if columns.least[slot] then
+    if wantsLeast[slot] then
       local carried = least[slot]
       local first = if carried == nil then 1 else 0
       if carried ~= nil then buffer.writef64(chunk, 0, carried) end
@@ -855,7 +845,7 @@ local function columnAccumulator(group, aggregateSpecs, columns, retain)
       least[slot] = lowest
     end
 
-    if columns.greatest[slot] then
+    if wantsGreatest[slot] then
       local carried = greatest[slot]
       local first = if carried == nil then 1 else 0
       if carried ~= nil then buffer.writef64(chunk, 0, carried) end
@@ -1240,13 +1230,8 @@ local function prepare(db: Database, sql: string): Plan
 
   if hasAggregate(ast.where) then error('jessql: aggregates are not allowed in WHERE', 0) end
 
-  for _, node in ast.groupBy do
-    if hasAggregate(node) then error('jessql: aggregates are not allowed in GROUP BY', 0) end
-  end
-
-  for _, join in ast.joins do
-    if hasAggregate(join.on) then error('jessql: aggregates are not allowed in JOIN ON', 0) end
-  end
+  if any[for node in ast.groupBy => hasAggregate(node)] then error('jessql: aggregates are not allowed in GROUP BY', 0) end
+  if any[for join in ast.joins => hasAggregate(join.on)] then error('jessql: aggregates are not allowed in JOIN ON', 0) end
 
   local aggregateIds, aggregateSpecs, aggregateByKey = {}, {}, {}
 
@@ -1261,8 +1246,7 @@ local function prepare(db: Database, sql: string): Plan
     if node.tag == 'binary' then return 'b:' .. node.op .. '(' .. exprKey(node.left) .. ',' .. exprKey(node.right) .. ')' end
 
     if node.tag == 'call' then
-      local parts = table.create(#node.args)
-      for index, argument in node.args do parts[index] = exprKey(argument) end
+      local parts = [for argument in node.args => exprKey(argument)]
       return 'call:' .. node.name .. ':' .. tostring(node.star) .. '(' .. table.concat(parts, ',') .. ')'
     end
 
@@ -1332,25 +1316,13 @@ local function prepare(db: Database, sql: string): Plan
 
     for sourceIndex, list in bySource do
       if list ~= nil then
-        sourceWhereFns[sourceIndex] = function(row, params)
-          for _, predicate in list do
-            if not sqlTruthy(predicate(row, nil, params)) then return false end
-          end
-
-          return true
-        end
+        sourceWhereFns[sourceIndex] = function(row, params) return all[for predicate in list => sqlTruthy(predicate(row, nil, params))] end
       end
     end
   end
 
   local function sourceFilterScore(sourceIndex)
-    local score = 0
-
-    for _, term in whereTermPlans do
-      if term.sourceIndex == sourceIndex then score += if term.pushable then 2 else 1 end
-    end
-
-    return score
+    return sum[for term in whereTermPlans if term.sourceIndex == sourceIndex => if term.pushable then 2 else 1]
   end
 
   local joinFns, joinPlans = {}, {}
@@ -1397,8 +1369,7 @@ local function prepare(db: Database, sql: string): Plan
     joinPlans[index] = plan
   end
 
-  local groupFns = {}
-  for index, node in ast.groupBy do groupFns[index] = compileExpr(node, sources, directSingle, nil) end
+  local groupFns = [for node in ast.groupBy => compileExpr(node, sources, directSingle, nil)]
 
   for _, spec in aggregateSpecs do
     if spec.star then
@@ -1412,7 +1383,7 @@ local function prepare(db: Database, sql: string): Plan
   -- An ungrouped query over one table whose aggregates are each of a column, or COUNT(*), reads
   -- every column once a row and has the data plane reduce it: `aggregateColumns` is the columns,
   -- and which of the sum, the least and the greatest is wanted of each, by its slot.
-  local aggregateColumns = { names = {}, summed = {}, least = {}, greatest = {} }
+  local aggregateColumns = { names = {}, wantsSum = {}, wantsLeast = {}, wantsGreatest = {} }
 
   for _, spec in aggregateSpecs do
     local argument = spec.expr.args[1]
@@ -1426,22 +1397,15 @@ local function prepare(db: Database, sql: string): Plan
     end
 
     spec.slot = slot
-    if spec.name == 'SUM' or spec.name == 'AVG' then aggregateColumns.summed[slot] = true end
-    if spec.name == 'MIN' then aggregateColumns.least[slot] = true end
-    if spec.name == 'MAX' then aggregateColumns.greatest[slot] = true end
+    if spec.name == 'SUM' or spec.name == 'AVG' then aggregateColumns.wantsSum[slot] = true end
+    if spec.name == 'MIN' then aggregateColumns.wantsLeast[slot] = true end
+    if spec.name == 'MAX' then aggregateColumns.wantsGreatest[slot] = true end
   end
 
   local columnAggregates = directSingle and #ast.groupBy == 0 and all[for spec in aggregateSpecs => spec.star or spec.slot ~= nil]
 
   local havingFn = if ast.having then compileExpr(ast.having, sources, directSingle, aggregateIds) else nil
-  local hasAvg = false
-
-  for _, spec in aggregateSpecs do
-    if spec.name == 'AVG' then
-      hasAvg = true
-      break
-    end
-  end
+  local hasAvg = any[for spec in aggregateSpecs => spec.name == 'AVG']
 
   -- A single simple GROUP BY column can carry its own representative value. If every
   -- non-aggregate column referenced after grouping is that same column, retaining the first
@@ -1578,8 +1542,7 @@ local function prepare(db: Database, sql: string): Plan
     orderFns[index] = { evaluate = evaluate, desc = order.desc }
   end
 
-  local neededSets = {}
-  for index = 1, #sources do neededSets[index] = {} end
+  local neededSets = [for _ in sources => {}]
 
   local function markExpr(node)
     if node == nil then return end
@@ -1731,17 +1694,13 @@ local function prepare(db: Database, sql: string): Plan
     end
 
     for sourceIndex, source in sources do
-      local sourceConstraints = {}
-
-      for _, constraint in constraints do
-        if constraint.sourceIndex == sourceIndex then
-          sourceConstraints[#sourceConstraints + 1] = {
-            column = constraint.column,
-            op = constraint.op,
-            value = if constraint.param then params[constraint.param] else constraint.value,
-          }
-        end
-      end
+      local sourceConstraints = [
+        for constraint in constraints if constraint.sourceIndex == sourceIndex => {
+          column = constraint.column,
+          op = constraint.op,
+          value = if constraint.param then params[constraint.param] else constraint.value,
+        }
+      ]
 
       local request = {
         columns = neededColumns[sourceIndex],
@@ -1809,11 +1768,7 @@ local function prepare(db: Database, sql: string): Plan
         residualWhere = nil
       elseif #active ~= #whereTermPlans then
         residualWhere = function(context, group, runParams)
-          for _, predicate in active do
-            if not sqlTruthy(predicate(context, group, runParams)) then return false end
-          end
-
-          return true
+          return all[for predicate in active => sqlTruthy(predicate(context, group, runParams))]
         end
       end
     end
@@ -2421,17 +2376,16 @@ local function prepare(db: Database, sql: string): Plan
   plan.parameterCount = ast.params
 
   function plan.explain()
-    local joins = {}
+    local joins = [
+      for index, join in enumerate(ast.joins) => {
+        kind = join.kind,
+        table = join.source.name,
+        alias = join.source.alias,
+        strategy = joinPlans[index].strategy,
+      }
+    ]
 
-    for index, join in ast.joins do
-      joins[index] = { kind = join.kind, table = join.source.name, alias = join.source.alias, strategy = joinPlans[index].strategy }
-    end
-
-    local scans = {}
-
-    for index, source in sources do
-      scans[index] = { table = source.name, alias = source.alias, columns = neededColumns[index] }
-    end
+    local scans = [for index, source in enumerate(sources) => { table = source.name, alias = source.alias, columns = neededColumns[index] }]
 
     return {
       scans = scans,
