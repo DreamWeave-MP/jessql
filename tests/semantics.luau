@@ -292,12 +292,7 @@ suite.describe('ORDER BY', function()
 
     --- The rows `keep` accepts in the order `keys` and then `id` give.
     local function ordered(keep, keys)
-      local out = {}
-
-      for _, row in rows do
-        if not keep or keep(row) then table.insert(out, row) end
-      end
-
+      local out = [for row in rows if not keep or keep(row) => row]
       table.insert(keys, ascending 'id')
       table.sort(out, function(left, right) return before(keys, left, right) end)
       return out
@@ -407,15 +402,8 @@ end)
 
 --- The ids of the rows of `source` that `text` keeps, and the ids `keep` keeps of `Things`.
 local function kept(db, source, text, params, keep)
-  local got, wanted = {}, {}
-
-  for _, row in db:query(`SELECT id FROM {source} WHERE {text}`, params).rows do
-    table.insert(got, row.id)
-  end
-
-  for _, row in Things do
-    if keep(row) then table.insert(wanted, row.id) end
-  end
+  local got = [for row in db:query(`SELECT id FROM {source} WHERE {text}`, params).rows => row.id]
+  local wanted = [for row in Things if keep(row) => row.id]
 
   return got, wanted
 end

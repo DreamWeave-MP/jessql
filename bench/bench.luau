@@ -76,12 +76,7 @@ local function readScore(row) return row.score end
 
 --- A copy of the `rows` that `keep` accepts, in the order `before` gives when there is one.
 local function reference(rows, keep, before)
-  local out = {}
-
-  for _, row in rows do
-    if not keep or keep(row) then table.insert(out, row) end
-  end
-
+  local out = [for row in rows if not keep or keep(row) => row]
   if before then table.sort(out, before) end
 
   return out
@@ -89,7 +84,8 @@ end
 
 --- The `count` rows of `rows` after the first `skip`.
 local function page(rows, skip, count)
-  return table.move(rows, skip + 1, math.min(#rows, skip + count), 1, {})
+  local first, last = skip + 1, skip + count
+  return rows[first:last]
 end
 
 -- `score` is different in every row, `value` and `bucket` repeat, and `rank` is NULL in every
@@ -377,8 +373,8 @@ do
       MAX(score) AS high, COUNT(rank) AS ranked FROM records WHERE bucket < 48]],
     nil,
     function(rows)
-      local row = rows[1]
-      return row.found + row.total + row.mean + row.low + row.high + row.ranked
+      local {found, total, mean, low, high, ranked} = rows[1]
+      return found + total + mean + low + high + ranked
     end,
     kept + total + scoreTotal / kept + low + high + ranked
   )
@@ -439,15 +435,7 @@ do
       FROM records WHERE value >= ? GROUP BY kind, bucket HAVING count(*) >= 10
       ORDER BY total DESC LIMIT 25]],
     { 2500 },
-    function(rows)
-      local total = 0
-
-      for position, row in rows do
-        total += position * row.total
-      end
-
-      return total
-    end,
+    function(rows) return sum[for position, row in enumerate(rows) => position * row.total] end,
     expected
   )
 
@@ -457,15 +445,7 @@ do
     bucketExpected += (bucket + 1) * bucketTotals[bucket]
   end
 
-  local function check(rows)
-    local total = 0
-
-    for position, row in rows do
-      total += position * row.total
-    end
-
-    return total
-  end
+  local function check(rows) return sum[for position, row in enumerate(rows) => position * row.total] end
 
   local text = 'SELECT bucket, COUNT(*) AS found, SUM(value) AS total FROM %s GROUP BY bucket ORDER BY bucket'
   query('group by one column, 100k rows', string.format(text, 'records'), nil, check, bucketExpected)
@@ -521,15 +501,7 @@ do
     [[SELECT l.bucket, COUNT(r.id) AS found FROM left_rows l LEFT JOIN right_rows r ON l.id = r.id
       WHERE r.value < 5000 GROUP BY l.bucket ORDER BY l.bucket]],
     nil,
-    function(rows)
-      local total = 0
-
-      for position, row in rows do
-        total += position * row.found
-      end
-
-      return total
-    end,
+    function(rows) return sum[for position, row in enumerate(rows) => position * row.found] end,
     grouped
   )
 
