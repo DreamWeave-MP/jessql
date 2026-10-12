@@ -547,6 +547,63 @@ suite.describe('WHERE', function()
     expect(db:query('SELECT id FROM things WHERE extreme > ? AND bucket > 3', { math.huge }).rows).toEqual {}
   end)
 
+  suite.it('reads a row that has a metatable one cell at a time, and only the cells it needs', function()
+    local db = sql.new()
+    local rows = {}
+    local reads = {}
+
+    for id = 1, 6 do
+      rows[id] = setmetatable({}, {
+        __index = function(_row, key)
+          table.insert(reads, `{id}.{key}`)
+          return if key == 'first' then id else 6 - id
+        end,
+      })
+    end
+
+    db:register('lazy', { columns = { 'first', 'second' }, scan = function(_request) return rows end })
+    local result = db:query('SELECT COUNT(*) AS found, SUM(second) AS total FROM lazy WHERE first > 2 AND second >= 2')
+
+    expect(result.rows).toEqual { { found = 2, total = 5 } }
+
+    expect(reads).toEqual {
+      '1.first', '2.first', '3.first', '3.second', '3.second', '4.first', '4.second', '4.second',
+      '5.first', '5.second', '6.first', '6.second',
+    }
+  end)
+
+  suite.it('reads rows that are not a plain array the way a loop over them does', function()
+    local db = sql.new()
+    local rows = { { value = 4 }, { value = 1 }, nil, { value = 9 } }
+    rows.extra = { value = 7 }
+
+    local visited, total = 0, 0
+
+    for _, row in rows :: { [unknown]: { value: number } } do
+      if row.value <= 2 then continue end
+
+      visited += 1
+      total += row.value
+    end
+
+    db:register('holed', { columns = { 'value' }, scan = function(_request) return rows end })
+    expect(db:query('SELECT COUNT(*) AS found, SUM(value) AS total FROM holed WHERE value > 2').rows).toEqual { { found = visited, total = total } }
+    expect(#db:query('SELECT value FROM holed WHERE value > 2 ORDER BY value').rows).toBe(visited)
+  end)
+
+  suite.it('compares a column that holds NaN and NULL', function()
+    local db = sql.new()
+    local rows = { { id = 1, value = 1 }, { id = 2 }, { id = 3, value = 0 / 0 }, { id = 4, value = 2 }, { id = 5, value = -0 } }
+
+    db:table('odd', rows, { 'id', 'value' })
+    expect(db:query('SELECT id FROM odd WHERE value != 1').rows).toEqual { { id = 3 }, { id = 4 }, { id = 5 } }
+    expect(db:query('SELECT id FROM odd WHERE value <> 1 AND id < 5').rows).toEqual { { id = 3 }, { id = 4 } }
+    expect(db:query('SELECT id FROM odd WHERE value >= 0').rows).toEqual { { id = 1 }, { id = 4 }, { id = 5 } }
+    expect(db:query('SELECT id FROM odd WHERE value < 1').rows).toEqual { { id = 5 } }
+    expect(db:query('SELECT id FROM odd WHERE id != 3 AND value != 2').rows).toEqual { { id = 1 }, { id = 5 } }
+    expect(db:query('SELECT COUNT(*) AS found, COUNT(value) AS held FROM odd WHERE id != 3 AND value != 2').rows).toEqual { { found = 2, held = 2 } }
+  end)
+
   suite.it('filters each side of a join before joining', function()
     local db = database()
     local wanted = {}
@@ -563,6 +620,15 @@ suite.describe('WHERE', function()
       WHERE o.weight >= ? AND t.rank < 8 AND t.bucket <> 0]]
 
     expect(db:query(text, { 6 }).rows).toEqual(wanted)
+
+    local named = {}
+
+    for _, row in wanted do
+      if string.sub(Things[row.id].name, 1, 2) == 'n1' and Things[row.id].score > -60 then table.insert(named, row) end
+    end
+
+    expect(db:query(`{text} AND t.name LIKE 'n1%' AND t.score > -60`, { 6 }).rows).toEqual(named)
+    expect(db:query('SELECT t.id FROM owners o JOIN things t ON t.id = o.thing WHERE t.id < 0 AND t.mixed < 9').rows).toEqual {}
 
     expect(function()
       db:query('SELECT t.id FROM owners o JOIN things t ON t.id = o.thing WHERE t.mixed < 9')
@@ -648,6 +714,29 @@ suite.describe('aggregates', function()
     expect(db:query('SELECT SUM(mixed) AS total FROM things').rows).toEqual { { total = Count * (Count + 1) / 2 } }
     expect(db:query('SELECT AVG(mixed) AS mean FROM things WHERE id < 3').rows).toEqual { { mean = 1.5 } }
     expect(db:query('SELECT COUNT(mixed) AS found FROM things').rows).toEqual { { found = Count } }
+  end)
+
+  suite.it('keep a NaN that comes first as the least and the greatest, and pass over one that comes later', function()
+    local db = sql.new()
+    local notNumber = 0 / 0
+    local later = { { value = 3 }, { value = notNumber }, { value = -2 }, {}, { value = -0 } }
+    local first = { { value = notNumber }, { value = 3 }, { value = -2 } }
+
+    db:table('later', later, { 'value' })
+    db:table('first', first, { 'value' })
+    db:table('none', {}, { 'value' })
+    local text = 'SELECT COUNT(*) AS found, COUNT(value) AS held, SUM(value) AS total, MIN(value) AS least, MAX(value) AS greatest FROM %s'
+    local row = db:query(string.format(text, 'later')).rows[1]
+
+    expect({ row.found, row.held, row.least, row.greatest }).toEqual { 5, 4, -2, 3 }
+    expect(row.total ~= row.total).toBe(true)
+
+    row = db:query(string.format(text, 'first')).rows[1]
+    expect({ row.found, row.held }).toEqual { 3, 3 }
+    expect(row.least ~= row.least and row.greatest ~= row.greatest and row.total ~= row.total).toBe(true)
+    expect(db:query(string.format(text, 'none')).rows).toEqual { { found = 0, held = 0 } }
+    expect(db:query(string.format(text, 'later') .. ' WHERE value > 100').rows).toEqual { { found = 0, held = 0 } }
+    expect(1 / db:query('SELECT SUM(value) AS total FROM later WHERE value = 0').rows[1].total).toBe(math.huge)
   end)
 
   suite.it('add in the order the rows come in', function()
