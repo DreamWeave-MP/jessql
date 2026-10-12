@@ -155,9 +155,9 @@ local NotNumber = 0 / 0
 local AggregateChunk = 256
 local Numbers: dream_data_Kind_f64 = data.f64()
 
--- An ordering's key columns start with room for this many rows, and this many of them are
--- looked at for keys that repeat before the columns are sorted.
-local InitialOrderCapacity, OrderSample = 64, 256
+-- How many of an ordering's rows are looked at for keys that repeat before its key columns are
+-- sorted.
+local OrderSample = 256
 
 local function lower(text) return string.lower(text) end
 
@@ -1021,43 +1021,208 @@ local function sampleRepeats(columns: { buffer }, count: number): boolean
   return false
 end
 
---- An ordering, as two functions: `offer` takes rows one at a time, and `finish` hands them back
---- as units in ORDER BY order, all of them or the first `keep`. `offer` reads a row's keys once,
---- in order, and makes the row a unit (its context passed through `retain`) only if it may be
---- kept; a unit the caller already has is passed as the third argument. A unit carries its keys
---- as `order`, or its one key as `orderKey`.
----
---- The first `keep` are kept on a heap under the comparator, as they always were: a row enters
---- when it goes before the last one kept, and which of two rows with equal keys is kept, and in
---- what order, is what that heap and `table.sort` make of them.
----
---- All of them are ordered as columns when every key is a number or NULL: one f64 column per
---- key, sorted by `orderOfColumns`. That order is the comparator's when no two rows have every
---- key equal. When two do, or a key is of any other kind, NaN included, the rows are sorted by
---- `table.sort` under the comparator, each with the keys already read for it, so that rows with
---- equal keys come back in the order they always have.
-local function orderSink(orderFns, params, keep: number?, retain, expected: number?)
+--- Gives every unit the keys the comparator reads, `order`, or `orderKey` when there is one
+--- key: out of the key `columns` for what a numeric ordering had read when it met `key`, a value
+--- that is neither a number nor NULL, as key `failedKey` of unit `failedUnit`; read now for the
+--- rest. Nothing is read twice. A `failedUnit` past the last unit takes every key out of the
+--- columns.
+local function restoreOrderKeys(units, orderFns, params, columns: { buffer }, failedUnit: number, failedKey: number, key)
   local keyCount = #orderFns
-  local firstEvaluate, firstDesc = orderFns[1].evaluate, orderFns[1].desc
-  local capacity = if keep then 0 else math.max(expected or 0, InitialOrderCapacity)
-  local columns = [for _ in orderFns => buffer.create(capacity * 8)]
-  local pending = table.create(keyCount)
-  local units = {}
-  local held = 0
-  local comparing = keep ~= nil
-  local heap = if keep then table.create(keep) else nil
 
-  local function oneBefore(left, right)
+  if keyCount == 1 then
+    local order = orderFns[1]
+
+    for unitIndex, unit in units do
+      if unitIndex < failedUnit then
+        unit.orderKey = keyOf(buffer.readf64(columns[1], (unitIndex - 1) * 8), order.desc)
+      elseif unitIndex == failedUnit then
+        unit.orderKey = key
+      else
+        unit.orderKey = order.evaluate(unit.context, unit.group, params)
+      end
+    end
+
+    return
+  end
+
+  for unitIndex, unit in units do
+    local keys = table.create(keyCount)
+    local stored = if unitIndex < failedUnit then keyCount elseif unitIndex == failedUnit then failedKey - 1 else 0
+
+    for keyIndex, order in orderFns do
+      if keyIndex <= stored then
+        keys[keyIndex] = keyOf(buffer.readf64(columns[keyIndex], (unitIndex - 1) * 8), order.desc)
+      elseif unitIndex == failedUnit and keyIndex == failedKey then
+        keys[keyIndex] = key
+      else
+        keys[keyIndex] = order.evaluate(unit.context, unit.group, params)
+      end
+    end
+
+    unit.order = keys
+  end
+end
+
+--- Whether a unit goes before another by their one key, `orderKey`.
+local function oneKeyBefore(desc: boolean)
+  return function(left, right)
     local leftKey, rightKey = left.orderKey, right.orderKey
     if leftKey == rightKey then return false end
-    if leftKey == nil then return not firstDesc end
-    if rightKey == nil then return firstDesc end
-    if firstDesc then return leftKey > rightKey end
+    if leftKey == nil then return not desc end
+    if rightKey == nil then return desc end
+    if desc then return leftKey > rightKey end
 
     return leftKey < rightKey
   end
+end
 
-  local function manyBefore(left, right)
+--- Whether a unit goes before another by their keys, `order`.
+local function manyKeysBefore(orderFns)
+  return function(left, right)
+    for index, order in orderFns do
+      local leftKey, rightKey = left.order[index], right.order[index]
+      if leftKey == rightKey then continue end
+      if leftKey == nil then return not order.desc end
+      if rightKey == nil then return order.desc end
+      if order.desc then return leftKey > rightKey end
+
+      return leftKey < rightKey
+    end
+
+    return false
+  end
+end
+
+--- `units` in ORDER BY order, each unit's keys read once and in order. Keys that are all
+--- numbers or NULL go into one f64 column each and are sorted by `orderOfColumns`: that order is
+--- the comparator's when no two units have every key equal. When two do, or a key is of any
+--- other kind, NaN included, the units are sorted by `table.sort` under the comparator, as they
+--- always were, so that units with equal keys come back in the order they always have.
+local function orderUnits(units, orderFns, params)
+  local count, keyCount = #units, #orderFns
+  local columns = [for _ in orderFns => buffer.create(count * 8)]
+  local numeric = true
+
+  for unitIndex, unit in units do
+    local offset = (unitIndex - 1) * 8
+
+    for keyIndex, order in orderFns do
+      local key = order.evaluate(unit.context, unit.group, params)
+
+      if type(key) == 'number' and key == key then
+        buffer.writef64(columns[keyIndex], offset, if order.desc then -key else key)
+      elseif key == nil then
+        buffer.writef64(columns[keyIndex], offset, NotNumber)
+      else
+        restoreOrderKeys(units, orderFns, params, columns, unitIndex, keyIndex, key)
+        numeric = false
+        break
+      end
+    end
+
+    if not numeric then break end
+  end
+
+  if numeric and not sampleRepeats(columns, count) then
+    local order = orderOfColumns(columns, orderFns, count)
+    if not hasEqualNeighbours(columns, order, count) then return [for position in order[1:count, 'u32'] => units[position + 1]] end
+  end
+
+  if numeric then restoreOrderKeys(units, orderFns, params, columns, count + 1, 0, nil) end
+
+  table.sort(units, if keyCount == 1 then oneKeyBefore(orderFns[1].desc) else manyKeysBefore(orderFns))
+  return units
+end
+
+--- The first `keep` rows of an ORDER BY, as two functions: `offer` takes a row's context and
+--- group, and `finish` hands the rows kept back as units, in order. They are kept on a heap
+--- under the comparator, as they always were: a row enters when it goes before the last one
+--- kept, and which of two rows with equal keys is kept, and in what order, is what the heap and
+--- `table.sort` make of them. A row's keys are read once and in order, and it becomes a unit,
+--- its context passed through `retain`, only when it enters.
+local function boundedOrdering(orderFns, params, keep: number, retain)
+  local heap = table.create(keep)
+
+  -- The heap's moves are written out for one key and for several: each calls its comparator by
+  -- name, which Luau compiles into the loop, where one picked at run time is called every step.
+  if #orderFns == 1 then
+    local evaluate, desc = orderFns[1].evaluate, orderFns[1].desc
+
+    local function before(left, right)
+      local leftKey, rightKey = left.orderKey, right.orderKey
+      if leftKey == rightKey then return false end
+      if leftKey == nil then return not desc end
+      if rightKey == nil then return desc end
+      if desc then return leftKey > rightKey end
+
+      return leftKey < rightKey
+    end
+
+    local function siftUp(index)
+      while index > 1 do
+        local parent = index // 2
+        if not before(heap[parent], heap[index]) then break end
+
+        heap[index], heap[parent] = heap[parent], heap[index]
+        index = parent
+      end
+    end
+
+    local function siftDown(index)
+      while true do
+        local left = index * 2
+        if left > #heap then return end
+
+        local right = left + 1
+        local worst = left
+        if right <= #heap and before(heap[left], heap[right]) then worst = right end
+        if not before(heap[index], heap[worst]) then return end
+
+        heap[index], heap[worst] = heap[worst], heap[index]
+        index = worst
+      end
+    end
+
+    local function offer(context, group)
+      local key = evaluate(context, group, params)
+      local size = #heap
+
+      if size < keep then
+        heap[size + 1] = { context = retain(context), group = group, orderKey = key }
+        siftUp(size + 1)
+        return
+      end
+
+      local last = heap[1].orderKey
+
+      -- Most rows offered to a full heap are numbers that do not go before the last one kept.
+      if type(key) == 'number' and type(last) == 'number' then
+        if not (if desc then key > last else key < last) then return end
+      elseif key == last then
+        return
+      elseif key == nil then
+        if desc then return end
+      elseif last == nil then
+        if not desc then return end
+      elseif not (if desc then key > last else key < last) then
+        return
+      end
+
+      heap[1] = { context = retain(context), group = group, orderKey = key }
+      siftDown(1)
+    end
+
+    local function finish()
+      table.sort(heap, before)
+      return heap
+    end
+
+    return offer, finish
+  end
+
+  local pending = table.create(#orderFns)
+
+  local function before(left, right)
     for index, order in orderFns do
       local leftKey, rightKey = left.order[index], right.order[index]
       if leftKey == rightKey then continue end
@@ -1071,237 +1236,56 @@ local function orderSink(orderFns, params, keep: number?, retain, expected: numb
     return false
   end
 
-  -- The heap's two moves are written out for one key and for several: each calls its
-  -- comparator by name, which Luau compiles into the loop, where a comparator picked when the
-  -- ordering starts would be called for every step.
-  local function siftUpOne(index)
+  local function siftUp(index)
     while index > 1 do
       local parent = index // 2
-      if not oneBefore(heap[parent], heap[index]) then break end
+      if not before(heap[parent], heap[index]) then break end
 
       heap[index], heap[parent] = heap[parent], heap[index]
       index = parent
     end
   end
 
-  local function siftDownOne(index)
+  local function siftDown(index)
     while true do
       local left = index * 2
       if left > #heap then return end
 
       local right = left + 1
       local worst = left
-      if right <= #heap and oneBefore(heap[left], heap[right]) then worst = right end
-      if not oneBefore(heap[index], heap[worst]) then return end
+      if right <= #heap and before(heap[left], heap[right]) then worst = right end
+      if not before(heap[index], heap[worst]) then return end
 
       heap[index], heap[worst] = heap[worst], heap[index]
       index = worst
     end
   end
 
-  local function siftUpMany(index)
-    while index > 1 do
-      local parent = index // 2
-      if not manyBefore(heap[parent], heap[index]) then break end
-
-      heap[index], heap[parent] = heap[parent], heap[index]
-      index = parent
-    end
-  end
-
-  local function siftDownMany(index)
-    while true do
-      local left = index * 2
-      if left > #heap then return end
-
-      local right = left + 1
-      local worst = left
-      if right <= #heap and manyBefore(heap[left], heap[right]) then worst = right end
-      if not manyBefore(heap[index], heap[worst]) then return end
-
-      heap[index], heap[worst] = heap[worst], heap[index]
-      index = worst
-    end
-  end
-
-  --- Keeps a unit that has its keys: among all the rows, or on the heap, where it takes the
-  --- place of the last row kept once the heap is full.
-  local function place(unit)
-    if not heap then
-      held += 1
-      units[held] = unit
-      return
+  local function offer(context, group)
+    for keyIndex, order in orderFns do
+      pending[keyIndex] = order.evaluate(context, group, params)
     end
 
     local size = #heap
+    if size >= keep and not keysBefore(orderFns, pending, heap[1].order) then return end
+
+    local unit = { context = retain(context), group = group, order = table.clone(pending) }
 
     if size < keep then
       heap[size + 1] = unit
-      if keyCount == 1 then siftUpOne(size + 1) else siftUpMany(size + 1) end
+      siftUp(size + 1)
     else
       heap[1] = unit
-      if keyCount == 1 then siftDownOne(1) else siftDownMany(1) end
+      siftDown(1)
     end
-  end
-
-  --- Takes the row whose keys are in `pending`, under the comparator.
-  local function compared(context, group, unit)
-    if heap and #heap >= keep and not keysBefore(orderFns, pending, heap[1].order) then return end
-
-    if unit then
-      unit.order = table.clone(pending)
-      place(unit)
-    else
-      place({ context = retain(context), group = group, order = table.clone(pending) })
-    end
-  end
-
-  --- Hands the rows held as columns to the comparator, each with the keys its columns hold.
-  local function compare()
-    comparing = true
-
-    for index = 1, held do
-      local unit = units[index]
-
-      if keyCount == 1 then
-        unit.orderKey = keyOf(buffer.readf64(columns[1], (index - 1) * 8), firstDesc)
-        continue
-      end
-
-      local keys = table.create(keyCount)
-
-      for keyIndex, order in orderFns do
-        keys[keyIndex] = keyOf(buffer.readf64(columns[keyIndex], (index - 1) * 8), order.desc)
-      end
-
-      unit.order = keys
-    end
-  end
-
-  --- Holds a row whose keys are in the columns, which double when they fill.
-  local function hold(context, group, unit)
-    held += 1
-    units[held] = unit or { context = retain(context), group = group }
-    if held < capacity then return end
-
-    capacity *= 2
-
-    for keyIndex, keys in columns do
-      local larger = buffer.create(capacity * 8)
-      buffer.copy(larger, 0, keys)
-      columns[keyIndex] = larger
-    end
-  end
-
-  --- Takes a row under the comparator by its one key. Against a heap that is full, two numbers
-  --- are compared here as the comparator would compare them, without a unit to hold either.
-  local function comparedOne(context, group, unit, key)
-    if heap and #heap >= keep then
-      local last = heap[1].orderKey
-      local entering
-
-      if type(key) == 'number' and type(last) == 'number' then
-        entering = if firstDesc then key > last else key < last
-      elseif key == last then
-        entering = false
-      elseif key == nil then
-        entering = not firstDesc
-      elseif last == nil then
-        entering = firstDesc
-      elseif firstDesc then
-        entering = key > last
-      else
-        entering = key < last
-      end
-
-      if not entering then return end
-    end
-
-    if unit then
-      unit.orderKey = key
-      place(unit)
-    else
-      place({ context = retain(context), group = group, orderKey = key })
-    end
-  end
-
-  --- `offer` for one key, which is most orderings.
-  local function offerOne(context, group, unit)
-    local key = firstEvaluate(context, group, params)
-
-    if comparing then
-      -- Most rows offered to a full heap are numbers that do not go before the last one kept.
-      if heap and type(key) == 'number' and #heap >= keep then
-        local last = heap[1].orderKey
-        if type(last) == 'number' and not (if firstDesc then key > last else key < last) then return end
-      end
-
-      comparedOne(context, group, unit, key)
-    elseif type(key) == 'number' and key == key then
-      buffer.writef64(columns[1], held * 8, if firstDesc then -key else key)
-      hold(context, group, unit)
-    elseif key == nil then
-      buffer.writef64(columns[1], held * 8, NotNumber)
-      hold(context, group, unit)
-    else
-      compare()
-      comparedOne(context, group, unit, key)
-    end
-  end
-
-  local function offerMany(context, group, unit)
-    if comparing then
-      for keyIndex, order in orderFns do
-        pending[keyIndex] = order.evaluate(context, group, params)
-      end
-
-      compared(context, group, unit)
-      return
-    end
-
-    local offset = held * 8
-
-    for keyIndex, order in orderFns do
-      local key = order.evaluate(context, group, params)
-
-      if type(key) == 'number' and key == key then
-        buffer.writef64(columns[keyIndex], offset, if order.desc then -key else key)
-      elseif key == nil then
-        buffer.writef64(columns[keyIndex], offset, NotNumber)
-      else
-        for earlier = 1, keyIndex - 1 do
-          pending[earlier] = keyOf(buffer.readf64(columns[earlier], offset), orderFns[earlier].desc)
-        end
-
-        pending[keyIndex] = key
-
-        for later = keyIndex + 1, keyCount do
-          pending[later] = orderFns[later].evaluate(context, group, params)
-        end
-
-        compare()
-        compared(context, group, unit)
-        return
-      end
-    end
-
-    hold(context, group, unit)
   end
 
   local function finish()
-    if not comparing and not sampleRepeats(columns, held) then
-      local order = orderOfColumns(columns, orderFns, held)
-      if not hasEqualNeighbours(columns, order, held) then return [for position in order[1:held, 'u32'] => units[position + 1]] end
-    end
-
-    if not comparing then compare() end
-
-    local sorted = heap or units
-    table.sort(sorted, if keyCount == 1 then oneBefore else manyBefore)
-    return sorted
+    table.sort(heap, before)
+    return heap
   end
 
-  return if keyCount == 1 then offerOne else offerMany, finish
+  return offer, finish
 end
 
 local function prepare(db: Database, sql: string): Plan
@@ -2381,7 +2365,7 @@ local function prepare(db: Database, sql: string): Plan
       local keep = if #orderFns > 0 and ast.limit ~= nil then ast.offset + ast.limit else nil
       local offer, finish
 
-      if keep ~= nil and keep > 0 then offer, finish = orderSink(orderFns, params, keep, sameContext) end
+      if keep ~= nil and keep > 0 then offer, finish = boundedOrdering(orderFns, params, keep, sameContext) end
 
       for _, group in order do
         for index, spec in aggregateSpecs do
@@ -2395,7 +2379,7 @@ local function prepare(db: Database, sql: string): Plan
         if havingFn and not sqlTruthy(havingFn(context, group, params)) then continue end
 
         if offer ~= nil then
-          offer(context, group, nil)
+          offer(context, group)
         elseif keep ~= 0 then
           units[#units + 1] = { context = context, group = group }
         end
@@ -2422,12 +2406,12 @@ local function prepare(db: Database, sql: string): Plan
         end
       elseif stopAfter ~= nil then
         if stopAfter > 0 then
-          local offer, finish = orderSink(orderFns, params, stopAfter, retainContext)
+          local offer, finish = boundedOrdering(orderFns, params, stopAfter, retainContext)
 
           -- `offer` takes a context as a visitor is handed one, and answers nothing.
           if residualWhere then
             eachContext(function(context)
-              if sqlTruthy(residualWhere(context, nil, params)) then offer(context, nil, nil) end
+              if sqlTruthy(residualWhere(context, nil, params)) then offer(context, nil) end
             end)
           else
             eachContext(offer)
@@ -2447,9 +2431,7 @@ local function prepare(db: Database, sql: string): Plan
     end
 
     if #orderFns > 0 and not orderHandled and not orderAlreadySorted then
-      local offer, finish = orderSink(orderFns, params, nil, sameContext, #units)
-      for _, unit in units do offer(unit.context, unit.group, unit) end
-      units = finish()
+      units = orderUnits(units, orderFns, params)
     end
 
     local first = ast.offset + 1
