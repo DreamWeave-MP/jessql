@@ -253,6 +253,37 @@ suite.describe('ORDER BY', function()
     end
   end)
 
+  suite.it('keeps rows whose numeric keys are all equal in the order they came in', function()
+    local db = database()
+    local byBucket = project(reference(Things, nil, { ascending 'bucket' }), { 'id' })
+    local byRank = project(reference(Things, nil, { descending 'rank', ascending 'bucket' }), { 'id' })
+    local byZero = project(reference(Things, nil, { ascending 'extreme' }), { 'id' })
+
+    for _, source in { 'things', 'stream', 'volatile' } do
+      expect(db:query(`SELECT id FROM {source} ORDER BY bucket`).rows).toEqual(byBucket)
+      expect(db:query(`SELECT id FROM {source} ORDER BY rank DESC, bucket`).rows).toEqual(byRank)
+      expect(db:query(`SELECT id FROM {source} ORDER BY extreme`).rows).toEqual(byZero)
+    end
+  end)
+
+  suite.it('orders by a key that is a number in some rows and a string in rows it is never compared with', function()
+    local db = sql.new()
+    local rows = {}
+
+    for id = 1, 120 do
+      local late = if id > 80 then `s{id % 5}` elseif id % 9 == 0 then nil else (id * 7) % 13
+      rows[id] = { id = id, tier = if id > 80 then 1 else 0, late = late }
+    end
+
+    db:table('tiers', rows, { 'id', 'tier', 'late' })
+    local upwards = reference(rows, nil, { ascending 'tier', descending 'late', ascending 'id' })
+    local downwards = reference(rows, nil, { descending 'tier', ascending 'late', descending 'id' })
+
+    expect(db:query('SELECT id FROM tiers ORDER BY tier, late DESC, id').rows).toEqual(project(upwards, { 'id' }))
+    expect(db:query('SELECT id FROM tiers ORDER BY tier DESC, late, id DESC').rows).toEqual(project(downwards, { 'id' }))
+    expect(function() db:query('SELECT id FROM tiers ORDER BY late') end).toThrow('attempt to compare')
+  end)
+
   suite.it('raises for keys that do not compare with each other', function()
     local db = database()
 

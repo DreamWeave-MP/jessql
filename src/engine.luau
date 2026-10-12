@@ -1,6 +1,7 @@
 --!strict
 --!native
 
+local data = require('@dream/data')
 local parser = require('@jessql/parser')
 
 --- A row: its cells by column name, each holding whatever its source put there.
@@ -146,6 +147,9 @@ export type Database = {
 
 local engine = {}
 local AGG = { COUNT = true, SUM = true, AVG = true, MIN = true, MAX = true }
+
+-- What a key column holds for NULL: `data.argsort` puts it after every number.
+local NotNumber = 0 / 0
 
 local function lower(text) return string.lower(text) end
 
@@ -712,6 +716,87 @@ local function valueKey(value)
   if valueType == 'number' then return 'D' .. tostring(value) .. ';' end
   if valueType == 'boolean' then return if value then 'B1;' else 'B0;' end
   return 'O' .. tostring(value) .. ';'
+end
+
+--- `unit.order` for the units a numeric ordering had already read when it met `key`, a value that
+--- is neither a number nor NULL, as key `failedKey` of unit `failedUnit`; and for the rest, read
+--- now. Nothing is read twice: what the columns hold is taken back out of them.
+local function restoreOrderKeys(units, orderFns, params, columns, failedUnit, failedKey, key)
+  local keyCount = #orderFns
+
+  for unitIndex, unit in units do
+    local keys = table.create(keyCount)
+    local stored = if unitIndex < failedUnit then keyCount elseif unitIndex == failedUnit then failedKey - 1 else 0
+
+    for keyIndex, order in orderFns do
+      if keyIndex <= stored then
+        local held = buffer.readf64(columns[keyIndex], (unitIndex - 1) * 8)
+        if held == held then keys[keyIndex] = if order.desc then -held else held end
+      elseif unitIndex == failedUnit and keyIndex == failedKey then
+        keys[keyIndex] = key
+      else
+        keys[keyIndex] = order.evaluate(unit.context, unit.group, params)
+      end
+    end
+
+    unit.order = keys
+  end
+end
+
+--- A stable ordering of `count` keys, as positions: NULL, held as NaN, first when the key runs
+--- upwards and last when it runs downwards, where the negated numbers already put it.
+local function orderOfKeys(keys: buffer, count: number, nullCount: number, desc: boolean): buffer
+  local order = buffer.create(count * 4)
+  data.argsort(keys, 'f64', 0, count, order)
+  if nullCount == 0 or desc then return order end
+
+  local valueCount = count - nullCount
+  local nullsFirst = buffer.create(count * 4)
+  buffer.copy(nullsFirst, 0, order, valueCount * 4, nullCount * 4)
+  buffer.copy(nullsFirst, nullCount * 4, order, 0, valueCount * 4)
+  return nullsFirst
+end
+
+--- `units` in ORDER BY order. Keys that are all numbers or NULL are sorted as columns, one
+--- stable pass per key from the last to the first, so units whose keys are all equal keep the
+--- order they came in. A key of any other kind, NaN included, leaves the ordering to
+--- `orderBefore`, which raises for values that do not compare.
+local function orderUnits(units, orderFns, params, orderBefore)
+  local count, keyCount = #units, #orderFns
+  local columns = [for _ in orderFns => buffer.create(count * 8)]
+  local nullCounts = table.create(keyCount, 0)
+
+  for unitIndex, unit in units do
+    local offset = (unitIndex - 1) * 8
+
+    for keyIndex, order in orderFns do
+      local key = order.evaluate(unit.context, unit.group, params)
+
+      if type(key) == 'number' and key == key then
+        buffer.writef64(columns[keyIndex], offset, if order.desc then -key else key)
+      elseif key == nil then
+        buffer.writef64(columns[keyIndex], offset, NotNumber)
+        nullCounts[keyIndex] += 1
+      else
+        restoreOrderKeys(units, orderFns, params, columns, unitIndex, keyIndex, key)
+        table.sort(units, orderBefore)
+        return units
+      end
+    end
+  end
+
+  local order = orderOfKeys(columns[keyCount], count, nullCounts[keyCount], orderFns[keyCount].desc)
+  local gathered = buffer.create(if keyCount > 1 then count * 8 else 0)
+
+  for keyIndex = keyCount - 1, 1, -1 do
+    data.gather(columns[keyIndex], 'f64', 0, count, order, gathered, 0, count)
+    local pass = orderOfKeys(gathered, count, nullCounts[keyIndex], orderFns[keyIndex].desc)
+    local composed = buffer.create(count * 4)
+    data.gather(order, 'u32', 0, count, pass, composed, 0, count)
+    order = composed
+  end
+
+  return [for position in order[1:count, 'u32'] => units[position + 1]]
 end
 
 local function prepare(db: Database, sql: string): Plan
@@ -2031,8 +2116,7 @@ local function prepare(db: Database, sql: string): Plan
           table.sort(units, orderBefore)
         end
       else
-        for _, unit in units do decorateOrder(unit) end
-        table.sort(units, orderBefore)
+        units = orderUnits(units, orderFns, params, orderBefore)
       end
     end
 
