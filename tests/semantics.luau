@@ -796,6 +796,32 @@ suite.describe('result rows', function()
     expect(cells).toEqual { 4, 4, 1 }
   end)
 
+  suite.it('are walked in the order of a row whose cells were put in one at a time, NULL ones left out', function()
+    local db = database()
+    local names = { 'id', 'rank', 'label', 'extreme', 'score', 'name', 'bucket' }
+
+    for _, text in { 'SELECT id, rank, label, extreme, score, name, bucket FROM things', 'SELECT id, rank, label, extreme, score, name, bucket FROM volatile ORDER BY id' } do
+      for position, row in db:query(text).rows do
+        local built, walked, wanted = {}, {}, {}
+
+        for _, name in names do
+          local value = Things[position][name]
+          if value ~= nil then built[name] = value end
+        end
+
+        for key in row do
+          table.insert(walked, key)
+        end
+
+        for key in built do
+          table.insert(wanted, key)
+        end
+
+        expect({ position, walked }).toEqual { position, wanted }
+      end
+    end
+  end)
+
   suite.it('keep, for a name two columns share, the last value that is not NULL', function()
     local db = database()
 

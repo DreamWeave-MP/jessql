@@ -1587,8 +1587,8 @@ local function prepare(db: Database, sql: string): Plan
   end
 
   -- A result row starts as a copy of this one, which has every result column in it already, so
-  -- that filling the row never grows it; a cell that is NULL is set back to nothing. Two result
-  -- columns of one name keep the last value that is not NULL, and get the row built key by key.
+  -- that filling the row never grows it. Two result columns of one name keep the last value that
+  -- is not NULL, and get the row built key by key.
   local rowTemplate = {}
 
   for _, name in resultColumns do
@@ -2444,10 +2444,26 @@ local function prepare(db: Database, sql: string): Plan
       local row
 
       if rowTemplate then
+        local filled = true
         row = table.clone(rowTemplate)
 
         for index, selector in selectors do
-          row[resultColumns[index]] = selector(unit.context, unit.group, params)
+          local value = selector(unit.context, unit.group, params)
+          if value == nil then filled = false end
+
+          row[resultColumns[index]] = value
+        end
+
+        -- A row with a NULL cell is built key by key after all, so that a caller walking it
+        -- meets its cells in the order it always has: a copy keeps the place of the missing one.
+        if not filled then
+          local copied = row
+          row = {}
+
+          for _, name in resultColumns do
+            local value = copied[name]
+            if value ~= nil then row[name] = value end
+          end
         end
       else
         row = {}
