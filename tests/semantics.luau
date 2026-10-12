@@ -636,6 +636,38 @@ suite.describe('WHERE', function()
   end)
 end)
 
+suite.describe('result rows', function()
+  suite.it('hold a cell for every column that is not NULL, and nothing for one that is', function()
+    local db = database()
+    local rows = db:query('SELECT id, rank, label, extreme FROM things WHERE id >= 82 AND id <= 84').rows
+    local cells = {}
+
+    for position, row in rows do
+      cells[position] = 0
+
+      for _ in row do
+        cells[position] += 1
+      end
+    end
+
+    expect(rows).toEqual {
+      { id = 82, rank = 2, label = 'ebony', extreme = 1.5 },
+      { id = 83, rank = 9, label = 'glass', extreme = -1.5 },
+      { id = 84 },
+    }
+
+    expect(cells).toEqual { 4, 4, 1 }
+  end)
+
+  suite.it('keep, for a name two columns share, the last value that is not NULL', function()
+    local db = database()
+
+    expect(db:query('SELECT id AS cell, rank AS cell FROM things WHERE id = 6').rows).toEqual { { cell = 6 } }
+    expect(db:query('SELECT id AS cell, rank AS cell FROM things WHERE id = 1').rows).toEqual { { cell = 7 } }
+    expect(db:query('SELECT rank AS cell, id AS cell FROM things WHERE id = 6').columns).toEqual { 'cell', 'cell' }
+  end)
+end)
+
 suite.describe('aggregates', function()
   suite.it('count, add, average, and find the least and the greatest, skipping NULL', function()
     local db = database()

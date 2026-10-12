@@ -1520,6 +1520,20 @@ local function prepare(db: Database, sql: string): Plan
     end
   end
 
+  -- A result row starts as a copy of this one, which has every result column in it already, so
+  -- that filling the row never grows it; a cell that is NULL is set back to nothing. Two result
+  -- columns of one name keep the last value that is not NULL, and get the row built key by key.
+  local rowTemplate = {}
+
+  for _, name in resultColumns do
+    if rowTemplate[name] ~= nil then
+      rowTemplate = nil
+      break
+    end
+
+    rowTemplate[name] = false
+  end
+
   local orderFns, orderSourceInfo = {}, {}
 
   for index, order in ast.orderBy do
@@ -2358,11 +2372,21 @@ local function prepare(db: Database, sql: string): Plan
 
     for unitIndex = first, last do
       local unit = units[unitIndex]
-      local row = {}
+      local row
 
-      for index, selector in selectors do
-        local value = selector(unit.context, unit.group, params)
-        if value ~= nil then row[resultColumns[index]] = value end
+      if rowTemplate then
+        row = table.clone(rowTemplate)
+
+        for index, selector in selectors do
+          row[resultColumns[index]] = selector(unit.context, unit.group, params)
+        end
+      else
+        row = {}
+
+        for index, selector in selectors do
+          local value = selector(unit.context, unit.group, params)
+          if value ~= nil then row[resultColumns[index]] = value end
+        end
       end
 
       resultRows[#resultRows + 1] = row
