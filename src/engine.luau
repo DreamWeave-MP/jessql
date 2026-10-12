@@ -155,6 +155,12 @@ local NotNumber = 0 / 0
 local AggregateChunk = 256
 local Numbers: dream_data_Kind_f64 = data.f64()
 
+-- Making an ungrouped aggregate's columns costs what they save over some fifty rows, which a small
+-- table never pays back: a table of fewer rows than `AggregateRows` is read a row at a time, as
+-- it always was, and so are the first `AggregateDelay` rows a WHERE keeps of any other.
+local AggregateRows = 512
+local AggregateDelay = 128
+
 -- How many of an ordering's rows are looked at for keys that repeat before its key columns are
 -- sorted.
 local OrderSample = 256
@@ -814,14 +820,41 @@ end
 --- metatable, whose cells are read once for each aggregate and in their order, or one holding
 --- anything but a number or NULL in a column. `finish` leaves `group` as a row at a time would
 --- have left it after the rows fed, for the results to be read or `accumulate` to go on from.
+--- The rows `accumulate` has put into `group` already are gone on from in turn. Both functions
+--- are nil when a sum, least or greatest of those rows is not a number, which no column of
+--- numbers goes on from.
 local function columnAccumulator(group, aggregateSpecs, columns, retain)
   local {names, wantsSum, wantsLeast, wantsGreatest} = columns
-  local chunks = [for _ in names => buffer.create((AggregateChunk + 1) * 8)]
   local held = table.create(#names, 0)
   local counts = table.create(#names, 0)
   local sums = table.create(#names, 0)
   local least, greatest = {}, {}
   local rowCount = 0
+
+  for index, spec in aggregateSpecs do
+    local slot, gathered = spec.slot, group[index]
+
+    if spec.star then
+      rowCount = gathered
+    elseif spec.name == 'COUNT' then
+      counts[slot] = gathered
+    elseif gathered == nil then
+      continue
+    elseif type(gathered) ~= 'number' then
+      return nil, nil
+    elseif spec.name == 'AVG' then
+      sums[slot], counts[slot] = gathered, group.avgCounts[index]
+    elseif spec.name == 'SUM' then
+      -- A sum that is there has added a cell; how many is asked only of a COUNT or an AVG.
+      sums[slot], counts[slot] = gathered, math.max(counts[slot], 1)
+    elseif spec.name == 'MIN' then
+      least[slot] = gathered
+    else
+      greatest[slot] = gathered
+    end
+  end
+
+  local chunks = [for _ in names => buffer.create((AggregateChunk + 1) * 8)]
 
   local function reduce(slot)
     local count = held[slot]
@@ -879,7 +912,7 @@ local function columnAccumulator(group, aggregateSpecs, columns, retain)
       end
     end
 
-    if rowCount == 0 then group.first = retain(row) end
+    if group.first == nil then group.first = retain(row) end
 
     rowCount += 1
     return true
@@ -2295,23 +2328,37 @@ local function prepare(db: Database, sql: string): Plan
       if #groupFns == 0 then
         local group = newGroup(nil)
         order[1] = group
-        local feed, finish
+        local columnar = columnAggregates and (directIter ~= nil or (type(contexts) == 'table' and rawlen(contexts) >= AggregateRows))
 
-        if columnAggregates then feed, finish = columnAccumulator(group, aggregateSpecs, aggregateColumns, retainContext) end
+        if columnar then
+          local feed, finish
+          local awaited = AggregateDelay
 
-        eachContext(function(context)
-          if residualWhere and not sqlTruthy(residualWhere(context, nil, params)) then return end
-          if feed and feed(context) then return end
+          eachContext(function(context)
+            if residualWhere and not sqlTruthy(residualWhere(context, nil, params)) then return end
 
-          if feed then
-            finish()
-            feed = nil
-          end
+            if awaited == 0 then
+              feed, finish = columnAccumulator(group, aggregateSpecs, aggregateColumns, retainContext)
+              awaited = math.huge
+            end
 
-          accumulate(group, context)
-        end)
+            if feed and feed(context) then return end
 
-        if feed then finish() end
+            if feed then
+              finish()
+              feed = nil
+            end
+
+            accumulate(group, context)
+            awaited -= 1
+          end)
+
+          if feed then finish() end
+        else
+          eachContext(function(context)
+            if not residualWhere or sqlTruthy(residualWhere(context, nil, params)) then accumulate(group, context) end
+          end)
+        end
       else
         local root = {}
 
