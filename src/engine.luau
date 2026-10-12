@@ -151,6 +151,10 @@ local AGG = { COUNT = true, SUM = true, AVG = true, MIN = true, MAX = true }
 -- What a key column holds for NULL: `data.argsort` puts it after every number.
 local NotNumber = 0 / 0
 
+-- How many numbers of a column an ungrouped aggregate holds before the data plane reduces them.
+local AggregateChunk = 256
+local Numbers: dream_data_Kind_f64 = data.f64()
+
 -- An ordering's key columns start with room for this many rows, and a bounded ordering holds at
 -- least this many beyond the rows it keeps before it sorts them and drops the rest.
 local InitialOrderCapacity, OrderBatch = 64, 1024
@@ -811,6 +815,114 @@ local function valueKey(value)
   return 'O' .. tostring(value) .. ';'
 end
 
+--- The aggregates of an ungrouped query over one table, each of a column or COUNT(*), as two
+--- functions. `feed` takes a row: each column's number goes into a chunk that the data plane
+--- reduces whole when it fills, with the running sum, least and greatest carried in as the
+--- chunk's first element, so every result is the one a row at a time gives: a sum adds in row
+--- order from zero, and the least and the greatest are the first that nothing after is below or
+--- above. `feed` answers false and takes nothing for a row it does not read this way: one with a
+--- metatable, whose cells are read once for each aggregate and in their order, or one holding
+--- anything but a number or NULL in a column. `finish` leaves `group` as a row at a time would
+--- have left it after the rows fed, for the results to be read or `accumulate` to go on from.
+local function columnAccumulator(group, aggregateSpecs, columns, retain)
+  local names = columns.names
+  local chunks = [for _ in names => buffer.create((AggregateChunk + 1) * 8)]
+  local held = table.create(#names, 0)
+  local counts = table.create(#names, 0)
+  local sums = table.create(#names, 0)
+  local least, greatest = {}, {}
+  local rowCount = 0
+
+  local function reduce(slot)
+    local count = held[slot]
+    if count == 0 then return end
+
+    local chunk: buffer = chunks[slot]
+    local numbers: dream_data_Kind_f64 = Numbers
+
+    if columns.summed[slot] then
+      buffer.writef64(chunk, 0, sums[slot])
+      local total = numbers:sum(chunk, 0, count + 1)
+      sums[slot] = total
+    end
+
+    if columns.least[slot] then
+      local carried = least[slot]
+      local first = if carried == nil then 1 else 0
+      if carried ~= nil then buffer.writef64(chunk, 0, carried) end
+
+      local lowest = numbers:min(chunk, first * 8, count + 1 - first)
+      least[slot] = lowest
+    end
+
+    if columns.greatest[slot] then
+      local carried = greatest[slot]
+      local first = if carried == nil then 1 else 0
+      if carried ~= nil then buffer.writef64(chunk, 0, carried) end
+
+      local highest = numbers:max(chunk, first * 8, count + 1 - first)
+      greatest[slot] = highest
+    end
+
+    counts[slot] += count
+    held[slot] = 0
+  end
+
+  local function feed(row)
+    if type(row) ~= 'table' or getmetatable(row) ~= nil then return false end
+
+    for slot, name in names do
+      local value = row[name]
+
+      if type(value) == 'number' then
+        if held[slot] == AggregateChunk then reduce(slot) end
+
+        local count = held[slot] + 1
+        buffer.writef64(chunks[slot], count * 8, value)
+        held[slot] = count
+      elseif value ~= nil then
+        for earlier = 1, slot - 1 do
+          if row[names[earlier]] ~= nil then held[earlier] -= 1 end
+        end
+
+        return false
+      end
+    end
+
+    if rowCount == 0 then group.first = retain(row) end
+
+    rowCount += 1
+    return true
+  end
+
+  local function finish()
+    for slot in names do
+      reduce(slot)
+    end
+
+    for index, spec in aggregateSpecs do
+      local slot = spec.slot
+
+      if spec.star then
+        group[index] = rowCount
+      elseif spec.name == 'COUNT' then
+        group[index] = counts[slot]
+      elseif spec.name == 'AVG' then
+        group[index] = sums[slot]
+        group.avgCounts[index] = counts[slot]
+      elseif spec.name == 'SUM' then
+        if counts[slot] > 0 then group[index] = sums[slot] end
+      elseif spec.name == 'MIN' then
+        group[index] = least[slot]
+      else
+        group[index] = greatest[slot]
+      end
+    end
+  end
+
+  return feed, finish
+end
+
 --- Whether the ORDER BY keys `leftKeys` go before `rightKeys`: NULL before every value when a key
 --- runs upwards and after every value when it runs downwards. Raises for values that do not
 --- compare with each other.
@@ -1296,6 +1408,30 @@ local function prepare(db: Database, sql: string): Plan
       spec.argFn = compileExpr(spec.expr.args[1], sources, directSingle, nil)
     end
   end
+
+  -- An ungrouped query over one table whose aggregates are each of a column, or COUNT(*), reads
+  -- every column once a row and has the data plane reduce it: `aggregateColumns` is the columns,
+  -- and which of the sum, the least and the greatest is wanted of each, by its slot.
+  local aggregateColumns = { names = {}, summed = {}, least = {}, greatest = {} }
+
+  for _, spec in aggregateSpecs do
+    local argument = spec.expr.args[1]
+    if spec.star or not directSingle or argument.tag ~= 'column' then continue end
+
+    local slot = table.find(aggregateColumns.names, argument.boundName)
+
+    if not slot then
+      table.insert(aggregateColumns.names, argument.boundName)
+      slot = #aggregateColumns.names
+    end
+
+    spec.slot = slot
+    if spec.name == 'SUM' or spec.name == 'AVG' then aggregateColumns.summed[slot] = true end
+    if spec.name == 'MIN' then aggregateColumns.least[slot] = true end
+    if spec.name == 'MAX' then aggregateColumns.greatest[slot] = true end
+  end
+
+  local columnAggregates = directSingle and #ast.groupBy == 0 and all[for spec in aggregateSpecs => spec.star or spec.slot ~= nil]
 
   local havingFn = if ast.having then compileExpr(ast.having, sources, directSingle, aggregateIds) else nil
   local hasAvg = false
@@ -2124,10 +2260,23 @@ local function prepare(db: Database, sql: string): Plan
       if #groupFns == 0 then
         local group = newGroup(nil)
         order[1] = group
+        local feed, finish
+
+        if columnAggregates then feed, finish = columnAccumulator(group, aggregateSpecs, aggregateColumns, retainContext) end
 
         eachContext(function(context)
-          if not residualWhere or sqlTruthy(residualWhere(context, nil, params)) then accumulate(group, context) end
+          if residualWhere and not sqlTruthy(residualWhere(context, nil, params)) then return end
+          if feed and feed(context) then return end
+
+          if feed then
+            finish()
+            feed = nil
+          end
+
+          accumulate(group, context)
         end)
+
+        if feed then finish() end
       else
         local root = {}
 

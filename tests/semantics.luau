@@ -739,6 +739,84 @@ suite.describe('aggregates', function()
     expect(1 / db:query('SELECT SUM(value) AS total FROM later WHERE value = 0').rows[1].total).toBe(math.huge)
   end)
 
+  suite.it('give over many rows what a loop over them gives, whatever some of the rows are', function()
+    local text = [[SELECT COUNT(*) AS found, COUNT(gap) AS held, SUM(gap) AS total, AVG(gap) AS mean, MIN(gap) AS least,
+      MAX(gap) AS greatest, SUM(score) AS scores, MIN(score) AS lowest, MAX(score) AS highest FROM %s WHERE id %s]]
+
+    --- 1,000 rows, of which `change` alters some, and what the aggregates of those `keep`
+    --- accepts are.
+    local function expectAggregates(change, comparison, keep)
+      local db = sql.new()
+      local rows, columns = {}, { 'id', 'gap', 'score' }
+
+      for id = 1, 1000 do
+        rows[id] = { id = id, gap = if id % 3 == 0 then nil else (id * 7919) % 1009 - 500, score = 1 / id + (id * 31) % 17 }
+        change(rows[id], id)
+      end
+
+      local wanted = { found = 0, held = 0 }
+      local total, scores = 0, 0
+
+      for _, row in rows do
+        if not keep(row) then continue end
+
+        wanted.found += 1
+        scores += row.score
+        wanted.lowest = math.min(wanted.lowest or row.score, row.score)
+        wanted.highest = math.max(wanted.highest or row.score, row.score)
+        if row.gap == nil then continue end
+
+        wanted.held += 1
+        total += row.gap
+        wanted.least = math.min(wanted.least or row.gap, row.gap)
+        wanted.greatest = math.max(wanted.greatest or row.gap, row.gap)
+      end
+
+      wanted.scores = scores
+      if wanted.held > 0 then wanted.total, wanted.mean = total, total / wanted.held end
+
+      db:table('plain', rows, columns)
+      db:register('stream', streamed(rows, columns, false))
+      db:register('volatile', streamed(rows, columns, true))
+
+      for _, source in { 'plain', 'stream', 'volatile' } do
+        expect(db:query(string.format(text, source, comparison)).rows).toEqual { wanted }
+      end
+    end
+
+    local function unchanged(_row, _id) end
+
+    expectAggregates(unchanged, '> 0', function(_row) return true end)
+    expectAggregates(unchanged, '> 300', function(row) return row.id > 300 end)
+    expectAggregates(unchanged, '< 200', function(row) return row.id < 200 end)
+
+    -- A row the WHERE drops is not read for the aggregates, whatever it holds.
+    expectAggregates(function(row, id)
+      if id == 700 then row.score = tostring(row.score) end
+    end, '!= 700', function(row) return row.id ~= 700 end)
+
+    expectAggregates(function(row, id)
+      if id >= 600 and id % 50 == 0 then setmetatable(row, {}) end
+    end, '> 10', function(row) return row.id > 10 end)
+
+    local db = sql.new()
+    local rows = {}
+
+    for id = 1, 800 do
+      rows[id] = { id = id, score = if id == 640 then '2.5' else id % 9 }
+    end
+
+    local total = 0
+
+    for _, row in rows do
+      total += row.score
+    end
+
+    db:table('held', rows, { 'id', 'score' })
+    expect(db:query('SELECT SUM(score) AS total, COUNT(score) AS found FROM held').rows).toEqual { { total = total, found = 800 } }
+    expect(function() db:query('SELECT MIN(score) AS least FROM held') end).toThrow('attempt to compare')
+  end)
+
   suite.it('add in the order the rows come in', function()
     local db = sql.new()
     local rows, total = {}, 0
