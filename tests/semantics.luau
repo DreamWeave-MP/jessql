@@ -253,19 +253,6 @@ suite.describe('ORDER BY', function()
     end
   end)
 
-  suite.it('keeps rows whose numeric keys are all equal in the order they came in', function()
-    local db = database()
-    local byBucket = project(reference(Things, nil, { ascending 'bucket' }), { 'id' })
-    local byRank = project(reference(Things, nil, { descending 'rank', ascending 'bucket' }), { 'id' })
-    local byZero = project(reference(Things, nil, { ascending 'extreme' }), { 'id' })
-
-    for _, source in { 'things', 'stream', 'volatile' } do
-      expect(db:query(`SELECT id FROM {source} ORDER BY bucket`).rows).toEqual(byBucket)
-      expect(db:query(`SELECT id FROM {source} ORDER BY rank DESC, bucket`).rows).toEqual(byRank)
-      expect(db:query(`SELECT id FROM {source} ORDER BY extreme`).rows).toEqual(byZero)
-    end
-  end)
-
   suite.it('orders by a key that is a number in some rows and a string in rows it is never compared with', function()
     local db = sql.new()
     local rows = {}
@@ -284,7 +271,7 @@ suite.describe('ORDER BY', function()
     expect(function() db:query('SELECT id FROM tiers ORDER BY late') end).toThrow('attempt to compare')
   end)
 
-  suite.it('keeps the first rows of the whole order under LIMIT, over more rows than it holds at once', function()
+  suite.it('orders many rows by keys that repeat, down to a key that does not, with LIMIT and without', function()
     local db = sql.new()
     local rows, columns = {}, { 'id', 'value', 'score', 'gap', 'tier', 'late' }
 
@@ -303,8 +290,7 @@ suite.describe('ORDER BY', function()
     db:register('stream', streamed(rows, columns, false))
     db:register('volatile', streamed(rows, columns, true))
 
-    --- The rows `keep` accepts in the order `keys` give, rows of equal keys in the order they
-    --- came in, which is the order of their ids.
+    --- The rows `keep` accepts in the order `keys` and then `id` give.
     local function ordered(keep, keys)
       local out = {}
 
@@ -318,15 +304,19 @@ suite.describe('ORDER BY', function()
     end
 
     local cases = {
-      { 'ORDER BY value LIMIT 10', ordered(nil, { ascending 'value' }), 0, 10 },
-      { 'ORDER BY value DESC LIMIT 10 OFFSET 990', ordered(nil, { descending 'value' }), 990, 10 },
-      { 'ORDER BY gap, value DESC LIMIT 25', ordered(nil, { ascending 'gap', descending 'value' }), 0, 25 },
-      { 'ORDER BY gap DESC LIMIT 2000 OFFSET 1000', ordered(nil, { descending 'gap' }), 1000, 2000 },
-      { 'ORDER BY gap DESC, value LIMIT 3 OFFSET 3999', ordered(nil, { descending 'gap', ascending 'value' }), 3999, 3 },
+      { 'ORDER BY value, id LIMIT 10', ordered(nil, { ascending 'value' }), 0, 10 },
+      { 'ORDER BY value DESC, id LIMIT 10 OFFSET 990', ordered(nil, { descending 'value' }), 990, 10 },
+      { 'ORDER BY gap, value DESC, id LIMIT 25', ordered(nil, { ascending 'gap', descending 'value' }), 0, 25 },
+      { 'ORDER BY gap DESC, id LIMIT 2000 OFFSET 1000', ordered(nil, { descending 'gap' }), 1000, 2000 },
+      { 'ORDER BY gap DESC, value, id LIMIT 3 OFFSET 3999', ordered(nil, { descending 'gap', ascending 'value' }), 3999, 3 },
+      { 'ORDER BY gap DESC, value, id', ordered(nil, { descending 'gap', ascending 'value' }), 0, 6000 },
+      { 'ORDER BY gap, id DESC', ordered(nil, { ascending 'gap', descending 'id' }), 0, 6000 },
       { 'WHERE value > 10 ORDER BY score LIMIT 5', ordered(function(row) return row.value > 10 end, { ascending 'score' }), 0, 5 },
+      { 'WHERE value > 10 ORDER BY score DESC', ordered(function(row) return row.value > 10 end, { descending 'score' }), 0, 6000 },
       { 'ORDER BY tier, late, id LIMIT 30 OFFSET 20', ordered(nil, { ascending 'tier', ascending 'late' }), 20, 30 },
       { 'ORDER BY tier DESC, late DESC, id DESC LIMIT 7', ordered(nil, { descending 'tier', descending 'late', descending 'id' }), 0, 7 },
       { 'ORDER BY tier, late DESC, id LIMIT 4100', ordered(nil, { ascending 'tier', descending 'late' }), 0, 4100 },
+      { 'ORDER BY tier, late DESC, id', ordered(nil, { ascending 'tier', descending 'late' }), 0, 6000 },
     }
 
     for _, source in { 'big', 'stream', 'volatile' } do
@@ -341,7 +331,7 @@ suite.describe('ORDER BY', function()
       local group = byValue[row.value]
 
       if not group then
-        group = { value = row.value, found = 0, first = #groups + 1 }
+        group = { value = row.value, found = 0 }
         byValue[row.value] = group
         table.insert(groups, group)
       end
@@ -352,13 +342,14 @@ suite.describe('ORDER BY', function()
     table.sort(groups, function(left, right)
       if left.found ~= right.found then return left.found > right.found end
 
-      return left.first < right.first
+      return left.value < right.value
     end)
 
-    local text = 'SELECT value, COUNT(*) AS found FROM %s GROUP BY value ORDER BY found DESC LIMIT 5 OFFSET 40'
+    local text = 'SELECT value, COUNT(*) AS found FROM %s GROUP BY value ORDER BY found DESC, value'
 
     for _, source in { 'big', 'stream', 'volatile' } do
-      expect(db:query(string.format(text, source)).rows).toEqual(project(groups, { 'value', 'found' }, 40, 5))
+      expect(db:query(string.format(text, source)).rows).toEqual(project(groups, { 'value', 'found' }))
+      expect(db:query(string.format(text, source) .. ' LIMIT 5 OFFSET 40').rows).toEqual(project(groups, { 'value', 'found' }, 40, 5))
     end
   end)
 
