@@ -137,6 +137,52 @@ local function ascending(name) return { read = column(name), desc = false } end
 
 local function descending(name) return { read = column(name), desc = true } end
 
+--- The first `keep` of `rows` under `keys`, as a heap that holds `keep` rows gives them: a row is
+--- taken while there is room, and after that when it goes before the last row held, whose place
+--- it takes. Which of several rows with equal keys are held, and in what order, is what the heap
+--- and the sort of what it holds make of them.
+local function bounded(rows, keys, keep)
+  local heap = {}
+
+  local function goesBefore(left, right) return before(keys, left, right) end
+
+  local function siftUp(index)
+    while index > 1 do
+      local parent = index // 2
+      if not goesBefore(heap[parent], heap[index]) then break end
+
+      heap[index], heap[parent] = heap[parent], heap[index]
+      index = parent
+    end
+  end
+
+  local function siftDown(index)
+    while true do
+      local left = index * 2
+      if left > #heap then return end
+
+      local last = if left < #heap and goesBefore(heap[left], heap[left + 1]) then left + 1 else left
+      if not goesBefore(heap[index], heap[last]) then return end
+
+      heap[index], heap[last] = heap[last], heap[index]
+      index = last
+    end
+  end
+
+  for _, row in rows do
+    if #heap < keep then
+      table.insert(heap, row)
+      siftUp(#heap)
+    elseif goesBefore(row, heap[1]) then
+      heap[1] = row
+      siftDown(1)
+    end
+  end
+
+  table.sort(heap, goesBefore)
+  return heap
+end
+
 suite.describe('ORDER BY', function()
   suite.it('orders by a number, upwards and downwards', function()
     local db = database()
@@ -346,6 +392,118 @@ suite.describe('ORDER BY', function()
       expect(db:query(string.format(text, source)).rows).toEqual(project(groups, { 'value', 'found' }))
       expect(db:query(string.format(text, source) .. ' LIMIT 5 OFFSET 40').rows).toEqual(project(groups, { 'value', 'found' }, 40, 5))
     end
+  end)
+
+  suite.it('gives rows whose keys are all equal the order a comparator sort gives them, and LIMIT the rows a heap holds', function()
+    local db = sql.new()
+    local rows, columns = {}, { 'id', 'bucket', 'gap', 'zero', 'near' }
+
+    for id = 1, 3000 do
+      rows[id] = {
+        id = id,
+        bucket = (id * 7) % 13,
+        gap = if id % 4 == 0 then nil else (id * 5) % 3,
+        zero = if id % 2 == 0 then 0 else -0,
+        -- Different in every row but the last, which repeats the seventh.
+        near = if id == 3000 then 7.5 else id + 0.5,
+      }
+    end
+
+    db:table('big', rows, columns)
+    db:register('stream', streamed(rows, columns, false))
+    db:register('volatile', streamed(rows, columns, true))
+
+    local orderings = {
+      { 'bucket', { ascending 'bucket' } },
+      { 'bucket DESC', { descending 'bucket' } },
+      { 'gap', { ascending 'gap' } },
+      { 'gap DESC', { descending 'gap' } },
+      { 'zero', { ascending 'zero' } },
+      { 'near', { ascending 'near' } },
+      { 'near DESC', { descending 'near' } },
+      { 'bucket, gap DESC', { ascending 'bucket', descending 'gap' } },
+      { 'gap DESC, bucket', { descending 'gap', ascending 'bucket' } },
+      { 'near, bucket DESC', { ascending 'near', descending 'bucket' } },
+      { 'zero DESC, gap, bucket', { descending 'zero', ascending 'gap', ascending 'bucket' } },
+    }
+
+    local pages = { { 1, 0 }, { 5, 0 }, { 40, 25 }, { 700, 0 }, { 30, 2960 }, { 4000, 0 } }
+    local filtered = [for row in rows if row.bucket < 9 => row]
+
+    for _, ordering in orderings do
+      local text, keys = ordering[1], ordering[2]
+
+      local function goesBefore(left, right) return before(keys, left, right) end
+
+      local sorted, sortedFiltered = table.clone(rows), table.clone(filtered)
+      table.sort(sorted, goesBefore)
+      table.sort(sortedFiltered, goesBefore)
+
+      for _, source in { 'big', 'stream', 'volatile' } do
+        expect({ text, db:query(`SELECT id FROM {source} ORDER BY {text}`).rows }).toEqual { text, project(sorted, { 'id' }) }
+
+        expect({ text, db:query(`SELECT id FROM {source} WHERE bucket < 9 ORDER BY {text}`).rows }).toEqual {
+          text,
+          project(sortedFiltered, { 'id' }),
+        }
+
+        for _, bounds in pages do
+          local limit, offset = bounds[1], bounds[2]
+          local tail = `{text} LIMIT {limit} OFFSET {offset}`
+
+          expect({ tail, db:query(`SELECT id FROM {source} ORDER BY {tail}`).rows }).toEqual {
+            tail,
+            project(bounded(rows, keys, limit + offset), { 'id' }, offset, limit),
+          }
+
+          expect({ tail, db:query(`SELECT id FROM {source} WHERE bucket < 9 ORDER BY {tail}`).rows }).toEqual {
+            tail,
+            project(bounded(filtered, keys, limit + offset), { 'id' }, offset, limit),
+          }
+        end
+      end
+    end
+
+    local groups, byGap = {}, {}
+
+    for _, row in rows do
+      local key = `{row.bucket}:{row.gap}`
+      local group = byGap[key]
+
+      if not group then
+        group = { bucket = row.bucket, gap = row.gap, found = 0, least = row.id }
+        byGap[key] = group
+        table.insert(groups, group)
+      end
+
+      group.found += 1
+    end
+
+    for _, ordering in { { 'found', { ascending 'found' } }, { 'found DESC', { descending 'found' } }, { 'gap, found DESC', { ascending 'gap', descending 'found' } } } do
+      local text, keys = ordering[1], ordering[2]
+      local sorted = table.clone(groups)
+      table.sort(sorted, function(left, right) return before(keys, left, right) end)
+
+      for _, source in { 'big', 'volatile' } do
+        local grouped = `SELECT bucket, gap, COUNT(*) AS found, MIN(id) AS least FROM {source} GROUP BY bucket, gap ORDER BY {text}`
+
+        expect({ text, db:query(grouped).rows }).toEqual { text, sorted }
+        expect({ text, db:query(`{grouped} LIMIT 9 OFFSET 4`).rows }).toEqual { text, project(bounded(groups, keys, 13), { 'bucket', 'gap', 'found', 'least' }, 4, 9) }
+      end
+    end
+  end)
+
+  suite.it('orders no rows and one row', function()
+    local db = database()
+
+    for _, tail in { 'score', 'score DESC, id', 'name', 'rank, score LIMIT 3', 'score LIMIT 3 OFFSET 2' } do
+      expect(db:query(`SELECT id FROM things WHERE id < 0 ORDER BY {tail}`).rows).toEqual {}
+      expect(db:query(`SELECT id FROM volatile WHERE id < 0 ORDER BY {tail}`).rows).toEqual {}
+    end
+
+    expect(db:query('SELECT id FROM things WHERE id = 9 ORDER BY score').rows).toEqual { { id = 9 } }
+    expect(db:query('SELECT id FROM stream WHERE id = 9 ORDER BY rank DESC, score').rows).toEqual { { id = 9 } }
+    expect(db:query('SELECT id FROM things WHERE id = 9 ORDER BY score LIMIT 4').rows).toEqual { { id = 9 } }
   end)
 
   suite.it('raises for keys that do not compare with each other', function()
@@ -826,6 +984,41 @@ suite.describe('aggregates', function()
     db:table('held', rows, { 'id', 'score' })
     expect(db:query('SELECT SUM(score) AS total, COUNT(score) AS found FROM held').rows).toEqual { { total = total, found = 800 } }
     expect(function() db:query('SELECT MIN(score) AS least FROM held') end).toThrow('attempt to compare')
+  end)
+
+  suite.it('count every row once, wherever a row falls whose later column is not a number', function()
+    local db = sql.new()
+    local rows = {}
+
+    for id = 1, 700 do
+      rows[id] = { id = id, value = 1 / id + (if id % 2 == 0 then 1e15 else -1e15), other = id % 5 }
+    end
+
+    db:table('held', rows, { 'id', 'value', 'other' })
+    db:register('volatile', streamed(rows, { 'id', 'value', 'other' }, true))
+
+    local text = [[SELECT COUNT(*) AS found, SUM(value) AS total, MIN(value) AS least, MAX(value) AS greatest,
+      COUNT(value) AS held, SUM(other) AS others, AVG(value) AS mean FROM %s]]
+
+    for position = 1, 700 do
+      -- Luau adds a string that reads as a number, so the sum goes on through it.
+      rows[position].other = '2'
+      local wanted = { found = 700, held = 700, least = rows[1].value, greatest = rows[1].value }
+      local total, others = 0, 0
+
+      for _, row in rows do
+        total += row.value
+        others += row.other
+        wanted.least = math.min(wanted.least, row.value)
+        wanted.greatest = math.max(wanted.greatest, row.value)
+      end
+
+      wanted.total, wanted.others, wanted.mean = total, others, total / 700
+      expect({ position, db:query(string.format(text, 'held')).rows }).toEqual { position, { wanted } }
+      if position % 64 <= 1 then expect({ position, db:query(string.format(text, 'volatile')).rows }).toEqual { position, { wanted } } end
+
+      rows[position].other = position % 5
+    end
   end)
 
   suite.it('add in the order the rows come in', function()
