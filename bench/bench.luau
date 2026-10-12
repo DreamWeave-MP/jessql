@@ -226,6 +226,21 @@ do
   )
 
   query(
+    'order by two numbers that repeat together, 100k rows',
+    'SELECT id, value FROM records ORDER BY bucket, value DESC',
+    nil,
+    function(rows) return weigh(rows, readValue) end,
+    weigh(
+      reference(records, nil, function(left, right)
+        if left.bucket ~= right.bucket then return left.bucket < right.bucket end
+
+        return left.value > right.value
+      end),
+      readValue
+    )
+  )
+
+  query(
     'order by a nullable number, 100k rows',
     'SELECT id FROM records ORDER BY rank, id',
     nil,
@@ -343,6 +358,16 @@ do
     function(rows) return weigh(rows, readValue) end,
     weigh(records, readValue)
   )
+
+  local function readRank(row) return row.rank or -1 end
+
+  query(
+    'project three columns, one NULL in every tenth row, 100k rows',
+    'SELECT id, rank, value FROM records',
+    nil,
+    function(rows) return weigh(rows, readRank) end,
+    weigh(records, readRank)
+  )
 end
 
 do
@@ -377,6 +402,24 @@ do
       return found + total + mean + low + high + ranked
     end,
     kept + total + scoreTotal / kept + low + high + ranked
+  )
+
+  local smallTotal, smallLow, smallHigh = 0, math.huge, -math.huge
+
+  for _, row in smallRows do
+    smallTotal += row.value
+    smallLow, smallHigh = math.min(smallLow, row.value), math.max(smallHigh, row.value)
+  end
+
+  query(
+    'four aggregates, 400 rows',
+    'SELECT COUNT(*) AS found, SUM(value) AS total, MIN(value) AS low, MAX(value) AS high FROM small',
+    nil,
+    function(rows)
+      local {found, total, low, high} = rows[1]
+      return found + total + low + high
+    end,
+    SmallCount + smallTotal + smallLow + smallHigh
   )
 
   local streamedTotal, streamedCount = 0, 0
