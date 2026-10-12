@@ -165,6 +165,10 @@ local AggregateDelay = 128
 -- sorted.
 local OrderSample = 256
 
+-- How many result rows are built key by key after one with a NULL cell, before a row is started
+-- as a copy again.
+local RowRetry = 64
+
 local function lower(text) return string.lower(text) end
 
 local function hasAggregate(expr)
@@ -2523,11 +2527,13 @@ local function prepare(db: Database, sql: string): Plan
     if ast.limit ~= nil then last = math.min(last, ast.offset + ast.limit) end
     local resultRows = table.create(math.max(0, last - first + 1))
 
+    local keyed = if rowTemplate then 0 else math.huge
+
     for unitIndex = first, last do
       local unit = units[unitIndex]
       local row
 
-      if rowTemplate then
+      if keyed == 0 then
         local filled = true
         row = table.clone(rowTemplate)
 
@@ -2540,9 +2546,11 @@ local function prepare(db: Database, sql: string): Plan
 
         -- A row with a NULL cell is built key by key after all, so that a caller walking it
         -- meets its cells in the order it always has: a copy keeps the place of the missing one.
+        -- So are the rows after it, for a while: where one row has a NULL cell more tend to,
+        -- and a copy made only to be built again costs more than it saves.
         if not filled then
           local copied = row
-          row = {}
+          row, keyed = {}, RowRetry
 
           for _, name in resultColumns do
             local value = copied[name]
@@ -2550,6 +2558,7 @@ local function prepare(db: Database, sql: string): Plan
           end
         end
       else
+        keyed -= 1
         row = {}
 
         for index, selector in selectors do
