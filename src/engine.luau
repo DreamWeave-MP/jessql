@@ -280,6 +280,82 @@ local function bindColumn(expr, sources)
   return sourceIndex, expr.boundName
 end
 
+--- `column op value` over one table's row as one function, where `value` is a literal that is
+--- not NULL: a WHERE is mostly these, and the general form calls a function for each side
+--- before it compares. Nil for an operator that is not a comparison.
+local function columnAgainstLiteral(op, key, value)
+  if op == '=' then
+    return function(row, _group, _params)
+      local left = row[key]
+      return if left == nil then nil else left == value
+    end
+  elseif op == '!=' or op == '<>' then
+    return function(row, _group, _params)
+      local left = row[key]
+      return if left == nil then nil else left ~= value
+    end
+  elseif op == '<' then
+    return function(row, _group, _params)
+      local left = row[key]
+      return if left == nil then nil else left < value
+    end
+  elseif op == '<=' then
+    return function(row, _group, _params)
+      local left = row[key]
+      return if left == nil then nil else left <= value
+    end
+  elseif op == '>' then
+    return function(row, _group, _params)
+      local left = row[key]
+      return if left == nil then nil else left > value
+    end
+  elseif op == '>=' then
+    return function(row, _group, _params)
+      local left = row[key]
+      return if left == nil then nil else left >= value
+    end
+  end
+
+  return nil
+end
+
+--- `column op ?` over one table's row as one function, the parameter read on every call.
+local function columnAgainstParam(op, key, index)
+  if op == '=' then
+    return function(row, _group, params)
+      local left, right = row[key], params[index]
+      return if left == nil or right == nil then nil else left == right
+    end
+  elseif op == '!=' or op == '<>' then
+    return function(row, _group, params)
+      local left, right = row[key], params[index]
+      return if left == nil or right == nil then nil else left ~= right
+    end
+  elseif op == '<' then
+    return function(row, _group, params)
+      local left, right = row[key], params[index]
+      return if left == nil or right == nil then nil else left < right
+    end
+  elseif op == '<=' then
+    return function(row, _group, params)
+      local left, right = row[key], params[index]
+      return if left == nil or right == nil then nil else left <= right
+    end
+  elseif op == '>' then
+    return function(row, _group, params)
+      local left, right = row[key], params[index]
+      return if left == nil or right == nil then nil else left > right
+    end
+  elseif op == '>=' then
+    return function(row, _group, params)
+      local left, right = row[key], params[index]
+      return if left == nil or right == nil then nil else left >= right
+    end
+  end
+
+  return nil
+end
+
 local function compileExpr(expr, sources, directSingle, aggregateIds)
   local tag = expr.tag
 
@@ -332,6 +408,19 @@ local function compileExpr(expr, sources, directSingle, aggregateIds)
     local leftOperand = compileExpr(expr.left, sources, directSingle, aggregateIds)
     local rightOperand = compileExpr(expr.right, sources, directSingle, aggregateIds)
     local op = expr.op
+
+    if directSingle and expr.left.tag == 'column' then
+      local right = expr.right
+      local fused = nil
+
+      if right.tag == 'literal' and right.value ~= nil then
+        fused = columnAgainstLiteral(op, expr.left.boundName, right.value)
+      elseif right.tag == 'param' then
+        fused = columnAgainstParam(op, expr.left.boundName, right.index)
+      end
+
+      if fused then return fused end
+    end
 
     if op == 'AND' then
       return function(context, group, params)
