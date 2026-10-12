@@ -151,6 +151,10 @@ local AGG = { COUNT = true, SUM = true, AVG = true, MIN = true, MAX = true }
 -- What a key column holds for NULL: `data.argsort` puts it after every number.
 local NotNumber = 0 / 0
 
+-- An ordering's key columns start with room for this many rows, and a bounded ordering holds at
+-- least this many beyond the rows it keeps before it sorts them and drops the rest.
+local InitialOrderCapacity, OrderBatch = 64, 1024
+
 local function lower(text) return string.lower(text) end
 
 local function hasAggregate(expr)
@@ -718,85 +722,313 @@ local function valueKey(value)
   return 'O' .. tostring(value) .. ';'
 end
 
---- `unit.order` for the units a numeric ordering had already read when it met `key`, a value that
---- is neither a number nor NULL, as key `failedKey` of unit `failedUnit`; and for the rest, read
---- now. Nothing is read twice: what the columns hold is taken back out of them.
-local function restoreOrderKeys(units, orderFns, params, columns, failedUnit, failedKey, key)
-  local keyCount = #orderFns
+--- Whether the ORDER BY keys `leftKeys` go before `rightKeys`: NULL before every value when a key
+--- runs upwards and after every value when it runs downwards. Raises for values that do not
+--- compare with each other.
+local function keysBefore(orderFns, leftKeys, rightKeys)
+  for index, order in orderFns do
+    local leftKey, rightKey = leftKeys[index], rightKeys[index]
+    if leftKey == rightKey then continue end
+    if leftKey == nil then return not order.desc end
+    if rightKey == nil then return order.desc end
+    if order.desc then return leftKey > rightKey end
 
-  for unitIndex, unit in units do
-    local keys = table.create(keyCount)
-    local stored = if unitIndex < failedUnit then keyCount elseif unitIndex == failedUnit then failedKey - 1 else 0
-
-    for keyIndex, order in orderFns do
-      if keyIndex <= stored then
-        local held = buffer.readf64(columns[keyIndex], (unitIndex - 1) * 8)
-        if held == held then keys[keyIndex] = if order.desc then -held else held end
-      elseif unitIndex == failedUnit and keyIndex == failedKey then
-        keys[keyIndex] = key
-      else
-        keys[keyIndex] = order.evaluate(unit.context, unit.group, params)
-      end
-    end
-
-    unit.order = keys
+    return leftKey < rightKey
   end
+
+  return false
 end
 
---- A stable ordering of `count` keys, as positions: NULL, held as NaN, first when the key runs
---- upwards and last when it runs downwards, where the negated numbers already put it.
-local function orderOfKeys(keys: buffer, count: number, nullCount: number, desc: boolean): buffer
+--- The key a column holds as `stored`: NaN for NULL, and a number negated when the key runs
+--- downwards, so that every column sorts upwards.
+local function keyOf(stored: number, desc: boolean): number?
+  if stored ~= stored then return nil end
+
+  return if desc then -stored else stored
+end
+
+--- A stable ordering of the first `count` keys of a column, as positions. `data.argsort` puts
+--- NaN, which is NULL, last: where it goes downwards. Upwards it is moved to the front.
+local function orderOfKeys(keys: buffer, count: number, desc: boolean): buffer
   local order = buffer.create(count * 4)
   data.argsort(keys, 'f64', 0, count, order)
-  if nullCount == 0 or desc then return order end
+  if desc then return order end
 
-  local valueCount = count - nullCount
+  local valueCount = data.count(keys, 'f64', 0, count, 'le', math.huge)
+  if valueCount == count then return order end
+
+  local nullCount = count - valueCount
   local nullsFirst = buffer.create(count * 4)
   buffer.copy(nullsFirst, 0, order, valueCount * 4, nullCount * 4)
   buffer.copy(nullsFirst, nullCount * 4, order, 0, valueCount * 4)
   return nullsFirst
 end
 
---- `units` in ORDER BY order. Keys that are all numbers or NULL are sorted as columns, one
---- stable pass per key from the last to the first, so units whose keys are all equal keep the
---- order they came in. A key of any other kind, NaN included, leaves the ordering to
---- `orderBefore`, which raises for values that do not compare.
-local function orderUnits(units, orderFns, params, orderBefore)
-  local count, keyCount = #units, #orderFns
-  local columns = [for _ in orderFns => buffer.create(count * 8)]
-  local nullCounts = table.create(keyCount, 0)
+--- The positions of the first `count` rows of the key `columns` in ORDER BY order: one stable
+--- pass per key, from the last key to the first, so rows whose keys are all equal stay in the
+--- order they are held in.
+local function orderOfColumns(columns: { buffer }, orderFns, count: number): buffer
+  local keyCount = #columns
+  local order = orderOfKeys(columns[keyCount], count, orderFns[keyCount].desc)
+  if keyCount == 1 then return order end
 
-  for unitIndex, unit in units do
-    local offset = (unitIndex - 1) * 8
-
-    for keyIndex, order in orderFns do
-      local key = order.evaluate(unit.context, unit.group, params)
-
-      if type(key) == 'number' and key == key then
-        buffer.writef64(columns[keyIndex], offset, if order.desc then -key else key)
-      elseif key == nil then
-        buffer.writef64(columns[keyIndex], offset, NotNumber)
-        nullCounts[keyIndex] += 1
-      else
-        restoreOrderKeys(units, orderFns, params, columns, unitIndex, keyIndex, key)
-        table.sort(units, orderBefore)
-        return units
-      end
-    end
-  end
-
-  local order = orderOfKeys(columns[keyCount], count, nullCounts[keyCount], orderFns[keyCount].desc)
-  local gathered = buffer.create(if keyCount > 1 then count * 8 else 0)
+  local gathered = buffer.create(count * 8)
 
   for keyIndex = keyCount - 1, 1, -1 do
     data.gather(columns[keyIndex], 'f64', 0, count, order, gathered, 0, count)
-    local pass = orderOfKeys(gathered, count, nullCounts[keyIndex], orderFns[keyIndex].desc)
+    local pass = orderOfKeys(gathered, count, orderFns[keyIndex].desc)
     local composed = buffer.create(count * 4)
     data.gather(order, 'u32', 0, count, pass, composed, 0, count)
     order = composed
   end
 
-  return [for position in order[1:count, 'u32'] => units[position + 1]]
+  return order
+end
+
+local function sameContext(context) return context end
+
+--- An ordering, as two functions: `offer` takes rows one at a time, and `finish` hands them back
+--- as units in ORDER BY order, all of them or the first `keep`. `offer` reads a row's keys once,
+--- in order, and makes the row a unit (its context passed through `retain`) only if it may be
+--- kept; a unit the caller already has is passed as the third argument.
+---
+--- Keys that are numbers or NULL go into one f64 column per key and are sorted by
+--- `orderOfColumns`, so rows whose keys are all equal come back in the order they were offered. A
+--- bounded ordering holds at most `keep` rows and as many again (a batch at the least): when it
+--- is full it sorts, drops what fell out, and from then on turns away a row whose first key is
+--- already past the last one kept. The first key of any other kind, NaN included, hands every
+--- row held and every row after to a comparator, on a heap when bounded: the order then is
+--- whatever `table.sort` gives rows whose keys are equal.
+local function orderSink(orderFns, params, keep: number?, retain, expected: number?)
+  local keyCount = #orderFns
+  local firstEvaluate, firstDesc = orderFns[1].evaluate, orderFns[1].desc
+  local bound = if keep then keep + math.max(keep, OrderBatch) else math.huge
+  local capacity = math.min(bound, math.max(expected or 0, InitialOrderCapacity))
+  local columns = [for _ in orderFns => buffer.create(capacity * 8)]
+  local pending = table.create(keyCount)
+  local units = {}
+  local held = 0
+  local threshold: number? = nil
+  local comparing = false
+  local heap = nil
+
+  local function unitBefore(left, right)
+    for index, order in orderFns do
+      local leftKey, rightKey = left.order[index], right.order[index]
+      if leftKey == rightKey then continue end
+      if leftKey == nil then return not order.desc end
+      if rightKey == nil then return order.desc end
+      if order.desc then return leftKey > rightKey end
+
+      return leftKey < rightKey
+    end
+
+    return false
+  end
+
+  local function siftUp(index)
+    while index > 1 do
+      local parent = index // 2
+      if not unitBefore(heap[parent], heap[index]) then break end
+
+      heap[index], heap[parent] = heap[parent], heap[index]
+      index = parent
+    end
+  end
+
+  local function siftDown(index)
+    while true do
+      local left = index * 2
+      if left > #heap then return end
+
+      local right = left + 1
+      local worst = left
+      if right <= #heap and unitBefore(heap[left], heap[right]) then worst = right end
+      if not unitBefore(heap[index], heap[worst]) then return end
+
+      heap[index], heap[worst] = heap[worst], heap[index]
+      index = worst
+    end
+  end
+
+  --- Puts a unit that has its keys on the heap, if it goes before the last one the heap keeps.
+  local function push(unit)
+    local size = #heap
+
+    if size < keep then
+      heap[size + 1] = unit
+      siftUp(size + 1)
+    elseif unitBefore(unit, heap[1]) then
+      heap[1] = unit
+      siftDown(1)
+    end
+  end
+
+  --- Takes the row whose keys are in `pending`, under the comparator.
+  local function compared(context, group, unit)
+    if heap and #heap >= keep and not keysBefore(orderFns, pending, heap[1].order) then return end
+
+    local kept = unit or { context = retain(context), group = group }
+    kept.order = table.clone(pending)
+
+    if heap then
+      push(kept)
+      return
+    end
+
+    held += 1
+    units[held] = kept
+  end
+
+  --- Hands the rows held to the comparator, each with the keys its columns held for it.
+  local function compare()
+    comparing = true
+    if keep then heap = table.create(keep) end
+
+    for index = 1, held do
+      local unit = units[index]
+      local keys = table.create(keyCount)
+
+      for keyIndex, order in orderFns do
+        keys[keyIndex] = keyOf(buffer.readf64(columns[keyIndex], (index - 1) * 8), order.desc)
+      end
+
+      unit.order = keys
+      if heap then push(unit) end
+    end
+  end
+
+  local function grow()
+    capacity = math.min(bound, capacity * 2)
+
+    for keyIndex, keys in columns do
+      local larger = buffer.create(capacity * 8)
+      buffer.copy(larger, 0, keys)
+      columns[keyIndex] = larger
+    end
+  end
+
+  --- Sorts the rows held and keeps the first `keep`, in order.
+  local function prune()
+    local order = orderOfColumns(columns, orderFns, held)
+    local kept = math.min(held, keep)
+
+    for keyIndex, keys in columns do
+      local compacted = buffer.create(capacity * 8)
+      data.gather(keys, 'f64', 0, held, order, compacted, 0, kept)
+      columns[keyIndex] = compacted
+    end
+
+    units = [for position in order[1:kept, 'u32'] => units[position + 1]]
+    held = kept
+    if kept < keep then return end
+
+    -- NULL stands at the end it sorts to; a row whose first key is past this one cannot be kept.
+    local last = buffer.readf64(columns[1], (kept - 1) * 8)
+    threshold = if last == last then last elseif firstDesc then math.huge else -math.huge
+  end
+
+  --- Holds a row whose keys are in the columns, and sorts or makes room when the columns fill.
+  local function hold(context, group, unit)
+    held += 1
+    units[held] = unit or { context = retain(context), group = group }
+    if held < capacity then return end
+
+    if capacity < bound then
+      grow()
+    else
+      prune()
+    end
+  end
+
+  --- `offer` for one key, which is most orderings: a row past the last one kept, or level with
+  --- it, having come after it, is turned away before anything is stored. An infinity may be
+  --- standing for NULL on either side of that comparison, so it is left to the sort.
+  local function offerOne(context, group, unit)
+    local key = firstEvaluate(context, group, params)
+    local stored, sortKey
+
+    if comparing then
+      pending[1] = key
+      compared(context, group, unit)
+      return
+    elseif type(key) == 'number' and key == key then
+      stored = if firstDesc then -key else key
+      sortKey = stored
+    elseif key == nil then
+      stored = NotNumber
+      sortKey = if firstDesc then math.huge else -math.huge
+    else
+      pending[1] = key
+      compare()
+      compared(context, group, unit)
+      return
+    end
+
+    if threshold and (sortKey > threshold or (sortKey == threshold and math.abs(sortKey) ~= math.huge)) then return end
+
+    buffer.writef64(columns[1], held * 8, stored)
+    hold(context, group, unit)
+  end
+
+  local function offerMany(context, group, unit)
+    if comparing then
+      for keyIndex, order in orderFns do
+        pending[keyIndex] = order.evaluate(context, group, params)
+      end
+
+      compared(context, group, unit)
+      return
+    end
+
+    local offset = held * 8
+
+    for keyIndex, order in orderFns do
+      local key = order.evaluate(context, group, params)
+
+      if type(key) == 'number' and key == key then
+        buffer.writef64(columns[keyIndex], offset, if order.desc then -key else key)
+      elseif key == nil then
+        buffer.writef64(columns[keyIndex], offset, NotNumber)
+      else
+        for earlier = 1, keyIndex - 1 do
+          pending[earlier] = keyOf(buffer.readf64(columns[earlier], offset), orderFns[earlier].desc)
+        end
+
+        pending[keyIndex] = key
+
+        for later = keyIndex + 1, keyCount do
+          pending[later] = orderFns[later].evaluate(context, group, params)
+        end
+
+        compare()
+        compared(context, group, unit)
+        return
+      end
+    end
+
+    if threshold then
+      local first = buffer.readf64(columns[1], offset)
+      if first ~= first then first = if firstDesc then math.huge else -math.huge end
+      if first > threshold then return end
+    end
+
+    hold(context, group, unit)
+  end
+
+  local function finish()
+    if comparing then
+      local sorted = heap or units
+      table.sort(sorted, unitBefore)
+      return sorted
+    end
+
+    local order = orderOfColumns(columns, orderFns, held)
+    local kept = if keep then math.min(held, keep) else held
+    return [for position in order[1:kept, 'u32'] => units[position + 1]]
+  end
+
+  return if keyCount == 1 then offerOne else offerMany, finish
 end
 
 local function prepare(db: Database, sql: string): Plan
@@ -1753,29 +1985,6 @@ local function prepare(db: Database, sql: string): Plan
       end
     end
 
-    local decorateOrder = nil
-    local orderBefore = nil
-
-    if #orderFns > 0 then
-      decorateOrder = function(unit)
-        local keys = table.create(#orderFns)
-        for index, order in orderFns do keys[index] = order.evaluate(unit.context, unit.group, params) end
-        unit.order = keys
-      end
-
-      orderBefore = function(left, right)
-        for index, order in orderFns do
-          local leftKey, rightKey = left.order[index], right.order[index]
-          if leftKey == rightKey then continue end
-          if leftKey == nil then return not order.desc end
-          if rightKey == nil then return order.desc end
-          if order.desc then return leftKey > rightKey else return leftKey < rightKey end
-        end
-
-        return false
-      end
-    end
-
     local units = {}
     local orderAlreadySorted = false
 
@@ -1881,31 +2090,9 @@ local function prepare(db: Database, sql: string): Plan
       end
 
       local keep = if #orderFns > 0 and ast.limit ~= nil then ast.offset + ast.limit else nil
-      local heap = if keep ~= nil and keep > 0 then table.create(keep) else nil
+      local offer, finish
 
-      local function worse(left, right) return orderBefore(right, left) end
-
-      local function siftUp(index)
-        while index > 1 do
-          local parent = math.floor(index / 2)
-          if not worse(heap[index], heap[parent]) then break end
-          heap[index], heap[parent] = heap[parent], heap[index]
-          index = parent
-        end
-      end
-
-      local function siftDown(index)
-        while true do
-          local left = index * 2
-          if left > #heap then return end
-          local right = left + 1
-          local worst = left
-          if right <= #heap and worse(heap[right], heap[left]) then worst = right end
-          if not worse(heap[worst], heap[index]) then return end
-          heap[index], heap[worst] = heap[worst], heap[index]
-          index = worst
-        end
-      end
+      if keep ~= nil and keep > 0 then offer, finish = orderSink(orderFns, params, keep, sameContext) end
 
       for _, group in order do
         for index, spec in aggregateSpecs do
@@ -1917,26 +2104,16 @@ local function prepare(db: Database, sql: string): Plan
 
         local context = groupContext(group)
         if havingFn and not sqlTruthy(havingFn(context, group, params)) then continue end
-        local unit = { context = context, group = group }
 
-        if heap ~= nil then
-          decorateOrder(unit)
-
-          if #heap < keep then
-            heap[#heap + 1] = unit
-            siftUp(#heap)
-          elseif orderBefore(unit, heap[1]) then
-            heap[1] = unit
-            siftDown(1)
-          end
+        if offer ~= nil then
+          offer(context, group, nil)
         elseif keep ~= 0 then
-          units[#units + 1] = unit
+          units[#units + 1] = { context = context, group = group }
         end
       end
 
-      if heap ~= nil then
-        units = heap
-        table.sort(units, orderBefore)
+      if finish ~= nil then
+        units = finish()
         orderAlreadySorted = true
       elseif keep == 0 then
         units = {}
@@ -1956,105 +2133,13 @@ local function prepare(db: Database, sql: string): Plan
         end
       elseif stopAfter ~= nil then
         if stopAfter > 0 then
-          local heap = table.create(stopAfter)
+          local offer, finish = orderSink(orderFns, params, stopAfter, retainContext)
 
-          if #orderFns == 1 then
-            local order = orderFns[1]
+          eachContext(function(context)
+            if not residualWhere or sqlTruthy(residualWhere(context, nil, params)) then offer(context, nil, nil) end
+          end)
 
-            local function beforeKey(left, right)
-              if left ~= right then
-                if left == nil then return not order.desc end
-                if right == nil then return order.desc end
-                if order.desc then return left > right else return left < right end
-              end
-
-              return false
-            end
-
-            local function worse(left, right) return beforeKey(right.orderKey, left.orderKey) end
-
-            local function siftUp(index)
-              while index > 1 do
-                local parent = math.floor(index / 2)
-                if not worse(heap[index], heap[parent]) then break end
-                heap[index], heap[parent] = heap[parent], heap[index]
-                index = parent
-              end
-            end
-
-            local function siftDown(index)
-              while true do
-                local left = index * 2
-                if left > #heap then return end
-                local right = left + 1
-                local worst = left
-                if right <= #heap and worse(heap[right], heap[left]) then worst = right end
-                if not worse(heap[worst], heap[index]) then return end
-                heap[index], heap[worst] = heap[worst], heap[index]
-                index = worst
-              end
-            end
-
-            eachContext(function(context)
-              if not residualWhere or sqlTruthy(residualWhere(context, nil, params)) then
-                local key = order.evaluate(context, nil, params)
-
-                if #heap < stopAfter then
-                  local unit = { context = retainContext(context), group = nil, orderKey = key }
-                  heap[#heap + 1] = unit
-                  siftUp(#heap)
-                elseif beforeKey(key, heap[1].orderKey) then
-                  heap[1] = { context = retainContext(context), group = nil, orderKey = key }
-                  siftDown(1)
-                end
-              end
-            end)
-
-            units = heap
-            table.sort(units, function(left, right) return beforeKey(left.orderKey, right.orderKey) end)
-          else
-            local function worse(left, right) return orderBefore(right, left) end
-
-            local function siftUp(index)
-              while index > 1 do
-                local parent = math.floor(index / 2)
-                if not worse(heap[index], heap[parent]) then break end
-                heap[index], heap[parent] = heap[parent], heap[index]
-                index = parent
-              end
-            end
-
-            local function siftDown(index)
-              while true do
-                local left = index * 2
-                if left > #heap then return end
-                local right = left + 1
-                local worst = left
-                if right <= #heap and worse(heap[right], heap[left]) then worst = right end
-                if not worse(heap[worst], heap[index]) then return end
-                heap[index], heap[worst] = heap[worst], heap[index]
-                index = worst
-              end
-            end
-
-            eachContext(function(context)
-              if not residualWhere or sqlTruthy(residualWhere(context, nil, params)) then
-                local unit = { context = retainContext(context), group = nil }
-                decorateOrder(unit)
-
-                if #heap < stopAfter then
-                  heap[#heap + 1] = unit
-                  siftUp(#heap)
-                elseif orderBefore(unit, heap[1]) then
-                  heap[1] = unit
-                  siftDown(1)
-                end
-              end
-            end)
-
-            units = heap
-            table.sort(units, orderBefore)
-          end
+          units = finish()
         end
 
         orderAlreadySorted = true
@@ -2068,56 +2153,9 @@ local function prepare(db: Database, sql: string): Plan
     end
 
     if #orderFns > 0 and not orderHandled and not orderAlreadySorted then
-      local keep = if ast.limit ~= nil then ast.offset + ast.limit else nil
-
-      if keep ~= nil and keep < #units then
-        if keep == 0 then
-          units = {}
-        else
-          local heap = table.create(keep)
-
-          local function worse(left, right) return orderBefore(right, left) end
-
-          local function siftUp(index)
-            while index > 1 do
-              local parent = math.floor(index / 2)
-              if not worse(heap[index], heap[parent]) then break end
-              heap[index], heap[parent] = heap[parent], heap[index]
-              index = parent
-            end
-          end
-
-          local function siftDown(index)
-            while true do
-              local left = index * 2
-              if left > #heap then return end
-              local right = left + 1
-              local worst = left
-              if right <= #heap and worse(heap[right], heap[left]) then worst = right end
-              if not worse(heap[worst], heap[index]) then return end
-              heap[index], heap[worst] = heap[worst], heap[index]
-              index = worst
-            end
-          end
-
-          for _, unit in units do
-            decorateOrder(unit)
-
-            if #heap < keep then
-              heap[#heap + 1] = unit
-              siftUp(#heap)
-            elseif orderBefore(unit, heap[1]) then
-              heap[1] = unit
-              siftDown(1)
-            end
-          end
-
-          units = heap
-          table.sort(units, orderBefore)
-        end
-      else
-        units = orderUnits(units, orderFns, params, orderBefore)
-      end
+      local offer, finish = orderSink(orderFns, params, nil, sameContext, #units)
+      for _, unit in units do offer(unit.context, unit.group, unit) end
+      units = finish()
     end
 
     local first = ast.offset + 1

@@ -284,6 +284,84 @@ suite.describe('ORDER BY', function()
     expect(function() db:query('SELECT id FROM tiers ORDER BY late') end).toThrow('attempt to compare')
   end)
 
+  suite.it('keeps the first rows of the whole order under LIMIT, over more rows than it holds at once', function()
+    local db = sql.new()
+    local rows, columns = {}, { 'id', 'value', 'score', 'gap', 'tier', 'late' }
+
+    for id = 1, 6000 do
+      rows[id] = {
+        id = id,
+        value = (id * 7919) % 97,
+        score = (id * 7919) % 6007 + 0.5,
+        gap = if id % 3 == 0 then nil else (id * 31) % 50,
+        tier = if id > 4000 then 1 else 0,
+        late = if id > 4000 then `s{id % 5}` elseif id % 9 == 0 then nil else (id * 7) % 13,
+      }
+    end
+
+    db:table('big', rows, columns)
+    db:register('stream', streamed(rows, columns, false))
+    db:register('volatile', streamed(rows, columns, true))
+
+    --- The rows `keep` accepts in the order `keys` give, rows of equal keys in the order they
+    --- came in, which is the order of their ids.
+    local function ordered(keep, keys)
+      local out = {}
+
+      for _, row in rows do
+        if not keep or keep(row) then table.insert(out, row) end
+      end
+
+      table.insert(keys, ascending 'id')
+      table.sort(out, function(left, right) return before(keys, left, right) end)
+      return out
+    end
+
+    local cases = {
+      { 'ORDER BY value LIMIT 10', ordered(nil, { ascending 'value' }), 0, 10 },
+      { 'ORDER BY value DESC LIMIT 10 OFFSET 990', ordered(nil, { descending 'value' }), 990, 10 },
+      { 'ORDER BY gap, value DESC LIMIT 25', ordered(nil, { ascending 'gap', descending 'value' }), 0, 25 },
+      { 'ORDER BY gap DESC LIMIT 2000 OFFSET 1000', ordered(nil, { descending 'gap' }), 1000, 2000 },
+      { 'ORDER BY gap DESC, value LIMIT 3 OFFSET 3999', ordered(nil, { descending 'gap', ascending 'value' }), 3999, 3 },
+      { 'WHERE value > 10 ORDER BY score LIMIT 5', ordered(function(row) return row.value > 10 end, { ascending 'score' }), 0, 5 },
+      { 'ORDER BY tier, late, id LIMIT 30 OFFSET 20', ordered(nil, { ascending 'tier', ascending 'late' }), 20, 30 },
+      { 'ORDER BY tier DESC, late DESC, id DESC LIMIT 7', ordered(nil, { descending 'tier', descending 'late', descending 'id' }), 0, 7 },
+      { 'ORDER BY tier, late DESC, id LIMIT 4100', ordered(nil, { ascending 'tier', descending 'late' }), 0, 4100 },
+    }
+
+    for _, source in { 'big', 'stream', 'volatile' } do
+      for _, case in cases do
+        expect({ case[1], db:query(`SELECT id FROM {source} {case[1]}`).rows }).toEqual { case[1], project(case[2], { 'id' }, case[3], case[4]) }
+      end
+    end
+
+    local groups, byValue = {}, {}
+
+    for _, row in rows do
+      local group = byValue[row.value]
+
+      if not group then
+        group = { value = row.value, found = 0, first = #groups + 1 }
+        byValue[row.value] = group
+        table.insert(groups, group)
+      end
+
+      group.found += 1
+    end
+
+    table.sort(groups, function(left, right)
+      if left.found ~= right.found then return left.found > right.found end
+
+      return left.first < right.first
+    end)
+
+    local text = 'SELECT value, COUNT(*) AS found FROM %s GROUP BY value ORDER BY found DESC LIMIT 5 OFFSET 40'
+
+    for _, source in { 'big', 'stream', 'volatile' } do
+      expect(db:query(string.format(text, source)).rows).toEqual(project(groups, { 'value', 'found' }, 40, 5))
+    end
+  end)
+
   suite.it('raises for keys that do not compare with each other', function()
     local db = database()
 
