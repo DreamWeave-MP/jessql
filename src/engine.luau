@@ -1126,11 +1126,42 @@ local function manyKeysBefore(orderFns)
   end
 end
 
+--- Gives every unit, as its `orderKey`, the place of its keys among all the units' keys, which
+--- `order` holds sorted: units whose keys are all equal share a place, so a comparator over the
+--- places answers for any two units what one over their keys answers.
+local function placeUnits(units, columns: { buffer }, order: buffer, count: number)
+  local place, before = 0, -1
+
+  for position = 0, count - 1 do
+    local unitIndex = buffer.readu32(order, position * 4)
+    local offset = unitIndex * 8
+
+    if before >= 0 then
+      for _, keys in columns do
+        local left, right = buffer.readf64(keys, before), buffer.readf64(keys, offset)
+
+        if left ~= right and (left == left or right == right) then
+          place += 1
+          break
+        end
+      end
+    end
+
+    units[unitIndex + 1].orderKey = place
+    before = offset
+  end
+end
+
+--- Whether a unit goes before another by the place of its keys, `orderKey`.
+local function placeBefore(left, right) return left.orderKey < right.orderKey end
+
 --- `units` in ORDER BY order, each unit's keys read once and in order. Keys that are all
 --- numbers or NULL go into one f64 column each and are sorted by `orderOfColumns`: that order is
---- the comparator's when no two units have every key equal. When two do, or a key is of any
---- other kind, NaN included, the units are sorted by `table.sort` under the comparator, as they
---- always were, so that units with equal keys come back in the order they always have.
+--- the comparator's when no two units have every key equal. When two do, the units are sorted
+--- by `table.sort` as they always were, so that units with equal keys come back in the order
+--- they always have: under a comparator that reads each unit's place in the sorted columns, and
+--- so answers as the one over the keys does, or under the one over the keys itself. Keys of any
+--- other kind, NaN included, are sorted under the comparator over the keys.
 local function orderUnits(units, orderFns, params)
   local count, keyCount = #units, #orderFns
   local columns = [for _ in orderFns => buffer.create(count * 8)]
@@ -1156,12 +1187,18 @@ local function orderUnits(units, orderFns, params)
     if not numeric then break end
   end
 
-  if numeric and not sampleRepeats(columns, count) then
+  -- One key that repeats is sorted no faster by its place than by itself, so the columns are
+  -- left unsorted when a sample of them says it does.
+  if numeric and keyCount == 1 and sampleRepeats(columns, count) then
+    restoreOrderKeys(units, orderFns, params, columns, count + 1, 0, nil)
+  elseif numeric then
     local order = orderOfColumns(columns, orderFns, count)
     if not hasEqualNeighbours(columns, order, count) then return [for position in order[1:count, 'u32'] => units[position + 1]] end
-  end
 
-  if numeric then restoreOrderKeys(units, orderFns, params, columns, count + 1, 0, nil) end
+    placeUnits(units, columns, order, count)
+    table.sort(units, placeBefore)
+    return units
+  end
 
   table.sort(units, if keyCount == 1 then oneKeyBefore(orderFns[1].desc) else manyKeysBefore(orderFns))
   return units
