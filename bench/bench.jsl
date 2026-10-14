@@ -2,7 +2,7 @@
 -- grouping, joins, streamed providers, and preparing a statement. Every workload returns a
 -- checksum of its result, and the checksum is compared with one worked out from the fixture by a
 -- plain loop, so a broken fast path cannot post a time. Run by
--- `jess run --package . bench/bench.luau [filter]`, on a release build.
+-- `jess run --package . bench/bench.jsl [filter]`, on a release build.
 local sql = require('@jessql')
 
 -- A build without the verified toolchain runs Luau slower than a release does, so a number from

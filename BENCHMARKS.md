@@ -1,6 +1,6 @@
 # jessql benchmarks
 
-`bench/bench.luau` times the engine through its public API: a table of 100,000 rows (two joined
+`bench/bench.jsl` times the engine through its public API: a table of 100,000 rows (two joined
 tables of 50,000, one of 400 for the nested loop and the small aggregate), the same rows behind a
 streaming provider that reuses one row, and a provider that is only looked up. Every workload
 returns a checksum of its result that is compared with one worked out from the fixture by a plain
@@ -22,7 +22,7 @@ batches of about a tenth of a second each, with a full collection between batche
 
 ```sh
 flock $HOME/.cache/agents-bench.lock systemd-run --user --scope -q -p MemoryMax=3G -p MemorySwapMax=0 \
-  target/l3i2/jess run --package jpk/jessql --package-path jpk jpk/jessql/bench/bench.luau
+  target/l3i2/jess run --package jpk/jessql --package-path jpk jpk/jessql/bench/bench.jsl
 ```
 
 | Workload | Before | After | |
@@ -103,5 +103,5 @@ counts that keep few rows, 0.83x on the top-20 query, whose filter keeps nearly 
 same holds for ORDER BY with LIMIT through bounded sorted columns, which was 2.3x faster on large
 offsets but returned rows with equal keys in a different order from the heap's.
 
-`bench/join.luau`, `bench/run.luau` and `bench/topk.luau` are the older one-shot scripts; they
+`bench/join.jsl`, `bench/run.jsl` and `bench/topk.jsl` are the older one-shot scripts; they
 print their own times and are not part of the table.
