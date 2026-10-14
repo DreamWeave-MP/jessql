@@ -171,7 +171,7 @@ local RowRetry = 64
 
 local function lower(text) return string.lower(text) end
 
-local function hasAggregate(expr)
+local function hasAggregate(expr: parser.Expr?): boolean
   if expr == nil then return false end
   if expr.tag == 'call' and AGG[expr.name] then return true end
   if expr.tag == 'binary' then return hasAggregate(expr.left) or hasAggregate(expr.right) end
@@ -1393,7 +1393,7 @@ local function prepare(db: Database, sql: string): Plan
     return tostring(node.tag)
   end
 
-  local function registerAggregates(node)
+  local function registerAggregates(node: parser.Expr?)
     if node == nil then return end
 
     if node.tag == 'call' and AGG[node.name] then
