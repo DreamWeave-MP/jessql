@@ -1,5 +1,4 @@
 --!strict
---!native
 
 local engine = require('@jessql/engine')
 local parser = require('@jessql/parser')
