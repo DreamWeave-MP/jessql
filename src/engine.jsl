@@ -982,7 +982,7 @@ local function orderOfKeys(keys: buffer, count: number, desc: boolean): buffer
   data.argsort(keys, 'f64', 0, count, order)
   if desc then return order end
 
-  local valueCount = data.count(keys, 'f64', 0, count, 'le', math.huge)
+  local valueCount = data.countWhere(keys, 'f64', 0, count, 'le', math.huge)
   if valueCount == count then return order end
 
   local nullCount = count - valueCount
