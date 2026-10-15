@@ -105,3 +105,70 @@ offsets but returned rows with equal keys in a different order from the heap's.
 
 `bench/join.jsl`, `bench/run.jsl` and `bench/topk.jsl` are the older one-shot scripts; they
 print their own times and are not part of the table.
+
+## Which modules are native, and why
+
+Jess compiles to machine code only what is marked (`--!native` on a module, `@native` on one
+function), and every load pays for what is marked. A module carries `--!native` when a row below
+spends its time there and the module is small (12 KB or less); a larger module carries `@native`
+on the functions the row spends its time in, and nothing else.
+
+Measured 2026-10-15 with `jess 0.1.0`, the verified release build of jess `07c38cb` on l3i
+2.0.3, on the i7-10870H, the one-minute load 1.42 and 1.01 at the start of the two
+sessions. In each session the bench ran alternately on this package and on a copy of it with
+every module marked, three fresh runs of `bench/bench.jsl` each, every run's row the median of
+its batches; a column is the median of the three, and a ratio is against the all-marked runs of
+the same session. Which functions a row spends its time in comes from `jess run --profile` of
+that row alone, unmarked. The load cost is a fresh `jess run --package <this package>
+--package-path jpk` of a script that only requires `@jessql`, the two sides alternating, the
+median of five each after one warm-up.
+
+| Requiring `@jessql` | All marked | This state |
+| --- | ---: | ---: |
+| Unmarked | 0.074 s | 0.052 s |
+| Final | 0.070 s | 0.070 s |
+
+| Row | All marked (ms) | Unmarked / all marked | Final (ms) | Final / all marked |
+| --- | ---: | ---: | ---: | ---: |
+| order by a number, 100k rows | 62.12 | **1.546×** | 63.54 | 1.023× |
+| order by a number descending, 100k rows | 56.29 | **1.519×** | 55.82 | 0.992× |
+| order by a number with ties, 100k rows | 157.2 | **1.214×** | 157.9 | 1.004× |
+| order by two numbers, 100k rows | 50.66 | **1.719×** | 52.12 | 1.029× |
+| order by two numbers that repeat together, 100k rows | 155.1 | **1.322×** | 154.9 | 0.999× |
+| order by a nullable number, 100k rows | 53.38 | **1.788×** | 54.78 | 1.026× |
+| order by a string, 100k rows | 120.8 | **1.574×** | 123.1 | 1.019× |
+| filter then order by a number, 100k rows | 43.33 | **1.581×** | 44.16 | 1.019× |
+| top 20 of 100k by a number | 9.640 | **2.303×** | 9.651 | 1.001× |
+| top 20 of 100k by two numbers | 13.19 | **1.940×** | 13.14 | 0.996× |
+| 50 rows after 5,000 of 100k by a number | 21.24 | **2.588×** | 21.35 | 1.005× |
+| filter on two numbers, 100k rows | 17.68 | **1.763×** | 17.72 | 1.003× |
+| filter on a nullable number, 100k rows | 6.645 | **1.957×** | 6.579 | 0.990× |
+| filter on a string, 100k rows | 8.178 | **1.785×** | 8.272 | 1.011× |
+| filter on a LIKE prefix, 100k rows | 10.88 | **1.829×** | 10.96 | 1.007× |
+| filter on an expression, 100k rows | 17.04 | **2.308×** | 16.44 | 0.965× |
+| project three columns, 100k rows | 33.94 | **1.414×** | 34.30 | 1.011× |
+| project three columns, one NULL in every tenth row, 100k rows | 43.11 | **1.434×** | 42.80 | 0.993× |
+| count the rows a filter keeps, 100k rows | 7.481 | **2.505×** | 7.352 | 0.983× |
+| six aggregates over a filter, 100k rows | 12.70 | **2.906×** | 12.77 | 1.006× |
+| four aggregates, 400 rows | 0.06297 | **2.782×** | 0.06247 | 0.992× |
+| two aggregates over a streamed filter, 100k rows | 35.22 | **1.426×** | 34.86 | 0.990× |
+| group by two columns, 100k rows | 19.51 | **2.274×** | 19.33 | 0.991× |
+| group by one column, 100k rows | 12.91 | **2.153×** | 12.92 | 1.000× |
+| group by one column, 100k streamed rows | 38.40 | **1.424×** | 38.47 | 1.002× |
+| top 20 of 100k streamed rows by a number | 31.60 | **1.219×** | 31.73 | 1.004× |
+| hash join 50k to 50k, filtered, top 10 | 6.470 | **1.897×** | 6.376 | 0.985× |
+| hash join 50k to 50k, filtered, every row | 18.58 | **1.522×** | 18.73 | 1.009× |
+| left join 50k to 50k, grouped | 15.16 | **1.916×** | 15.15 | 1.000× |
+| nested-loop join 400 to 400, counted | 22.15 | **1.928×** | 22.24 | 1.004× |
+| indexed join from a streamed driver, 50k rows | 23.60 | **1.689×** | 23.53 | 0.997× |
+| prepare a statement of every clause | 0.07432 | **1.934×** | 0.07271 | 0.978× |
+| parse a statement of every clause | 0.03472 | **2.381×** | 0.03556 | 1.024× |
+
+What carries the directive: `engine`, `lexer`, and `parser`, whole; only the 944-byte entry loads
+as bytecode.
+
+The engine's hot code is mostly the closures a query is compiled into, one per expression,
+filter, and join. Marking only those the rows' profiles named saved 0.010 s a load and left the
+queries 1.05x to 1.91x slower than all marked: a nested-loop join of 400 to 400 went from 23 ms
+to 43 ms. Whole, every row is within 5% of all marked, at what all marked costs to require; a
+database is the queries it runs, so that is the state kept.
