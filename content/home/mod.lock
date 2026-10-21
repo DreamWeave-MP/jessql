@@ -1,0 +1,49 @@
+{
+  "schema_version": "3",
+  "document": "lock",
+  "project": "6b0fec20-c982-440d-87a4-15aa83a3c680",
+  "note": "Written by CI when a release tag is pushed: what each published release's archive contains. Do not edit.",
+  "releases": [
+    {
+      "version": "0.1.6",
+      "locked_from": "e7425c7959c5b45bfb222369eca986d636de7a16",
+      "artifacts": [
+        {
+          "id": "jpk",
+          "format": "jpk",
+          "filename": "org.dreamweave.jessql-0.1.6.jpk",
+          "media_type": "application/vnd.jess.jpk",
+          "size": 75625,
+          "digests": {
+            "sha256": "3a6281e312e4ae40246f19b421d10c9dec67b12e6bdc38c9facf33a0e334843e"
+          },
+          "jess": {
+            "package": "org.dreamweave.jessql",
+            "jess_api": "1",
+            "content_digest": "50ad29e8e61f5f0da1351b361cfc56b75696d843b68b7d90d99f04a6aeef45fe",
+            "dependencies": {}
+          }
+        }
+      ],
+      "runtimes": {},
+      "platforms": [],
+      "provides": [],
+      "relationships": [],
+      "components": [
+        {
+          "id": "main",
+          "name": "JessQL",
+          "path": ".",
+          "required": true,
+          "default": true,
+          "requires": [],
+          "conflicts": [],
+          "suggested_with": []
+        }
+      ],
+      "groups": [],
+      "extensions": {},
+      "critical_extensions": []
+    }
+  ]
+}
