@@ -12,6 +12,7 @@ export type Row = { [string]: unknown }
 export type Options = { maxFrameBytes: number?, recoverTail: boolean? }
 export type Store = {
   createTable: (self: Store, name: string, columns: { string }, primaryKey: string) -> (),
+  createIndex: (self: Store, name: string, column: string) -> (),
   insert: (self: Store, name: string, row: Row) -> (),
   upsert: (self: Store, name: string, row: Row) -> (),
   delete: (self: Store, name: string, key: unknown) -> boolean,
@@ -25,6 +26,7 @@ export type Store = {
 }
 export type Transaction = {
   createTable: (self: Transaction, name: string, columns: { string }, primaryKey: string) -> (),
+  createIndex: (self: Transaction, name: string, column: string) -> (),
   insert: (self: Transaction, name: string, row: Row) -> (),
   upsert: (self: Transaction, name: string, row: Row) -> (),
   delete: (self: Transaction, name: string, key: unknown) -> boolean,
@@ -32,8 +34,18 @@ export type Transaction = {
 }
 
 type Schema = { columns: { string }, primaryKey: string, allowed: { [string]: boolean } }
-type TableState = { schema: Schema, rows: { [string]: Row }, order: { string }, seen: { [string]: boolean }, count: number }
-type Operation = { kind: string, table: string, columns: { string }?, primaryKey: string?, row: Row?, key: unknown }
+type Bucket = { keys: { string }, seen: { [string]: boolean }, live: { [string]: boolean }, count: number }
+type Index = { buckets: { [string]: Bucket } }
+type TableState = {
+  schema: Schema,
+  rows: { [string]: Row },
+  order: { string },
+  seen: { [string]: boolean },
+  count: number,
+  secondary: { [string]: Index },
+  available: { [string]: boolean },
+}
+type Operation = { kind: string, table: string, columns: { string }?, primaryKey: string?, column: string?, row: Row?, key: unknown }
 type Pending = { [string]: { [string]: Row | boolean } }
 type DatabaseState = {
   path: string,
@@ -118,30 +130,97 @@ local function frame(payload: string, maximum: number): string
   return buffer.tostring(header) .. payload
 end
 
+local function indexSet(index: Index, value: unknown, key: string, present: boolean)
+  if value == nil then return end
+  local encoded = keyOf(value)
+  local bucket = index.buckets[encoded]
+  if not bucket then
+    if not present then return end
+    bucket = { keys = {}, seen = {}, live = {}, count = 0 }
+    index.buckets[encoded] = bucket
+  end
+
+  if present then
+    if bucket.live[key] then return end
+
+    if not bucket.seen[key] then
+      bucket.seen[key] = true
+      bucket.keys[#bucket.keys + 1] = key
+    end
+    bucket.live[key] = true
+    bucket.count += 1
+  elseif bucket.live[key] then
+    bucket.live[key] = nil
+    bucket.count -= 1
+  end
+end
+
+local function updateIndexes(current: TableState, key: string, before: Row?, after: Row?)
+  for column, index in current.secondary do
+    local oldValue = if before then before[column] else nil
+    local newValue = if after then after[column] else nil
+    if oldValue ~= newValue then
+      indexSet(index, oldValue, key, false)
+      indexSet(index, newValue, key, true)
+    end
+  end
+end
+
+local function indexedKeys(current: TableState, request: queryEngine.Request): ({ string }, { [string]: boolean }?)
+  local bestKeys = current.order
+  local bestSet = nil
+  local bestCount = current.count + 1
+  for _, constraint in request.constraints do
+    if constraint.op ~= '=' or constraint.value == nil or not scalar(constraint.value) then continue end
+    local column = constraint.column
+    local value = constraint.value
+    if column == current.schema.primaryKey then
+      local key = keyOf(value)
+      return { key }, nil
+    end
+    local index = current.secondary[column]
+    if index then
+      local bucket = index.buckets[keyOf(value)]
+      local count = if bucket then bucket.count else 0
+      if count < bestCount then
+        bestCount = count
+        bestKeys = if bucket then bucket.keys else {}
+        bestSet = if bucket then bucket.live else nil
+      end
+    end
+  end
+  return bestKeys, bestSet
+end
+
 local function tableProvider(state: DatabaseState, name: string): queryEngine.Provider
-  local schema = (state.tables[name] :: TableState).schema
+  local current = state.tables[name] :: TableState
   return {
-    columns = schema.columns,
-    indexes = { [schema.primaryKey] = true },
+    columns = current.schema.columns,
+    indexes = current.available,
     count = function() return (state.tables[name] :: TableState).count end,
-    scan = function(_request)
-      local current = state.tables[name] :: TableState
-      local rows = table.create(current.count) :: { queryEngine.Row }
-      for _, key in current.order do
-        local row = current.rows[key]
+    scan = function(request)
+      local tableState = state.tables[name] :: TableState
+      local keys, live = indexedKeys(tableState, request)
+      local rows: { queryEngine.Row } = {}
+      for _, key in keys do
+        if live and not (live :: { [string]: boolean })[key] then continue end
+        local row = tableState.rows[key]
         if row then rows[#rows + 1] = row end
       end
       return rows
     end,
-    iterate = function(_request)
-      local current = state.tables[name] :: TableState
+    iterate = function(request)
+      local tableState = state.tables[name] :: TableState
+      local keys, live = indexedKeys(tableState, request)
       local cursor = 0
       local iterator: queryEngine.Iterator = {
         _jessqlIter = 'v1',
         next = function(): queryEngine.SourceRow?
-          while cursor < #current.order do
+          while cursor < #keys do
             cursor += 1
-            local row = current.rows[current.order[cursor]]
+            local key = keys[cursor]
+            if live and not (live :: { [string]: boolean })[key] then continue end
+            local row = tableState.rows[key]
             if row then return row end
           end
           return nil
@@ -150,10 +229,25 @@ local function tableProvider(state: DatabaseState, name: string): queryEngine.Pr
       return iterator
     end,
     lookup = function(column, value, _request)
-      local current = state.tables[name] :: TableState
-      if column ~= current.schema.primaryKey or value == nil or not scalar(value) then return nil end
-      local row = current.rows[keyOf(value)]
-      return if row then { row } else {}
+      local tableState = state.tables[name] :: TableState
+      if value == nil or not scalar(value) then return nil end
+
+      if column == tableState.schema.primaryKey then
+        local row = tableState.rows[keyOf(value)]
+        return if row then { row } else {}
+      end
+      local index = tableState.secondary[column]
+      if not index then return nil end
+      local bucket = index.buckets[keyOf(value)]
+      local rows: { queryEngine.Row } = {}
+      if bucket then
+        for _, key in bucket.keys do
+          if not bucket.live[key] then continue end
+          local row = tableState.rows[key]
+          if row then rows[#rows + 1] = row end
+        end
+      end
+      return rows
     end,
   }
 end
@@ -164,13 +258,27 @@ local function apply(state: DatabaseState, operations: { Operation })
     local name = operation.table
     if operation.kind == 'create' then
       local schema = makeSchema(operation.columns :: { string }, operation.primaryKey :: string)
-      state.tables[name] = { schema = schema, rows = {}, order = {}, seen = {}, count = 0 }
+      state.tables[name] = {
+        schema = schema, rows = {}, order = {}, seen = {}, count = 0,
+        secondary = {}, available = { [schema.primaryKey] = true },
+      }
       state.engine:register(name, tableProvider(state, name))
+    elseif operation.kind == 'index' then
+      local current = state.tables[name] :: TableState
+      local column = operation.column :: string
+      local index: Index = { buckets = {} }
+      for _, key in current.order do
+        local row = current.rows[key]
+        if row then indexSet(index, row[column], key, true) end
+      end
+      current.secondary[column] = index
+      current.available[column] = true
     elseif operation.kind == 'put' then
       local current = state.tables[name] :: TableState
       local row = operation.row :: Row
       local key = keyOf(row[current.schema.primaryKey])
       if current.rows[key] == nil then current.count += 1 end
+      updateIndexes(current, key, current.rows[key], row)
 
       if not current.seen[key] then
         current.seen[key] = true
@@ -181,6 +289,7 @@ local function apply(state: DatabaseState, operations: { Operation })
       local current = state.tables[name] :: TableState
       local key = keyOf(operation.key)
       if current.rows[key] ~= nil then
+        updateIndexes(current, key, current.rows[key], nil)
         current.rows[key] = nil
         current.count -= 1
       end
@@ -194,6 +303,7 @@ local function buildTransaction(state: DatabaseState)
   local operations: { Operation } = {}
   local staged: Pending = {}
   local created: { [string]: Schema } = {}
+  local indexed: { [string]: { [string]: boolean } } = {}
   local active = true
   local transaction = {} :: Transaction
 
@@ -216,6 +326,23 @@ local function buildTransaction(state: DatabaseState)
     local schema = makeSchema(columns, pk)
     created[name] = schema
     operations[#operations + 1] = { kind = 'create', table = name, columns = schema.columns, primaryKey = schema.primaryKey, key = nil }
+  end
+
+  function transaction.createIndex(_self: Transaction, name: string, column: string)
+    writable()
+    name = requireName(name)
+    column = requireName(column)
+    local schema = findSchema(name)
+    if not schema.allowed[column] then error('jessql storage: no such column', 2) end
+    local current = state.tables[name]
+    if column == schema.primaryKey or (current and current.available[column])
+      or (indexed[name] and indexed[name][column]) then
+      error('jessql storage: index already exists', 2)
+    end
+
+    if not indexed[name] then indexed[name] = {} end
+    indexed[name][column] = true
+    operations[#operations + 1] = { kind = 'index', table = name, column = column, key = nil }
   end
 
   function transaction.get(_self: Transaction, name: string, key: unknown): Row?
@@ -271,6 +398,8 @@ local function replay(state: DatabaseState, operations: { Operation })
   for _, operation in operations do
     if operation.kind == 'create' then
       tx:createTable(operation.table, operation.columns :: { string }, operation.primaryKey :: string)
+    elseif operation.kind == 'index' then
+      tx:createIndex(operation.table, operation.column :: string)
     elseif operation.kind == 'put' then
       tx:upsert(operation.table, operation.row :: Row)
     elseif operation.kind == 'del' then
@@ -408,6 +537,10 @@ function storage.open(path: string, options: Options?): Store
     self:transaction(function(tx) tx:createTable(name, columns, primaryKey) end)
   end
 
+  function db.createIndex(self: Store, name: string, column: string)
+    self:transaction(function(tx) tx:createIndex(name, column) end)
+  end
+
   function db.insert(self: Store, name: string, row: Row)
     self:transaction(function(tx) tx:insert(name, row) end)
   end
@@ -448,50 +581,97 @@ function storage.open(path: string, options: Options?): Store
   function db.checkpoint(_self: Store)
     ready()
     if state.busy then error('jessql storage: checkpoint inside transaction', 2) end
-    -- Rebuild a deterministic compact log and atomically replace the old file.
-    local result = { Magic }
-    local names = {}
-    for name in state.tables do names[#names + 1] = name end
-    table.sort(names)
+    -- Write a new compact log beside the live log; rename only after a complete close.
+    -- The old log stays usable if snapshot construction fails.
+    local temp = state.path .. '.checkpoint.tmp'
+    local writer, openError = fs.openWrite(temp, { truncate = true, create = true })
+    if not writer then error('jessql storage: ' .. tostring(openError), 2) end
     local sequence = 0
-    for _, name in names do
-      local current = state.tables[name]
-      local ops: { Operation } = { {
-        kind = 'create', table = name, columns = current.schema.columns,
-        primaryKey = current.schema.primaryKey, key = nil,
-      } }
+    local batch: { Operation } = {}
+    local estimate = 0
+    local maximum = state.maxFrameBytes
 
-      for _, key in current.order do
-        local row = current.rows[key]
-        if row then ops[#ops + 1] = { kind = 'put', table = name, row = row, key = nil } end
-      end
-      -- Chunk snapshots into frames, so recovery retains the same frame bound as commits.
-      local batch: { Operation } = {}
-      for _, op in ops do
-        local nextBatch = table.clone(batch)
-        nextBatch[#nextBatch + 1] = op
-        local payload = json.encodeTable({ version = 1, sequence = sequence + 1, ops = nextBatch })
-        if #payload > state.maxFrameBytes and #batch > 0 then
-          sequence += 1
-          result[#result + 1] = frame(json.encodeTable({ version = 1, sequence = sequence, ops = batch }), state.maxFrameBytes)
-          batch = { op }
-        else
-          batch = nextBatch
+    local function writeBytes(contents: string)
+      local count, err = writer:write(contents)
+      if count ~= #contents then error('jessql storage: checkpoint write: ' .. tostring(err), 2) end
+    end
+
+    local function flushBatch()
+      if #batch == 0 then return end
+      sequence += 1
+      local payload = json.encodeTable({ version = 1, sequence = sequence, ops = batch })
+      writeBytes(frame(payload, maximum))
+      batch = {}
+      estimate = 0
+    end
+
+    local function add(operation: Operation)
+      -- Exact single-op length, then a conservative bound for the frame metadata.
+      -- Avoid O(n^2) repeated serialization of the ever-growing batch.
+      local size = #json.encodeTable(operation) + 1
+      if estimate + size > maximum - 128 then flushBatch() end
+      batch[#batch + 1] = operation
+      estimate += size
+    end
+
+    -- A checkpoint may throw (invalid oversized row or I/O failure). Close and
+    -- discard the temporary file without changing the readable original.
+    local ok, failure = pcall(function()
+      writeBytes(Magic)
+      local names: { string } = {}
+      for name in state.tables do names[#names + 1] = name end
+      table.sort(names)
+      for _, name in names do
+        local current = state.tables[name]
+        add({ kind = 'create', table = name, columns = current.schema.columns,
+          primaryKey = current.schema.primaryKey, key = nil })
+        local indexColumns: { string } = {}
+        for column in current.secondary do indexColumns[#indexColumns + 1] = column end
+        table.sort(indexColumns)
+        for _, column in indexColumns do
+          add({ kind = 'index', table = name, column = column, key = nil })
+        end
+
+        for _, key in current.order do
+          local row = current.rows[key]
+          if row then add({ kind = 'put', table = name, row = row, key = nil }) end
         end
       end
-
-      if #batch > 0 then
-        sequence += 1
-        result[#result + 1] = frame(json.encodeTable({ version = 1, sequence = sequence, ops = batch }), state.maxFrameBytes)
-      end
+      flushBatch()
+    end)
+    local closed, closeError = writer:close()
+    if not ok or not closed then
+      fs.remove(temp)
+      error('jessql storage: checkpoint failed: ' .. tostring(failure or closeError), 2)
     end
-    local contents = table.concat(result)
-    local count, err = fs.writeFile(state.path, contents, { atomic = true })
-    if count ~= #contents then
+
+    local renamed, renameError = fs.rename(temp, state.path)
+    if not renamed then
       state.poisoned = true
-      error('jessql storage: checkpoint failed (reopen required): ' .. tostring(err), 2)
+      error('jessql storage: checkpoint rename uncertain: ' .. tostring(renameError), 2)
     end
     state.sequence = sequence
+
+    -- Discard dead key slots and stale secondary postings after compaction.
+    for _, current in state.tables do
+      local liveOrder: { string } = {}
+      local liveSeen: { [string]: boolean } = {}
+      for _, key in current.order do
+        if current.rows[key] then
+          liveOrder[#liveOrder + 1] = key
+          liveSeen[key] = true
+        end
+      end
+      current.order = liveOrder
+      current.seen = liveSeen
+      for column in current.secondary do
+        local index: Index = { buckets = {} }
+        for _, key in liveOrder do
+          indexSet(index, current.rows[key][column], key, true)
+        end
+        current.secondary[column] = index
+      end
+    end
   end
 
   function db.close(_self: Store)
