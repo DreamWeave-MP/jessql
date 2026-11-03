@@ -5,14 +5,15 @@ id = "org.dreamweave.jessql"
 version = "0.1.6"
 jess_api = "1"
 include = ["src", "bench", "tests", "README.md"]
-tests = ["tests/run.jsl", "tests/semantics.jsl", "tests/style.jsl"]
+tests = ["tests/run.jsl", "tests/semantics.jsl", "tests/style.jsl", "tests/storage.jsl"]
 
 [modules]
 "@jessql" = "src/init.jsl"
 "@jessql/lexer" = "src/lexer.jsl"
 "@jessql/parser" = "src/parser.jsl"
 "@jessql/engine" = "src/engine.jsl"
+"@jessql/storage" = "src/storage.jsl"
 
 [[layer]]
 id = "jessql.core"
-exports = ["@jessql", "@jessql/lexer", "@jessql/parser", "@jessql/engine"]
+exports = ["@jessql", "@jessql/lexer", "@jessql/parser", "@jessql/engine", "@jessql/storage"]

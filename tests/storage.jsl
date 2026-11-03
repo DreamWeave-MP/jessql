@@ -1,0 +1,139 @@
+--!strict
+local sql = require('@jessql')
+local fs = require('@dream/fs')
+local test = require('@jess/test')
+local expect = test.expect
+local suite = test.new()
+
+local function fixture(name: string): string
+  local path = fs.join(assert(fs.cwd()), '.jessql-' .. name .. '.wal')
+  fs.remove(path)
+  fs.remove(path .. '.lock')
+  return path
+end
+
+local function clean(path: string)
+  fs.remove(path)
+  fs.remove(path .. '.lock')
+end
+
+suite.describe('native persistent store', function()
+  suite.it('round-trips tables and indexed primary-key reads through reopen', function()
+    local path = fixture('roundtrip')
+    local db = sql.open(path)
+    db:createTable('Messages', { 'id', 'room', 'body' }, 'id')
+    db:insert('messages', { id = 'm1', room = 'r', body = 'hello' })
+    db:insert('messages', { id = 'm2', room = 'r', body = 'world' })
+    expect(db:get('messages', 'm2').body).toBe('world')
+    expect(db:query('SELECT COUNT(*) AS n FROM messages').rows[1].n).toBe(2)
+    db:close()
+
+    local reopened = sql.open(path)
+    expect(reopened:get('messages', 'm1').body).toBe('hello')
+    local plan = reopened:prepare('SELECT body FROM messages WHERE id = ?')
+    expect(plan.run({ 'm2' }).rows[1].body).toBe('world')
+    expect(plan.explain().scans[1].table).toBe('messages')
+    reopened:close()
+    clean(path)
+  end)
+
+  suite.it('commits a batch once, rolls back failed callbacks and rejects duplicates', function()
+    local path = fixture('rollback')
+    local db = sql.open(path)
+    db:createTable('entries', { 'id', 'value' }, 'id')
+    db:transaction(function(tx)
+      tx:insert('entries', { id = 1, value = 10 })
+      tx:insert('entries', { id = 2, value = 20 })
+      expect(tx:get('entries', 2).value).toBe(20)
+    end)
+
+    -- A callback failure must not commit an earlier staged upsert.
+    local ok = pcall(function()
+      db:transaction(function(tx)
+        tx:upsert('entries', { id = 1, value = 100 })
+        tx:insert('entries', { id = 2, value = 200 })
+      end)
+    end)
+    expect(ok).toBe(false)
+    expect(db:get('entries', 1).value).toBe(10)
+    expect(db:query('SELECT SUM(value) AS n FROM entries').rows[1].n).toBe(30)
+    db:close()
+
+    local reopened = sql.open(path)
+    expect(reopened:get('entries', 1).value).toBe(10)
+    expect(reopened:get('entries', 2).value).toBe(20)
+    reopened:close()
+    clean(path)
+  end)
+
+  suite.it('updates, deletes and restores keys without duplicating rows', function()
+    local path = fixture('update')
+    local db = sql.open(path)
+    db:createTable('t', { 'key', 'value' }, 'key')
+    db:upsert('t', { key = 1, value = 'a' })
+    db:upsert('t', { key = 1, value = 'b' })
+    expect(db:delete('t', 1)).toBe(true)
+    expect(db:delete('t', 1)).toBe(false)
+    db:insert('t', { key = 1, value = 'c' })
+    expect(db:query('SELECT COUNT(*) AS n FROM t').rows[1].n).toBe(1)
+    expect(db:query('SELECT value FROM t').rows[1].value).toBe('c')
+    db:checkpoint()
+    db:close()
+
+    local reopened = sql.open(path)
+    expect(reopened:get('t', 1).value).toBe('c')
+    reopened:close()
+    clean(path)
+  end)
+
+  suite.it('recovers incomplete appended frames without accepting them', function()
+    local path = fixture('tail')
+    local db = sql.open(path)
+    db:createTable('t', { 'id' }, 'id')
+    db:insert('t', { id = 'acknowledged' })
+    db:close()
+    assert(fs.writeFile(path, string.char(0x20, 0, 0), { append = true }))
+    -- Strict recovery deliberately raises on a partial final record.
+    local strictOk = pcall(function() sql.open(path, { recoverTail = false }) end)
+    expect(strictOk).toBe(false)
+
+    local recovered = sql.open(path)
+    expect(recovered:query('SELECT COUNT(*) AS n FROM t').rows[1].n).toBe(1)
+    recovered:insert('t', { id = 'new' })
+    recovered:close()
+    local again = sql.open(path)
+    expect(again:query('SELECT COUNT(*) AS n FROM t').rows[1].n).toBe(2)
+    again:close()
+    clean(path)
+  end)
+
+  suite.it('rejects corrupted committed records instead of silently discarding data', function()
+    local path = fixture('corrupt')
+    local db = sql.open(path)
+    db:createTable('t', { 'id' }, 'id')
+    db:insert('t', { id = 1 })
+    db:close()
+    local contents = assert(fs.readFileString(path))
+    -- The last byte is in a complete CRC-protected record.
+    assert(fs.writeFile(path, string.char(0), { offset = #contents - 1 }))
+    -- A bad checksum must fail to reopen rather than hide corruption.
+    local ok = pcall(function() sql.open(path) end)
+    expect(ok).toBe(false)
+    clean(path)
+  end)
+
+  suite.it('refuses a second writer while the first lock is held', function()
+    local path = fixture('lock')
+    local db = sql.open(path)
+    -- A bad checksum must fail to reopen rather than hide corruption.
+    -- An exclusive advisory lock must reject the competing opener.
+    local ok = pcall(function() sql.open(path) end)
+    expect(ok).toBe(false)
+    db:close()
+    local reopened = sql.open(path)
+    reopened:close()
+    clean(path)
+  end)
+end)
+
+return suite

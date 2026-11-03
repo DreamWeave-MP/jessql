@@ -1,0 +1,506 @@
+--!strict
+--!native
+-- JessQL's native append-only store. No external database or FFI dependency.
+-- Records are length-delimited and CRC-protected; one record contains one transaction.
+-- A torn trailing record is discarded. A corrupt complete record fails closed.
+local fs = require('@dream/fs')
+local bytes = require('@dream/bytes')
+local json = require('@jess/json')
+local queryEngine = require('@jessql/engine')
+
+export type Row = { [string]: unknown }
+export type Options = { maxFrameBytes: number?, recoverTail: boolean? }
+export type Store = {
+  createTable: (self: Store, name: string, columns: { string }, primaryKey: string) -> (),
+  insert: (self: Store, name: string, row: Row) -> (),
+  upsert: (self: Store, name: string, row: Row) -> (),
+  delete: (self: Store, name: string, key: unknown) -> boolean,
+  get: (self: Store, name: string, key: unknown) -> Row?,
+  transaction: (self: Store, callback: (Transaction) -> ()) -> (),
+  query: (self: Store, sql: string, params: { unknown }?) -> queryEngine.Result,
+  prepare: (self: Store, sql: string) -> queryEngine.Plan,
+  tables: (self: Store) -> { queryEngine.TableInfo },
+  checkpoint: (self: Store) -> (),
+  close: (self: Store) -> (),
+}
+export type Transaction = {
+  createTable: (self: Transaction, name: string, columns: { string }, primaryKey: string) -> (),
+  insert: (self: Transaction, name: string, row: Row) -> (),
+  upsert: (self: Transaction, name: string, row: Row) -> (),
+  delete: (self: Transaction, name: string, key: unknown) -> boolean,
+  get: (self: Transaction, name: string, key: unknown) -> Row?,
+}
+
+type Schema = { columns: { string }, primaryKey: string, allowed: { [string]: boolean } }
+type TableState = { schema: Schema, rows: { [string]: Row }, order: { string }, seen: { [string]: boolean }, count: number }
+type Operation = { kind: string, table: string, columns: { string }?, primaryKey: string?, row: Row?, key: unknown }
+type Pending = { [string]: { [string]: Row | boolean } }
+type DatabaseState = {
+  path: string,
+  lock: dream_fs_Lock,
+  engine: queryEngine.Database,
+  tables: { [string]: TableState },
+  sequence: number,
+  maxFrameBytes: number,
+  closed: boolean,
+  busy: boolean,
+  poisoned: boolean,
+}
+
+local Magic = 'JQLW1\n'
+local HeaderBytes = 8
+local DefaultMaxFrame = 16 * 1024 * 1024
+local Deleted = false
+
+local function requireName(name: string): string
+  if type(name) ~= 'string' or not string.match(name, '^[%a_][%w_]*$') then
+    error('jessql storage: invalid identifier', 3)
+  end
+  return string.lower(name)
+end
+
+-- Explicit scalar-only contract: no arbitrary Lua objects, cycles, NaN or infinities.
+-- Integers must fit exactly in IEEE754; full i64 support requires a separate value type.
+local function scalar(value: unknown): boolean
+  if value == nil then return true end
+  local kind = type(value)
+  if kind == 'string' or kind == 'boolean' then return true end
+  return kind == 'number' and (value :: number) == (value :: number)
+    and math.abs(value :: number) < math.huge
+end
+
+local function keyOf(value: unknown): string
+  if not scalar(value) or value == nil then error('jessql storage: invalid primary key', 3) end
+  local kind = type(value)
+  if kind == 'string' then return 's' .. (value :: string) end
+  if kind == 'boolean' then return if value == true then 'b1' else 'b0' end
+  local number = value :: number
+  if number == 0 then number = 0 end
+  return 'n' .. string.format('%.17g', number)
+end
+
+local function makeSchema(columns: { string }, primaryKey: string): Schema
+  if type(columns) ~= 'table' or #columns == 0 or #columns > 256 then
+    error('jessql storage: columns must be a non-empty array (up to 256)', 3)
+  end
+  local allowed, copy = {}, {}
+  for _, column in columns do
+    local normalized = requireName(column)
+    if allowed[normalized] then error('jessql storage: duplicate column', 3) end
+    allowed[normalized] = true
+    copy[#copy + 1] = normalized
+  end
+  local pk = requireName(primaryKey)
+  if not allowed[pk] then error('jessql storage: primary key is not a column', 3) end
+  return { columns = copy, primaryKey = pk, allowed = allowed }
+end
+
+local function copyRow(schema: Schema, row: Row): Row
+  if type(row) ~= 'table' then error('jessql storage: row must be a table', 3) end
+  local copy: Row = {}
+  for key, value in row do
+    if type(key) ~= 'string' or not schema.allowed[string.lower(key)] then
+      error('jessql storage: unknown column', 3)
+    end
+
+    if not scalar(value) then error('jessql storage: unsupported value', 3) end
+    copy[string.lower(key)] = value
+  end
+  keyOf(copy[schema.primaryKey])
+  return copy
+end
+
+local function frame(payload: string, maximum: number): string
+  if #payload > maximum then error('jessql storage: transaction exceeds frame limit', 3) end
+  local header = buffer.create(HeaderBytes)
+  buffer.writeu32(header, 0, #payload)
+  buffer.writeu32(header, 4, bytes.crc32(payload))
+  return buffer.tostring(header) .. payload
+end
+
+local function tableProvider(state: DatabaseState, name: string): queryEngine.Provider
+  local schema = (state.tables[name] :: TableState).schema
+  return {
+    columns = schema.columns,
+    indexes = { [schema.primaryKey] = true },
+    count = function() return (state.tables[name] :: TableState).count end,
+    scan = function(_request)
+      local current = state.tables[name] :: TableState
+      local rows = table.create(current.count) :: { queryEngine.Row }
+      for _, key in current.order do
+        local row = current.rows[key]
+        if row then rows[#rows + 1] = row end
+      end
+      return rows
+    end,
+    iterate = function(_request)
+      local current = state.tables[name] :: TableState
+      local cursor = 0
+      local iterator: queryEngine.Iterator = {
+        _jessqlIter = 'v1',
+        next = function(): queryEngine.SourceRow?
+          while cursor < #current.order do
+            cursor += 1
+            local row = current.rows[current.order[cursor]]
+            if row then return row end
+          end
+          return nil
+        end,
+      }
+      return iterator
+    end,
+    lookup = function(column, value, _request)
+      local current = state.tables[name] :: TableState
+      if column ~= current.schema.primaryKey or value == nil or not scalar(value) then return nil end
+      local row = current.rows[keyOf(value)]
+      return if row then { row } else {}
+    end,
+  }
+end
+
+local function apply(state: DatabaseState, operations: { Operation })
+  -- Transaction has already been validated; applying it must not perform I/O.
+  for _, operation in operations do
+    local name = operation.table
+    if operation.kind == 'create' then
+      local schema = makeSchema(operation.columns :: { string }, operation.primaryKey :: string)
+      state.tables[name] = { schema = schema, rows = {}, order = {}, seen = {}, count = 0 }
+      state.engine:register(name, tableProvider(state, name))
+    elseif operation.kind == 'put' then
+      local current = state.tables[name] :: TableState
+      local row = operation.row :: Row
+      local key = keyOf(row[current.schema.primaryKey])
+      if current.rows[key] == nil then current.count += 1 end
+
+      if not current.seen[key] then
+        current.seen[key] = true
+        current.order[#current.order + 1] = key
+      end
+      current.rows[key] = row
+    elseif operation.kind == 'del' then
+      local current = state.tables[name] :: TableState
+      local key = keyOf(operation.key)
+      if current.rows[key] ~= nil then
+        current.rows[key] = nil
+        current.count -= 1
+      end
+    else
+      error('jessql storage: unknown log operation', 2)
+    end
+  end
+end
+
+local function buildTransaction(state: DatabaseState)
+  local operations: { Operation } = {}
+  local staged: Pending = {}
+  local created: { [string]: Schema } = {}
+  local active = true
+  local transaction = {} :: Transaction
+
+  local function writable()
+    if not active then error('jessql storage: transaction is no longer active', 3) end
+  end
+
+  local function findSchema(name: string): Schema
+    local schema = created[name]
+    if schema then return schema end
+    local current = state.tables[name]
+    if not current then error('jessql storage: no such table: ' .. name, 3) end
+    return current.schema
+  end
+
+  function transaction.createTable(_self: Transaction, name: string, columns: { string }, pk: string)
+    writable()
+    name = requireName(name)
+    if created[name] or state.tables[name] then error('jessql storage: table already exists', 2) end
+    local schema = makeSchema(columns, pk)
+    created[name] = schema
+    operations[#operations + 1] = { kind = 'create', table = name, columns = schema.columns, primaryKey = schema.primaryKey, key = nil }
+  end
+
+  function transaction.get(_self: Transaction, name: string, key: unknown): Row?
+    writable()
+    name = requireName(name)
+    findSchema(name)
+    local encoded = keyOf(key)
+    local pending = staged[name]
+    local change = if pending then pending[encoded] else nil
+    if change == Deleted then return nil end
+    if type(change) == 'table' then return table.clone(change :: Row) end
+    local current = state.tables[name]
+    local row = if current then current.rows[encoded] else nil
+    return if row then table.clone(row) else nil
+  end
+
+  local function put(name: string, row: Row, insertOnly: boolean)
+    writable()
+    name = requireName(name)
+    local schema = findSchema(name)
+    local saved = copyRow(schema, row)
+    if insertOnly and transaction:get(name, saved[schema.primaryKey]) ~= nil then
+      error('jessql storage: duplicate primary key', 3)
+    end
+
+    if not staged[name] then staged[name] = {} end
+    staged[name][keyOf(saved[schema.primaryKey])] = saved
+    operations[#operations + 1] = { kind = 'put', table = name, row = saved, key = nil }
+  end
+
+  function transaction.insert(_self: Transaction, name: string, row: Row) put(name, row, true) end
+  function transaction.upsert(_self: Transaction, name: string, row: Row) put(name, row, false) end
+
+  function transaction.delete(_self: Transaction, name: string, key: unknown): boolean
+    writable()
+    name = requireName(name)
+    findSchema(name)
+    local exists = transaction:get(name, key) ~= nil
+    if exists then
+      if not staged[name] then staged[name] = {} end
+      staged[name][keyOf(key)] = Deleted
+      operations[#operations + 1] = { kind = 'del', table = name, key = key }
+    end
+    return exists
+  end
+
+  return transaction, operations, function() active = false end
+end
+
+local function replay(state: DatabaseState, operations: { Operation })
+  -- Reuse write-time schema, uniqueness and value validation before mutating live state.
+  local tx, _, finish = buildTransaction(state)
+  for _, operation in operations do
+    if operation.kind == 'create' then
+      tx:createTable(operation.table, operation.columns :: { string }, operation.primaryKey :: string)
+    elseif operation.kind == 'put' then
+      tx:upsert(operation.table, operation.row :: Row)
+    elseif operation.kind == 'del' then
+      tx:delete(operation.table, operation.key)
+    else
+      error('jessql storage: invalid log record', 2)
+    end
+  end
+  finish()
+  apply(state, operations)
+end
+
+local function load(state: DatabaseState, recoverTail: boolean)
+  local reader, err = fs.open(state.path)
+  if not reader then error('jessql storage: ' .. tostring(err), 2) end
+  local size = reader:size()
+  local magic = reader:readAt(0, #Magic)
+  if not magic or buffer.tostring(magic) ~= Magic then
+    reader:close()
+    error('jessql storage: invalid file header', 2)
+  end
+  local offset = #Magic
+  local limit = state.maxFrameBytes
+  while offset < size do
+    if size - offset < HeaderBytes then break end
+    local header = reader:readAt(offset, HeaderBytes)
+    if not header or buffer.len(header) ~= HeaderBytes then
+      reader:close()
+      error('jessql storage: read failed', 2)
+    end
+    local length = buffer.readu32(header, 0)
+    local checksum = buffer.readu32(header, 4)
+    if length == 0 or length > limit then
+      reader:close()
+      error('jessql storage: invalid frame length', 2)
+    end
+
+    if size - offset - HeaderBytes < length then break end
+    local body = reader:readAt(offset + HeaderBytes, length)
+    if not body or buffer.len(body) ~= length then
+      reader:close()
+      error('jessql storage: read failed', 2)
+    end
+    local payload = buffer.tostring(body)
+    if bytes.crc32(payload) ~= checksum then
+      reader:close()
+      error('jessql storage: checksum mismatch', 2)
+    end
+    local parsed = json.decode(payload) :: { [string]: unknown }
+    if type(parsed) ~= 'table' or parsed.version ~= 1 or parsed.sequence ~= state.sequence + 1
+      or type(parsed.ops) ~= 'table' then
+      reader:close()
+      error('jessql storage: invalid transaction metadata', 2)
+    end
+    replay(state, parsed.ops :: { Operation })
+    state.sequence += 1
+    offset += HeaderBytes + length
+  end
+  reader:close()
+  if offset ~= size then
+    if not recoverTail then error('jessql storage: incomplete trailing transaction', 2) end
+    local writer, err = fs.openWrite(state.path, { create = false, truncate = false })
+    if not writer then error('jessql storage: ' .. tostring(err), 2) end
+    local ok, truncateError = writer:truncate(offset)
+    local closed, closeError = writer:close()
+    if not ok or not closed then error('jessql storage: ' .. tostring(truncateError or closeError), 2) end
+  end
+end
+
+local function write(state: DatabaseState, ops: { Operation })
+  if #ops == 0 then return end
+  local payload = json.encodeTable({ version = 1, sequence = state.sequence + 1, ops = ops })
+  local record = frame(payload, state.maxFrameBytes)
+  local count, err = fs.writeFile(state.path, record, { append = true, create = false })
+  if count ~= #record then
+    state.poisoned = true
+    error('jessql storage: append failed (reopen required): ' .. tostring(err), 2)
+  end
+  apply(state, ops)
+  state.sequence += 1
+end
+
+local storage = {}
+
+function storage.open(path: string, options: Options?): Store
+  if type(path) ~= 'string' or path == '' then error('jessql storage: path is required', 2) end
+  local max = if options then options.maxFrameBytes else nil
+  if max ~= nil and (max < 1024 or max > 256 * 1024 * 1024 or max % 1 ~= 0) then
+    error('jessql storage: invalid frame limit', 2)
+  end
+  local lock, err = fs.lock(path .. '.lock', { createParents = true })
+  if not lock then error('jessql storage: database locked: ' .. tostring(err), 2) end
+
+  local state: DatabaseState = {
+    path = path, lock = lock, engine = queryEngine.new(), tables = {}, sequence = 0,
+    maxFrameBytes = max or DefaultMaxFrame, closed = false, busy = false, poisoned = false,
+  }
+
+  -- Opening can fail on invalid frames; release the advisory lock on failure.
+  local ok, failure = pcall(function()
+    if not fs.exists(path) then
+      local count, writeError = fs.writeFile(path, Magic, { exclusive = true, createParents = true })
+      if count ~= #Magic then error('jessql storage: ' .. tostring(writeError)) end
+    end
+    load(state, options == nil or options.recoverTail ~= false)
+  end)
+
+  if not ok then lock:unlock(); error(failure, 2) end
+
+  local db = {} :: Store
+  local function ready()
+    if state.closed then error('jessql storage: database closed', 3) end
+    if state.poisoned then error('jessql storage: database requires reopen', 3) end
+  end
+
+  function db.transaction(_self: Store, callback: (Transaction) -> ())
+    ready()
+    if state.busy then error('jessql storage: nested or concurrent transaction', 2) end
+    state.busy = true
+    local tx, ops, finish = buildTransaction(state)
+    -- A user callback may throw; discard its staged writes on failure.
+    local succeeded, callbackError = pcall(callback, tx)
+    finish()
+    if not succeeded then
+      state.busy = false
+      error(callbackError, 2)
+    end
+    -- I/O can fail; leave in-memory state untouched and poison uncertain append outcomes.
+    local committed, commitError = pcall(write, state, ops)
+    state.busy = false
+    if not committed then error(commitError, 2) end
+  end
+
+  function db.createTable(self: Store, name: string, columns: { string }, primaryKey: string)
+    self:transaction(function(tx) tx:createTable(name, columns, primaryKey) end)
+  end
+
+  function db.insert(self: Store, name: string, row: Row)
+    self:transaction(function(tx) tx:insert(name, row) end)
+  end
+
+  function db.upsert(self: Store, name: string, row: Row)
+    self:transaction(function(tx) tx:upsert(name, row) end)
+  end
+
+  function db.delete(self: Store, name: string, key: unknown): boolean
+    local deleted = false
+    self:transaction(function(tx) deleted = tx:delete(name, key) end)
+    return deleted
+  end
+
+  function db.get(_self: Store, name: string, key: unknown): Row?
+    ready()
+    local current = state.tables[requireName(name)]
+    if not current then error('jessql storage: no such table', 2) end
+    local row = current.rows[keyOf(key)]
+    return if row then table.clone(row) else nil
+  end
+
+  function db.query(_self: Store, sql: string, params: { unknown }?): queryEngine.Result
+    ready()
+    return state.engine:query(sql, params)
+  end
+
+  function db.prepare(_self: Store, sql: string): queryEngine.Plan
+    ready()
+    return state.engine:prepare(sql)
+  end
+
+  function db.tables(_self: Store): { queryEngine.TableInfo }
+    ready()
+    return state.engine:tables()
+  end
+
+  function db.checkpoint(_self: Store)
+    ready()
+    if state.busy then error('jessql storage: checkpoint inside transaction', 2) end
+    -- Rebuild a deterministic compact log and atomically replace the old file.
+    local result = { Magic }
+    local names = {}
+    for name in state.tables do names[#names + 1] = name end
+    table.sort(names)
+    local sequence = 0
+    for _, name in names do
+      local current = state.tables[name]
+      local ops: { Operation } = { {
+        kind = 'create', table = name, columns = current.schema.columns,
+        primaryKey = current.schema.primaryKey, key = nil,
+      } }
+
+      for _, key in current.order do
+        local row = current.rows[key]
+        if row then ops[#ops + 1] = { kind = 'put', table = name, row = row, key = nil } end
+      end
+      -- Chunk snapshots into frames, so recovery retains the same frame bound as commits.
+      local batch: { Operation } = {}
+      for _, op in ops do
+        local nextBatch = table.clone(batch)
+        nextBatch[#nextBatch + 1] = op
+        local payload = json.encodeTable({ version = 1, sequence = sequence + 1, ops = nextBatch })
+        if #payload > state.maxFrameBytes and #batch > 0 then
+          sequence += 1
+          result[#result + 1] = frame(json.encodeTable({ version = 1, sequence = sequence, ops = batch }), state.maxFrameBytes)
+          batch = { op }
+        else
+          batch = nextBatch
+        end
+      end
+
+      if #batch > 0 then
+        sequence += 1
+        result[#result + 1] = frame(json.encodeTable({ version = 1, sequence = sequence, ops = batch }), state.maxFrameBytes)
+      end
+    end
+    local contents = table.concat(result)
+    local count, err = fs.writeFile(state.path, contents, { atomic = true })
+    if count ~= #contents then
+      state.poisoned = true
+      error('jessql storage: checkpoint failed (reopen required): ' .. tostring(err), 2)
+    end
+    state.sequence = sequence
+  end
+
+  function db.close(_self: Store)
+    if state.closed then return end
+    if state.busy then error('jessql storage: close inside transaction', 2) end
+    state.closed = true
+    state.lock:unlock()
+  end
+  return db
+end
+
+return storage
