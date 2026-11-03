@@ -172,3 +172,21 @@ filter, and join. Marking only those the rows' profiles named saved 0.010 s a lo
 queries 1.05x to 1.91x slower than all marked: a nested-loop join of 400 to 400 went from 23 ms
 to 43 ms. Whole, every row is within 5% of all marked, at what all marked costs to require; a
 database is the queries it runs, so that is the state kept.
+
+
+## Native persistence prototype (unmerged feature branch)
+
+Tested on the supplied `jess 0.3.0` Linux x64 runtime with `bench/storage.jsl`, a single
+process, local filesystem, buffered writes, primary-key hash storage, and secondary equality
+index. Numbers vary with hardware, filesystem and cache state; no `fsync` is performed.
+
+| Workload | Measured time |
+| --- | ---: |
+| 50,000 inserts in 64-row transactions | 0.562 s (~88,972 rows/s) |
+| 1,000 indexed equality COUNT queries (50k-row table) | 0.160 s |
+| Streaming compact checkpoint, 50k live rows | 0.792 s |
+| Reopen and replay compact checkpoint, 50k rows | 0.399 s |
+
+These numbers are **not a claim of durable commits per second**. `@dream/fs` currently lacks a
+documented stable-storage barrier, and the 50k rows are entirely resident in memory. The
+benchmark is for comparing native JSL engine revisions, not production deployment estimates.

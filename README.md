@@ -1,8 +1,9 @@
 # jessql
 
-A Luau relational query engine packaged as a Jess JPK. It is deliberately a query engine, not a
-storage engine: in-memory tables and arbitrary Jess/JPK objects can be exposed as relational
-providers without copying their domain semantics into JessQL.
+A Luau relational query engine packaged as a Jess JPK. Its existing in-memory and virtual-provider
+query paths remain available without storage dependencies. The native persistence feature branch
+also adds an **experimental, all-JSL append-only transactional store**, without SQLite or another
+database dependency. It is not yet safe for power-loss-critical production workloads.
 
 ## Package
 
@@ -30,6 +31,26 @@ LIMIT 20]], { 500 })
 
 Prepared queries expose `run(params)` and `explain()`. `explain()` reports projection-pruned scans,
 join strategies, grouping, aggregate count, and parameter count.
+
+
+## Experimental native persistence (feature branch)
+
+```luau
+local sql = require('@jessql')
+local db = sql.open('data/app.wal')
+db:createTable('events', { 'id', 'room', 'body' }, 'id')
+db:createIndex('events', 'room')
+db:transaction(function(tx)
+  tx:insert('events', { id = '1', room = 'lobby', body = 'hello' })
+end)
+local rows = db:query('SELECT body FROM events WHERE room = ?', { 'lobby' }).rows
+db:checkpoint()
+db:close()
+```
+
+No SQLite bindings are involved. The engine uses Jess filesystem, bytes and JSON primitives.
+**Buffered writes are not power-loss durable without a real file/directory sync primitive.**
+See [docs/PERSISTENCE.md](docs/PERSISTENCE.md) for the full contract and limitations.
 
 ## Provider protocol
 
@@ -70,8 +91,10 @@ JessQL can combine an indexed lookup side with a lazy ordered driver and stop as
 `LIKE`, arithmetic/comparison/boolean operators, `IS [NOT] NULL`, and `COUNT`, `SUM`, `AVG`,
 `MIN`, `MAX`. Scalar functions include `LOWER`, `UPPER`, `LENGTH`, `ABS`, and `COALESCE`.
 
-No persistent page store, WAL, transactions, mutations, subqueries/CTEs, set operators, or window
-functions are implemented yet.
+The in-development native store provides a checksummed append log, a transaction API, indexed
+persistent providers, crash-tail recovery, and snapshot compaction. It does **not** yet have a
+page store, SQL DML/DDL grammar, MVCC, subqueries/CTEs, set operators, or window functions.
+See [Native persistence architecture and safety boundary](docs/PERSISTENCE.md).
 
 ## 0.1.1 execution work
 

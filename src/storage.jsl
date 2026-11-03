@@ -76,7 +76,8 @@ end
 local function scalar(value: unknown): boolean
   if value == nil then return true end
   local kind = type(value)
-  if kind == 'string' or kind == 'boolean' then return true end
+  if kind == 'string' then return utf8.len(value :: string) ~= nil end
+  if kind == 'boolean' then return true end
   return kind == 'number' and (value :: number) == (value :: number)
     and math.abs(value :: number) < math.huge
 end
