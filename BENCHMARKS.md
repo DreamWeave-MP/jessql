@@ -444,3 +444,25 @@ The new regression tests cover mixed number/string AVL bounds and ascending/
 descending parity, packed deleted-key history, reinsertion without duplicate
 order slots, index counts, compaction, checkpoint and reopen. Neither the WAL
 format nor the buffered-write durability contract changed.
+
+## Experimental hybrid cold pages and hot WAL (Jess 0.3.0, Linux x64)
+
+Reproduce with `jess run --package . --trusted bench/hybrid-compare.jsl prepare 100000`,
+then separate processes for `resident 100000` and `hybrid 100000`. Six alternating
+measurements (three per configuration), from the same logical data and query
+checksum. The resident baseline has an ordered primary-key AVL index.
+
+| 100K-row metric | Resident packed median | Hybrid median |
+| --- | ---: | ---: |
+| Reopen elapsed CPU | 1.331 s | 0.0124 s |
+| RSS just after open | 76,312 KiB | 30,976 KiB |
+| RSS after query workload | 76,312 KiB | 42,908 KiB |
+| 300 random primary-key reads | 0.00121 s | 0.2517 s |
+| Three ordered ranges, LIMIT 20 | 0.000196 s | 0.00981 s |
+| Logical COUNT | 100,000 | 100,000 |
+| Query checksum | 20,999,420 | 20,999,420 |
+
+Medians from alternating runs; CPU and RSS vary with the host and GC. **Hybrid
+is significantly slower for hot queries**, and only its decoded-page cache is
+bounded. The massive reopen improvement comes from not reconstructing the full
+resident table and index. Buffered I/O, not fsync-backed durability.

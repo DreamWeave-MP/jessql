@@ -5,6 +5,29 @@ query paths remain available without storage dependencies. The native persistenc
 also adds an **experimental, all-JSL append-only transactional store**, without SQLite or another
 database dependency. It is not yet safe for power-loss-critical production workloads.
 
+
+## Experimental hybrid hot/cold pages
+
+The native persistence branch now includes a self-contained immutable page
+provider and a single-table hybrid overlay:
+
+```luau
+local sql = require('@jessql')
+-- First create a sorted immutable snapshot using sql.paged.create(...).
+local db = sql.hybrid.open('events.hot.wal', 'events.gen1', 'events', {
+    cachePages = 8, rowLayout = 'packed',
+})
+db:upsert({ id = 100, room = 'main', body = 'edited' })
+local next = db:query('SELECT id FROM events WHERE id >= ? ORDER BY id LIMIT 20', { 95 })
+db:exportSnapshot('events.gen2') -- does not activate or durably publish it
+```
+
+Hot rows and tombstones are WAL-backed and transactions see staged changes.
+The snapshot is checksummed, read-only, and opened with a bounded page cache.
+See [Hybrid storage details and limitations](docs/HYBRID.md) before using this
+experimental API. Power-loss durability, automatic segment promotion, and
+bounded total RSS are **not yet provided**.
+
 ## Package
 
 - package: `org.dreamweave.jessql` 0.1.6
