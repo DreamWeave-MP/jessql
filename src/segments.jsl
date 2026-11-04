@@ -8,7 +8,7 @@ local secondary = require('@jessql/secondary')
 local engine = require('@jessql/engine')
 
 export type Row = { [string]: unknown }
-export type Options = { cachePages: number?, pageBytes: number? }
+export type Options = { cachePages: number?, pageBytes: number?, deletePaths: { [number]: string }? }
 export type Snapshot = paged.Snapshot & {
   openIndexes: (self: Snapshot, paths: { string }, options: paged.Options?) -> secondary.Index,
 }
@@ -24,6 +24,34 @@ local function compare(leftValue: unknown, rightValue: unknown): number
   if left == 'boolean' then return if leftValue == false then -1 else 1 end
   if left == 'number' then return if (leftValue :: number) < (rightValue :: number) then -1 else 1 end
   return if (leftValue :: string) < (rightValue :: string) then -1 else 1
+end
+
+-- Use the same primary-key identity as the hot WAL's tombstone table.
+-- Callers of createTombstones supply already-encoded, sorted keys, avoiding
+-- materializing a full deletion set when writing a cold generation.
+local function encodeKey(key: unknown): string
+  if key == nil then error('jessql segments: NULL primary key', 3) end
+  local kind = type(key)
+  if kind == 'string' then return 's' .. (key :: string) end
+  if kind == 'boolean' then return if key == true then 'b1' else 'b0' end
+
+  if kind ~= 'number' or key ~= key or math.abs(key :: number) == math.huge then
+    error('jessql segments: invalid primary key', 3)
+  end
+  local value = key :: number
+  if value == 0 then value = 0 end
+  return 'n' .. string.format('%.17g', value)
+end
+
+local function validEncodedKey(key: unknown): boolean
+  if type(key) ~= 'string' or utf8.len(key :: string) == nil then return false end
+  local text = key :: string
+  if string.sub(text, 1, 1) == 's' then return true end
+  if #text < 2 then return false end
+  if text == 'b0' or text == 'b1' then return true end
+  if string.sub(text, 1, 1) ~= 'n' then return false end
+  local parsed = tonumber(string.sub(text, 2))
+  return parsed ~= nil and encodeKey(parsed) == text
 end
 
 local function project(row: Row, columns: { string }?): Row
@@ -47,8 +75,19 @@ function segments.open(paths: { string }, options: Options?): Snapshot
     error('jessql segments: expected 1 to 8 snapshot paths', 2)
   end
   local readers: { paged.Snapshot } = {}
+  local deletions: { [number]: paged.Snapshot } = {}
   local seen: { [string]: boolean } = {}
   local cachePages = if options then options.cachePages else nil
+  local deletePaths = if options then options.deletePaths else nil
+  if deletePaths then
+    for number, deletePath in deletePaths do
+      if type(number) ~= 'number' or number % 1 ~= 0 or number < 1 or number > #paths
+        or type(deletePath) ~= 'string' or deletePath == '' then
+        error('jessql segments: invalid deletion sidecar mapping', 2)
+      end
+    end
+  end
+
   -- Snapshot opens and schema validation can throw; close prior readers on failure.
   local valid, failure = pcall(function()
     for _, path in paths do
@@ -64,11 +103,35 @@ function segments.open(paths: { string }, options: Options?): Snapshot
           error('jessql segments: incompatible snapshot schema')
         end
       end
+
       readers[#readers + 1] = reader
+      local deletePath: string? = nil
+      if deletePaths ~= nil then deletePath = (deletePaths :: { [number]: string })[#readers] end
+
+      if deletePath then
+        if seen[deletePath] then error('jessql segments: duplicate deletion path') end
+        seen[deletePath] = true
+        local deleteReader = paged.open(deletePath, { cachePages = cachePages or 1 })
+        deletions[#readers] = deleteReader
+        if deleteReader.primaryKey ~= 'id' or #deleteReader.columns ~= 2
+          or deleteReader.columns[1] ~= 'id' or deleteReader.columns[2] ~= 'token'
+          or deleteReader.keyKind ~= 'string' then
+          error('jessql segments: invalid deletion sidecar schema')
+        end
+        local marker = deleteReader:get('!identity')
+        if not marker or marker.token ~= reader.identity then
+          error('jessql segments: deletion sidecar identity mismatch')
+        end
+      end
     end
   end)
 
   if not valid then
+    for number = 1, #readers do
+      local deletion = deletions[number]
+      if deletion then deletion:close() end
+    end
+
     for _, reader in readers do reader:close() end
     error(failure, 2)
   end
@@ -76,10 +139,16 @@ function segments.open(paths: { string }, options: Options?): Snapshot
   local first = readers[1]
   local count, keyKind = 0, 'empty'
   local identities: { string } = { 'JQLM1' }
-  for _, reader in readers do
+  for number, reader in readers do
     count += reader.count
     local token = reader.identity
     identities[#identities + 1] = tostring(#token) .. ':' .. token
+    local deleteReader = deletions[number]
+    if deleteReader then
+      local deleteToken = deleteReader.identity
+      identities[#identities + 1] = 'D' .. tostring(#deleteToken) .. ':' .. deleteToken
+    end
+
     if reader.keyKind ~= 'empty' then
       if keyKind == 'empty' then keyKind = reader.keyKind
       elseif keyKind ~= reader.keyKind then keyKind = 'mixed' end
@@ -101,7 +170,11 @@ function segments.open(paths: { string }, options: Options?): Snapshot
 
   function snapshot.get(_self: Snapshot, key: unknown): Row?
     ready()
+    if key == nil then return nil end
+    local encoded = encodeKey(key)
     for index = #readers, 1, -1 do
+      local deleteReader = deletions[index]
+      if deleteReader and deleteReader:get(encoded) then return nil end
       local row = readers[index]:get(key)
       if row then return row end
     end
@@ -124,9 +197,10 @@ function segments.open(paths: { string }, options: Options?): Snapshot
 
     return function(): Row?
       ready()
-      local winner = 0
-      local selected: Row? = nil
-      for index = 1, #readers do
+      while true do
+        local winner = 0
+        local selected: Row? = nil
+        for index = 1, #readers do
         local row = heads[index]
         if not row then continue end
 
@@ -141,17 +215,25 @@ function segments.open(paths: { string }, options: Options?): Snapshot
         end
       end
 
-      if not selected then return nil end
-      local key = selected[primaryKey]
-      -- Advance *all* matching heads before yielding the newest row.
-      -- Older generations cannot resurrect shadowed values.
-      for index = 1, #readers do
-        local row = heads[index]
-        if row and compare(row[primaryKey], key) == 0 then
-          heads[index] = iterators[index]()
+        if not selected then return nil end
+        local key = selected[primaryKey]
+        -- Advance *all* matching heads before yielding the newest row.
+        -- Older generations cannot resurrect shadowed values.
+        for index = 1, #readers do
+          local row = heads[index]
+          if row and compare(row[primaryKey], key) == 0 then
+            heads[index] = iterators[index]()
+          end
         end
+        local hidden = false
+        local encoded = encodeKey(key)
+        for index = winner, #readers do
+          local deleteReader = deletions[index]
+          if deleteReader and deleteReader:get(encoded) then hidden = true; break end
+        end
+
+        if not hidden then return project(selected, columns) end
       end
-      return project(selected, columns)
     end
   end
 
@@ -253,11 +335,17 @@ function segments.open(paths: { string }, options: Options?): Snapshot
     local indexClosed = false
     local merged = {} :: secondary.Index
     merged.partitionColumn, merged.orderColumn = firstIndex.partitionColumn, firstIndex.orderColumn
-    merged.orderKind, merged.complete, merged.count = firstIndex.orderKind, true, 0
+    merged.orderKind, merged.complete, merged.count = '', true, 0
     for _, item in indexes do
-      if merged.orderKind == '' and item.orderKind ~= '' then merged.orderKind = item.orderKind end
-      if item.orderKind == 'mixed' or item.orderKind == '' then merged.complete = false end
-      if not item.complete then merged.complete = false end
+      -- An empty tombstone-only generation has no index sort kind. Do not
+      -- disable accelerated reads from otherwise homogeneous generations.
+      if item.count > 0 then
+        if merged.orderKind == '' then merged.orderKind = item.orderKind end
+
+        if item.orderKind == 'mixed' or item.orderKind == '' or not item.complete then
+          merged.complete = false
+        end
+      end
       merged.count += item.count
     end
 
@@ -303,8 +391,15 @@ function segments.open(paths: { string }, options: Options?): Snapshot
           -- Never emit a stale index entry from a shadowed snapshot. This
           -- requires no key-sized seen set and handles changed secondary keys.
           local shadowed = false
-          for newer = chosen + 1, #readers do
-            if readers[newer]:get(selected[primaryKey]) then
+          local encoded = encodeKey(selected[primaryKey])
+          for newer = chosen, #readers do
+            local deleteReader = deletions[newer]
+            if deleteReader and deleteReader:get(encoded) then
+              shadowed = true
+              break
+            end
+
+            if newer > chosen and readers[newer]:get(selected[primaryKey]) then
               shadowed = true
               break
             end
@@ -346,6 +441,15 @@ function segments.open(paths: { string }, options: Options?): Snapshot
       cached += metrics.cachedPages
       reads += metrics.pageReads
     end
+
+    for number = 1, #readers do
+      local deletion = deletions[number]
+      if not deletion then continue end
+      local metrics = deletion:stats()
+      pages += metrics.pages
+      cached += metrics.cachedPages
+      reads += metrics.pageReads
+    end
     return { pages = pages, rows = count, cachedPages = cached, pageReads = reads }
   end
 
@@ -353,15 +457,49 @@ function segments.open(paths: { string }, options: Options?): Snapshot
     if closed then return end
     closed = true
     if activeIndex then activeIndex:close() end
+
+    for number = 1, #readers do
+      local deletion = deletions[number]
+      if deletion then deletion:close() end
+    end
+
     for _, reader in readers do reader:close() end
   end
   return snapshot
 end
 
+-- Publish a separate immutable deletion record set for one snapshot.
+-- Keys are WAL-encoded ('s...', 'n...', 'b0'/'b1'), strictly byte-sorted,
+-- and supplied by a streaming iterator. The first record binds this sidecar
+-- to its own data snapshot. This operation does not rotate or retire a WAL.
+function segments.createTombstones(path: string, source: string, nextKey: () -> string, options: Options?)
+  local reader = paged.open(source, { cachePages = if options then options.cachePages else 1 })
+  local identity = reader.identity
+  reader:close()
+  local previous = ''
+  local marker = false
+  paged.create(path, { 'id', 'token' }, 'id', function(): Row?
+    if not marker then
+      marker = true
+      return { id = '!identity', token = identity }
+    end
+    local key = nextKey()
+    if key == nil then return nil end
+
+    if not validEncodedKey(key) or key <= previous then
+      error('jessql segments: deletions must be valid sorted encoded primary keys')
+    end
+    previous = key
+    return { id = key, token = '' }
+  end, { pageBytes = if options then options.pageBytes else nil })
+end
+
 -- Bounded-memory explicit compaction. Inputs remain untouched. Caller must
 -- separately publish the resulting generation and rotate its WAL safely.
 function segments.compact(path: string, sources: { string }, options: Options?)
-  local snapshot = segments.open(sources, { cachePages = if options then options.cachePages else 1 })
+  local snapshot = segments.open(sources, { cachePages = if options then options.cachePages else 1,
+    deletePaths = if options then options.deletePaths else nil })
+
   -- Snapshot publication can fail during file creation or source streaming.
   local succeeded, failure = pcall(function()
     paged.create(path, snapshot.columns, snapshot.primaryKey,

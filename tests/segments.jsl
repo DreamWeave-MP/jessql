@@ -191,8 +191,8 @@ suite.describe('immutable generation merging', function()
       local row = forward()
       if not row then break end
       expect(row.room).toBe('even')
-      expect(row.stream >= 100 and row.stream < 170).toBe(true)
-      expect(row.stream > last).toBe(true)
+      expect((row.stream :: number) >= 100 and (row.stream :: number) < 170).toBe(true)
+      expect((row.stream :: number) > last).toBe(true)
       expect(row.body).toBe((snapshotView:get(row.id) :: sql.Row).body)
       last = row.stream :: number
     end
@@ -203,7 +203,7 @@ suite.describe('immutable generation merging', function()
     while true do
       local row = reverse()
       if not row then break end
-      expect(row.stream <= previous).toBe(true)
+      expect((row.stream :: number) <= previous).toBe(true)
       expect(row.room).toBe('odd')
       previous = row.stream :: number
     end
@@ -225,8 +225,8 @@ suite.describe('immutable generation merging', function()
     local params = { { 'even', 100 }, { 'odd', 170 }, { 'moved' } }
     local function assertSame()
       for number, query in queries do
-        local actual = indexed:query(query, params[number]).rows
-        local expected = reference:query(query, params[number]).rows
+        local actual = indexed:query(query, (params[number] :: { unknown })).rows
+        local expected = reference:query(query, (params[number] :: { unknown })).rows
         expect(#actual).toBe(#expected)
         for position, row in actual do
           expect(row.id).toBe(expected[position].id)
@@ -240,7 +240,7 @@ suite.describe('immutable generation merging', function()
         expect(tx:delete(102)).toBe(true)
         tx:upsert({ id = 103, room = 'even', stream = 101, body = 'hot moved' })
         tx:insert({ id = 250, room = 'even', stream = 102, body = 'new hot' })
-        local inside = tx:query(queries[1], params[1]).rows
+        local inside = tx:query(queries[1], (params[1] :: { unknown })).rows
         expect(#inside > 0).toBe(true)
       end)
     end
@@ -287,6 +287,157 @@ suite.describe('immutable generation merging', function()
     valid:close()
     fs.remove(first)
     fs.remove(second)
+    cleanup(base)
+  end)
+
+  suite.it('applies cold deletion generations across point, ordered, and indexed hybrid reads', function()
+    local firstPath, secondPath, thirdPath, base = files('tombstone')
+    snapshot(firstPath, 1, 80, 1)
+    snapshot(secondPath, 41, 90, 2)
+    snapshot(thirdPath, 91, 120, 3)
+    local sources = { firstPath, secondPath, thirdPath }
+    local sidecars = { base .. '.a.idx', base .. '.b.idx', base .. '.c.idx' }
+    local deletion = base .. '.delete'
+    fs.remove(deletion)
+    for generation, path in sidecars do
+      fs.remove(path)
+      sql.secondary.create(path, sources[generation], 'room', 'body', { format = 'compact' })
+    end
+    local deleted = { 'n10', 'n42', 'n95' }
+    local cursor = 0
+    sql.segments.createTombstones(deletion, thirdPath, function()
+      cursor += 1
+      return deleted[cursor]
+    end, { pageBytes = 512 })
+    local deletePaths = { [3] = deletion }
+    local view = sql.segments.open(sources, { cachePages = 1, deletePaths = deletePaths })
+    for _, key in { 10, 42, 95 } do expect(view:get(key)).toBe(nil) end
+    expect((view:get(41) :: sql.Row).body).toBe('2:41')
+    local query = sql.new()
+    query:register('events', view:provider())
+    expect(query:query('SELECT COUNT(*) AS n FROM events').rows[1].n).toBe(117)
+    local ascending = query:query('SELECT id FROM events WHERE id >= ? ORDER BY id', { 7 }).rows
+    for _, row in ascending do expect(row.id ~= 10 and row.id ~= 42 and row.id ~= 95).toBe(true) end
+    view:close()
+
+    -- Compaction must carry deletion visibility into its candidate output;
+    -- omitting a cold tombstone here would resurrect an old generation row.
+    sql.segments.compact(base .. '.out', sources,
+      { cachePages = 1, pageBytes = 512, deletePaths = deletePaths })
+    local compacted = sql.paged.open(base .. '.out')
+    expect(compacted.count).toBe(117)
+    for _, key in { 10, 42, 95 } do expect(compacted:get(key)).toBe(nil) end
+    compacted:close()
+
+    local db = sql.hybrid.open(base .. '.wal', sources, 'events', {
+      cachePages = 1, deletePaths = deletePaths, secondaryIndexPaths = sidecars,
+    })
+    local indexed = db:query('SELECT id FROM events WHERE room = ? ORDER BY body LIMIT 120', { 'even' }).rows
+    for _, row in indexed do expect(row.id ~= 10 and row.id ~= 42 and row.id ~= 95).toBe(true) end
+    db:upsert({ id = 42, room = 'even', body = 'hot revival' })
+    expect((db:get(42) :: sql.Row).body).toBe('hot revival')
+    expect(db:query('SELECT COUNT(*) AS n FROM events').rows[1].n).toBe(118)
+    db:close()
+    local reopened = sql.hybrid.open(base .. '.wal', sources, 'events', {
+      deletePaths = deletePaths, secondaryIndexPaths = sidecars,
+    })
+    expect((reopened:get(42) :: sql.Row).body).toBe('hot revival')
+    expect(reopened:get(10)).toBe(nil)
+    reopened:close()
+    -- Removing the cold deletion sidecar changes the WAL identity.
+    local mismatch = pcall(function()
+      sql.hybrid.open(base .. '.wal', sources, 'events', { secondaryIndexPaths = sidecars })
+    end)
+    expect(mismatch).toBe(false)
+    for _, path in sidecars do fs.remove(path) end
+    fs.remove(deletion)
+    cleanup(base)
+  end)
+
+  suite.it('rejects wrong or unsorted deletion sidecars and preserves source generations', function()
+    local firstPath, secondPath, _, base = files('delete-invalid')
+    snapshot(firstPath, 1, 10, 1)
+    snapshot(secondPath, 5, 15, 2)
+    local deletion = base .. '.deleted'
+    fs.remove(deletion)
+    local keys = { 'n1', 'n5', 'n6' }
+    local position = 0
+    sql.segments.createTombstones(deletion, firstPath, function()
+      position += 1
+      return keys[position]
+    end)
+
+    -- A sidecar created against another snapshot must never be attached.
+    local wrong = pcall(function()
+      sql.segments.open({ firstPath, secondPath }, { deletePaths = { [2] = deletion } })
+    end)
+    expect(wrong).toBe(false)
+
+    local good = sql.segments.open({ firstPath, secondPath }, { deletePaths = { [1] = deletion } })
+    expect(good:get(1)).toBe(nil)
+    -- A later snapshot supersedes an earlier tombstone if it has that key.
+    expect((good:get(5) :: sql.Row).body).toBe('2:5')
+    expect((good:get(6) :: sql.Row).body).toBe('2:6')
+    expect((good:get(11) :: sql.Row).body).toBe('2:11')
+    good:close()
+    local stillThere = sql.paged.open(firstPath)
+    expect((stillThere:get(5) :: sql.Row).body).toBe('1:5')
+    stillThere:close()
+    local reversed = base .. '.reverse.deleted'
+    fs.remove(reversed)
+    local badKeys = { 'n9', 'n8' }
+    position = 0
+    -- Nonmonotonic deletion keys fail creation and leave no usable file.
+    local sorted = pcall(function()
+      sql.segments.createTombstones(reversed, secondPath, function()
+        position += 1
+        return badKeys[position]
+      end)
+    end)
+    expect(sorted).toBe(false)
+    fs.remove(deletion)
+    fs.remove(reversed)
+    cleanup(base)
+  end)
+
+  suite.it('keeps composite seeking enabled when newest generation contains only deletions', function()
+    local firstPath, secondPath, thirdPath, base = files('deletion-only')
+    snapshot(firstPath, 1, 20, 1)
+    snapshot(secondPath, 21, 40, 2)
+    sql.paged.create(thirdPath, { 'id', 'room', 'body' }, 'id', function()
+      return nil
+    end)
+    local sources = { firstPath, secondPath, thirdPath }
+    local sidecars = { base .. '.a.idx', base .. '.b.idx', base .. '.c.idx' }
+    for generation, path in sidecars do
+      fs.remove(path)
+      sql.secondary.create(path, sources[generation], 'room', 'body', { format = 'compact' })
+    end
+    local deletion = base .. '.deleted'
+    fs.remove(deletion)
+    local keys = { 'n3', 'n30' }
+    local nextKey = 0
+    sql.segments.createTombstones(deletion, thirdPath, function()
+      nextKey += 1
+      return keys[nextKey]
+    end)
+    local cold = sql.segments.open(sources, { deletePaths = { [3] = deletion } })
+    local index = cold:openIndexes(sidecars)
+    expect(index.complete).toBe(true)
+    expect(index.orderKind).toBe('string')
+    local iterator = index:iterate('odd')
+    local seen = 0
+    while true do
+      local row = iterator()
+      if not row then break end
+      expect(row.id ~= 3).toBe(true)
+      seen += 1
+    end
+    expect(seen).toBe(19)
+    expect(cold:get(30)).toBe(nil)
+    cold:close()
+    for _, path in sidecars do fs.remove(path) end
+    fs.remove(deletion)
     cleanup(base)
   end)
 
