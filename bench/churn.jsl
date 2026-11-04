@@ -1,0 +1,40 @@
+--!strict
+-- Repeated indexed-row updates and deletes: report append cost and bounded index slots.
+local sql = require('@jessql')
+local fs = require('@dream/fs')
+
+local cycles = tonumber((...)) or 20000
+local path = fs.join(assert(fs.cwd()), '.jessql-churn-bench.wal')
+fs.remove(path)
+fs.remove(path .. '.lock')
+
+local db = sql.open(path)
+db:createTable('state', { 'id', 'bucket', 'value' }, 'id')
+db:createIndex('state', 'bucket')
+db:transaction(function(tx)
+  for id = 1, 300 do
+    tx:insert('state', { id = id, bucket = id % 7, value = 0 })
+  end
+end)
+
+local start = os.clock()
+for iteration = 1, cycles do
+  local id = iteration % 300 + 1
+  db:update('state', id, { bucket = iteration % 7, value = iteration })
+end
+local updated = os.clock()
+for id = 1, 260 do db:delete('state', id) end
+local deleted = os.clock()
+
+local stats = db:stats().state
+assert(stats.rows == 40)
+assert(stats.keySlots <= stats.rows * 2 + 64)
+assert(stats.indexKeys.bucket == 40)
+assert(stats.indexSlots.bucket <= stats.rows * 2 + 7 * 64)
+print(string.format('updates=%d update_s=%.3f updates_per_s=%.0f delete_s=%.3f',
+  cycles, updated - start, cycles / (updated - start), deleted - updated))
+print(string.format('live_rows=%d row_slots=%d index_live=%d index_slots=%d',
+  stats.rows, stats.keySlots, stats.indexKeys.bucket, stats.indexSlots.bucket))
+db:close()
+fs.remove(path)
+fs.remove(path .. '.lock')

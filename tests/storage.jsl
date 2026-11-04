@@ -339,6 +339,46 @@ suite.describe('native persistent store', function()
     clean(path)
   end)
 
+  suite.it('bounds stale hash-index and row-order slots through sustained churn', function()
+    local path = fixture('churn')
+    local db = sql.open(path)
+    db:createTable('state', { 'id', 'group_id', 'value' }, 'id')
+    db:createIndex('state', 'group_id')
+    db:transaction(function(tx)
+      for id = 1, 300 do
+        tx:insert('state', { id = id, group_id = id % 7, value = id })
+      end
+    end)
+
+    for iteration = 1, 3000 do
+      local id = iteration % 300 + 1
+      db:update('state', id, { group_id = iteration % 7, value = iteration })
+    end
+
+    for id = 1, 260 do db:delete('state', id) end
+
+    local before = db:stats().state
+    expect(before.rows).toBe(40)
+    expect(before.keySlots <= 64 + before.rows * 2).toBe(true)
+    expect(before.indexKeys.group_id).toBe(40)
+    expect(before.indexSlots.group_id <= 7 * 64 + 2 * before.rows).toBe(true)
+    expect(db:query('SELECT COUNT(*) AS n FROM state').rows[1].n).toBe(40)
+    for id = 261, 300 do
+      local expected = db:get('state', id)
+      local counted = db:query('SELECT COUNT(*) AS n FROM state WHERE group_id = ? AND id = ?', { expected.group_id, id })
+      expect(counted.rows[1].n).toBe(1)
+    end
+    db:checkpoint()
+    local compacted = db:stats().state
+    expect(compacted.keySlots).toBe(40)
+    expect(compacted.indexSlots.group_id).toBe(40)
+    db:close()
+    db = sql.open(path)
+    expect(db:stats().state.indexSlots.group_id).toBe(40)
+    db:close()
+    clean(path)
+  end)
+
   suite.it('rolls back schema changes and supports a new table evolved within one transaction', function()
     local path = fixture('schema-rollback')
     local db = sql.open(path)

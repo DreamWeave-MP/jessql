@@ -23,9 +23,11 @@ export type Store = {
   query: (self: Store, sql: string, params: { unknown }?) -> queryEngine.Result,
   prepare: (self: Store, sql: string) -> queryEngine.Plan,
   tables: (self: Store) -> { queryEngine.TableInfo },
+  stats: (self: Store) -> { [string]: TableMetrics },
   checkpoint: (self: Store) -> (),
   close: (self: Store) -> (),
 }
+export type TableMetrics = { rows: number, keySlots: number, indexSlots: { [string]: number }, indexKeys: { [string]: number } }
 export type Transaction = {
   createTable: (self: Transaction, name: string, columns: { string }, primaryKey: string) -> (),
   createIndex: (self: Transaction, name: string, column: string) -> (),
@@ -135,6 +137,37 @@ local function frame(payload: string, maximum: number): string
   return buffer.tostring(header) .. payload
 end
 
+-- Maintain bounded tombstone overhead under long-running update/delete churn.
+-- Rebuilding only after the dead slots exceed the live slots amortizes the cost.
+local function compactBucket(index: Index, encoded: string, bucket: Bucket)
+  if bucket.count == 0 then
+    index.buckets[encoded] = nil
+  elseif #bucket.keys > 64 + 2 * bucket.count then
+    local liveKeys, liveSeen = {} :: { string }, {} :: { [string]: boolean }
+    for _, key in bucket.keys do
+      if bucket.live[key] then
+        liveKeys[#liveKeys + 1] = key
+        liveSeen[key] = true
+      end
+    end
+    bucket.keys = liveKeys
+    bucket.seen = liveSeen
+  end
+end
+
+local function compactOrder(current: TableState)
+  if #current.order <= 64 + 2 * current.count then return end
+  local liveOrder, liveSeen = {} :: { string }, {} :: { [string]: boolean }
+  for _, key in current.order do
+    if current.rows[key] then
+      liveOrder[#liveOrder + 1] = key
+      liveSeen[key] = true
+    end
+  end
+  current.order = liveOrder
+  current.seen = liveSeen
+end
+
 local function indexSet(index: Index, value: unknown, key: string, present: boolean)
   if value == nil then return end
   local encoded = keyOf(value)
@@ -157,6 +190,7 @@ local function indexSet(index: Index, value: unknown, key: string, present: bool
   elseif bucket.live[key] then
     bucket.live[key] = nil
     bucket.count -= 1
+    compactBucket(index, encoded, bucket)
   end
 end
 
@@ -344,6 +378,7 @@ local function apply(state: DatabaseState, operations: { Operation })
         updateIndexes(current, key, current.rows[key], nil)
         current.rows[key] = nil
         current.count -= 1
+        compactOrder(current)
       end
     else
       error('jessql storage: unknown log operation', 2)
@@ -701,6 +736,26 @@ function storage.open(path: string, options: Options?): Store
   function db.tables(_self: Store): { queryEngine.TableInfo }
     ready()
     return state.engine:tables()
+  end
+
+  -- Snapshot-only counters for verifying memory growth and index maintenance.
+  function db.stats(_self: Store): { [string]: TableMetrics }
+    ready()
+    local output: { [string]: TableMetrics } = {}
+    for name, current in state.tables do
+      local metrics: TableMetrics = { rows = current.count, keySlots = #current.order, indexSlots = {}, indexKeys = {} }
+      for column, index in current.secondary do
+        local slots, keys = 0, 0
+        for _, bucket in index.buckets do
+          slots += #bucket.keys
+          keys += bucket.count
+        end
+        metrics.indexSlots[column] = slots
+        metrics.indexKeys[column] = keys
+      end
+      output[name] = metrics
+    end
+    return output
   end
 
   function db.checkpoint(_self: Store)

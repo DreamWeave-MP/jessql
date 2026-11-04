@@ -90,8 +90,12 @@ back to normal query execution; this remains optional for other providers.
 `checkpoint()` streams a compact logical snapshot into a sibling `.checkpoint.tmp`
 file, bounded by the frame size, and renames it over the previous log only
 after writing and closing. It then purges deleted row slots and stale index
-postings from memory. An interrupted pre-rename checkpoint leaves the original
-log intact. The engine does not automatically checkpoint yet.
+postings from memory. Hot tables also compact stale slots incrementally when
+tombstones exceed a bounded threshold, so long-running update/delete churn
+does not grow the in-memory hash posting lists without bound. `db:stats()`
+reports per-table live row counts, total key slots, and live/allocated secondary
+index postings; it is an O(index-size) diagnostic snapshot, not a cheap query
+metric. An interrupted pre-rename checkpoint leaves the original log intact. The engine does not automatically checkpoint yet.
 
 ## Durability boundary (important)
 
@@ -118,6 +122,7 @@ appends poison the handle and require closing/reopening.
 jess package test .
 jess check src/storage.jsl --package .
 jess run --trusted --package . bench/storage.jsl 50000 64
+jess run --trusted --package . bench/churn.jsl 20000
 ```
 
 The integration suite runs against the source provider and the packed JPK,
