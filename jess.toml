@@ -18,8 +18,9 @@ tests = ["tests/run.jsl", "tests/semantics.jsl", "tests/style.jsl", "tests/stora
 "@jessql/paged" = "src/paged.jsl"
 "@jessql/hybrid" = "src/hybrid.jsl"
 "@jessql/secondary" = "src/secondary.jsl"
+"@jessql/compactsecondary" = "src/compactsecondary.jsl"
 "@jessql/mutations" = "src/mutations.jsl"
 
 [[layer]]
 id = "jessql.core"
-exports = ["@jessql", "@jessql/lexer", "@jessql/parser", "@jessql/engine", "@jessql/storage", "@jessql/ordered", "@jessql/packed", "@jessql/paged", "@jessql/hybrid", "@jessql/secondary", "@jessql/mutations"]
+exports = ["@jessql", "@jessql/lexer", "@jessql/parser", "@jessql/engine", "@jessql/storage", "@jessql/ordered", "@jessql/packed", "@jessql/paged", "@jessql/hybrid", "@jessql/secondary", "@jessql/compactsecondary", "@jessql/mutations"]
