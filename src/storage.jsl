@@ -57,6 +57,7 @@ export type Transaction = {
   upsert: (self: Transaction, name: string, row: Row) -> (),
   delete: (self: Transaction, name: string, key: unknown) -> boolean,
   get: (self: Transaction, name: string, key: unknown) -> Row?,
+  query: (self: Transaction, sql: string, params: { unknown }?) -> queryEngine.Result,
 }
 
 type Schema = { columns: { string }, primaryKey: string, allowed: { [string]: boolean } }
@@ -927,6 +928,128 @@ local function buildTransaction(state: DatabaseState)
     local current = state.tables[name]
     local row = if current then current.rows[encoded] else nil
     return if row then table.clone(row) else nil
+  end
+
+  -- Query a transaction's logical state, including its inserts, replacements,
+  -- deletes, freshly created tables and nullable schema additions. Providers
+  -- merge the existing indexes with staged keys, without cloning every row.
+  -- They do not claim ordered scans: pending changes may invalidate ordering.
+  function transaction.query(_self: Transaction, sql: string, params: { unknown }?): queryEngine.Result
+    writable()
+    local view = queryEngine.new()
+    local names: { [string]: boolean } = {}
+    for name in state.tables do names[name] = true end
+    for name in created do names[name] = true end
+
+    for name in names do
+      local schema = findSchema(name)
+      local current = state.tables[name]
+      local pending = staged[name]
+      local indexes: { [string]: boolean } = { [schema.primaryKey] = true }
+      if current then
+        for column in current.available do indexes[column] = true end
+      end
+
+      if indexed[name] then
+        for column in indexed[name] do indexes[column] = true end
+      end
+
+      -- The iterator first walks committed candidates (possibly indexed),
+      -- then appends staged inserts/moves missing from that candidate set.
+      -- It checks pending values at consumption time, not construction time.
+      local function rows(request: queryEngine.Request): queryEngine.Iterator
+        local candidates: { string } = {}
+        local live: { [string]: boolean }? = nil
+        if current then candidates, live = indexedKeys(current, request) end
+        local cursor = 0
+        local visited: { [string]: boolean } = {}
+        local pendingKeys: { string } = {}
+        if pending then
+          for key in pending do pendingKeys[#pendingKeys + 1] = key end
+        end
+        local pendingCursor = 0
+
+        return {
+          _jessqlIter = 'v1',
+          next = function(): queryEngine.SourceRow?
+            while cursor < #candidates do
+              cursor += 1
+              local key = candidates[cursor]
+              if visited[key] then continue end
+              -- An index tombstone may have been resurrected in this tx.
+
+              if live and not (live :: { [string]: boolean })[key] and not (pending and type(pending[key]) == 'table') then
+                continue
+              end
+              visited[key] = true
+              local change = if pending then pending[key] else nil
+              local row: Row? = if change == Deleted then nil
+                elseif type(change) == 'table' then change :: Row
+                else (current :: TableState).rows[key]
+              if row then return row end
+            end
+
+            while pendingCursor < #pendingKeys do
+              pendingCursor += 1
+              local key = pendingKeys[pendingCursor]
+              if visited[key] then continue end
+              visited[key] = true
+              local row = (pending :: { [string]: Row | boolean })[key]
+              if type(row) == 'table' then return row :: Row end
+            end
+            return nil
+          end,
+        }
+      end
+
+      local provider: queryEngine.Provider = {
+        columns = schema.columns,
+        indexes = indexes,
+        count = function(): number
+          local total = if current then current.count else 0
+          if pending then
+            for key, changed in pending do
+              local wasPresent = current ~= nil and current.rows[key] ~= nil
+              if changed == Deleted then
+                if wasPresent then total -= 1 end
+              elseif type(changed) == 'table' and not wasPresent then
+                total += 1
+              end
+            end
+          end
+          return total
+        end,
+        scan = function(request: queryEngine.Request): queryEngine.SourceRows
+          local iterator = rows(request)
+          local result: { queryEngine.SourceRow } = {}
+          while true do
+            local row = iterator.next()
+            if not row then break end
+            result[#result + 1] = row
+          end
+          return result
+        end,
+        iterate = rows,
+        lookup = function(column: string, value: unknown, _request: queryEngine.Request): queryEngine.SourceRows
+          if value == nil or not scalar(value) then return {} end
+
+          local request: queryEngine.Request = {
+            columns = {}, constraints = { { column = column, op = '=', value = value } },
+            whereComplete = false, allowVolatileRows = false,
+          }
+          local iterator = rows(request)
+          local result: { queryEngine.SourceRow } = {}
+          while true do
+            local row = iterator.next()
+            if not row then break end
+            if row[column] == value then result[#result + 1] = row end
+          end
+          return result
+        end,
+      }
+      view:register(name, provider)
+    end
+    return view:query(sql, params)
   end
 
   -- Return a statement-stable set of keys for an indexed equality predicate.
