@@ -1,0 +1,63 @@
+--!strict
+-- Compare a global one-column ordered index with a per-room composite index.
+-- This benchmark runs without filesystem durability; all rows are memory-resident.
+local sql = require('@jessql')
+local fs = require('@dream/fs')
+
+local total = tonumber((...)) or 25000
+local probes = tonumber(select(2, ...)) or 150
+local Rooms = 64
+local BatchSize = 128
+local path = fs.join(assert(fs.cwd()), '.jessql-composite-bench.wal')
+fs.remove(path)
+fs.remove(path .. '.lock')
+
+local db = sql.open(path)
+db:createTable('events', { 'id', 'room_id', 'stream_id', 'payload' }, 'id')
+for first = 1, total, batchSize do
+  db:transaction(function(tx)
+    for id = first, math.min(first + BatchSize - 1, total) do
+      tx:insert('events', { id = id, room_id = 'room' .. (id % Rooms), stream_id = id, payload = 'x' })
+    end
+  end)
+end
+
+db:createOrderedIndex('events', 'stream_id')
+local selection = db:prepare('SELECT stream_id FROM events WHERE room_id = ? AND stream_id > ? ORDER BY stream_id LIMIT 20')
+local counting = db:prepare('SELECT COUNT(*) AS n FROM events WHERE room_id = ? AND stream_id >= ? AND stream_id < ?')
+local function measure(): (number, number, number, number)
+  local selectedRows, countedRows = 0, 0
+  local start = os.clock()
+  for iteration = 1, probes do
+    local minimum = (iteration * 97) % (total - 2000)
+    selectedRows += #selection.run({ 'room' .. (iteration % Rooms), minimum }).rows
+  end
+  local selectTime = os.clock() - start
+
+  start = os.clock()
+  for iteration = 1, probes do
+    local minimum = (iteration * 97) % (total - 2000)
+    countedRows += counting.run({ 'room' .. (iteration % Rooms), minimum, minimum + 1500 }).rows[1].n
+  end
+  return selectTime, os.clock() - start, selectedRows, countedRows
+end
+
+local baselineRead, baselineCount, baselineRows, baselineTotals = measure()
+local buildStart = os.clock()
+db:createCompositeIndex('events', 'room_id', 'stream_id')
+local buildTime = os.clock() - buildStart
+selection = db:prepare('SELECT stream_id FROM events WHERE room_id = ? AND stream_id > ? ORDER BY stream_id LIMIT 20')
+counting = db:prepare('SELECT COUNT(*) AS n FROM events WHERE room_id = ? AND stream_id >= ? AND stream_id < ?')
+local indexedRead, indexedCount, indexedRows, indexedTotals = measure()
+assert(baselineRows == indexedRows and baselineTotals == indexedTotals)
+
+print(string.format('rows=%d rooms=%d probes=%d selected=%d counted=%d', total, Rooms, probes, indexedRows, indexedTotals))
+print(string.format('global_range_read_s=%.5f composite_read_s=%.5f read_speedup=%.2fx',
+  baselineRead, indexedRead, baselineRead / indexedRead))
+print(string.format('global_range_count_s=%.5f composite_count_s=%.5f count_speedup=%.2fx',
+  baselineCount, indexedCount, baselineCount / indexedCount))
+print(string.format('composite_build_s=%.5f', buildTime))
+
+db:close()
+fs.remove(path)
+fs.remove(path .. '.lock')

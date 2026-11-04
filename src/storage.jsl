@@ -16,6 +16,7 @@ export type Store = {
   createTable: (self: Store, name: string, columns: { string }, primaryKey: string) -> (),
   createIndex: (self: Store, name: string, column: string) -> (),
   createOrderedIndex: (self: Store, name: string, column: string) -> (),
+  createCompositeIndex: (self: Store, name: string, prefix: string, suffix: string) -> (),
   exec: (self: Store, sql: string, params: { unknown }?) -> number,
   prepareExec: (self: Store, sql: string) -> MutationPlan,
   addColumn: (self: Store, name: string, column: string) -> (),
@@ -37,11 +38,12 @@ export type MutationPlan = {
   run: (params: { unknown }?) -> number,
   inTransaction: (tx: Transaction, params: { unknown }?) -> number,
 }
-export type TableMetrics = { rows: number, keySlots: number, indexSlots: { [string]: number }, indexKeys: { [string]: number } }
+export type TableMetrics = { rows: number, keySlots: number, indexSlots: { [string]: number }, indexKeys: { [string]: number }, compositePartitions: { [string]: number } }
 export type Transaction = {
   createTable: (self: Transaction, name: string, columns: { string }, primaryKey: string) -> (),
   createIndex: (self: Transaction, name: string, column: string) -> (),
   createOrderedIndex: (self: Transaction, name: string, column: string) -> (),
+  createCompositeIndex: (self: Transaction, name: string, prefix: string, suffix: string) -> (),
   primaryKey: (self: Transaction, name: string) -> string,
   exec: (self: Transaction, sql: string, params: { unknown }?) -> number,
   addColumn: (self: Transaction, name: string, column: string) -> (),
@@ -58,6 +60,7 @@ type Index = {
   buckets: { [string]: Bucket }, ordered: boolean?, tree: ordered.Tree?,
   types: { [string]: number }?, nulls: Bucket?,
 }
+type Composite = { prefix: string, suffix: string, partitions: { [string]: Index } }
 type TableState = {
   schema: Schema,
   rows: { [string]: Row },
@@ -65,9 +68,10 @@ type TableState = {
   seen: { [string]: boolean },
   count: number,
   secondary: { [string]: Index },
+  composites: { [string]: Composite },
   available: { [string]: boolean },
 }
-type Operation = { kind: string, table: string, columns: { string }?, primaryKey: string?, column: string?, ordered: boolean?, row: Row?, key: unknown }
+type Operation = { kind: string, table: string, columns: { string }?, primaryKey: string?, column: string?, suffix: string?, ordered: boolean?, row: Row?, key: unknown }
 type Pending = { [string]: { [string]: Row | boolean } }
 type DatabaseState = {
   path: string,
@@ -86,6 +90,10 @@ local Magic = 'JQLW1\n'
 local HeaderBytes = 8
 local DefaultMaxFrame = 16 * 1024 * 1024
 local Deleted = false
+
+local function compositeName(prefix: string, suffix: string): string
+  return prefix .. ':' .. suffix
+end
 
 local function requireName(name: string): string
   if type(name) ~= 'string' or not string.match(name, '^[%a_][%w_]*$') then
@@ -259,6 +267,17 @@ local function orderType(index: Index): string?
   return 'empty'
 end
 
+-- Return the value of an exact equality on a given column, if present.
+local function equalityValue(request: queryEngine.Request, column: string): unknown
+  for _, constraint in request.constraints do
+    if constraint.column == column and constraint.op == '=' and constraint.value ~= nil
+      and scalar(constraint.value) then
+      return constraint.value
+    end
+  end
+  return nil
+end
+
 -- An ordered index can supply a direct range cursor for simple predicates.
 -- Never claim that a partial WHERE has been evaluated: JessQL handles it.
 local function orderedCursor(current: TableState, request: queryEngine.Request): queryEngine.Iterator?
@@ -269,15 +288,38 @@ local function orderedCursor(current: TableState, request: queryEngine.Request):
     column, descending = order[1].column, order[1].desc
   elseif not order then
     for _, constraint in request.constraints do
-      if constraint.op == '<' or constraint.op == '<=' or constraint.op == '>' or constraint.op == '>=' then
-        local index = current.secondary[constraint.column]
-        if index and index.ordered then column = constraint.column; break end
+      if constraint.op ~= '<' and constraint.op ~= '<=' and constraint.op ~= '>' and constraint.op ~= '>=' then
+        continue
       end
+
+      local index = current.secondary[constraint.column]
+      if index and index.ordered then column = constraint.column; break end
+
+      for _, composite in current.composites do
+        if composite.suffix ~= constraint.column then continue end
+        if equalityValue(request, composite.prefix) == nil then continue end
+        column = constraint.column
+        break
+      end
+
+      if column then break end
     end
   end
 
   if not column then return nil end
   local index = current.secondary[column]
+  for _, composite in current.composites do
+    if composite.suffix ~= column then continue end
+    local prefix = equalityValue(request, composite.prefix)
+    if prefix == nil then continue end
+    index = composite.partitions[keyOf(prefix)]
+    -- An absent prefix has no rows. This is still a correctly ordered scan.
+    if not index then
+      return { _jessqlIter = 'v1', ordered = order ~= nil, next = function() return nil end }
+    end
+    break
+  end
+
   if not index or not index.ordered then return nil end
 
   local kind = orderType(index)
@@ -367,7 +409,33 @@ local function orderedCursor(current: TableState, request: queryEngine.Request):
   }
 end
 
+-- Each prefix value has its own suffix AVL tree. There is no combined-string
+-- encoding: suffix comparison preserves numeric ordering and avoids collisions.
+local function compositeSet(composite: Composite, row: Row, key: string, present: boolean)
+  local prefix = row[composite.prefix]
+  if prefix == nil then return end
+  local encoded = keyOf(prefix)
+  local index = composite.partitions[encoded]
+  if not index then
+    if not present then return end
+    index = { buckets = {}, ordered = true, types = {} } :: Index
+    composite.partitions[encoded] = index
+  end
+  indexSet(index, row[composite.suffix], key, present)
+  if not present and next(index.buckets) == nil and index.nulls == nil then
+    composite.partitions[encoded] = nil
+  end
+end
+
 local function updateIndexes(current: TableState, key: string, before: Row?, after: Row?)
+  for _, composite in current.composites do
+    if before and after and before[composite.prefix] == after[composite.prefix]
+      and before[composite.suffix] == after[composite.suffix] then continue end
+
+    if before then compositeSet(composite, before, key, false) end
+    if after then compositeSet(composite, after, key, true) end
+  end
+
   for column, index in current.secondary do
     local oldValue = if before then before[column] else nil
     local newValue = if after then after[column] else nil
@@ -413,6 +481,54 @@ local function tableProvider(state: DatabaseState, name: string): queryEngine.Pr
     countFiltered = function(request)
       if not request.whereComplete or #request.constraints == 0 then return nil end
       local tableState = state.tables[name] :: TableState
+      -- Composite (prefix = value, suffix range) counts can be answered by one
+      -- partition's subtree weights without reading any matching rows.
+      for _, composite in tableState.composites do
+        local prefixValue: unknown = nil
+        local hasPrefix, hasRange, compatible = false, false, true
+        local lower: (string | number)? = nil
+        local upper: (string | number)? = nil
+        local lowerStrict, upperStrict = false, false
+        for _, constraint in request.constraints do
+          if constraint.column == composite.prefix and constraint.op == '=' then
+            if hasPrefix then compatible = false; break end
+            hasPrefix, prefixValue = true, constraint.value
+          elseif constraint.column == composite.suffix and
+            (constraint.op == '<' or constraint.op == '<=' or constraint.op == '>' or constraint.op == '>=') then
+            if constraint.value == nil then return 0 end
+            local value = constraint.value
+            if type(value) ~= 'number' and type(value) ~= 'string' then compatible = false; break end
+            local bound = value :: string | number
+            if constraint.op == '>' or constraint.op == '>=' then
+              if not lower or ordered.compare(bound, lower) > 0
+                or (bound == lower and constraint.op == '>') then
+                lower, lowerStrict = bound, constraint.op == '>'
+              end
+            else
+              if not upper or ordered.compare(bound, upper) < 0
+                or (bound == upper and constraint.op == '<') then
+                upper, upperStrict = bound, constraint.op == '<'
+              end
+            end
+            hasRange = true
+          else
+            compatible = false
+            break
+          end
+        end
+
+        if compatible and hasPrefix and hasRange then
+          if prefixValue == nil then return 0 end
+          if not scalar(prefixValue) then break end
+          local index = composite.partitions[keyOf(prefixValue)]
+          if not index then return 0 end
+          local kind = orderType(index)
+          if kind and (kind == 'empty' or ((not lower or type(lower) == kind)
+            and (not upper or type(upper) == kind))) then
+            return ordered.countRange(index.tree, lower, lowerStrict, upper, upperStrict)
+          end
+        end
+      end
       -- A fully covered range over one ordered column can be counted by AVL
       -- subtree cardinalities without reading or materializing any rows.
       local rangeColumn: string? = nil
@@ -562,7 +678,7 @@ local function apply(state: DatabaseState, operations: { Operation })
       local schema = makeSchema(operation.columns :: { string }, operation.primaryKey :: string)
       state.tables[name] = {
         schema = schema, rows = {}, order = {}, seen = {}, count = 0,
-        secondary = {}, available = { [schema.primaryKey] = true },
+        secondary = {}, composites = {}, available = { [schema.primaryKey] = true },
       }
 
       state.engine:register(name, tableProvider(state, name))
@@ -583,6 +699,16 @@ local function apply(state: DatabaseState, operations: { Operation })
       end
       current.secondary[column] = index
       current.available[column] = true
+    elseif operation.kind == 'composite' then
+      local current = state.tables[name] :: TableState
+      local prefix = operation.column :: string
+      local suffix = operation.suffix :: string
+      local composite: Composite = { prefix = prefix, suffix = suffix, partitions = {} }
+      for _, key in current.order do
+        local row = current.rows[key]
+        if row then compositeSet(composite, row, key, true) end
+      end
+      current.composites[compositeName(prefix, suffix)] = composite
     elseif operation.kind == 'put' then
       local current = state.tables[name] :: TableState
       local row = operation.row :: Row
@@ -608,7 +734,7 @@ local function apply(state: DatabaseState, operations: { Operation })
       error('jessql storage: unknown log operation', 2)
     end
 
-    if operation.kind == 'create' or operation.kind == 'addcol' or operation.kind == 'index' then
+    if operation.kind == 'create' or operation.kind == 'addcol' or operation.kind == 'index' or operation.kind == 'composite' then
       state.schemaVersion += 1
     end
   end
@@ -618,7 +744,7 @@ local function buildTransaction(state: DatabaseState)
   local operations: { Operation } = {}
   local staged: Pending = {}
   local created, altered = {} :: { [string]: Schema }, {} :: { [string]: Schema }
-  local indexed: { [string]: { [string]: boolean } } = {}
+  local indexed, composites = {} :: { [string]: { [string]: boolean } }, {} :: { [string]: { [string]: boolean } }
   local active = true
   local transaction = {} :: Transaction
 
@@ -702,6 +828,28 @@ local function buildTransaction(state: DatabaseState)
 
   function transaction.createOrderedIndex(_self: Transaction, name: string, column: string)
     index(name, column, true)
+  end
+
+  function transaction.createCompositeIndex(_self: Transaction, name: string, prefix: string, suffix: string)
+    writable()
+    name = requireName(name)
+    prefix = requireName(prefix)
+    suffix = requireName(suffix)
+    local schema = findSchema(name)
+    if prefix == suffix then error('jessql storage: composite columns must differ', 2) end
+
+    if not schema.allowed[prefix] or not schema.allowed[suffix] then
+      error('jessql storage: no such composite index column', 2)
+    end
+    local id = compositeName(prefix, suffix)
+    local current = state.tables[name]
+    if (current and current.composites[id]) or (composites[name] and composites[name][id]) then
+      error('jessql storage: composite index already exists', 2)
+    end
+
+    if not composites[name] then composites[name] = {} end
+    composites[name][id] = true
+    operations[#operations + 1] = { kind = 'composite', table = name, column = prefix, suffix = suffix, key = nil }
   end
 
   function transaction.get(_self: Transaction, name: string, key: unknown): Row?
@@ -812,6 +960,8 @@ local function replay(state: DatabaseState, operations: { Operation })
       else
         tx:createIndex(operation.table, operation.column :: string)
       end
+    elseif operation.kind == 'composite' then
+      tx:createCompositeIndex(operation.table, operation.column :: string, operation.suffix :: string)
     elseif operation.kind == 'addcol' then
       tx:addColumn(operation.table, operation.column :: string)
     elseif operation.kind == 'put' then
@@ -997,6 +1147,10 @@ function storage.open(path: string, options: Options?): Store
     self:transaction(function(tx) tx:createOrderedIndex(name, column) end)
   end
 
+  function db.createCompositeIndex(self: Store, name: string, prefix: string, suffix: string)
+    self:transaction(function(tx) tx:createCompositeIndex(name, prefix, suffix) end)
+  end
+
   function db.addColumn(self: Store, name: string, column: string)
     self:transaction(function(tx) tx:addColumn(name, column) end)
   end
@@ -1070,7 +1224,7 @@ function storage.open(path: string, options: Options?): Store
     ready()
     local output: { [string]: TableMetrics } = {}
     for name, current in state.tables do
-      local metrics: TableMetrics = { rows = current.count, keySlots = #current.order, indexSlots = {}, indexKeys = {} }
+      local metrics: TableMetrics = { rows = current.count, keySlots = #current.order, indexSlots = {}, indexKeys = {}, compositePartitions = {} }
       for column, index in current.secondary do
         local slots, keys = 0, 0
         for _, bucket in index.buckets do
@@ -1079,6 +1233,12 @@ function storage.open(path: string, options: Options?): Store
         end
         metrics.indexSlots[column] = slots
         metrics.indexKeys[column] = keys
+      end
+
+      for id, composite in current.composites do
+        local partitions = 0
+        for _ in composite.partitions do partitions += 1 end
+        metrics.compositePartitions[id] = partitions
       end
       output[name] = metrics
     end
@@ -1140,6 +1300,14 @@ function storage.open(path: string, options: Options?): Store
             ordered = current.secondary[column].ordered == true, key = nil })
         end
 
+        local compoundNames: { string } = {}
+        for id in current.composites do compoundNames[#compoundNames + 1] = id end
+        table.sort(compoundNames)
+        for _, id in compoundNames do
+          local compound = current.composites[id]
+          add({ kind = 'composite', table = name, column = compound.prefix, suffix = compound.suffix, key = nil })
+        end
+
         for _, key in current.order do
           local row = current.rows[key]
           if row then add({ kind = 'put', table = name, row = row, key = nil }) end
@@ -1172,6 +1340,13 @@ function storage.open(path: string, options: Options?): Store
       end
       current.order = liveOrder
       current.seen = liveSeen
+      for _, composite in current.composites do
+        composite.partitions = {}
+        for _, key in liveOrder do
+          compositeSet(composite, current.rows[key], key, true)
+        end
+      end
+
       for column in current.secondary do
         local wasOrdered = current.secondary[column].ordered == true
         local index: Index = { buckets = {}, ordered = wasOrdered,

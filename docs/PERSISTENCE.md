@@ -42,8 +42,9 @@ A prepared plan validates the store schema generation and rejects execution or
 explanation after `createTable`, `addColumn`, or `createIndex`. Re-prepare queries
 after schema changes. Plans also reject use after database close.
 
-SQL `INSERT`, `UPDATE`, `DELETE`, `CREATE TABLE`, and `CREATE INDEX` syntax are
-**not yet parsed**; use the typed mutation API. SQL reads within an in-progress
+SQL `INSERT`, `UPDATE`, and `DELETE` support the intentionally restricted
+parameterized DML grammar described below. SQL `CREATE TABLE` and `CREATE INDEX`
+are not parsed; use the typed schema API. SQL reads within an in-progress
 transaction see committed state, not the staged overlay; use `tx:get` to read
 your pending writes. Transactions must not yield. There is no MVCC, schema
 migration, foreign-key enforcement, composite key, query cancellation or online
@@ -151,9 +152,7 @@ Exact `COUNT(*)` on fully-covered, single-column bounded ranges can use AVL
 subtree cardinalities in O(log distinct values), including duplicate values.
 The tree and count metadata are rebuilt on reopen/checkpoint from durable log
 records; schema mutations invalidate prepared SQL plans. The tree and its
-posting lists are still entirely in memory, *not* a disk B-tree. There is no
-composite `(room_id, stream_id)` index yet, so a separate room equality predicate
-may still require filtering or sorting many rows. The implementation never
+posting lists are still entirely in memory, *not* a disk B-tree. Composite `(room_id, stream_id)` indexes are available as described below. The implementation never
 claims to have fully evaluated a residual SQL WHERE condition that it did not.
 
 ## Parameterized SQL mutations
@@ -189,3 +188,39 @@ The restriction is intentional: we do not yet have statement-level predicate
 snapshots, row-level constraints, or multi-row mutation limits. A failed DML
 statement inside a transaction throws; if the caller does not catch it, the
 whole callback rolls back without appending the journal frame.
+
+## Composite ordered indexes for scoped streams
+
+`db:createCompositeIndex(table, equalityColumn, orderedColumn)` (also available
+on `tx`) creates a two-column in-memory index. Its first column is an exact
+partition key; each partition maintains its own AVL tree over the second
+column. For example:
+
+```luau
+db:createCompositeIndex('events', 'room_id', 'stream_id')
+local page = db:prepare([[
+  SELECT event_id, stream_id FROM events
+  WHERE room_id = ? AND stream_id > ?
+  ORDER BY stream_id LIMIT 100
+]])
+local rows = page.run({ '!room', lastStreamId }).rows
+```
+
+`ORDER BY` can be ascending or descending. Exact prefix-equality and suffix
+range predicates (`<`, `<=`, `>`, `>=`) can seek within one partition, rather
+than iterating through events belonging to other rooms. Fully covered
+`COUNT(*)` queries of the same shape can use subtree cardinalities. The SQL
+executor retains responsibility for all residual filters and SQL type
+semantics. NULL-prefix records do not match prefix equality; NULL suffixes
+follow the same sort order as the existing ordered provider. Heterogeneous
+suffix types that are not safely comparable fall back to normal evaluation.
+
+Both columns must exist and differ. Duplicate composite definitions are
+rejected; the schema operation is journaled atomically and survives checkpoint
+and reopen. Updates/deletes maintain both the index and bounded posting lists;
+empty partitions are reclaimed. `db:stats()` reports `compositePartitions`
+for diagnostics. All partitions and rows are still memory-resident. Only a
+**two-column** equality-prefix/ordered-suffix index is currently supported;
+this is not a general multi-column B-tree or a disk index.
+
+Benchmark with `jess run --trusted --package . bench/composite.jsl 25000 150`.

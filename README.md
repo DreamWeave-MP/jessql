@@ -167,3 +167,10 @@ db:close()
 See [the persistence documentation](docs/PERSISTENCE.md) for supported SQL,
 NULL binding, transaction semantics, range index limitations and the missing
 power-loss durability barrier.
+
+### Scoped ordered indexes (native persistence branch)
+
+An experimental two-column `db:createCompositeIndex('events', 'room_id', 'stream_id')`
+keeps per-room ordered stream indexes, including bounded ascending/descending
+queries and exact range counts. This is pure JSL and uses the existing WAL;
+see `docs/PERSISTENCE.md` and `bench/composite.jsl` for guarantees and limits.

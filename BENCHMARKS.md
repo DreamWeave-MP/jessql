@@ -227,3 +227,20 @@ updates_per_mode=5000 parse_each_s=0.0630 prepared_s=0.0442 speedup=1.43x
 These are single-run observations, including row copy/index maintenance and
 journal commit, not parser-only timings. A larger representative DML suite is
 required to assess concurrency and long-term regressions.
+
+## Native two-column scoped ordered indexes (Jess 0.3.0, buffered)
+
+`jess run --trusted --package . bench/composite.jsl 25000 150` compares
+single-column `stream_id` ordered indexing to `room_id, stream_id` composite
+indexing on the **same 25,000 persisted rows in 64 rooms**, using the same
+prepared SQL and verifying identical SELECT row counts and COUNT(*) totals.
+
+| Query workload (150 repetitions) | Global ordered index | Composite ordered index | Improvement |
+|---|---:|---:|---:|
+| `room_id = ? AND stream_id > ? ORDER BY stream_id LIMIT 20` | 0.08621 s | 0.00622 s | 13.87× |
+| `room_id = ? AND stream_id >= ? AND stream_id < ?` exact count | 0.09081 s | 0.00068 s | 134.17× |
+
+Building the composite index took 0.09321 seconds. These are one-run CPU-time
+microbenchmarks, not reliable p99 measurements. Rows, indexes, and range
+queries execute in memory after buffered log appends; they are **not**
+fsync-protected and do not imply disk-B-tree performance.

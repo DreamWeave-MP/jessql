@@ -637,6 +637,133 @@ suite.describe('native persistent store', function()
     clean(path)
   end)
 
+  suite.it('seeks a composite room stream and preserves ordering through checkpoint/reopen', function()
+    local path = fixture('composite-stream')
+    local db = sql.open(path)
+    db:createTable('events', { 'id', 'room_id', 'stream_id', 'body' }, 'id')
+    db:transaction(function(tx)
+      for id = 1, 120 do
+        tx:insert('events', { id = id, room_id = if id % 3 == 0 then 'a' else 'b',
+          stream_id = 121 - id, body = 'body' })
+      end
+    end)
+    db:createOrderedIndex('events', 'stream_id')
+    local statement = 'SELECT stream_id FROM events WHERE room_id = ? AND stream_id >= ? AND stream_id < ? ORDER BY stream_id LIMIT 5'
+    local before = db:query(statement, { 'a', 25, 70 })
+    local expected: { number } = {}
+    for id = 1, 120 do
+      local seq = 121 - id
+      if id % 3 == 0 and seq >= 25 and seq < 70 then expected[#expected + 1] = seq end
+    end
+    table.sort(expected)
+    expect(#before.rows).toBe(5)
+    for index = 1, 5 do expect(before.rows[index].stream_id).toBe(expected[index]) end
+
+    db:createCompositeIndex('events', 'room_id', 'stream_id')
+    local query = db:prepare(statement)
+    local after = query.run({ 'a', 25, 70 })
+    expect(#after.rows).toBe(5)
+    for index = 1, 5 do expect(after.rows[index].stream_id).toBe(expected[index]) end
+    local desc = db:query('SELECT stream_id FROM events WHERE room_id = ? ORDER BY stream_id DESC LIMIT 3', { 'a' })
+    expect(desc.rows[1].stream_id).toBe(118)
+    expect(desc.rows[2].stream_id).toBe(115)
+    expect(desc.rows[3].stream_id).toBe(112)
+    expect(db:stats().events.compositePartitions['room_id:stream_id']).toBe(2)
+
+    db:checkpoint()
+    db:close()
+    db = sql.open(path)
+    expect(#db:query(statement, { 'a', 25, 70 }).rows).toBe(5)
+    expect(db:stats().events.compositePartitions['room_id:stream_id']).toBe(2)
+    -- Mutations move postings between partitions and remove empty partitions.
+    db:update('events', 3, { room_id = 'c', stream_id = 1 })
+    expect(db:query('SELECT COUNT(*) AS n FROM events WHERE room_id = ? AND stream_id >= ?', { 'c', 0 }).rows[1].n).toBe(1)
+    db:delete('events', 3)
+    expect(db:stats().events.compositePartitions['room_id:stream_id']).toBe(2)
+    db:close()
+    clean(path)
+  end)
+
+  suite.it('composite exact range counts match a model under repeated update/delete churn', function()
+    local path = fixture('composite-count')
+    local db = sql.open(path)
+    db:createTable('events', { 'id', 'room', 'sequence' }, 'id')
+    db:createCompositeIndex('events', 'room', 'sequence')
+    local model: { [number]: { room: string, sequence: number } } = {}
+    for id = 1, 80 do
+      local room = if id % 2 == 0 then 'a' else 'b'
+      local seq = id % 11
+      model[id] = { room = room, sequence = seq }
+      db:insert('events', { id = id, room = room, sequence = seq })
+    end
+
+    local function verify()
+      for _, room in { 'a', 'b', 'missing' } do
+        for low = -2, 12, 3 do
+          local high = low + 6
+          local expected = 0
+          for _, data in model do
+            if data.room == room and data.sequence > low and data.sequence <= high then expected += 1 end
+          end
+          local actual = db:query('SELECT COUNT(*) AS n FROM events WHERE room = ? AND sequence > ? AND sequence <= ?', { room, low, high })
+          expect(actual.rows[1].n).toBe(expected)
+        end
+      end
+    end
+    verify()
+    for id = 1, 80 do
+      if id % 9 == 0 then
+        db:delete('events', id)
+        model[id] = nil
+      else
+        local room = if id % 5 == 0 then 'c' else if id % 2 == 0 then 'a' else 'b'
+        local seq = (id * 7) % 13
+        db:update('events', id, { room = room, sequence = seq })
+        model[id] = { room = room, sequence = seq }
+      end
+    end
+    verify()
+    db:checkpoint()
+    db:close()
+    db = sql.open(path)
+    verify()
+    db:close()
+    clean(path)
+  end)
+
+  suite.it('rejects invalid and duplicate composite indexes without corrupting schema', function()
+    local path = fixture('composite-errors')
+    local db = sql.open(path)
+    db:createTable('events', { 'id', 'room', 'sequence' }, 'id')
+    -- An index must contain two distinct schema columns.
+    expect(pcall(function() db:createCompositeIndex('events', 'room', 'room') end)).toBe(false)
+    -- An unknown prefix is never silently admitted.
+    expect(pcall(function() db:createCompositeIndex('events', 'missing', 'sequence') end)).toBe(false)
+    -- An unknown suffix is never silently admitted.
+    expect(pcall(function() db:createCompositeIndex('events', 'room', 'missing') end)).toBe(false)
+    -- Rollback must discard the pending schema operation.
+    local worked = pcall(function()
+      db:transaction(function(tx)
+        tx:createCompositeIndex('events', 'room', 'sequence')
+        error('discard proposed schema change')
+      end)
+    end)
+    expect(worked).toBe(false)
+    db:createCompositeIndex('events', 'room', 'sequence')
+    -- Duplicate index definitions fail without altering the existing index.
+    expect(pcall(function() db:createCompositeIndex('events', 'room', 'sequence') end)).toBe(false)
+    local old = db:prepare('SELECT id FROM events')
+    db:createCompositeIndex('events', 'sequence', 'room')
+    -- Schema changes invalidate prepared queries.
+    expect(pcall(function() old.run() end)).toBe(false)
+    db:close()
+    db = sql.open(path)
+    -- Journal replay must restore the duplicate-index guard.
+    expect(pcall(function() db:createCompositeIndex('events', 'room', 'sequence') end)).toBe(false)
+    db:close()
+    clean(path)
+  end)
+
   suite.it('refuses a second writer while the first lock is held', function()
     local path = fixture('lock')
     local db = sql.open(path)
