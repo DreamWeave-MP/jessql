@@ -5,7 +5,7 @@ id = "org.dreamweave.jessql"
 version = "0.1.6"
 jess_api = "1"
 include = ["src", "bench", "tests", "docs", "README.md"]
-tests = ["tests/run.jsl", "tests/semantics.jsl", "tests/style.jsl", "tests/storage.jsl", "tests/paged.jsl", "tests/hybrid.jsl", "tests/secondary.jsl", "tests/segments.jsl"]
+tests = ["tests/run.jsl", "tests/semantics.jsl", "tests/style.jsl", "tests/storage.jsl", "tests/paged.jsl", "tests/hybrid.jsl", "tests/secondary.jsl", "tests/segments.jsl", "tests/delta.jsl"]
 
 [modules]
 "@jessql" = "src/init.jsl"
@@ -18,10 +18,11 @@ tests = ["tests/run.jsl", "tests/semantics.jsl", "tests/style.jsl", "tests/stora
 "@jessql/paged" = "src/paged.jsl"
 "@jessql/hybrid" = "src/hybrid.jsl"
 "@jessql/segments" = "src/segments.jsl"
+"@jessql/delta" = "src/delta.jsl"
 "@jessql/secondary" = "src/secondary.jsl"
 "@jessql/compactsecondary" = "src/compactsecondary.jsl"
 "@jessql/mutations" = "src/mutations.jsl"
 
 [[layer]]
 id = "jessql.core"
-exports = ["@jessql", "@jessql/lexer", "@jessql/parser", "@jessql/engine", "@jessql/storage", "@jessql/ordered", "@jessql/packed", "@jessql/paged", "@jessql/hybrid", "@jessql/segments", "@jessql/secondary", "@jessql/compactsecondary", "@jessql/mutations"]
+exports = ["@jessql", "@jessql/lexer", "@jessql/parser", "@jessql/engine", "@jessql/storage", "@jessql/ordered", "@jessql/packed", "@jessql/paged", "@jessql/hybrid", "@jessql/segments", "@jessql/delta", "@jessql/secondary", "@jessql/compactsecondary", "@jessql/mutations"]

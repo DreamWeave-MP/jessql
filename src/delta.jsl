@@ -1,0 +1,139 @@
+--!strict
+--!native
+-- Bounded-memory external sort for immutable delta candidates.
+-- Scratch runs are never published as database generations.
+local paged = require('@jessql/paged')
+local segments = require('@jessql/segments')
+local fs = require('@dream/fs')
+
+export type Row = { [string]: unknown }
+export type Options = { pageBytes: number?, runRows: number?, mergeFanIn: number?, maxRows: number? }
+export type Metrics = { rows: number, spilledRuns: number, mergePasses: number, maxBufferedRows: number }
+
+local DefaultRunRows = 8192
+local DefaultFanIn = 8
+local delta = {}
+
+local function compare(leftValue: unknown, rightValue: unknown): number
+  local left, right = type(leftValue), type(rightValue)
+  local ranks = { boolean = 1, number = 2, string = 3 }
+  if left ~= right then return if (ranks[left] or 9) < (ranks[right] or 9) then -1 else 1 end
+  if leftValue == rightValue then return 0 end
+  if left == 'boolean' then return if leftValue == false then -1 else 1 end
+  if left == 'number' then return if (leftValue :: number) < (rightValue :: number) then -1 else 1 end
+  return if (leftValue :: string) < (rightValue :: string) then -1 else 1
+end
+
+local function boundedInteger(value: number, min: number, max: number, name: string)
+  if type(value) ~= 'number' or value % 1 ~= 0 or value < min or value > max then
+    error('jessql delta: invalid ' .. name, 3)
+  end
+end
+
+-- Consume each row exactly once. At most `runRows` unsorted records are held
+-- in memory. After spilling, merge groups of at most `mergeFanIn` snapshots,
+-- repeating levels until a single sorted candidate can be emitted.
+-- There is no automatic publication, WAL truncation or file retirement.
+function delta.create(path: string, columns: { string }, primaryKey: string,
+  nextRow: () -> Row?, options: Options?): Metrics
+  local runRows = if options and options.runRows then options.runRows else DefaultRunRows
+  local fanIn = if options and options.mergeFanIn then options.mergeFanIn else DefaultFanIn
+  local pageBytes = if options then options.pageBytes else nil
+  local maxRows = if options and options.maxRows then options.maxRows else math.huge
+  boundedInteger(runRows, 2, 65536, 'runRows')
+  boundedInteger(fanIn, 2, 8, 'mergeFanIn')
+  if maxRows ~= math.huge then boundedInteger(maxRows, 0, 1000000000, 'maxRows') end
+
+  if type(path) ~= 'string' or path == '' or type(nextRow) ~= 'function' then
+    error('jessql delta: invalid output or iterator', 2)
+  end
+
+  local scratch: { string } = {}
+  local sequence = 0
+  local metrics: Metrics = { rows = 0, spilledRuns = 0, mergePasses = 0, maxBufferedRows = 0 }
+  local bufferRows: { Row } = {}
+  local runs: { string } = {}
+
+  local function scratchPath(): string
+    sequence += 1
+    return path .. '.jql-run-' .. tostring(sequence)
+  end
+
+  local function fromBuffer(): () -> Row?
+    table.sort(bufferRows, function(left, right)
+      return compare(left[primaryKey], right[primaryKey]) < 0
+    end)
+    local position = 0
+    return function(): Row?
+      position += 1
+      return bufferRows[position]
+    end
+  end
+
+  local function spill()
+    if #bufferRows == 0 then return end
+    local destination = scratchPath()
+    paged.create(destination, columns, primaryKey, fromBuffer(), { pageBytes = pageBytes })
+    scratch[#scratch + 1] = destination
+    runs[#runs + 1] = destination
+    metrics.spilledRuns += 1
+    bufferRows = {}
+  end
+
+  local function merge(destination: string, paths: { string })
+    segments.compact(destination, paths, { cachePages = 1, pageBytes = pageBytes })
+  end
+
+  -- Row sources and page writes can fail; remove every completed scratch run before propagating.
+  local ok, failure = pcall(function()
+    while true do
+      local row = nextRow()
+      if not row then break end
+      metrics.rows += 1
+      if metrics.rows > maxRows then error('jessql delta: maximum row count exceeded') end
+      bufferRows[#bufferRows + 1] = row
+      metrics.maxBufferedRows = math.max(metrics.maxBufferedRows, #bufferRows)
+      if #bufferRows >= runRows then spill() end
+    end
+
+    if #runs == 0 then
+      -- Small deltas avoid scratch files and extra disk writes altogether.
+      paged.create(path, columns, primaryKey, fromBuffer(), { pageBytes = pageBytes })
+      return
+    end
+
+    spill()
+    while #runs > fanIn do
+      metrics.mergePasses += 1
+      local nextRuns: { string } = {}
+      local offset = 1
+      while offset <= #runs do
+        local group: { string } = {}
+        for index = offset, math.min(offset + fanIn - 1, #runs) do
+          group[#group + 1] = runs[index]
+        end
+
+        if #group == 1 then
+          nextRuns[#nextRuns + 1] = group[1]
+        else
+          local destination = scratchPath()
+          merge(destination, group)
+          scratch[#scratch + 1] = destination
+          nextRuns[#nextRuns + 1] = destination
+        end
+        offset += fanIn
+      end
+      runs = nextRuns
+    end
+
+    if #runs > 1 then metrics.mergePasses += 1 end
+    merge(path, runs)
+  end)
+
+  -- No scratch file may survive a successful build or an exception.
+  for _, temporary in scratch do fs.remove(temporary) end
+  if not ok then error(failure, 2) end
+  return metrics
+end
+
+return delta

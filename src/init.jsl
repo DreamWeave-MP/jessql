@@ -9,6 +9,7 @@ local paged = require('@jessql/paged')
 local hybrid = require('@jessql/hybrid')
 local secondary = require('@jessql/secondary')
 local segments = require('@jessql/segments')
+local delta = require('@jessql/delta')
 
 export type Database = engine.Database
 export type PersistentDatabase = storage.Store
@@ -43,6 +44,7 @@ return {
   hybrid = hybrid,
   secondary = secondary,
   segments = segments,
+  delta = delta,
   NULL = mutations.NULL,
   parse = parser.parse,
   lex = lexer.lex,
