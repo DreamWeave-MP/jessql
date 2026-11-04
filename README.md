@@ -41,6 +41,15 @@ generation lists, delete cold files, or claim power-loss durability. See
 [segment semantics and safety](docs/SEGMENTS.md) and
 [segment-index benchmark](BENCHMARKS.md#segmented-cold-secondary-index-merge).
 
+## Experimental bounded hot-delta candidates
+
+`db:exportDelta(rowsPath, deletedPath, { runRows = 8192, mergeFanIn = 8 })`
+streams **only** committed hot rows and WAL tombstones to a pair of immutable
+candidate files, using an external sorter with bounded input batches.
+This avoids rebuilding the entire cold logical dataset per flush. It does not
+rotate the existing WAL, adopt the candidate, or reclaim previous generations.
+See [delta-flush semantics and benchmarks](docs/DELTA-FLUSH.md).
+
 ## Package
 
 - package: `org.dreamweave.jessql` 0.1.6

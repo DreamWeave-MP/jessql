@@ -1,0 +1,218 @@
+--!strict
+local sql = require('@jessql')
+local fs = require('@dream/fs')
+local test = require('@jess/test')
+local suite, expect = test.new(), test.expect
+
+local function basePath(name: string): string
+  local wd, failure = fs.cwd()
+  local cwd: string = assert(wd, failure)
+  return fs.join(cwd, '.jessql-delta-' .. name)
+end
+
+local function expectAbsent(path: string)
+  local exists = fs.exists(path)
+  expect(exists).toBe(false)
+end
+
+local function clear(base: string)
+  for _, ending in { '.base', '.rows', '.deletes', '.wal', '.wal.lock',
+    '.new.wal', '.new.wal.lock', '.other' } do
+    fs.remove(base .. ending)
+  end
+end
+
+suite.describe('bounded delta candidates', function()
+  suite.it('externally sorts into a checksummed snapshot with bounded runs and multilevel merge', function()
+    local base = basePath('external')
+    clear(base)
+    local nextNumber = 742
+    local result = sql.delta.create(base .. '.rows', { 'id', 'value' }, 'id', function()
+      nextNumber -= 1
+      if nextNumber == 0 then return nil end
+      return { id = nextNumber, value = nextNumber * 13 }
+    end, { runRows = 13, mergeFanIn = 3, pageBytes = 512 })
+    expect(result.rows).toBe(741)
+    expect(result.maxBufferedRows).toBe(13)
+    expect(result.spilledRuns > 50).toBe(true)
+    expect(result.mergePasses > 1).toBe(true)
+    local snapshot = sql.paged.open(base .. '.rows', { cachePages = 1 })
+    expect(snapshot.count).toBe(741)
+    expect((assert(snapshot:get(1))).value).toBe(13)
+    expect((assert(snapshot:get(741))).value).toBe(9633)
+    local nextRow = snapshot:iterateRows({ 'id' }, true)
+    for id = 741, 1, -1 do expect((assert(nextRow())).id).toBe(id) end
+    expect(nextRow()).toBe(nil)
+    snapshot:close()
+    for id = 1, result.spilledRuns + result.mergePasses * 100 do
+      expectAbsent(base .. '.rows.jql-run-' .. tostring(id))
+    end
+    clear(base)
+  end)
+
+  suite.it('rejects over-budget and malformed builds without publishing a result', function()
+    local base = basePath('failure')
+    clear(base)
+    local key = 0
+    -- An over-budget source must fail and leave no candidate or scratch files.
+    local ok = pcall(function()
+      sql.delta.create(base .. '.rows', { 'id' }, 'id', function()
+        key += 1
+        return if key <= 20 then { id = key } else nil
+      end, { runRows = 3, mergeFanIn = 2, maxRows = 11 })
+    end)
+    expect(ok).toBe(false)
+    expectAbsent(base .. '.rows')
+    for id = 1, 50 do expectAbsent(base .. '.rows.jql-run-' .. tostring(id)) end
+
+    -- Invalid external-sort parameters must fail before creating output files.
+    local bad = pcall(function()
+      sql.delta.create(base .. '.rows', { 'id' }, 'id', function()
+        return { id = 2 }
+      end, { runRows = 1 })
+    end)
+    expect(bad).toBe(false)
+    clear(base)
+  end)
+
+  suite.it('streams committed packed rows and invalidates old cursors after mutations', function()
+    local base = basePath('cursor')
+    clear(base)
+    local store = sql.open(base .. '.wal', { rowLayout = 'packed' })
+    store:createTable('events', { 'id', 'body' }, 'id')
+    for id = 1, 20 do store:insert('events', { id = id, body = 'event' }) end
+    local nextRow = store:iterateRows('events')
+    expect((assert(nextRow())).id).toBe(1)
+    store:insert('events', { id = 21, body = 'new' })
+    -- A stale cursor must reject use after a committed mutation.
+    local oldCursorValid = pcall(nextRow)
+    expect(oldCursorValid).toBe(false)
+    local current = store:iterateRows('events')
+    local count = 0
+    while current() do count += 1 end
+    expect(count).toBe(21)
+    local before = store:iterateRows('events')
+    local saved = assert(before())
+    saved.body = 'not committed'
+    expect((assert(store:get('events', saved.id))).body).toBe('event')
+    store:checkpoint()
+    -- A checkpoint can reset the WAL sequence; it still invalidates the cursor.
+    local checkpointCursorValid = pcall(before)
+    expect(checkpointCursorValid).toBe(false)
+    store:close()
+    clear(base)
+  end)
+
+  suite.it('exports hot rows and deletions as an independently replayable delta generation', function()
+    local base = basePath('hybrid')
+    clear(base)
+    local position = 0
+    sql.paged.create(base .. '.base', { 'id', 'room', 'value' }, 'id', function()
+      position += 1
+      if position > 300 then return nil end
+      return { id = position, room = if position % 2 == 0 then 'even' else 'odd', value = position }
+    end, { pageBytes = 512 })
+    local db = sql.hybrid.open(base .. '.wal', base .. '.base', 'events', { rowLayout = 'packed' })
+    db:transaction(function(tx)
+      for id = 20, 100 do tx:upsert({ id = id, room = 'moved', value = id * 10 }) end
+      for id = 101, 145 do expect(tx:delete(id)).toBe(true) end
+      for id = 301, 370 do tx:insert({ id = id, room = 'new', value = id }) end
+      tx:upsert({ id = 110, room = 'reintroduced', value = 1100 })
+    end)
+    local result = db:exportDelta(base .. '.rows', base .. '.deletes',
+      { runRows = 7, mergeFanIn = 3, pageBytes = 512 })
+    expect(result.rows.rows).toBe(152)
+    expect(result.deletions.rows).toBe(45)
+    expect(result.rows.maxBufferedRows <= 7).toBe(true)
+    expect(result.deletions.maxBufferedRows <= 7).toBe(true)
+    -- The original WAL remains open and bound to the original single snapshot.
+    expect((assert(db:get(110))).value).toBe(1100)
+    expect(db:get(111)).toBe(nil)
+    local sources = { base .. '.base', base .. '.rows' }
+    local cold = sql.segments.open(sources, { deletePaths = { [2] = base .. '.deletes' } })
+    expect(cold:get(111)).toBe(nil)
+    expect((assert(cold:get(50))).value).toBe(500)
+    expect((assert(cold:get(110))).value).toBe(1100)
+    expect((assert(cold:get(305))).room).toBe('new')
+    for id = 1, 370 do
+      local original = db:get(id)
+      local exported = cold:get(id)
+      expect(original == nil).toBe(exported == nil)
+      if original and exported then
+        expect(original.value).toBe(exported.value)
+        expect(original.room).toBe(exported.room)
+      end
+    end
+    cold:close()
+    local newDatabase = sql.hybrid.open(base .. '.new.wal', sources, 'events', {
+      rowLayout = 'packed', deletePaths = { [2] = base .. '.deletes' },
+    })
+    expect(newDatabase:query('SELECT COUNT(*) AS n FROM events').rows[1].n)
+      .toBe(db:query('SELECT COUNT(*) AS n FROM events').rows[1].n)
+    newDatabase:close()
+    db:close()
+    -- A candidate cannot silently rebind the original WAL.
+    local mismatch = pcall(function()
+      sql.hybrid.open(base .. '.wal', sources, 'events', {
+        deletePaths = { [2] = base .. '.deletes' },
+      })
+    end)
+    expect(mismatch).toBe(false)
+    clear(base)
+  end)
+
+  suite.it('does not leave a rows-only candidate if deletion publication fails', function()
+    local base = basePath('paired-error')
+    clear(base)
+    local id = 0
+    sql.paged.create(base .. '.base', { 'id', 'body' }, 'id', function()
+      id += 1
+      return if id <= 4 then { id = id, body = 'original' } else nil
+    end)
+    local db = sql.hybrid.open(base .. '.wal', base .. '.base', 'events')
+    db:delete(1)
+    db:delete(2)
+    -- The deletion-sidecar requires three rows (identity + two tombstones).
+    -- With a 2-row maximum, the rows snapshot can finish but the pair cannot.
+    local succeeded = pcall(function()
+      db:exportDelta(base .. '.rows', base .. '.deletes', { runRows = 2, maxRows = 2 })
+    end)
+    expect(succeeded).toBe(false)
+    expectAbsent(base .. '.rows')
+    expectAbsent(base .. '.deletes')
+    expect(db:get(1)).toBe(nil)
+    db:close()
+    clear(base)
+  end)
+
+  suite.it('supports empty and deletion-only candidate generations', function()
+    local base = basePath('empty')
+    clear(base)
+    local id = 0
+    sql.paged.create(base .. '.base', { 'id', 'body' }, 'id', function()
+      id += 1
+      return if id <= 8 then { id = id, body = 'old' } else nil
+    end)
+    local db = sql.hybrid.open(base .. '.wal', base .. '.base', 'events')
+    local empty = db:exportDelta(base .. '.rows', base .. '.deletes', { runRows = 2 })
+    expect(empty.rows.rows).toBe(0)
+    expect(empty.deletions.rows).toBe(1)
+    db:delete(3)
+    db:delete(8)
+    fs.remove(base .. '.rows')
+    fs.remove(base .. '.deletes')
+    local deletionOnly = db:exportDelta(base .. '.rows', base .. '.deletes', { runRows = 2 })
+    expect(deletionOnly.rows.rows).toBe(0)
+    expect(deletionOnly.deletions.rows).toBe(3)
+    local view = sql.segments.open({ base .. '.base', base .. '.rows' },
+      { deletePaths = { [2] = base .. '.deletes' } })
+    expect(view:get(3)).toBe(nil)
+    expect(view:get(8)).toBe(nil)
+    expect((assert(view:get(4))).body).toBe('old')
+    view:close()
+    db:close()
+    clear(base)
+  end)
+end)
+
+return suite

@@ -7,6 +7,8 @@ local storage = require('@jessql/storage')
 local paged = require('@jessql/paged')
 local segments = require('@jessql/segments')
 local secondary = require('@jessql/secondary')
+local delta = require('@jessql/delta')
+local fs = require('@dream/fs')
 
 export type Row = { [string]: unknown }
 export type Options = { cachePages: number?, rowLayout: string?, secondaryIndexPath: string?, secondaryIndexPaths: { string }?, deletePaths: { [number]: string }? }
@@ -29,6 +31,8 @@ export type Database = {
   prepare: (self: Database, sql: string) -> engine.Plan,
   stats: (self: Database) -> { coldRows: number, hotRows: number, tombstones: number, cachedPages: number },
   exportSnapshot: (self: Database, path: string, options: paged.Options?) -> (),
+  exportDelta: (self: Database, rowsPath: string, deletePath: string,
+    options: delta.Options?) -> { rows: delta.Metrics, deletions: delta.Metrics },
   close: (self: Database) -> (),
 }
 
@@ -629,6 +633,59 @@ function hybrid.open(walPath: string, snapshotPath: string | { string }, tableNa
       return row
     end
     paged.create(path, cold.columns, cold.primaryKey, nextRow, options)
+  end
+
+  -- Build an independent immutable candidate from the current hot overlay.
+  -- The source WAL remains the transaction authority and keeps its original
+  -- generation binding. Operators must separately validate and publish a
+  -- fresh WAL/generation identity before retiring any existing files.
+  function db.exportDelta(_self: Database, rowsPath: string, deletePath: string,
+    options: delta.Options?): { rows: delta.Metrics, deletions: delta.Metrics }
+    ready()
+    if activeTransaction then error('jessql hybrid: cannot export inside transaction', 2) end
+
+    if type(rowsPath) ~= 'string' or type(deletePath) ~= 'string'
+      or rowsPath == '' or deletePath == '' or rowsPath == deletePath
+      or rowsPath == walPath or deletePath == walPath then
+      error('jessql hybrid: invalid delta candidate paths', 2)
+    end
+
+    if fs.exists(rowsPath) or fs.exists(deletePath) then
+      error('jessql hybrid: candidate output already exists', 2)
+    end
+
+    -- Storage cursors are invalidated on any intervening WAL mutation; the
+    -- external sorter never materializes the entire hot table in memory.
+    local rowMetrics: delta.Metrics? = nil
+    local deleteMetrics: delta.Metrics? = nil
+    local rowsBuilt = false
+    -- Both candidate files form one logical generation. A failed deletion
+    -- export must not leave behind an apparently usable rows-only snapshot.
+    local built, failure = pcall(function()
+      rowMetrics = delta.create(rowsPath, cold.columns, cold.primaryKey,
+        store:iterateRows(name), options)
+      rowsBuilt = true
+      local snapshot = paged.open(rowsPath, { cachePages = 1 })
+      local token = snapshot.identity
+      snapshot:close()
+      local deleted = store:iterateRows(Tombstones)
+      local marker = false
+      deleteMetrics = delta.create(deletePath, { 'id', 'token' }, 'id', function(): Row?
+        if not marker then
+          marker = true
+          return { id = '!identity', token = token }
+        end
+        local row = deleted()
+        if not row then return nil end
+        return { id = row.id, token = '' }
+      end, options)
+    end)
+
+    if not built then
+      if rowsBuilt then fs.remove(rowsPath) end
+      error(failure, 2)
+    end
+    return { rows = rowMetrics :: delta.Metrics, deletions = deleteMetrics :: delta.Metrics }
   end
 
   function db.close(_self: Database)

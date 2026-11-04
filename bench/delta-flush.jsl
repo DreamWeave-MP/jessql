@@ -1,0 +1,65 @@
+--!strict
+--!native
+-- Compare exporting the entire logical database with bounded hot-only deltas.
+-- Prepare once; run both modes in fresh processes against identical input.
+local sql = require('@jessql')
+local fs = require('@dream/fs')
+
+local mode = arg[1] or 'delta'
+local coldRows = tonumber(arg[2]) or 80000
+local hotRows = tonumber(arg[3]) or 10000
+local base = arg[4] or '.jessql-delta-bench'
+local runRows = tonumber(arg[5]) or 1024
+local source = base .. '.base'
+local wal = base .. '.wal'
+local target = base .. '.candidate'
+local deletions = base .. '.deletions'
+
+if mode == 'cleanup' or mode == 'prepare' then
+  for _, path in { source, wal, wal .. '.lock', target, deletions } do fs.remove(path) end
+  if mode == 'cleanup' then return end
+
+  local index = 0
+  sql.paged.create(source, { 'id', 'room', 'body' }, 'id', function()
+    index += 1
+    if index > coldRows then return nil end
+    return { id = index, room = 'room-' .. tostring(index % 64), body = 'cold' }
+  end)
+  local db = sql.hybrid.open(wal, source, 'events', { rowLayout = 'packed', cachePages = 1 })
+  for chunk = 1, math.ceil(hotRows / 200) do
+    db:transaction(function(tx)
+      for offset = 1, 200 do
+        local number = (chunk - 1) * 200 + offset
+        if number > hotRows then break end
+        tx:upsert({ id = coldRows + number, room = 'room-' .. tostring(number % 64), body = 'hot' })
+      end
+    end)
+  end
+
+  db:transaction(function(tx)
+    for id = 1, 500 do tx:delete(id) end
+  end)
+  db:close()
+  print('prepared', coldRows, hotRows)
+  return
+end
+
+if mode ~= 'full' and mode ~= 'delta' then error('expected prepare, full, delta or cleanup') end
+for _, path in { target, deletions } do fs.remove(path) end
+local db = sql.hybrid.open(wal, source, 'events', { rowLayout = 'packed', cachePages = 1 })
+local opened = os.clock()
+local checksum = db:query('SELECT COUNT(*) AS n FROM events').rows[1].n
+local start = os.clock()
+if mode == 'delta' then
+  local result = db:exportDelta(target, deletions, { runRows = runRows, mergeFanIn = 4 })
+  print('delta_stats', result.rows.rows, result.deletions.rows,
+    result.rows.maxBufferedRows, result.rows.spilledRuns, result.rows.mergePasses)
+else
+  db:exportSnapshot(target)
+end
+local elapsed = os.clock() - start
+local snapshot = sql.paged.open(target)
+print('mode', mode, 'build_cpu_s', elapsed,
+  'opened_cpu_s', start - opened, 'output_rows', snapshot.count, 'query_rows', checksum)
+snapshot:close()
+db:close()
