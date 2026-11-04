@@ -160,6 +160,136 @@ suite.describe('immutable generation merging', function()
     cleanup(base)
   end)
 
+  suite.it('seeks across indexed generations and suppresses moved secondary keys', function()
+    local firstPath, secondPath, thirdPath, base = files('indexed')
+    local sources = { firstPath, secondPath, thirdPath }
+    local sidecars = { base .. '.a.idx', base .. '.b.idx', base .. '.c.idx' }
+    for _, path in sidecars do fs.remove(path) end
+    local bounds = { { 1, 140 }, { 61, 175 }, { 99, 200 } }
+    for generation, limits in bounds do
+      local key = limits[1] - 1
+      sql.paged.create(sources[generation], { 'id', 'room', 'stream', 'body' }, 'id', function()
+        key += 1
+        if key > limits[2] then return nil end
+
+        return { id = key,
+          room = if generation > 1 and key % 5 == 0 then 'moved'
+            else if key % 2 == 0 then 'even' else 'odd',
+          stream = if generation == 3 and key % 7 == 0 then key + 900 else key,
+          body = tostring(generation) .. ':' .. tostring(key) }
+      end, { pageBytes = 1024 })
+      sql.secondary.create(sidecars[generation], sources[generation], 'room', 'stream',
+        { format = 'compact', pageBytes = 512, runRows = 16, mergeFanIn = 3 })
+    end
+
+    local snapshotView = sql.segments.open(sources, { cachePages = 2 })
+    local indexedView = snapshotView:openIndexes(sidecars, { cachePages = 1 })
+    expect(indexedView.complete).toBe(true)
+    local forward = indexedView:iterate('even', false, 100, 170, false, true)
+    local last = -1
+    while true do
+      local row = forward()
+      if not row then break end
+      expect(row.room).toBe('even')
+      expect(row.stream >= 100 and row.stream < 170).toBe(true)
+      expect(row.stream > last).toBe(true)
+      expect(row.body).toBe((snapshotView:get(row.id) :: sql.Row).body)
+      last = row.stream :: number
+    end
+    local firstKey = snapshotView:get(100) :: sql.Row
+    expect(firstKey.room).toBe('moved')
+    local previous = math.huge
+    local reverse = indexedView:iterate('odd', true, 110, 165, false, false)
+    while true do
+      local row = reverse()
+      if not row then break end
+      expect(row.stream <= previous).toBe(true)
+      expect(row.room).toBe('odd')
+      previous = row.stream :: number
+    end
+    snapshotView:close()
+
+    local indexed = sql.hybrid.open(base .. '.wal', sources, 'events', {
+      cachePages = 2, rowLayout = 'packed', secondaryIndexPaths = sidecars,
+    })
+
+    local reference = sql.hybrid.open(base .. '.ref.wal', sources, 'events', {
+      cachePages = 2, rowLayout = 'packed',
+    })
+
+    local queries = {
+      'SELECT id, body FROM events WHERE room = ? AND stream > ? ORDER BY stream LIMIT 20',
+      'SELECT id, body FROM events WHERE room = ? AND stream < ? ORDER BY stream DESC LIMIT 20',
+      'SELECT id, body FROM events WHERE room = ? ORDER BY stream DESC LIMIT 15',
+    }
+    local params = { { 'even', 100 }, { 'odd', 170 }, { 'moved' } }
+    local function assertSame()
+      for number, query in queries do
+        local actual = indexed:query(query, params[number]).rows
+        local expected = reference:query(query, params[number]).rows
+        expect(#actual).toBe(#expected)
+        for position, row in actual do
+          expect(row.id).toBe(expected[position].id)
+          expect(row.body).toBe(expected[position].body)
+        end
+      end
+    end
+    assertSame()
+    for _, database in { indexed, reference } do
+      database:transaction(function(tx)
+        expect(tx:delete(102)).toBe(true)
+        tx:upsert({ id = 103, room = 'even', stream = 101, body = 'hot moved' })
+        tx:insert({ id = 250, room = 'even', stream = 102, body = 'new hot' })
+        local inside = tx:query(queries[1], params[1]).rows
+        expect(#inside > 0).toBe(true)
+      end)
+    end
+    assertSame()
+    indexed:close()
+    reference:close()
+    local reopened = sql.hybrid.open(base .. '.wal', sources, 'events', {
+      cachePages = 1, secondaryIndexPaths = sidecars,
+    })
+    expect(reopened:get(102)).toBe(nil)
+    expect((reopened:get(103) :: sql.Row).body).toBe('hot moved')
+    reopened:close()
+    for _, path in sidecars do fs.remove(path) end
+    cleanup(base)
+    fs.remove(base .. '.ref.wal')
+    fs.remove(base .. '.ref.wal.lock')
+  end)
+
+  suite.it('rejects mismatched generation sidecars without leaking the WAL lock', function()
+    local firstPath, secondPath, _, base = files('index-mismatch')
+    snapshot(firstPath, 1, 10, 1)
+    snapshot(secondPath, 5, 15, 2)
+    local first = base .. '.a.idx'
+    local second = base .. '.b.idx'
+    fs.remove(first)
+    fs.remove(second)
+    sql.secondary.create(first, firstPath, 'room', 'body')
+    sql.secondary.create(second, secondPath, 'room', 'body')
+    -- An incomplete sidecar list must fail before acquiring the WAL.
+    local missing = pcall(function()
+      sql.hybrid.open(base .. '.wal', { firstPath, secondPath }, 'events',
+        { secondaryIndexPaths = { first } })
+    end)
+    expect(missing).toBe(false)
+    -- Swapped sidecars must reject snapshot binding and release open readers.
+    local reversed = pcall(function()
+      sql.hybrid.open(base .. '.wal', { firstPath, secondPath }, 'events',
+        { secondaryIndexPaths = { second, first } })
+    end)
+    expect(reversed).toBe(false)
+    local valid = sql.hybrid.open(base .. '.wal', { firstPath, secondPath }, 'events',
+      { secondaryIndexPaths = { first, second } })
+    expect((valid:get(6) :: sql.Row).body).toBe('2:6')
+    valid:close()
+    fs.remove(first)
+    fs.remove(second)
+    cleanup(base)
+  end)
+
   suite.it('rejects incompatible schemas, duplicate paths, sidecar misbinding and excess fan-in', function()
     local firstPath, secondPath, _, base = files('invalid')
     snapshot(firstPath, 1, 5, 1)

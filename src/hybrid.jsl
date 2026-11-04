@@ -9,7 +9,7 @@ local segments = require('@jessql/segments')
 local secondary = require('@jessql/secondary')
 
 export type Row = { [string]: unknown }
-export type Options = { cachePages: number?, rowLayout: string?, secondaryIndexPath: string? }
+export type Options = { cachePages: number?, rowLayout: string?, secondaryIndexPath: string?, secondaryIndexPaths: { string }? }
 export type Transaction = {
   get: (self: Transaction, key: unknown) -> Row?,
   insert: (self: Transaction, row: Row) -> (),
@@ -341,18 +341,32 @@ end
 -- The snapshot is never modified or deleted by this API.
 function hybrid.open(walPath: string, snapshotPath: string | { string }, tableName: string, options: Options?): Database
   local name = validTable(tableName)
+  local indexCache = if options then options.cachePages else nil
+  if options and options.secondaryIndexPath and options.secondaryIndexPaths then
+    error('jessql hybrid: choose one secondary index configuration', 2)
+  end
+
   if type(snapshotPath) == 'table' and options and options.secondaryIndexPath then
-    error('jessql hybrid: secondary index sidecar requires a single snapshot', 2)
+    error('jessql hybrid: secondaryIndexPaths required for multiple generations', 2)
+  end
+
+  if type(snapshotPath) ~= 'table' and options and options.secondaryIndexPaths then
+    error('jessql hybrid: secondaryIndexPaths requires multiple generations', 2)
   end
   local cold = if type(snapshotPath) == 'table'
     then segments.open(snapshotPath :: { string }, { cachePages = if options then options.cachePages else nil })
     else paged.open(snapshotPath :: string, { cachePages = if options then options.cachePages else nil })
   local coldIndex: secondary.Index? = nil
-  if options and options.secondaryIndexPath then
+  if options and (options.secondaryIndexPath or options.secondaryIndexPaths) then
     -- A mismatched sidecar must not leave an open cold reader behind.
     local indexOk, indexResult = pcall(function()
-      coldIndex = secondary.open(options.secondaryIndexPath :: string, cold,
-        { cachePages = options.cachePages })
+      if options.secondaryIndexPaths then
+        coldIndex = (cold :: segments.Snapshot):openIndexes(options.secondaryIndexPaths,
+          { cachePages = indexCache })
+      else
+        coldIndex = secondary.open(options.secondaryIndexPath :: string, cold,
+          { cachePages = indexCache })
+      end
     end)
 
     if not indexOk then cold:close(); error(indexResult, 2) end

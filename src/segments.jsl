@@ -4,11 +4,14 @@
 -- Later snapshots shadow earlier rows with the same primary key. No file is
 -- replaced, retired, or published by opening or compacting this view.
 local paged = require('@jessql/paged')
+local secondary = require('@jessql/secondary')
 local engine = require('@jessql/engine')
 
 export type Row = { [string]: unknown }
 export type Options = { cachePages: number?, pageBytes: number? }
-export type Snapshot = paged.Snapshot
+export type Snapshot = paged.Snapshot & {
+  openIndexes: (self: Snapshot, paths: { string }, options: paged.Options?) -> secondary.Index,
+}
 
 local MaxSources = 8
 local segments = {}
@@ -85,6 +88,7 @@ function segments.open(paths: { string }, options: Options?): Snapshot
   local identity = table.concat(identities, '|')
   local primaryKey = first.primaryKey
   local closed = false
+  local activeIndex: secondary.Index? = nil
   local snapshot = {} :: Snapshot
   snapshot.columns, snapshot.primaryKey = first.columns, primaryKey
   -- Physical row count; duplicate keys in older generations are included.
@@ -207,6 +211,132 @@ function segments.open(paths: { string }, options: Options?): Snapshot
     }
   end
 
+  -- Open one snapshot-bound sidecar per generation. Keeping the underlying
+  -- page readers shared avoids duplicating the per-snapshot directory/cache.
+  -- A candidate from an older index is never visible when a newer generation
+  -- contains that key, *even when the newer row moved to another partition*.
+  function snapshot.openIndexes(_self: Snapshot, paths: { string }, indexOptions: paged.Options?): secondary.Index
+    ready()
+    if activeIndex then error('jessql segments: secondary indexes already open', 2) end
+
+    if type(paths) ~= 'table' or #paths ~= #readers then
+      error('jessql segments: expected one sidecar per generation', 2)
+    end
+
+    local indexes: { secondary.Index } = {}
+    -- Index opens can fail on corrupt metadata; close already-open sidecars.
+    local indexOk, indexError = pcall(function()
+      for number, path in paths do
+        if type(path) ~= 'string' or path == '' then
+          error('jessql segments: invalid secondary index path')
+        end
+        local item = secondary.open(path, readers[number], indexOptions)
+        if #indexes > 0 then
+          local original = indexes[1]
+          if item.partitionColumn ~= original.partitionColumn
+            or item.orderColumn ~= original.orderColumn
+            or (item.orderKind ~= original.orderKind and item.orderKind ~= '' and original.orderKind ~= '') then
+            item:close()
+            error('jessql segments: incompatible secondary indexes')
+          end
+        end
+        indexes[#indexes + 1] = item
+      end
+    end)
+
+    if not indexOk then
+      for _, item in indexes do item:close() end
+      error(indexError, 2)
+    end
+
+    local firstIndex = indexes[1]
+    local indexClosed = false
+    local merged = {} :: secondary.Index
+    merged.partitionColumn, merged.orderColumn = firstIndex.partitionColumn, firstIndex.orderColumn
+    merged.orderKind, merged.complete, merged.count = firstIndex.orderKind, true, 0
+    for _, item in indexes do
+      if merged.orderKind == '' and item.orderKind ~= '' then merged.orderKind = item.orderKind end
+      if item.orderKind == 'mixed' or item.orderKind == '' then merged.complete = false end
+      if not item.complete then merged.complete = false end
+      merged.count += item.count
+    end
+
+    function merged.iterate(_index: secondary.Index, prefix: unknown, descending: boolean?,
+      lower: unknown?, upper: unknown?, lowerStrict: boolean?, upperStrict: boolean?): () -> Row?
+      ready()
+      if indexClosed then error('jessql segments: index closed', 2) end
+      local reverse = descending == true
+      local advance: { () -> Row? } = {}
+      local heads: { Row? } = {}
+      for number, item in indexes do
+        local nextRow = item:iterate(prefix, descending, lower, upper, lowerStrict, upperStrict)
+        advance[number] = nextRow
+        heads[number] = nextRow()
+      end
+
+      return function(): Row?
+        ready()
+        if indexClosed then error('jessql segments: index closed', 2) end
+
+        while true do
+          local chosen = 0
+          local selected: Row? = nil
+          for number = 1, #indexes do
+            local row = heads[number]
+            if not row then continue end
+
+            if not selected then
+              chosen, selected = number, row
+            else
+              local difference = compare(row[merged.orderColumn], selected[merged.orderColumn])
+              if difference == 0 then difference = compare(row[primaryKey], selected[primaryKey]) end
+
+              if (if reverse then difference > 0 else difference < 0) then
+                chosen, selected = number, row
+              end
+            end
+          end
+
+          if not selected then return nil end
+
+          heads[chosen] = advance[chosen]()
+          -- Never emit a stale index entry from a shadowed snapshot. This
+          -- requires no key-sized seen set and handles changed secondary keys.
+          local shadowed = false
+          for newer = chosen + 1, #readers do
+            if readers[newer]:get(selected[primaryKey]) then
+              shadowed = true
+              break
+            end
+          end
+
+          if not shadowed then return selected end
+        end
+      end
+    end
+
+    function merged.stats(_index: secondary.Index): paged.Metrics
+      ready()
+      if indexClosed then error('jessql segments: index closed', 2) end
+      local pages, cached, reads = 0, 0, 0
+      for _, item in indexes do
+        local metrics = item:stats()
+        pages += metrics.pages
+        cached += metrics.cachedPages
+        reads += metrics.pageReads
+      end
+      return { pages = pages, rows = merged.count, cachedPages = cached, pageReads = reads }
+    end
+
+    function merged.close(_index: secondary.Index)
+      if indexClosed then return end
+      indexClosed = true
+      for _, item in indexes do item:close() end
+    end
+    activeIndex = merged
+    return merged
+  end
+
   function snapshot.stats(_self: Snapshot): paged.Metrics
     ready()
     local pages, cached, reads = 0, 0, 0
@@ -222,6 +352,7 @@ function segments.open(paths: { string }, options: Options?): Snapshot
   function snapshot.close(_self: Snapshot)
     if closed then return end
     closed = true
+    if activeIndex then activeIndex:close() end
     for _, reader in readers do reader:close() end
   end
   return snapshot
