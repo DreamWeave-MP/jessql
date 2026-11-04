@@ -26,6 +26,7 @@ export type Store = {
   upsert: (self: Store, name: string, row: Row) -> (),
   delete: (self: Store, name: string, key: unknown) -> boolean,
   get: (self: Store, name: string, key: unknown) -> Row?,
+  iterateRows: (self: Store, name: string) -> () -> Row?,
   transaction: (self: Store, callback: (Transaction) -> ()) -> (),
   query: (self: Store, sql: string, params: { unknown }?) -> queryEngine.Result,
   prepare: (self: Store, sql: string) -> queryEngine.Plan,
@@ -1614,6 +1615,7 @@ function storage.open(path: string, options: Options?): Store
   local cached: { [string]: { plan: queryEngine.Plan, age: number } } = {}
   local count, hits, misses, evictions, age = 0, 0, 0, 0, 0
   local generation = state.schemaVersion
+  local cursorRevision = 0
 
   local db = {} :: Store
   local function ready()
@@ -1637,6 +1639,7 @@ function storage.open(path: string, options: Options?): Store
     local committed, commitError = pcall(write, state, ops)
     state.busy = false
     if not committed then error(commitError, 2) end
+    if #ops > 0 then cursorRevision += 1 end
   end
 
   function db.exec(self: Store, sql: string, params: { unknown }?): number
@@ -1800,6 +1803,31 @@ function storage.open(path: string, options: Options?): Store
     end
 
     return plan
+  end
+
+  -- Stream committed rows without SQL result materialization. The cursor
+  -- invalidates on every WAL commit or checkpoint; a caller must not mix
+  -- versions while constructing an immutable generation.
+  function db.iterateRows(_self: Store, name: string): () -> Row?
+    ready()
+    if state.busy then error('jessql storage: cannot iterate inside transaction', 2) end
+    local current = state.tables[requireName(name)]
+    if not current then error('jessql storage: unknown table', 2) end
+    local version = cursorRevision
+    local position = 0
+    return function(): Row?
+      ready()
+      if state.busy or cursorRevision ~= version then
+        error('jessql storage: row cursor invalidated by mutation', 2)
+      end
+
+      while position < #current.order do
+        position += 1
+        local row = readRow(current, current.order[position], nil)
+        if row then return if current.packed then row else table.clone(row) end
+      end
+      return nil
+    end
   end
 
   function db.tables(_self: Store): { queryEngine.TableInfo }
@@ -1966,6 +1994,7 @@ function storage.open(path: string, options: Options?): Store
         current.secondary[column] = index
       end
     end
+    cursorRevision += 1
   end
 
   function db.close(_self: Store)
