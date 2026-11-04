@@ -3,6 +3,7 @@
 -- Immutable partition/ordered-value/primary-key index bound to a cold snapshot.
 -- The existing checksummed JQLP2 page format is reused for this sidecar.
 local paged = require('@jessql/paged')
+local fs = require('@dream/fs')
 
 export type Row = { [string]: unknown }
 export type Index = {
@@ -13,6 +14,10 @@ export type Index = {
   close: (self: Index) -> (),
   stats: (self: Index) -> paged.Metrics,
 }
+
+export type BuildOptions = { pageBytes: number?, cachePages: number?, runRows: number?, mergeFanIn: number? }
+export type BuildMetrics = { rows: number, entries: number, spilledRuns: number,
+  mergeOperations: number, maxBufferedEntries: number, maxOpenReaders: number }
 
 local secondary = {}
 
@@ -58,10 +63,108 @@ local function prefixKey(prefix: unknown): string
   return 'z' .. component(prefix) .. '|'
 end
 
+-- Merge bounded immutable runs with an in-memory min-heap of at most
+-- `fanIn` entries. Sources have independent one-page caches, and are closed
+-- after successful creation *or* any source/decode/write failure.
+local function mergeRuns(path: string, paths: { string }, options: paged.Options?,
+  metrics: BuildMetrics, markers: { Row }?)
+  local readers: { paged.Snapshot } = {}
+  local iterators: { () -> Row? } = {}
+  local heap: { { row: Row, source: number } } = {}
+  local function smaller(left: { row: Row, source: number }, right: { row: Row, source: number }): boolean
+    return (left.row.id :: string) < (right.row.id :: string)
+  end
+
+  local function push(entry: { row: Row, source: number })
+    local pos = #heap + 1
+    while pos > 1 do
+      local parent = math.floor(pos / 2)
+      if not smaller(entry, heap[parent]) then break end
+      heap[pos] = heap[parent]
+      pos = parent
+    end
+    heap[pos] = entry
+  end
+
+  local function pop(): { row: Row, source: number }?
+    local count = #heap
+    if count == 0 then return nil end
+    local first = heap[1]
+    local last = heap[count]
+    heap[count] = nil
+    if count > 1 then
+      local pos = 1
+      while pos * 2 < count do
+        local child = pos * 2
+        if child + 1 < count and smaller(heap[child + 1], heap[child]) then child += 1 end
+        if not smaller(heap[child], last) then break end
+        heap[pos] = heap[child]
+        pos = child
+      end
+      heap[pos] = last
+    end
+
+    return first
+  end
+
+  -- Reader opening, page decoding, and paged.create can throw; close every opened source.
+  local ok, failure = pcall(function()
+    for index, sourcePath in paths do
+      local reader = paged.open(sourcePath, { cachePages = 1 })
+      readers[#readers + 1] = reader
+      local iterator = reader:iterateRows()
+      iterators[index] = iterator
+      local row = iterator()
+      if row then push({ row = row, source = index }) end
+    end
+    metrics.maxOpenReaders = math.max(metrics.maxOpenReaders, #readers)
+    local markerPosition = 0
+    local function nextRow(): Row?
+      if markers and markerPosition < #markers then
+        markerPosition += 1
+        return markers[markerPosition]
+      end
+      local entry = pop()
+      if not entry then return nil end
+      local row = iterators[entry.source]()
+      if row then push({ row = row, source = entry.source }) end
+      return entry.row
+    end
+    paged.create(path, { 'id', 'pk' }, 'id', nextRow, options)
+  end)
+
+  for _, reader in readers do reader:close() end
+  if not ok then error(failure, 2) end
+  metrics.mergeOperations += 1
+end
+
+local function writeRun(path: string, rows: { Row }, options: paged.Options?)
+  table.sort(rows, function(left, right) return (left.id :: string) < (right.id :: string) end)
+  local cursor = 0
+  paged.create(path, { 'id', 'pk' }, 'id', function(): Row?
+    cursor += 1
+    return rows[cursor]
+  end, options)
+end
+
+-- `runRows` bounds in-memory key sorting independently of input size.
+-- The fan-in limits simultaneously opened run files during compaction.
+-- This is an external, tiered merge sort: completed runs are reclaimed
+-- incrementally, not retained in an O(total rows) run list.
 function secondary.create(path: string, snapshotPath: string, partitionColumn: string,
-  orderColumn: string, options: paged.Options?)
+  orderColumn: string, options: BuildOptions?): BuildMetrics
+  local runRows = if options and options.runRows then options.runRows else 16384
+  local fanIn = if options and options.mergeFanIn then options.mergeFanIn else 8
+  if runRows < 2 or runRows > 262144 or runRows % 1 ~= 0
+    or fanIn < 2 or fanIn > 32 or fanIn % 1 ~= 0 then
+    error('jessql secondary: invalid external-sort limits', 2)
+  end
   local snapshot = paged.open(snapshotPath, options)
-  -- Always close the source snapshot even if the builder or writer throws.
+  local metrics: BuildMetrics = { rows = 0, entries = 0, spilledRuns = 0,
+    mergeOperations = 0, maxBufferedEntries = 0, maxOpenReaders = 0 }
+  local scratch: { [string]: boolean } = {}
+  local prefix: string? = nil
+  -- Validation, scratch creation, and external merging can throw; cleanup must still run.
   local ok, failure = pcall(function()
     if partitionColumn == orderColumn or partitionColumn == snapshot.primaryKey
       or orderColumn == snapshot.primaryKey or not findColumn(snapshot.columns, partitionColumn)
@@ -69,9 +172,58 @@ function secondary.create(path: string, snapshotPath: string, partitionColumn: s
       error('jessql secondary: invalid index columns')
     end
 
-    -- Initial builder is bounded by input row count, not by snapshot size.
-    -- Query/open paths remain bounded by the JQLP2 page cache.
     local keys: { Row } = {}
+    local tiers: { { string } } = {}
+    local suffix = 0
+    local function newRun(): string
+      if not prefix then
+        -- The exclusive reservation prevents concurrent builders from sharing
+        -- scratch paths. Do not remove files owned by another process.
+        for _ = 1, 16 do
+          local candidate = path .. '.sort-' .. tostring(math.random(1, 2147483647))
+          local count = fs.writeFile(candidate .. '.owner', 'jessql',
+            { exclusive = true, createParents = true })
+          if count ~= 6 then continue end
+          prefix = candidate
+          scratch[candidate .. '.owner'] = true
+          break
+        end
+
+        if not prefix then error('jessql secondary: cannot reserve sort workspace') end
+      end
+      suffix += 1
+      local result = (prefix :: string) .. '-' .. tostring(suffix)
+      scratch[result] = true
+      return result
+    end
+
+    local function addRun(runPath: string, level: number)
+      local tier = tiers[level]
+      if not tier then tier = {}; tiers[level] = tier end
+      tier[#tier + 1] = runPath
+
+      if #tier >= fanIn then
+        local merged = newRun()
+        mergeRuns(merged, tier, options, metrics)
+        for _, old in tier do
+          fs.remove(old)
+          scratch[old] = nil
+        end
+        tiers[level] = {}
+        addRun(merged, level + 1)
+      end
+    end
+
+    local function spill()
+      if #keys == 0 then return end
+      metrics.maxBufferedEntries = math.max(metrics.maxBufferedEntries, #keys)
+      local run = newRun()
+      writeRun(run, keys, options)
+      metrics.spilledRuns += 1
+      keys = {}
+      addRun(run, 1)
+    end
+
     local nextRow = snapshot:iterateRows({ snapshot.primaryKey, partitionColumn, orderColumn })
     local count, skipped, orderKind = 0, 0, ''
     while true do
@@ -89,10 +241,12 @@ function secondary.create(path: string, snapshotPath: string, partitionColumn: s
           id = prefixKey(partition) .. component(ordered) .. '|' .. component(row[snapshot.primaryKey]),
           pk = row[snapshot.primaryKey],
         }
+
+        if #keys >= runRows then spill() end
       end
       count += 1
     end
-    table.sort(keys, function(left, right) return (left.id :: string) < (right.id :: string) end)
+    metrics.rows, metrics.entries = count, count - skipped
     local marker: { Row } = {
       { id = '!identity', pk = snapshot.identity },
       { id = '!partition', pk = partitionColumn },
@@ -100,18 +254,54 @@ function secondary.create(path: string, snapshotPath: string, partitionColumn: s
       { id = '!kind', pk = orderKind },
       { id = '!complete', pk = skipped == 0 },
       { id = '!count', pk = count },
-      { id = '!entries', pk = #keys },
+      { id = '!entries', pk = metrics.entries },
     }
     table.sort(marker, function(left, right) return (left.id :: string) < (right.id :: string) end)
-    local index = 0
-    paged.create(path, { 'id', 'pk' }, 'id', function(): Row?
-      index += 1
-      if index <= #marker then return marker[index] end
-      return keys[index - #marker]
-    end, options)
+
+    if prefix then spill() end
+
+    if not prefix then
+      -- Small indexes include their keys after metadata in one sorted sidecar.
+      local entries = keys
+      table.sort(entries, function(left, right) return (left.id :: string) < (right.id :: string) end)
+      local position = 0
+      paged.create(path, { 'id', 'pk' }, 'id', function(): Row?
+        position += 1
+        if position <= #marker then return marker[position] end
+        return entries[position - #marker]
+      end, options)
+      metrics.maxBufferedEntries = math.max(metrics.maxBufferedEntries, #entries)
+    else
+      local remaining: { string } = {}
+      for _, tier in tiers do
+        for _, name in tier do remaining[#remaining + 1] = name end
+      end
+
+      while #remaining > fanIn do
+        local compacted: { string } = {}
+        for offset = 1, #remaining, fanIn do
+          local batch: { string } = {}
+          for index = offset, math.min(offset + fanIn - 1, #remaining) do
+            batch[#batch + 1] = remaining[index]
+          end
+          local merged = newRun()
+          mergeRuns(merged, batch, options, metrics)
+          compacted[#compacted + 1] = merged
+          for _, old in batch do
+            fs.remove(old)
+            scratch[old] = nil
+          end
+        end
+        remaining = compacted
+      end
+      mergeRuns(path, remaining, options, metrics, marker)
+    end
   end)
   snapshot:close()
+
+  for name in scratch do fs.remove(name) end
   if not ok then error(failure, 2) end
+  return metrics
 end
 
 function secondary.open(path: string, snapshot: paged.Snapshot, options: paged.Options?): Index
