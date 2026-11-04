@@ -1,0 +1,199 @@
+--!strict
+local sql = require('@jessql')
+local fs = require('@dream/fs')
+local test = require('@jess/test')
+local expect = test.expect
+local suite = test.new()
+
+local function fixture(name: string): (string, string)
+  local root = fs.cwd() :: string
+  local base = fs.join(root, '.jessql-secondary-' .. name)
+  fs.remove(base .. '.cold')
+  fs.remove(base .. '.index')
+  return base .. '.cold', base .. '.index'
+end
+
+local function seed(path: string, count: number, changed: boolean?)
+  local id = 0
+  sql.paged.create(path, { 'id', 'room', 'stream', 'body' }, 'id', function()
+    id += 1
+    if id > count then return nil end
+    local stream = id - 101
+    return { id = id, room = if id % 3 == 0 then 'a' else 'b',
+      stream = stream, body = if changed then 'updated' else tostring(id) }
+  end, { pageBytes = 1024 })
+end
+
+suite.describe('immutable cold composite secondary index', function()
+  suite.it('seeks numeric ranges in both directions without scanning other partitions', function()
+    local cold, sidecar = fixture('ranges')
+    seed(cold, 300)
+    sql.secondary.create(sidecar, cold, 'room', 'stream', { pageBytes = 512 })
+    local source = sql.paged.open(cold, { cachePages = 2 })
+    local index = sql.secondary.open(sidecar, source, { cachePages = 2 })
+    expect(index.complete).toBe(true)
+    expect(index.count).toBe(300)
+    expect(index.orderKind).toBe('number')
+    local forward = index:iterate('a', false, -10, 20, true, false)
+    for id = 93, 120, 3 do
+      local row = forward() :: sql.Row
+      expect(row.id).toBe(id)
+      expect(row.room).toBe('a')
+    end
+    expect(forward()).toBe(nil)
+    local reverse = index:iterate('a', true, -10, 20, true, true)
+    for id = 120, 93, -3 do
+      expect((reverse() :: sql.Row).id).toBe(id)
+    end
+    expect(reverse()).toBe(nil)
+    expect(index:iterate('unrecognized')()).toBe(nil)
+    expect(index:stats().cachedPages <= 2).toBe(true)
+    index:close()
+    source:close()
+    fs.remove(cold)
+    fs.remove(sidecar)
+  end)
+
+  suite.it('rejects an index tied to a different cold snapshot', function()
+    local cold, sidecar = fixture('mismatch')
+    seed(cold, 40)
+    sql.secondary.create(sidecar, cold, 'room', 'stream')
+    local source = sql.paged.open(cold)
+    local valid = sql.secondary.open(sidecar, source)
+    valid:close()
+    source:close()
+    fs.remove(cold)
+    seed(cold, 41)
+    source = sql.paged.open(cold)
+    -- The source identity check must reject the replaced snapshot.
+    local rejected = pcall(function() sql.secondary.open(sidecar, source) end)
+    expect(rejected).toBe(false)
+    source:close()
+    fs.remove(cold)
+    fs.remove(sidecar)
+  end)
+
+  suite.it('rejects corrupted sidecar pages and keeps source snapshot intact', function()
+    local cold, sidecar = fixture('corruption')
+    seed(cold, 60)
+    sql.secondary.create(sidecar, cold, 'room', 'stream', { pageBytes = 512 })
+    local source = sql.paged.open(cold)
+    local raw = fs.readFileString(sidecar) :: string
+    local pos = string.find(raw, 'z', 1, true) :: number
+    local tampered = string.sub(raw, 1, pos - 1) .. 'x' .. string.sub(raw, pos + 1)
+    local bytesWritten = fs.writeFile(sidecar, tampered, { offset = 0, create = false })
+    expect(bytesWritten ~= nil).toBe(true)
+    -- A damaged first page can fail metadata loading; a later page must
+    -- fail before returning any affected row.
+    local rejected = pcall(function()
+      local index = sql.secondary.open(sidecar, source)
+      local nextRow = index:iterate('a')
+      nextRow()
+      index:close()
+    end)
+    expect(rejected).toBe(false)
+    expect((source:get(3) :: sql.Row).id).toBe(3)
+    source:close()
+    fs.remove(cold)
+    fs.remove(sidecar)
+  end)
+
+  suite.it('sorts escaped UTF-8 strings and rejects unsafe NULL fast paths', function()
+    local cold, sidecar = fixture('strings')
+    local wal = cold .. '.wal'
+    fs.remove(wal)
+    fs.remove(wal .. '.lock')
+    local values = { 'a', 'a\\b', 'quote"', 'z', 'é' }
+    table.sort(values)
+    local cursor = 0
+    sql.paged.create(cold, { 'id', 'room', 'stream' }, 'id', function()
+      cursor += 1
+      if cursor > #values then return nil end
+      return { id = cursor, room = '$room:example.org', stream = values[cursor] }
+    end, { pageBytes = 512 })
+    sql.secondary.create(sidecar, cold, 'room', 'stream', { pageBytes = 512 })
+    local source = sql.paged.open(cold)
+    local index = sql.secondary.open(sidecar, source)
+    expect(index.orderKind).toBe('string')
+    local reader = index:iterate('$room:example.org')
+    for _, stream in values do expect((reader() :: sql.Row).stream).toBe(stream) end
+    expect(reader()).toBe(nil)
+    index:close()
+    source:close()
+    local db = sql.hybrid.open(wal, cold, 'events', { secondaryIndexPath = sidecar })
+    local rows = db:query('SELECT stream FROM events WHERE room = ? ORDER BY stream', { '$room:example.org' }).rows
+    for position, stream in values do expect(rows[position].stream).toBe(stream) end
+    db:close()
+    fs.remove(cold)
+    fs.remove(sidecar)
+    fs.remove(wal)
+    fs.remove(wal .. '.lock')
+
+    cold, sidecar = fixture('nulls')
+    cursor = 0
+    sql.paged.create(cold, { 'id', 'room', 'stream' }, 'id', function()
+      cursor += 1
+      if cursor == 1 then return { id = 1, room = 'x', stream = 5 } end
+      if cursor == 2 then return { id = 2, room = 'x' } end
+      return nil
+    end)
+    sql.secondary.create(sidecar, cold, 'room', 'stream')
+    source = sql.paged.open(cold)
+    index = sql.secondary.open(sidecar, source)
+    expect(index.complete).toBe(false)
+    index:close()
+    source:close()
+    fs.remove(cold)
+    fs.remove(sidecar)
+  end)
+
+  suite.it('merges indexed room streams with WAL updates, tombstones and staged changes', function()
+    local cold, sidecar = fixture('hybrid')
+    local wal = cold .. '.wal'
+    fs.remove(wal)
+    fs.remove(wal .. '.lock')
+    seed(cold, 600)
+    sql.secondary.create(sidecar, cold, 'room', 'stream', { pageBytes = 1024 })
+    local plain = sql.hybrid.open(wal, cold, 'events', { cachePages = 2 })
+    local indexed = sql.hybrid.open -- Reopen after closing the WAL lock.
+    plain:close()
+    local db = indexed(wal, cold, 'events', { cachePages = 2, secondaryIndexPath = sidecar })
+    local function compare(sqlText: string, params: { unknown }?)
+      local indexedRows = db:query(sqlText, params).rows
+      db:close()
+      local baseline = sql.hybrid.open(wal, cold, 'events', { cachePages = 2 })
+      local plainRows = baseline:query(sqlText, params).rows
+      baseline:close()
+      db = indexed(wal, cold, 'events', { cachePages = 2, secondaryIndexPath = sidecar })
+      expect(#indexedRows).toBe(#plainRows)
+      for position, row in plainRows do
+        expect(indexedRows[position].id).toBe(row.id)
+        expect(indexedRows[position].stream).toBe(row.stream)
+      end
+    end
+    local query = 'SELECT id, stream FROM events WHERE room = ? AND stream > ? ORDER BY stream LIMIT 12'
+    compare(query, { 'a', 250 })
+    db:transaction(function(tx)
+      tx:upsert({ id = 501, room = 'a', stream = 140.5, body = 'moved-in' })
+      tx:upsert({ id = 504, room = 'b', stream = 403, body = 'moved-out' })
+      tx:delete(510)
+      tx:insert({ id = 700, room = 'a', stream = 140.25, body = 'inserted' })
+      local result = tx:query('SELECT id FROM events WHERE room = ? AND stream > ? ORDER BY stream LIMIT 4',
+        { 'a', 139 })
+      expect(result.rows[1].id).toBe(700)
+      expect(result.rows[2].id).toBe(501)
+    end)
+    compare(query, { 'a', 250 })
+    compare('SELECT id, stream FROM events WHERE room = ? AND stream >= ? ORDER BY stream DESC LIMIT 12',
+      { 'a', 200 })
+    compare('SELECT id, stream FROM events WHERE room = ? AND stream < ? ORDER BY stream LIMIT 12',
+      { 'a', 140 })
+    db:close()
+    fs.remove(cold)
+    fs.remove(sidecar)
+    fs.remove(wal)
+    fs.remove(wal .. '.lock')
+  end)
+
+end)
+return suite

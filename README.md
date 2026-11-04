@@ -226,3 +226,10 @@ postings use one position map and compact tombstones, including NULL keys in
 ordered indexes. Journal contents and all public query/mutation semantics remain
 unchanged. See `bench/rss.jsl` and [persistence architecture](docs/PERSISTENCE.md).
 This is an in-memory optimization, not an on-disk page store or a durability claim.
+
+### Experimental cold composite indexes
+
+Immutable snapshots can now have a separate `(partition, ordered value)`
+sidecar, including correct WAL overlay merging for selected hybrid SQL queries.
+See [docs/SECONDARY-INDEXES.md](docs/SECONDARY-INDEXES.md) for API use,
+measured latency/RSS tradeoffs, and the unbounded build-memory limitation.

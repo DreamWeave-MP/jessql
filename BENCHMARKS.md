@@ -476,3 +476,19 @@ random misses against 30K rows and a four-page cache, median CPU from five
 alternating runs improved **2.84x** with numeric keys and **1.75x** with
 Matrix-style string keys. All query checksums and page-read counts matched.
 See [full benchmark methodology and limitations](docs/COLD-PAGE-LOOKUPS.md).
+
+## Cold composite sidecar vs unindexed hybrid scan (Jess 0.3.0)
+
+24,000 cold events across 48 rooms, 40 queries of the form `WHERE room = ? AND
+stream >= ? ORDER BY stream LIMIT 12`, with identical result checksums:
+
+| Measurement | Baseline (3 runs) | Sidecar (3 runs) |
+| --- | ---: | ---: |
+| Median query CPU | 4.889 s | 0.0508 s |
+| Query CPU range | 4.690–4.992 s | 0.0478–0.0534 s |
+| Post-query RSS range | 32,884–34,420 KiB | 37,264–37,648 KiB |
+| Checksum | 4,548,468 | 4,548,468 |
+
+Sidecar build ~0.437 s, cold file ~1.9 MiB, sidecar ~3.3 MiB. This is a
+scan-avoidance result, not a universal performance claim. See
+`docs/SECONDARY-INDEXES.md` and `bench/secondary.jsl`.
