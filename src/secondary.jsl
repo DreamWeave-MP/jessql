@@ -3,6 +3,7 @@
 -- Immutable partition/ordered-value/primary-key index bound to a cold snapshot.
 -- The existing checksummed JQLP2 page format is reused for this sidecar.
 local paged = require('@jessql/paged')
+local compact = require('@jessql/compactsecondary')
 local fs = require('@dream/fs')
 
 export type Row = { [string]: unknown }
@@ -15,7 +16,7 @@ export type Index = {
   stats: (self: Index) -> paged.Metrics,
 }
 
-export type BuildOptions = { pageBytes: number?, cachePages: number?, runRows: number?, mergeFanIn: number? }
+export type BuildOptions = { pageBytes: number?, cachePages: number?, runRows: number?, mergeFanIn: number?, format: string? }
 export type BuildMetrics = { rows: number, entries: number, spilledRuns: number,
   mergeOperations: number, maxBufferedEntries: number, maxOpenReaders: number }
 
@@ -68,8 +69,13 @@ end
 -- Merge bounded immutable runs with an in-memory min-heap of at most
 -- `fanIn` entries. Sources have independent one-page caches, and are closed
 -- after successful creation *or* any source/decode/write failure.
+local function writeSidecar(path: string, nextRow: () -> Row?, options: paged.Options?, compressed: boolean)
+  if compressed then compact.create(path, nextRow, options)
+  else paged.create(path, { 'id', 'pk' }, 'id', nextRow, options) end
+end
+
 local function mergeRuns(path: string, paths: { string }, options: paged.Options?,
-  metrics: BuildMetrics, markers: { Row }?)
+  metrics: BuildMetrics, markers: { Row }?, compressed: boolean?)
   local readers: { paged.Snapshot } = {}
   local iterators: { () -> Row? } = {}
   local heap: { { row: Row, source: number } } = {}
@@ -132,7 +138,7 @@ local function mergeRuns(path: string, paths: { string }, options: paged.Options
       if row then push({ row = row, source = entry.source }) end
       return entry.row
     end
-    paged.create(path, { 'id', 'pk' }, 'id', nextRow, options)
+    writeSidecar(path, nextRow, options, compressed == true)
   end)
 
   for _, reader in readers do reader:close() end
@@ -155,6 +161,9 @@ end
 -- incrementally, not retained in an O(total rows) run list.
 function secondary.create(path: string, snapshotPath: string, partitionColumn: string,
   orderColumn: string, options: BuildOptions?): BuildMetrics
+  local compressed = options ~= nil and options.format == 'compact'
+  if options and options.format ~= nil and options.format ~= 'paged'
+    and options.format ~= 'compact' then error('jessql secondary: unsupported format', 2) end
   local runRows = if options and options.runRows then options.runRows else 16384
   local fanIn = if options and options.mergeFanIn then options.mergeFanIn else 8
   if runRows < 2 or runRows > 262144 or runRows % 1 ~= 0
@@ -289,11 +298,11 @@ function secondary.create(path: string, snapshotPath: string, partitionColumn: s
       local entries = keys
       table.sort(entries, function(left, right) return (left.id :: string) < (right.id :: string) end)
       local position = 0
-      paged.create(path, { 'id', 'pk' }, 'id', function(): Row?
+      writeSidecar(path, function(): Row?
         position += 1
         if position <= #marker then return marker[position] end
         return entries[position - #marker]
-      end, options)
+      end, options, compressed)
       metrics.maxBufferedEntries = math.max(metrics.maxBufferedEntries, #entries)
     else
       local remaining: { string } = {}
@@ -318,7 +327,7 @@ function secondary.create(path: string, snapshotPath: string, partitionColumn: s
         end
         remaining = compacted
       end
-      mergeRuns(path, remaining, options, metrics, marker)
+      mergeRuns(path, remaining, options, metrics, marker, compressed)
     end
   end)
   snapshot:close()
@@ -329,7 +338,13 @@ function secondary.create(path: string, snapshotPath: string, partitionColumn: s
 end
 
 function secondary.open(path: string, snapshot: paged.Snapshot, options: paged.Options?): Index
-  local pages = paged.open(path, options)
+  -- The legacy JQLP2 reader remains available for previously built sidecars.
+  local handle, openError = fs.open(path)
+  if not handle then error('jessql secondary: ' .. tostring(openError), 2) end
+  local head = handle:readAt(0, 6)
+  handle:close()
+  local pages = if head and buffer.tostring(head) == 'JQLS1\n'
+    then compact.open(path, options) else paged.open(path, options)
   -- Close the reader after *any* metadata failure, including a corrupt
   -- non-first metadata page. Never leak a failed sidecar-open handle.
   local ok, metadata = pcall(function(): Row
