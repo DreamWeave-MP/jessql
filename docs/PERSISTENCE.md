@@ -249,3 +249,58 @@ The cache is intentionally per-open-database and in memory only; it does not
 persist SQL text or share plans across worker instances. It is not a SQL
 injection defense: callers must continue to bind untrusted values with `?`.
 Benchmark with `jess run --trusted --package . bench/query-cache.jsl 3000`.
+
+## Transactional SQL expansion (after composite-index and plan-cache work)
+
+The native JSL store now accepts **bounded multi-row INSERT** statements:
+
+```sql
+INSERT INTO events (id, room, attempts) VALUES (?, ?, ?), (?, ?, ?);
+INSERT INTO events (id, room) VALUES (?, ?), (?, ?)
+  ON CONFLICT (id) DO NOTHING;
+```
+
+A single statement accepts at most **1,024 VALUES tuples**. Each tuple has the
+same column list, parameters stay positional, and the affected-row count omits
+primary-key conflicts ignored with `ON CONFLICT DO NOTHING`. The optional
+conflict target must be the table's primary key. There is no `DO UPDATE`,
+`RETURNING`, or arbitrary `INSERT ... SELECT` yet.
+
+`UPDATE` and `DELETE` now accept `WHERE indexed_column = ?`, not only primary
+key equality. Create the index using `db:createIndex(table, column)` or
+`db:createOrderedIndex(table, column)` first. The engine collects a stable set
+of primary keys, merges staged inserts/updates/deletes, checks each candidate's
+current value, and only then mutates rows. This prevents rows changed by the
+statement from reentering or disappearing from its own match set. Non-PK
+filters without an existing index fail instead of scanning the whole table.
+At most **10,000 rows** may be targeted per statement. This is a protective
+limit, not a configurable SQL `LIMIT` feature.
+
+Bounded numeric expressions in UPDATE are available for counter workloads:
+
+```sql
+UPDATE federation_queue SET attempts = attempts + 1 WHERE destination = ?;
+UPDATE federation_queue SET attempts = attempts - ? WHERE destination = ?;
+```
+
+Expressions are restricted to `existing_column + numeric_literal_or_parameter`
+or subtraction. They evaluate against each row's *original* values, so
+`SET a = a + 1, b = a + 1` uses the same old `a` for both. If the source or
+operand is NULL, the result is NULL. Non-number operands are rejected rather
+than silently coerced. Primary keys cannot be updated.
+
+A failed SQL parse, bind, or execution through `tx:exec` or a prepared plan's
+`inTransaction()` method **latches an abort** on the containing transaction:
+catching the error inside the callback does not permit partial SQL mutations
+to commit. A post-append in-memory apply failure also poisons the database
+handle and requires a close/reopen. This is intentionally conservative.
+
+**Performance / durability:** All changes use the existing one-frame-per-
+transaction append journal. The current Jess 0.3.0 writer interface cannot
+safely discard buffered bytes after an uncertain failed flush, so this pass
+**does not introduce a retained buffered WAL writer** or claim that `flush()`
+is a durable commit barrier. Benchmark `jess run --trusted --package .
+bench/bulk-dml.jsl 4000` separately measures single-statement inserts,
+prepared multi-row inserts, typed transaction batches, indexed SQL updates,
+and known-PK typed update loops. Grouping 20 rows per commit is inherently
+different from committing every row individually; compare both baselines.
