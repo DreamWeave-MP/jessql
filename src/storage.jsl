@@ -63,9 +63,12 @@ export type Transaction = {
 
 type Schema = { columns: { string }, primaryKey: string, allowed: { [string]: boolean } }
 type Bucket = { keys: { string }, seen: { [string]: boolean }, live: { [string]: boolean }, count: number }
+type Posting = string | Bucket
 type Index = {
-  buckets: { [string]: Bucket }, ordered: boolean?, tree: ordered.Tree?,
-  types: { [string]: number }?, nulls: Bucket?,
+  -- The common single-row posting is the encoded primary key itself. A bucket
+  -- is allocated only when at least two rows share an indexed value.
+  buckets: { [string]: Posting }, ordered: boolean?, tree: ordered.Tree?,
+  types: { [string]: number }?, nulls: Posting?,
 }
 type Composite = { prefix: string, suffix: string, partitions: { [string]: Index } }
 type TableState = {
@@ -171,6 +174,17 @@ end
 
 -- Maintain bounded tombstone overhead under long-running update/delete churn.
 -- Rebuilding only after the dead slots exceed the live slots amortizes the cost.
+local function postingCount(posting: Posting?): number
+  if not posting then return 0 end
+  return if type(posting) == 'string' then 1 else posting.count
+end
+
+local function postingKeys(posting: Posting?): ({ string }, { [string]: boolean }?)
+  if not posting then return {}, nil end
+  if type(posting) == 'string' then return { posting }, nil end
+  return posting.keys, posting.live
+end
+
 local function compactBucket(index: Index, encoded: string, bucket: Bucket)
   if bucket.count == 0 then
     index.buckets[encoded] = nil
@@ -184,6 +198,20 @@ local function compactBucket(index: Index, encoded: string, bucket: Bucket)
     end
     bucket.keys = liveKeys
     bucket.seen = liveSeen
+  end
+end
+
+-- Yield each live encoded primary key without allocating a result table.
+local function eachPosting(posting: Posting?, visit: (string) -> ())
+  if not posting then return end
+
+  if type(posting) == 'string' then
+    visit(posting)
+
+  else
+    for _, key in posting.keys do
+      if posting.live[key] then visit(key) end
+    end
   end
 end
 
@@ -203,59 +231,90 @@ end
 local function indexSet(index: Index, value: unknown, key: string, present: boolean)
   if value == nil and not index.ordered then return end
   local encoded = if value ~= nil then keyOf(value) else ''
-  local bucket = if value == nil then index.nulls else index.buckets[encoded]
-  if not bucket then
-    if not present then return end
-    bucket = { keys = {}, seen = {}, live = {}, count = 0 }
-    if value == nil then index.nulls = bucket else index.buckets[encoded] = bucket end
+  local posting = if value == nil then index.nulls else index.buckets[encoded]
+  local function set(nextPosting: Posting?)
+    if value == nil then index.nulls = nextPosting else index.buckets[encoded] = nextPosting end
   end
+  local kind = type(value)
 
   if present then
-    local entry = bucket :: Bucket
-    if entry.live[key] then return end
-
-    if entry.count == 0 and index.ordered and value ~= nil then
-      local kind = type(value)
-      local kinds = index.types :: { [string]: number }
-      kinds[kind] = (kinds[kind] or 0) + 1
-      if kind == 'number' or kind == 'string' then
-        index.tree = ordered.insert(index.tree, value :: string | number, encoded)
+    if not posting then
+      set(key) -- Avoid three small Lua tables for unique indexed values.
+      if index.ordered and value ~= nil then
+        local kinds = index.types :: { [string]: number }
+        kinds[kind] = (kinds[kind] or 0) + 1
+        if kind == 'number' or kind == 'string' then
+          index.tree = ordered.insert(index.tree, value :: string | number, encoded)
+        end
       end
-    elseif index.ordered and value ~= nil then
-      local kind = type(value)
-      if kind == 'number' or kind == 'string' then
-        index.tree = ordered.adjust(index.tree, value :: string | number, 1)
-      end
+      return
     end
 
-    if not entry.seen[key] then
-      entry.seen[key] = true
-      entry.keys[#entry.keys + 1] = key
+    if type(posting) == 'string' then
+      if posting == key then return end
+      -- Promote to a real posting list only on the second distinct row.
+      local other = posting
+      set({ keys = { other, key }, seen = { [other] = true, [key] = true },
+        live = { [other] = true, [key] = true }, count = 2 })
+    else
+      if posting.live[key] then return end
+
+      if not posting.seen[key] then
+        posting.seen[key] = true
+        posting.keys[#posting.keys + 1] = key
+      end
+
+      posting.live[key] = true
+      posting.count += 1
     end
 
-    entry.live[key] = true
-    entry.count += 1
-  elseif bucket and bucket.live[key] then
-    local entry = bucket :: Bucket
-    entry.live[key] = nil
-    entry.count -= 1
-    if entry.count == 0 and index.ordered and value ~= nil then
-      local kind = type(value)
+    if index.ordered and value ~= nil and (kind == 'number' or kind == 'string') then
+      index.tree = ordered.adjust(index.tree, value :: string | number, 1)
+    end
+
+    return
+  end
+
+  if not posting then return end
+
+  if type(posting) == 'string' then
+    if posting ~= key then return end
+    set(nil)
+    if index.ordered and value ~= nil then
       local kinds = index.types :: { [string]: number }
       kinds[kind] -= 1
       if kind == 'number' or kind == 'string' then
         index.tree = ordered.remove(index.tree, value :: string | number)
       end
-    elseif index.ordered and value ~= nil then
-      local kind = type(value)
+    end
+    return
+  end
+
+  if not posting.live[key] then return end
+
+  posting.live[key] = nil
+  posting.count -= 1
+  if index.ordered and value ~= nil and (kind == 'number' or kind == 'string') then
+    index.tree = ordered.adjust(index.tree, value :: string | number, -1)
+  end
+
+  -- Shrink back to an inline posting when only one row remains. SQL does not
+  -- guarantee tie order; no indexed iterator survives a synchronous write.
+  if posting.count == 1 then
+    for _, survivor in posting.keys do
+      if posting.live[survivor] then set(survivor); break end
+    end
+  elseif posting.count == 0 then
+    set(nil)
+    if index.ordered and value ~= nil then
+      local kinds = index.types :: { [string]: number }
+      kinds[kind] -= 1
       if kind == 'number' or kind == 'string' then
-        index.tree = ordered.adjust(index.tree, value :: string | number, -1)
+        index.tree = ordered.remove(index.tree, value :: string | number)
       end
     end
-
-    if value ~= nil then compactBucket(index, encoded, entry) end
-
-    if entry.count == 0 and value == nil then index.nulls = nil end
+  elseif value ~= nil then
+    compactBucket(index, encoded, posting)
   end
 end
 
@@ -363,11 +422,18 @@ local function orderedCursor(current: TableState, request: queryEngine.Request):
   local advance = ordered.iterate(index.tree, descending, lower, lowerStrict, upper, upperStrict)
   local nullBucket = index.nulls
   local nullPosition = 0
-  local posting: Bucket? = nil
+  local posting: Posting? = nil
   local postingPosition = 0
   local finished = false
+
   local function nextNull(): queryEngine.SourceRow?
     if not nullBucket then return nil end
+
+    if type(nullBucket) == 'string' then
+      if nullPosition > 0 then return nil end
+      nullPosition = 1
+      return current.rows[nullBucket]
+    end
 
     while nullPosition < #nullBucket.keys do
       nullPosition += 1
@@ -393,12 +459,20 @@ local function orderedCursor(current: TableState, request: queryEngine.Request):
 
       while true do
         if posting then
-          while postingPosition < #(posting :: Bucket).keys do
-            postingPosition += 1
-            local key = (posting :: Bucket).keys[postingPosition]
-            if (posting :: Bucket).live[key] then
-              local row = current.rows[key]
-              if row then return row end
+          if type(posting) == 'string' then
+            local key = posting :: string
+            posting = nil
+            local row = current.rows[key]
+            if row then return row end
+          else
+            local bucket = posting :: Bucket
+            while postingPosition < #bucket.keys do
+              postingPosition += 1
+              local key = bucket.keys[postingPosition]
+              if bucket.live[key] then
+                local row = current.rows[key]
+                if row then return row end
+              end
             end
           end
         end
@@ -465,11 +539,10 @@ local function indexedKeys(current: TableState, request: queryEngine.Request): (
     if prefix == nil or suffix == nil then continue end
     local index = composite.partitions[keyOf(prefix)]
     local bucket = if index then index.buckets[keyOf(suffix)] else nil
-    local count = if bucket then bucket.count else 0
+    local count = postingCount(bucket)
     if count < bestCount then
       bestCount = count
-      bestKeys = if bucket then bucket.keys else {}
-      bestSet = if bucket then bucket.live else nil
+      bestKeys, bestSet = postingKeys(bucket)
     end
   end
 
@@ -484,11 +557,10 @@ local function indexedKeys(current: TableState, request: queryEngine.Request): (
     local index = current.secondary[column]
     if index then
       local bucket = index.buckets[keyOf(value)]
-      local count = if bucket then bucket.count else 0
+      local count = postingCount(bucket)
       if count < bestCount then
         bestCount = count
-        bestKeys = if bucket then bucket.keys else {}
-        bestSet = if bucket then bucket.live else nil
+        bestKeys, bestSet = postingKeys(bucket)
       end
     end
   end
@@ -610,7 +682,7 @@ local function tableProvider(state: DatabaseState, name: string): queryEngine.Pr
         if #request.constraints == 2 then
           local index = composite.partitions[keyOf(prefix)]
           local bucket = if index then index.buckets[keyOf(suffix)] else nil
-          return if bucket then bucket.count else 0
+          return postingCount(bucket)
         end
       end
 
@@ -631,7 +703,7 @@ local function tableProvider(state: DatabaseState, name: string): queryEngine.Pr
           return if tableState.rows[keys[1]] then 1 else 0
         end
         local bucket = tableState.secondary[only.column].buckets[keyOf(only.value)]
-        return if bucket then bucket.count else 0
+        return postingCount(bucket)
       end
 
       -- More than one predicate: use the smallest available posting list, then
@@ -697,13 +769,10 @@ local function tableProvider(state: DatabaseState, name: string): queryEngine.Pr
       if not index then return nil end
       local bucket = index.buckets[keyOf(value)]
       local rows: { queryEngine.Row } = {}
-      if bucket then
-        for _, key in bucket.keys do
-          if not bucket.live[key] then continue end
-          local row = tableState.rows[key]
-          if row then rows[#rows + 1] = row end
-        end
-      end
+      eachPosting(bucket, function(key)
+        local row = tableState.rows[key]
+        if row then rows[#rows + 1] = row end
+      end)
       return rows
     end,
   }
@@ -1154,11 +1223,7 @@ local function buildTransaction(state: DatabaseState)
 
     if index then
       local bucket = index.buckets[keyOf(value)]
-      if bucket then
-        for _, key in bucket.keys do
-          if bucket.live[key] then consider(key) end
-        end
-      end
+      eachPosting(bucket, consider)
     end
 
     if stagedTable then
@@ -1249,9 +1314,7 @@ local function buildTransaction(state: DatabaseState)
         local bucket = index.buckets[node.encoded]
         if not bucket then error('jessql storage: index bucket missing', 2) end
 
-        for _, key in bucket.keys do
-          if bucket.live[key] then consider(key) end
-        end
+        eachPosting(bucket, consider)
       end
     end
 
@@ -1698,8 +1761,8 @@ function storage.open(path: string, options: Options?): Store
       for column, index in current.secondary do
         local slots, keys = 0, 0
         for _, bucket in index.buckets do
-          slots += #bucket.keys
-          keys += bucket.count
+          slots += if type(bucket) == 'string' then 1 else #bucket.keys
+          keys += postingCount(bucket)
         end
         metrics.indexSlots[column] = slots
         metrics.indexKeys[column] = keys
