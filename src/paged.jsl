@@ -59,7 +59,8 @@ end
 
 local function numberAt(value: string, offset: number): number
   if offset < 1 or offset + 3 > #value then error('jessql paged: truncated record', 3) end
-  return buffer.readu32(buffer.fromstring(string.sub(value, offset, offset + 3)), 0)
+  local b0, b1, b2, b3 = string.byte(value, offset, offset + 3)
+  return b0 + b1 * 256 + b2 * 65536 + b3 * 16777216
 end
 
 local function validateColumns(columns: { string }, primaryKey: string)
@@ -248,10 +249,12 @@ function paged.open(path: string, options: Options?): Snapshot
     local found = cache[index]
     if found then found.age = ticks; return found end
     local page = directory.pages[index]
-    local header = read(page.offset, 8)
-    if numberAt(header, 1) ~= page.length then error('jessql paged: page length mismatch', 2) end
-    local body = read(page.offset + 8, page.length)
-    if numberAt(header, 5) ~= page.checksum or page.checksum ~= bytes.crc32(body) then
+    -- The directory already contains the page length: fetch the header and body
+    -- in one positional read instead of issuing two filesystem calls per miss.
+    local frame = read(page.offset, page.length + 8)
+    if numberAt(frame, 1) ~= page.length then error('jessql paged: page length mismatch', 2) end
+    local body = string.sub(frame, 9)
+    if numberAt(frame, 5) ~= page.checksum or page.checksum ~= bytes.crc32(body) then
       error('jessql paged: page checksum mismatch', 2)
     end
     local entries: { Entry } = {}
