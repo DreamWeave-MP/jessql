@@ -5,6 +5,7 @@
 local engine = require('@jessql/engine')
 local storage = require('@jessql/storage')
 local paged = require('@jessql/paged')
+local segments = require('@jessql/segments')
 local secondary = require('@jessql/secondary')
 
 export type Row = { [string]: unknown }
@@ -338,9 +339,14 @@ end
 
 -- Opens an existing immutable snapshot plus a private mutable WAL.
 -- The snapshot is never modified or deleted by this API.
-function hybrid.open(walPath: string, snapshotPath: string, tableName: string, options: Options?): Database
+function hybrid.open(walPath: string, snapshotPath: string | { string }, tableName: string, options: Options?): Database
   local name = validTable(tableName)
-  local cold = paged.open(snapshotPath, { cachePages = if options then options.cachePages else nil })
+  if type(snapshotPath) == 'table' and options and options.secondaryIndexPath then
+    error('jessql hybrid: secondary index sidecar requires a single snapshot', 2)
+  end
+  local cold = if type(snapshotPath) == 'table'
+    then segments.open(snapshotPath :: { string }, { cachePages = if options then options.cachePages else nil })
+    else paged.open(snapshotPath :: string, { cachePages = if options then options.cachePages else nil })
   local coldIndex: secondary.Index? = nil
   if options and options.secondaryIndexPath then
     -- A mismatched sidecar must not leave an open cold reader behind.
