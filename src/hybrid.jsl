@@ -5,9 +5,10 @@
 local engine = require('@jessql/engine')
 local storage = require('@jessql/storage')
 local paged = require('@jessql/paged')
+local secondary = require('@jessql/secondary')
 
 export type Row = { [string]: unknown }
-export type Options = { cachePages: number?, rowLayout: string? }
+export type Options = { cachePages: number?, rowLayout: string?, secondaryIndexPath: string? }
 export type Transaction = {
   get: (self: Transaction, key: unknown) -> Row?,
   insert: (self: Transaction, row: Row) -> (),
@@ -84,7 +85,7 @@ local function keyLess(left: unknown, right: unknown): boolean
   return (left :: string) < (right :: string)
 end
 
-local function provider(cold: paged.Snapshot, tableName: string, primaryKey: string,
+local function provider(cold: paged.Snapshot, coldIndex: secondary.Index?, tableName: string, primaryKey: string,
   hotGet: (string, unknown) -> Row?, hotQuery: (string) -> engine.Result): engine.Provider
   local columns = cold.columns
 
@@ -131,6 +132,93 @@ local function provider(cold: paged.Snapshot, tableName: string, primaryKey: str
     end
 
     if not hasPrimaryKey then readColumns[#readColumns + 1] = primaryKey end
+
+    -- A snapshot-bound sidecar can stream one partition in ordered-value order.
+    -- We still merge hot changes and suppress every shadowed cold primary key.
+    -- Other predicates remain the SQL executor's responsibility.
+    local order = request.orderBy
+    if coldIndex and coldIndex.complete and coldIndex.orderKind ~= 'mixed'
+      and coldIndex.orderKind ~= '' and order ~= nil and #order == 1
+      and order[1].column == coldIndex.orderColumn then
+      local prefix: unknown = nil
+      local lower: unknown = nil
+      local upper: unknown = nil
+      local lowerStrict, upperStrict = false, false
+      local compatible = true
+      for _, constraint in request.constraints do
+        if constraint.column == coldIndex.partitionColumn and constraint.op == '=' then
+          prefix = constraint.value
+        elseif constraint.column == coldIndex.orderColumn
+          and (constraint.op == '>' or constraint.op == '>=' or constraint.op == '<' or constraint.op == '<=') then
+          if constraint.value == nil or type(constraint.value) ~= coldIndex.orderKind then
+            compatible = false
+            break
+          end
+          local value = constraint.value
+          if constraint.op == '>' or constraint.op == '>=' then
+            if lower == nil or keyLess(lower, value)
+              or (lower == value and constraint.op == '>') then
+              lower, lowerStrict = value, constraint.op == '>'
+            end
+          elseif upper == nil or keyLess(value, upper)
+            or (upper == value and constraint.op == '<') then
+            upper, upperStrict = value, constraint.op == '<'
+          end
+        end
+      end
+
+      if prefix ~= nil and compatible then
+        local selectedIndex = coldIndex :: secondary.Index
+        local matchingHot: { Row } = {}
+        for _, row in hotRows do
+          if row[coldIndex.partitionColumn] == prefix then
+            if type(row[coldIndex.orderColumn]) ~= coldIndex.orderKind then
+              compatible = false
+              break
+            end
+            matchingHot[#matchingHot + 1] = row
+          end
+        end
+
+        if compatible then
+          local descending = order[1].desc
+          table.sort(matchingHot, function(left, right)
+            local leftValue, rightValue = left[selectedIndex.orderColumn], right[selectedIndex.orderColumn]
+            if leftValue == rightValue then
+              return if descending then keyLess(right[primaryKey], left[primaryKey])
+                else keyLess(left[primaryKey], right[primaryKey])
+            end
+            return if descending then keyLess(rightValue, leftValue) else keyLess(leftValue, rightValue)
+          end)
+          local nextCold = selectedIndex:iterate(prefix, descending, lower, upper, lowerStrict, upperStrict)
+          local coldRow = nextCold()
+          local hotIndex = 1
+          local function nextMerged(): Row?
+            while coldRow do
+              if not masked[encodeKey((coldRow :: Row)[primaryKey])] then break end
+              coldRow = nextCold()
+            end
+            local hotRow = matchingHot[hotIndex]
+            if not coldRow and not hotRow then return nil end
+            local selectHot = not coldRow or (hotRow ~= nil and
+              (if descending then keyLess((coldRow :: Row)[selectedIndex.orderColumn], (hotRow :: Row)[selectedIndex.orderColumn])
+                else keyLess((hotRow :: Row)[selectedIndex.orderColumn], (coldRow :: Row)[selectedIndex.orderColumn])))
+            local selected: Row
+            if selectHot then
+              selected = hotRow :: Row
+              hotIndex += 1
+            else
+              selected = coldRow :: Row
+              coldRow = nextCold()
+            end
+            local result: Row = {}
+            for _, column in request.columns do result[column] = selected[column] end
+            return result
+          end
+          return { _jessqlIter = 'v1', ordered = true, next = nextMerged }
+        end
+      end
+    end
 
     local order = request.orderBy
     local orderedRead = order ~= nil and #order == 1 and order[1].column == primaryKey
@@ -253,13 +341,27 @@ end
 function hybrid.open(walPath: string, snapshotPath: string, tableName: string, options: Options?): Database
   local name = validTable(tableName)
   local cold = paged.open(snapshotPath, { cachePages = if options then options.cachePages else nil })
+  local coldIndex: secondary.Index? = nil
+  if options and options.secondaryIndexPath then
+    -- A mismatched sidecar must not leave an open cold reader behind.
+    local indexOk, indexResult = pcall(function()
+      coldIndex = secondary.open(options.secondaryIndexPath :: string, cold,
+        { cachePages = options.cachePages })
+    end)
+
+    if not indexOk then cold:close(); error(indexResult, 2) end
+  end
   local hot: storage.Store? = nil
   -- If the WAL is locked or invalid, close the cold reader before propagating.
   local ok, failure = pcall(function()
     hot = storage.open(walPath, { rowLayout = if options then options.rowLayout else 'packed' })
   end)
 
-  if not ok then cold:close(); error(failure, 2) end
+  if not ok then
+    if coldIndex then coldIndex:close() end
+    cold:close()
+    error(failure, 2)
+  end
   local store = hot :: storage.Store
   local closed = false
 
@@ -311,6 +413,7 @@ function hybrid.open(walPath: string, snapshotPath: string, tableName: string, o
   if not initialized then
     -- Cleanup must not hide the original initialization error.
     pcall(function() store:close() end)
+    if coldIndex then coldIndex:close() end
     cold:close()
     error(initFailure, 2)
   end
@@ -323,7 +426,7 @@ function hybrid.open(walPath: string, snapshotPath: string, tableName: string, o
 
   local function newView(getter: (string, unknown) -> Row?, query: (string) -> engine.Result): engine.Database
     local view = engine.new()
-    view:register(name, provider(cold, name, cold.primaryKey, getter, query))
+    view:register(name, provider(cold, coldIndex, name, cold.primaryKey, getter, query))
     return view
   end
 
@@ -507,6 +610,7 @@ function hybrid.open(walPath: string, snapshotPath: string, tableName: string, o
     if activeTransaction then error('jessql hybrid: cannot close during transaction', 2) end
     closed = true
     store:close()
+    if coldIndex then coldIndex:close() end
     cold:close()
   end
   return db
