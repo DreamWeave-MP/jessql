@@ -1574,4 +1574,112 @@ suite.describe('packed resident layout', function()
 
 end)
 
+suite.describe('compact ordered index nodes', function()
+  suite.it('recycles AVL nodes and preserves weighted counts and ordering', function()
+    local ordered = require('@jessql/ordered')
+    local tree = nil
+    for value = 1, 800 do
+      tree = ordered.insert(tree, value, 'n' .. tostring(value))
+      if value % 5 == 0 then tree = ordered.adjust(tree, value, 2) end
+    end
+    expect(ordered.countRange(tree, nil, false, nil, false)).toBe(1120)
+    local forward = ordered.iterate(tree, false, 375, true, 405, false)
+    local last = 375
+    while true do
+      local node = forward()
+      if not node then break end
+      expect(node.value > last).toBe(true)
+      last = node.value
+    end
+    expect(last).toBe(405)
+    local descending = ordered.iterate(tree, true, 375, false, 405, true)
+    last = 405
+    while true do
+      local node = descending()
+      if not node then break end
+      expect(node.value < last).toBe(true)
+      last = node.value
+    end
+    expect(last).toBe(375)
+
+    local highestSlot = tree.nextNode
+    for value = 1, 800 do tree = ordered.remove(tree, value) end
+    expect(ordered.countRange(tree, nil, false, nil, false)).toBe(0)
+    for value = 801, 1600 do tree = ordered.insert(tree, value, 'n' .. tostring(value)) end
+    -- Deleted nodes must be reused, not leaked as monotonically allocated slots.
+    expect(tree.nextNode).toBe(highestSlot)
+    expect(ordered.countRange(tree, 1000, true, 1200, false)).toBe(200)
+    local probe = ordered.iterate(tree, false, nil, false, nil, false)
+    for value = 801, 1600 do
+      local node = probe()
+      expect(node.value).toBe(value)
+    end
+    expect(probe()).toBe(nil)
+  end)
+
+  suite.it('preserves range cardinality through mixed index mutations and checkpoints', function()
+    for _, layout in { 'row', 'packed' } do
+      local path = fixture('compact-avl-' .. layout)
+      local db = sql.open(path, { rowLayout = layout })
+      db:createTable('events', { 'id', 'room', 'stream' }, 'id')
+      local values: { [number]: number } = {}
+      local rooms: { [number]: string } = {}
+      db:transaction(function(tx)
+        for id = 1, 240 do
+          local value = id % 41
+          local room = 'r' .. tostring(id % 7)
+          tx:insert('events', { id = id, room = room, stream = value })
+          values[id], rooms[id] = value, room
+        end
+      end)
+      db:createOrderedIndex('events', 'stream')
+      db:createCompositeIndex('events', 'room', 'stream')
+
+      for batch = 1, 12 do
+        db:transaction(function(tx)
+          for step = 1, 35 do
+            local id = (batch * 79 + step * 17) % 240 + 1
+            local value = (batch * 41 + step * 13) % 79
+            local room = 'r' .. tostring((batch + step) % 7)
+            if step % 5 == 0 then
+              tx:delete('events', id)
+              tx:insert('events', { id = id, room = room, stream = value })
+            else
+              tx:update('events', id, { room = room, stream = value })
+            end
+            values[id], rooms[id] = value, room
+          end
+        end)
+        local bound = batch * 5
+        local want, scoped = 0, 0
+        for id = 1, 240 do
+          if values[id] >= bound then
+            want += 1
+            if rooms[id] == 'r2' then scoped += 1 end
+          end
+        end
+        expect(db:query('SELECT COUNT(*) AS n FROM events WHERE stream >= ?', { bound }).rows[1].n).toBe(want)
+        expect(db:query('SELECT COUNT(*) AS n FROM events WHERE room = ? AND stream >= ?',
+          { 'r2', bound }).rows[1].n).toBe(scoped)
+        local sorted = db:query('SELECT stream FROM events WHERE room = ? AND stream >= ? ORDER BY stream DESC LIMIT 30',
+          { 'r2', bound }).rows
+        local previous = math.huge
+        for _, row in sorted do
+          expect((row.stream :: number) <= previous).toBe(true)
+          expect((row.stream :: number) >= bound).toBe(true)
+          previous = row.stream :: number
+        end
+      end
+      db:checkpoint()
+      db:close()
+      local reopened = sql.open(path, { rowLayout = layout })
+      local expected = 0
+      for id = 1, 240 do if values[id] >= 20 then expected += 1 end end
+      expect(reopened:query('SELECT COUNT(*) AS n FROM events WHERE stream >= 20').rows[1].n).toBe(expected)
+      reopened:close()
+      clean(path)
+    end
+  end)
+end)
+
 return suite
