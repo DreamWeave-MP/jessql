@@ -118,3 +118,46 @@ file size and SHA-256 digest
 `40d1e6f02855ece63b462c81f0e9c591217cfe6649aea231ba70061399ccdd52`.
 Query checksum also matched (`34358907`). This is a build-time RSS
 optimization, not a smaller index file or a faster indexed query.
+
+## Compact JQLS1 sidecars (opt-in)
+
+To eliminate duplicate primary-key serialization and JSON row overhead in a
+cold secondary index, pass `format = 'compact'` to `secondary.create()`:
+
+```lua
+sql.secondary.create('events.room-stream.compact', 'events.cold', 'room_id',
+  'stream_id', { format = 'compact', runRows = 16384, mergeFanIn = 8 })
+```
+
+The immutable `JQLS1` format stores one sorted key per entry using a binary
+record frame. Each key uses a 16-bit common-prefix length and a 32-bit
+suffix length, followed by its unshared bytes. The existing reversible
+`(partition, ordered value, primary key)` encoding supplies the primary key
+without duplicating it in a JSON row. CRC32 protects each page and the
+footer's sparse directory, including the source-snapshot identity and index
+metadata. Loaded pages are checked before any row from them is returned.
+
+`secondary.open()` automatically detects both `JQLP2` and `JQLS1`. Nothing
+changes for existing sidecars. `format = 'paged'` (the default) preserves the
+old format byte-for-byte. To migrate, construct a **new** sidecar from the
+same immutable cold snapshot, validate it, then point the hybrid opener at its
+path; do not overwrite an active sidecar. The `JQLS1` format is experimental.
+
+External spill runs still use `JQLP2`; only the final output is compact. Its
+build-time sorting budget and merge fan-in are unchanged, and the final
+writer consumes sorted entries as a stream. There is no need to hold the
+complete result in memory. The sparse page directory does still scale with
+the number of index pages, and key reconstruction allocates strings for a
+cached page. Like `JQLP2`, the current format caps total file size at 4 GiB,
+individual index keys at 4 MiB, and directory metadata at 16 MiB.
+
+This is **not compression of application records** and is not a durable commit
+protocol. `JQLS1` sidecars are independently rebuildable derived data; they
+must be bound to the exact source snapshot and republished through a safe
+filesystem protocol before a deployment relies on power-loss persistence.
+A CRC32 check detects accidental corruption; it is not cryptographic
+authentication.
+
+Benchmark: `jess run --package . --trusted bench/secondary-build.jsl build
+100000 16384 8 compact`. Run the equivalent command with `paged` to measure
+the original format. `prepare` generates the shared cold snapshot first.

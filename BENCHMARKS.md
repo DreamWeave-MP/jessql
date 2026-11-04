@@ -512,3 +512,29 @@ just live sorter objects. Runs were performed on the same host with the
 same prepared snapshot but are not an exhaustive benchmark. The external
 builder trades increased build time and temporary disk I/O for lower peak
 RSS. No change to the JQLP2 format or WAL; durability is still buffered.
+
+## Compact cold sidecars (JQLS1, experimental)
+
+With the Jess 0.3.0 Linux x64 release, 100,000 events in 48 partitions,
+16,384-entry external-sort runs, merge fan-in 8, and identical source cold
+snapshot, we compared four runs of the original `JQLP2` sidecar builder and
+four runs of the opt-in `JQLS1` compact builder, alternating process order.
+
+| Metric (median) | JQLP2 | JQLS1 |
+|---|---:|---:|
+| Sidecar bytes | 14,394,086 | **3,581,252** |
+| Builder CPU seconds | 2.882 | **2.279** |
+| Peak process RSS (KiB) | 64,898 | 64,748 |
+| 120 bounded indexed range reads (CPU seconds) | 0.276 | 0.230 |
+| Query checksum | 28,443,996 | 28,443,996 |
+
+The index sidecar is **75.1% smaller** in this workload. Builder CPU is about
+21% lower in the sampled medians; the bounded query measurements overlap
+between runs, so do not extrapolate the median improvement to all workloads.
+The shared external sorter still dominates peak RSS. Read latency varies
+with partition cardinality, page cache size, storage, and key lengths.
+
+The benchmark is `bench/secondary-build.jsl`; its fifth positional argument
+selects `paged` (the backwards-compatible default) or `compact`. This
+experiment changes *index representation only*. It does not change the WAL,
+snapshot row format, query semantics, or cross-platform durability guarantees.

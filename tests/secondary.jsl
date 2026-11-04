@@ -243,5 +243,195 @@ suite.describe('immutable cold composite secondary index', function()
     fs.remove(wal .. '.lock')
   end)
 
+
+  suite.it('round-trips compact sidecars across ordered ranges and multi-level external merging', function()
+    local cold, sidecar = fixture('compact-merged')
+    seed(cold, 741)
+    local metrics = sql.secondary.create(sidecar, cold, 'room', 'stream',
+      { format = 'compact', pageBytes = 512, runRows = 13, mergeFanIn = 3 })
+    expect(metrics.spilledRuns > 50).toBe(true)
+    local indexText = fs.readFileString(sidecar) :: string
+    expect(string.sub(indexText, 1, 6)).toBe('JQLS1\n')
+    local source = sql.paged.open(cold)
+    local index = sql.secondary.open(sidecar, source, { cachePages = 2 })
+    expect(index.complete).toBe(true)
+    expect(index.count).toBe(741)
+    local forward = index:iterate('a', false, 10, 200, false, false)
+    for id = 111, 300, 3 do expect((forward() :: sql.Row).id).toBe(id) end
+    expect(forward()).toBe(nil)
+    local reverse = index:iterate('a', true, 10, 200, false, false)
+    for id = 300, 111, -3 do expect((reverse() :: sql.Row).id).toBe(id) end
+    expect(reverse()).toBe(nil)
+    index:close()
+    source:close()
+    fs.remove(cold)
+    fs.remove(sidecar)
+  end)
+
+  suite.it('supports binary sidecars for UTF-8 string primary keys and shadowing', function()
+    local cold, sidecar = fixture('compact-utf8')
+    local wal = cold .. '.wal'
+    fs.remove(wal)
+    fs.remove(wal .. '.lock')
+    local cursor = 0
+    sql.paged.create(cold, { 'id', 'room', 'stream', 'body' }, 'id', function()
+      cursor += 1
+      if cursor > 120 then return nil end
+
+      return { id = string.format('$event%04d:例子.org', cursor), room = '🚀room',
+        stream = cursor / 2, body = 'data' }
+    end, { pageBytes = 512 })
+    sql.secondary.create(sidecar, cold, 'room', 'stream', { format = 'compact', pageBytes = 512 })
+    local source = sql.paged.open(cold)
+    local index = sql.secondary.open(sidecar, source)
+    local forward = index:iterate('🚀room', false, 10, 12)
+    for id = 20, 24 do
+      expect((forward() :: sql.Row).id).toBe(string.format('$event%04d:例子.org', id))
+    end
+    expect(forward()).toBe(nil)
+    index:close()
+    source:close()
+    local db = sql.hybrid.open(wal, cold, 'events', { secondaryIndexPath = sidecar })
+    db:transaction(function(tx)
+      tx:delete('$event0022:例子.org')
+      tx:upsert({ id = '$event0023:例子.org', room = '🚀room', stream = 1000, body = 'moved' })
+    end)
+    local results = db:query([[SELECT id FROM events WHERE room = ? AND stream >= ?
+      ORDER BY stream LIMIT 8]], { '🚀room', 10 }).rows
+    expect(results[1].id).toBe('$event0020:例子.org')
+    expect(results[2].id).toBe('$event0021:例子.org')
+    expect(results[3].id).toBe('$event0024:例子.org')
+    db:close()
+    fs.remove(cold)
+    fs.remove(sidecar)
+    fs.remove(wal)
+    fs.remove(wal .. '.lock')
+  end)
+
+  suite.it('rejects compact corruption, mismatched snapshots, and invalid formats', function()
+    local cold, sidecar = fixture('compact-integrity')
+    seed(cold, 100)
+    -- Expected malformed input or corruption must throw without changing usable state.
+    local ok = pcall(function()
+      sql.secondary.create(sidecar, cold, 'room', 'stream', { format = 'garbage' })
+    end)
+    expect(ok).toBe(false)
+    sql.secondary.create(sidecar, cold, 'room', 'stream', { format = 'compact', pageBytes = 512 })
+    local source = sql.paged.open(cold)
+    local index = sql.secondary.open(sidecar, source)
+    expect((index:iterate('a')() :: sql.Row).id).toBe(3)
+    index:close()
+    source:close()
+    local data = fs.readFileString(sidecar) :: string
+    local tampered = string.sub(data, 1, 16) .. 'X' .. string.sub(data, 18)
+    local written = fs.writeFile(sidecar, tampered, { offset = 0, create = false })
+    expect(written ~= nil).toBe(true)
+    source = sql.paged.open(cold)
+    -- Expected malformed input or corruption must throw without changing usable state.
+    local rejected = pcall(function()
+      local damaged = sql.secondary.open(sidecar, source)
+      damaged:iterate('a')()
+      damaged:close()
+    end)
+    expect(rejected).toBe(false)
+    source:close()
+    fs.remove(cold)
+    fs.remove(sidecar)
+    seed(cold, 100)
+    sql.secondary.create(sidecar, cold, 'room', 'stream', { format = 'compact' })
+    fs.remove(cold)
+    seed(cold, 101)
+    source = sql.paged.open(cold)
+    -- Expected malformed input or corruption must throw without changing usable state.
+    rejected = pcall(function() sql.secondary.open(sidecar, source) end)
+    expect(rejected).toBe(false)
+    source:close()
+    fs.remove(cold)
+    fs.remove(sidecar)
+  end)
+
+
+  suite.it('round-trips mixed primary-key scalar kinds in compact pages', function()
+    local cold, sidecar = fixture('compact-mixed-pk')
+    local rows: { sql.Row } = {
+      { id = false, room = 'x', stream = 1 },
+      { id = true, room = 'x', stream = 2 },
+      { id = -2.5, room = 'x', stream = 3 },
+      { id = 0, room = 'x', stream = 4 },
+      { id = 1099511627777, room = 'x', stream = 5 },
+      { id = '', room = 'x', stream = 6 },
+      { id = 'x|\n', room = 'x', stream = 7 },
+      { id = '🍀', room = 'x', stream = 8 },
+    }
+    local position = 0
+    sql.paged.create(cold, { 'id', 'room', 'stream' }, 'id', function(): sql.Row?
+      position += 1
+      return rows[position]
+    end, { pageBytes = 512 })
+    sql.secondary.create(sidecar, cold, 'room', 'stream', { format = 'compact', pageBytes = 512 })
+    local source = sql.paged.open(cold)
+    local index = sql.secondary.open(sidecar, source)
+    local iterator = index:iterate('x')
+    for _, row in rows do
+      local nextRow = iterator() :: sql.Row
+      expect(nextRow.id).toBe(row.id)
+      expect(nextRow.stream).toBe(row.stream)
+    end
+    expect(iterator()).toBe(nil)
+    index:close()
+    source:close()
+    fs.remove(cold)
+    fs.remove(sidecar)
+  end)
+
+  suite.it('keeps compact and legacy index iteration exactly equivalent', function()
+    local cold, compactPath = fixture('compact-parity')
+    local legacyPath = compactPath .. '.legacy'
+    seed(cold, 800)
+    sql.secondary.create(legacyPath, cold, 'room', 'stream', { pageBytes = 512 })
+    sql.secondary.create(compactPath, cold, 'room', 'stream', { pageBytes = 512, format = 'compact' })
+    local source = sql.paged.open(cold)
+    local compactIndex = sql.secondary.open(compactPath, source, { cachePages = 2 })
+    local legacyIndex = sql.secondary.open(legacyPath, source, { cachePages = 2 })
+    for testCase = 1, 40 do
+      local room = if testCase % 2 == 0 then 'a' else 'b'
+      local descending = testCase % 3 == 0
+      local lower = testCase * 4 - 101
+      local upper = lower + 75
+      local first = compactIndex:iterate(room, descending, lower, upper,
+        testCase % 4 == 0, testCase % 5 == 0)
+      local second = legacyIndex:iterate(room, descending, lower, upper,
+        testCase % 4 == 0, testCase % 5 == 0)
+      while true do
+        local left, right = first(), second()
+        expect(left == nil).toBe(right == nil)
+        if not left then break end
+        expect((left :: sql.Row).id).toBe((right :: sql.Row).id)
+      end
+    end
+    compactIndex:close()
+    legacyIndex:close()
+    source:close()
+    fs.remove(cold)
+    fs.remove(compactPath)
+    fs.remove(legacyPath)
+  end)
+
+  suite.it('opens a compact sidecar over an empty cold snapshot', function()
+    local cold, sidecar = fixture('compact-empty')
+    sql.paged.create(cold, { 'id', 'room', 'stream' }, 'id', function(): sql.Row? return nil end)
+    local metrics = sql.secondary.create(sidecar, cold, 'room', 'stream', { format = 'compact' })
+    expect(metrics.entries).toBe(0)
+    local source = sql.paged.open(cold)
+    local index = sql.secondary.open(sidecar, source)
+    expect(index.count).toBe(0)
+    expect(index.complete).toBe(true)
+    expect(index:iterate('missing')()).toBe(nil)
+    index:close()
+    source:close()
+    fs.remove(cold)
+    fs.remove(sidecar)
+  end)
+
 end)
 return suite

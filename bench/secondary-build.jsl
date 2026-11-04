@@ -7,6 +7,7 @@ local mode = arg[1] or 'build'
 local count = tonumber(arg[2]) or 100000
 local runRows = tonumber(arg[3]) or 4096
 local fanIn = tonumber(arg[4]) or 8
+local indexFormat = arg[5] or 'paged'
 local base = fs.join(fs.cwd() :: string, '.jessql-secondary-build')
 local cold, indexPath = base .. '.cold', base .. '.idx'
 local function rss(): number
@@ -34,8 +35,11 @@ end
 fs.remove(indexPath)
 local started = os.clock()
 local metrics = sql.secondary.create(indexPath, cold, 'room', 'stream',
-  { runRows = runRows, mergeFanIn = fanIn })
+  { runRows = runRows, mergeFanIn = fanIn, format = indexFormat })
 print('build_seconds', os.clock() - started)
+print('index_format', indexFormat)
+local file = fs.open(indexPath)
+if file then print('index_bytes', file:size()); file:close() end
 print('rss_after_build_KiB', rss())
 if metrics then
   print('spilled_runs', metrics.spilledRuns)
@@ -53,5 +57,19 @@ while true do
   checksum += row.id :: number
 end
 print('lookup_checksum', checksum)
+local queryStart = os.clock()
+local queryChecksum = 0
+for attempt = 1, 120 do
+  local room = 'room-' .. tostring(attempt % 48)
+  local nextEvent = index:iterate(room, false, 100, 140)
+  while true do
+    local event = nextEvent()
+    if not event then break end
+    queryChecksum += event.id :: number
+  end
+end
+print('bounded_query_seconds', os.clock() - queryStart)
+print('bounded_query_checksum', queryChecksum)
+print('sidecar_page_reads', index:stats().pageReads)
 index:close()
 source:close()
