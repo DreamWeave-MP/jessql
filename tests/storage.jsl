@@ -1213,6 +1213,58 @@ suite.describe('native persistent store', function()
     clean(path)
   end)
 
+  suite.it('matches committed SQL results for deterministic staged mutation sequences', function()
+    local path = fixture('tx-query-model')
+    local db = sql.open(path)
+    db:createTable('events', { 'id', 'room', 'priority' }, 'id')
+    db:createIndex('events', 'room')
+    db:createOrderedIndex('events', 'priority')
+    for id = 1, 80 do
+      db:insert('events', { id = id, room = 'r' .. tostring(id % 5), priority = id % 11 })
+    end
+
+    local statements = {
+      'SELECT COUNT(*) AS n FROM events',
+      'SELECT id FROM events WHERE room = ? ORDER BY id LIMIT 15',
+      'SELECT id FROM events WHERE priority >= ? ORDER BY id LIMIT 30',
+      'SELECT room, COUNT(*) AS n FROM events GROUP BY room ORDER BY room',
+      'SELECT id, room, priority FROM events ORDER BY id LIMIT 25',
+    }
+
+    for cycle = 1, 12 do
+      local expected: { { [string]: unknown } } = {}
+      db:transaction(function(tx)
+        for step = 1, 22 do
+          local id = (cycle * 17 + step * 13) % 89 + 1
+          if step % 5 == 0 then
+            tx:delete('events', id)
+          else
+            tx:upsert('events', { id = id, room = 'r' .. tostring((cycle + step) % 5),
+              priority = (cycle * 5 + step) % 11 })
+          end
+        end
+
+        for index, statement in statements do
+          local args = if index == 2 then { 'r2' } elseif index == 3 then { 5 } else nil
+          expected[index] = tx:query(statement, args).rows
+        end
+      end)
+
+      for index, statement in statements do
+        local args = if index == 2 then { 'r2' } elseif index == 3 then { 5 } else nil
+        expect(db:query(statement, args).rows).toEqual(expected[index])
+      end
+
+      if cycle % 4 == 0 then
+        db:checkpoint()
+        db:close()
+        db = sql.open(path)
+      end
+    end
+    db:close()
+    clean(path)
+  end)
+
   suite.it('refuses a second writer while the first lock is held', function()
     local path = fixture('lock')
     local db = sql.open(path)

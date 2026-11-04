@@ -44,9 +44,15 @@ after schema changes. Plans also reject use after database close.
 
 SQL `INSERT`, `UPDATE`, and `DELETE` support the intentionally restricted
 parameterized DML grammar described below. SQL `CREATE TABLE` and `CREATE INDEX`
-are not parsed; use the typed schema API. SQL reads within an in-progress
-transaction see committed state, not the staged overlay; use `tx:get` to read
-your pending writes. Transactions must not yield. There is no MVCC, schema
+are not parsed; use the typed schema API. `tx:query(sql, params?)` supports
+SQL SELECT with **read-your-writes** semantics over staged inserts, updates,
+deletes, freshly created tables, and nullable schema additions. It can run joins
+and aggregates without cloning every committed row. The normal `db:query()`
+outside the transaction still sees committed state. Transaction SELECT plans
+are cached within each callback (32 entries) and invalidated by schema/index
+changes; they read current staged values on every execution. Transaction views
+do not claim index-ordered scans because pending writes may disrupt ordering.
+Transactions must not yield. There is no MVCC, schema
 migration, foreign-key enforcement, composite key, query cancellation or online
 index rebuild. Prepared queries should be recreated after DDL/index changes.
 
@@ -170,24 +176,26 @@ end)
 local changed = db:exec('DELETE FROM events WHERE id = ?', { '$1' })
 ```
 
-Supported: explicit-column `INSERT INTO ... VALUES (...)`, `UPDATE ... SET
-column = literal_or_? [, ...] WHERE primary_key = literal_or_?`, and `DELETE
-FROM ... WHERE primary_key = literal_or_?`; literal strings, finite numeric
-literals, booleans, `NULL`, and positional `?` parameters. Optional trailing
-semicolon. `sql.NULL` is the explicit binding sentinel: Luau array holes are
-rejected rather than silently interpreted as NULL. DML returns an affected-row
-count, and prepared mutation plans reject schema changes or closed handles.
+Supported: explicit-column single- or multi-row `INSERT INTO ... VALUES (...)`,
+`ON CONFLICT (primary_key) DO NOTHING`, parameterized `UPDATE` assignments,
+and bounded indexed `DELETE`. UPDATE and DELETE require a single comparison
+predicate: primary-key or secondary-index equality (`=`), or an ordered-index
+range (`<`, `<=`, `>`, `>=`). Ranges accept finite numbers or strings with
+compatible index types; NULL comparisons match no rows. All indexed bulk
+writes collect a stable set of primary keys *before* updating rows, including
+staged edits, and cap matches at 10,000. Each INSERT accepts at most 1,024
+VALUES tuples. Literal strings, numeric literals, booleans, `NULL`, and
+positional `?` parameters are accepted. `sql.NULL` is the explicit binding
+sentinel: Luau array holes are rejected. DML returns the number of affected
+rows; prepared plans reject schema changes and closed handles.
 
-Intentionally unsupported: `INSERT ... SELECT`, arbitrary expressions,
-`RETURNING`, `ON CONFLICT`, multi-row VALUES, partial WHERE expressions,
-UPDATE/DELETE without a primary-key equality, multiple SQL statements, and SQL
-DDL. Use the typed schema methods for DDL and the typed transaction methods
-for broader application logic. No SQL text is constructed from bound parameters.
-
-The restriction is intentional: we do not yet have statement-level predicate
-snapshots, row-level constraints, or multi-row mutation limits. A failed DML
-statement inside a transaction throws; if the caller does not catch it, the
-whole callback rolls back without appending the journal frame.
+Unsupported: `INSERT ... SELECT`, `RETURNING`, `ON CONFLICT DO UPDATE`,
+composite WHERE conditions in DML, and range writes without a committed
+ordered index. The WHERE predicate cannot be omitted. SQL CREATE/ALTER
+DDL, multi-statement SQL and unrestricted expression evaluation remain
+unsupported; use the typed API where necessary. Invalid or partially failed
+SQL DML latches an abort on its transaction, even if the application catches
+the exception; no partially executed statement can be committed.
 
 ## Composite ordered indexes for scoped streams
 
@@ -304,3 +312,25 @@ bench/bulk-dml.jsl 4000` separately measures single-statement inserts,
 prepared multi-row inserts, typed transaction batches, indexed SQL updates,
 and known-PK typed update loops. Grouping 20 rows per commit is inherently
 different from committing every row individually; compare both baselines.
+
+## Transactional query hot path (experimental)
+
+`tx:query(sql, params?)` uses a lazy overlay provider. It first streams
+committed candidates through existing indexes, overrides staged replacements,
+omits staged deletes, and includes newly inserted keys. A primary-key equality
+seeks the relevant pending key directly, even when a transaction contains
+thousands of pending rows. Each transaction caches up to 32 SELECT plans;
+DDL/index mutations invalidate those plans while row mutations do not.
+A transaction handle becomes unusable after the callback returns.
+
+Run `jess run --trusted --package . bench/transaction-query.jsl` to compare
+repeated prepared-plan hits with unique SQL strings (forced misses), using
+4,000 staged rows and 2,500 primary-key queries. This is a CPU benchmark:
+no synchronized filesystem writes, cold disk reads, or concurrency are measured.
+The committed primary-key path remains preferable for read-only workloads.
+
+The next memory frontier is that **committed rows, all indexes, and recovery
+state still reside in RAM**. The overlay does not make this engine paged or
+MVCC-capable. Large transactions also accumulate staged rows and operations
+until commit; secondary-index lookups may still examine all staged keys. A
+page cache, disk-backed indexes and bounded staging require separate work.

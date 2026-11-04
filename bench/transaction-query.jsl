@@ -1,0 +1,50 @@
+--!strict
+-- Profile transaction-local SELECT planning and primary-key staging access.
+-- This measures CPU execution on resident rows, NOT disk-sync durability.
+local sql = require('@jessql')
+local fs = require('@dream/fs')
+
+local path = fs.join(assert(fs.cwd()), '.jessql-transaction-query-bench.wal')
+fs.remove(path)
+fs.remove(path .. '.lock')
+
+local db = sql.open(path)
+db:createTable('records', { 'id', 'bucket', 'payload' }, 'id')
+db:createIndex('records', 'bucket')
+
+local Total = 4000
+local Iterations = 2500
+local cachedElapsed, uniqueElapsed, sum = 0, 0, 0
+
+db:transaction(function(tx)
+  for id = 1, Total do
+    tx:insert('records', { id = id, bucket = id % 10, payload = id * 2 })
+  end
+
+  local statement = 'SELECT payload FROM records WHERE id = ?'
+  local started = os.clock()
+  for id = 1, Iterations do
+    local row = tx:query(statement, { id }).rows[1]
+    assert(row.payload == id * 2)
+    sum += row.payload
+  end
+  cachedElapsed = os.clock() - started
+
+  -- A comment makes each SQL source distinct while preserving semantics.
+  -- This is deliberately a plan-cache *miss* workload, not a raw parser timer.
+  started = os.clock()
+  for id = 1, Iterations do
+    local row = tx:query(statement .. ' -- probe ' .. tostring(id), { id }).rows[1]
+    assert(row.payload == id * 2)
+    sum += row.payload
+  end
+  uniqueElapsed = os.clock() - started
+end)
+
+assert(sum == Iterations * (Iterations + 1) * 2)
+assert(db:query('SELECT COUNT(*) AS n FROM records').rows[1].n == Total)
+print(string.format('rows=%d queries=%d cached=%.6f s unique_sql=%.6f s ratio=%.2fx',
+  Total, Iterations, cachedElapsed, uniqueElapsed, uniqueElapsed / cachedElapsed))
+db:close()
+fs.remove(path)
+fs.remove(path .. '.lock')
