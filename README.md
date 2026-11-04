@@ -179,3 +179,12 @@ Repeated persistent `db:query(sql, params)` calls now reuse bounded LRU
 compiled plans (`queryCacheEntries`, default 64, 0 disables), invalidating on
 schema changes. The cache never retains results. Use `db:cacheStats()` and
 `bench/query-cache.jsl` to assess hot-query benefits.
+
+## Resident index memory optimizations (feature branch)
+
+The native storage provider represents singleton equality and ordered-index postings
+inline, so unique values no longer allocate a multi-table posting list. Duplicate
+postings use one position map and compact tombstones, including NULL keys in
+ordered indexes. Journal contents and all public query/mutation semantics remain
+unchanged. See `bench/rss.jsl` and [persistence architecture](docs/PERSISTENCE.md).
+This is an in-memory optimization, not an on-disk page store or a durability claim.

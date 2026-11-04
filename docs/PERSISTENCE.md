@@ -85,6 +85,30 @@ subsequent append. A complete frame with an invalid checksum, invalid schema,
 or nonconsecutive sequence fails closed instead of silently losing data.
 CRC32 detects accidental damage; it is **not** authentication.
 
+### Resident-index memory layout
+
+Indexes avoid per-value posting-list allocations where possible. A value with
+exactly one matching row is stored directly as an encoded primary-key string;
+only a second matching row promotes that posting to a collection. When deletes
+reduce a posting to one row, the collection contracts back to the inline form.
+Duplicate postings use one dense slot array and one primary-key-to-slot map,
+not multiple hash sets. Deleted slots are marked with an impossible empty key
+and compacted when tombstones exceed a bounded overhead. Ordered NULL postings
+follow the same compaction rule.
+
+`db:stats()` exposes `indexSlots` and `indexKeys` for non-NULL postings, plus
+`indexNullSlots` for ordered NULL postings. Slot counts include stale positions
+not yet compacted, and are intended for regression tests/diagnostics; they are
+not exact heap-byte measurements. `bench/rss.jsl` samples operating-system RSS
+on Linux and runs the same read workload with configurable row counts. On other
+platforms it skips procfs measurements rather than preventing the benchmark
+from running. Existing WAL frames and schema formats are unchanged.
+
+**These optimizations do not make the store bounded-memory**: committed row
+tables, AVL nodes and every index still reside in the Luau heap. Disk-backed
+pages and typed storage remain separate research work; RSS is not a substitute
+for measured live-heap or page-cache accounting.
+
 A database-wide exclusive `@dream/fs.lock` protects writers across processes.
 The in-memory rows are stored in a primary-key hash map. Secondary hash indexes
 maintain posting lists on insert, update and delete; the JessQL provider uses

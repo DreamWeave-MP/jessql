@@ -1265,6 +1265,122 @@ suite.describe('native persistent store', function()
     clean(path)
   end)
 
+  suite.it('promotes and demotes single-key index postings across deletion and checkpoint', function()
+    local path = fixture('postings-inline')
+    local db = sql.open(path)
+    db:createTable('events', { 'id', 'room', 'stream', 'unique_code', 'status' }, 'id')
+    db:transaction(function(tx)
+      for id = 1, 240 do
+        tx:insert('events', { id = id, room = 'r' .. (id % 4), stream = id,
+          unique_code = 'u' .. id, status = if id % 11 == 0 then nil else id % 3 })
+      end
+    end)
+    db:createIndex('events', 'unique_code')
+    db:createIndex('events', 'status')
+    db:createOrderedIndex('events', 'stream')
+    db:createCompositeIndex('events', 'room', 'stream')
+
+    local metrics = db:stats().events
+    expect(metrics.indexKeys.unique_code).toBe(240)
+    expect(metrics.indexSlots.unique_code).toBe(240)
+    local uniquePlan = db:prepare('SELECT id FROM events WHERE unique_code = ?')
+    local point = db:prepare('SELECT id FROM events WHERE room = ? AND stream = ?')
+    local range = db:prepare('SELECT COUNT(*) AS n FROM events WHERE stream >= ? AND stream <= ?')
+
+    -- A unique bucket expands to duplicates and contracts back to an inline
+    -- posting after two removals. Old tombstone slots must never be returned.
+    db:update('events', 2, { unique_code = 'u1', status = nil })
+    db:update('events', 3, { unique_code = 'u1', status = nil })
+    expect(#uniquePlan.run({ 'u1' }).rows).toBe(3)
+    db:delete('events', 2)
+    expect(#uniquePlan.run({ 'u1' }).rows).toBe(2)
+    db:delete('events', 3)
+    expect(#uniquePlan.run({ 'u1' }).rows).toBe(1)
+    db:insert('events', { id = 3, room = 'r3', stream = 3, unique_code = 'u1', status = 1 })
+    expect(#uniquePlan.run({ 'u1' }).rows).toBe(2)
+    db:update('events', 3, { unique_code = 'u3' })
+    expect(#uniquePlan.run({ 'u1' }).rows).toBe(1)
+    expect(#uniquePlan.run({ 'u3' }).rows).toBe(1)
+    expect(#point.run({ 'r3', 3 }).rows).toBe(1)
+    expect(range.run({ 1, 240 }).rows[1].n).toBe(239)
+
+    db:checkpoint()
+    db:close()
+    db = sql.open(path)
+    expect(#db:query('SELECT id FROM events WHERE unique_code = ?', { 'u1' }).rows).toBe(1)
+    expect(db:query('SELECT COUNT(*) AS n FROM events').rows[1].n).toBe(239)
+    expect(db:stats().events.indexSlots.unique_code).toBe(239)
+    db:close()
+    clean(path)
+  end)
+
+  suite.it('recycles duplicate posting slots under repeated indexed churn', function()
+    local path = fixture('postings-churn')
+    local db = sql.open(path)
+    db:createTable('events', { 'id', 'bucket' }, 'id')
+    db:createIndex('events', 'bucket')
+    db:transaction(function(tx)
+      for id = 1, 160 do tx:insert('events', { id = id, bucket = id % 5 }) end
+    end)
+
+    for iteration = 1, 2200 do
+      local id = iteration % 160 + 1
+      db:update('events', id, { bucket = iteration % 5 })
+    end
+
+    for id = 1, 110 do db:delete('events', id) end
+
+    for value = 0, 4 do
+      local expected = 0
+      for id = 111, 160 do
+        if db:get('events', id).bucket == value then expected += 1 end
+      end
+      expect(db:query('SELECT COUNT(*) AS n FROM events WHERE bucket = ?', { value }).rows[1].n).toBe(expected)
+    end
+    local metrics = db:stats().events
+    expect(metrics.indexKeys.bucket).toBe(50)
+    expect(metrics.indexSlots.bucket <= 5 * 64 + 100).toBe(true)
+    db:checkpoint()
+    db:close()
+    db = sql.open(path)
+    expect(db:stats().events.indexKeys.bucket).toBe(50)
+    db:close()
+    clean(path)
+  end)
+
+  suite.it('bounds nullable ordered-posting tombstones during churn', function()
+    local path = fixture('postings-null-churn')
+    local db = sql.open(path)
+    db:createTable('events', { 'id', 'score' }, 'id')
+    db:createOrderedIndex('events', 'score')
+    db:transaction(function(tx)
+      for id = 1, 160 do tx:insert('events', { id = id }) end
+    end)
+
+    for iteration = 1, 1800 do
+      local id = iteration % 160 + 1
+      if iteration % 3 == 0 then
+        db:update('events', id, { score = iteration % 7 })
+      else
+        db:update('events', id, {}, { 'score' })
+      end
+    end
+
+    local actualNull = 0
+    for id = 1, 160 do
+      if db:get('events', id).score == nil then actualNull += 1 end
+    end
+    local nullSlots = db:stats().events.indexNullSlots.score
+    expect(nullSlots <= 64 + 2 * actualNull).toBe(true)
+    expect(#db:query('SELECT id FROM events ORDER BY score LIMIT 10').rows).toBe(10)
+    db:checkpoint()
+    db:close()
+    db = sql.open(path)
+    expect(db:stats().events.indexNullSlots.score).toBe(actualNull)
+    db:close()
+    clean(path)
+  end)
+
   suite.it('refuses a second writer while the first lock is held', function()
     local path = fixture('lock')
     local db = sql.open(path)

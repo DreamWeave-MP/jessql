@@ -264,3 +264,32 @@ This measured run shows **4.63× lower total CPU time** for the specific hot-
 query microbenchmark. No disk-sync or network I/O is involved. SQL texts are
 identical except for bound parameters; random diverse SQL may show little
 benefit and may evict cached plans.
+
+## Resident index RSS and query throughput (native persistence branch)
+
+Benchmark: `jess run --trusted --package . bench/rss.jsl 80000`, Jess 0.3.0
+Linux x64, fresh database per process, 256 inserts per transaction, equality
+index on a unique code, duplicate-heavy room index, unique numeric ordered
+index, room+numeric composite index, 5,000 equality probes and 800 bounded
+room-stream range queries. The script asserts query counts/checksums. Exact
+baseline tree: `5ada94d229f5e18fabcf0a2f3f0558d97d13108e`; the optimized
+source changes only resident index metadata, not WAL contents. Runs alternated
+baseline/optimized on the same runtime (3 each for 40k rows, 2 each for 80k).
+
+| Rows | Metric | Baseline median | Compact postings median |
+|---:|---|---:|---:|
+| 40,000 | OS peak RSS | 161,344 KiB | 110,856 KiB (−31.3%) |
+| 40,000 | RSS after building indexes | 143,656 KiB | 94,336 KiB (−34.3%) |
+| 40,000 | End-to-end CPU time | 1.495 s | 0.998 s |
+| 80,000 | OS peak RSS | 277,480 KiB | 181,178 KiB (−34.7%) |
+| 80,000 | RSS after building indexes | 259,888 KiB | 163,204 KiB (−37.2%) |
+| 80,000 | End-to-end CPU time | 3.135 s | 2.166 s |
+| 80,000 | 5,000 indexed equality reads | 0.0974 s | 0.0832 s |
+| 80,000 | 800 bounded composite reads | 0.0958 s | 0.0554 s |
+
+The 40k and 80k runs have identical query checksums before/after. Timings and
+RSS are single-host development measurements, not statistically controlled
+production benchmarks. RSS includes the Jess binary, allocator arenas, and
+heap objects awaiting collection. CPU timings vary materially between runs;
+no universal query speedup is claimed. No fsync durability or disk paging is
+measured. The independent replay archive includes machine-readable raw runs.
