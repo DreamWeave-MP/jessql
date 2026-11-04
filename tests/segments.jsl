@@ -1,0 +1,193 @@
+--!strict
+local sql = require('@jessql')
+local fs = require('@dream/fs')
+local test = require('@jess/test')
+local expect = test.expect
+local suite = test.new()
+
+local function files(label: string): (string, string, string, string)
+  local current = fs.cwd()
+  local cwd: string = assert(current)
+  local base = fs.join(cwd, '.jessql-segments-' .. label)
+  for _, suffix in { '.a', '.b', '.c', '.out', '.wal', '.wal.lock' } do
+    fs.remove(base .. suffix)
+  end
+  return base .. '.a', base .. '.b', base .. '.c', base
+end
+
+local function cleanup(base: string)
+  for _, suffix in { '.a', '.b', '.c', '.out', '.wal', '.wal.lock' } do
+    fs.remove(base .. suffix)
+  end
+end
+
+local function snapshot(path: string, first: number, last: number, generation: number)
+  local key = first - 1
+  sql.paged.create(path, { 'id', 'room', 'body' }, 'id', function()
+    key += 1
+    if key > last then return nil end
+
+    return { id = key, room = if key % 2 == 0 then 'even' else 'odd',
+      body = tostring(generation) .. ':' .. tostring(key) }
+  end, { pageBytes = 512 })
+end
+
+suite.describe('immutable generation merging', function()
+  suite.it('deduplicates overlapping keys and honors newest generation for point and SQL queries', function()
+    local firstPath, secondPath, thirdPath, base = files('overlap')
+    snapshot(firstPath, 1, 80, 1)
+    snapshot(secondPath, 41, 100, 2)
+    snapshot(thirdPath, 65, 110, 3)
+    local opened = sql.segments.open({ firstPath, secondPath, thirdPath }, { cachePages = 1 })
+    expect(opened.count).toBe(186) -- Physical rows, not logical count.
+    expect(assert(opened:get(5)).body).toBe('1:5')
+    expect(assert(opened:get(50)).body).toBe('2:50')
+    expect(assert(opened:get(75)).body).toBe('3:75')
+    expect(opened:get(111)).toBe(nil)
+    local db = sql.new()
+    db:register('events', opened:provider())
+    expect(db:query('SELECT COUNT(*) AS n FROM events').rows[1].n).toBe(110)
+    expect(db:query('SELECT COUNT(*) AS n FROM events WHERE room = ?', { 'even' }).rows[1].n).toBe(55)
+    local rows = db:query('SELECT id, body FROM events ORDER BY id').rows
+    expect(#rows).toBe(110)
+    for index, row in rows do
+      expect(row.id).toBe(index)
+      local generation = if index >= 65 then 3 elseif index >= 41 then 2 else 1
+      expect(row.body).toBe(tostring(generation) .. ':' .. tostring(index))
+    end
+    local backwards = opened:iterateRows({ 'id' }, true, 40, 44)
+    for key = 44, 40, -1 do
+      expect((backwards() :: { [string]: unknown }).id).toBe(key)
+    end
+    expect(backwards()).toBe(nil)
+    expect(opened:stats().cachedPages <= 3).toBe(true)
+    opened:close()
+    -- A closed page reader must reject subsequent access.
+    local closedOk = pcall(function() opened:get(42) end)
+    expect(closedOk).toBe(false)
+    cleanup(base)
+  end)
+
+  suite.it('merges a transactional WAL and prevents rebinding to reordered cold generations', function()
+    local firstPath, secondPath, _, base = files('hybrid')
+    snapshot(firstPath, 1, 20, 1)
+    snapshot(secondPath, 10, 25, 2)
+    local db = sql.hybrid.open(base .. '.wal', { firstPath, secondPath }, 'events', { cachePages = 1 })
+    expect(assert(db:get(12)).body).toBe('2:12')
+    db:transaction(function(tx)
+      expect(tx:delete(12)).toBe(true)
+      tx:upsert({ id = 15, room = 'odd', body = 'hot' })
+      tx:insert({ id = 30, room = 'even', body = 'new' })
+      expect(tx:get(12)).toBe(nil)
+      expect(tx:query('SELECT COUNT(*) AS n FROM events').rows[1].n).toBe(25)
+    end)
+    expect(db:get(12)).toBe(nil)
+    expect(db:query('SELECT COUNT(*) AS n FROM events').rows[1].n).toBe(25)
+    local rows = db:query('SELECT id FROM events WHERE id >= ? ORDER BY id LIMIT 3', { 14 }).rows
+    expect(rows[1].id).toBe(14)
+    expect(rows[2].id).toBe(15)
+    expect(rows[3].id).toBe(16)
+    db:close()
+
+    local again = sql.hybrid.open(base .. '.wal', { firstPath, secondPath }, 'events')
+    expect(again:get(12)).toBe(nil)
+    expect(assert(again:get(15)).body).toBe('hot')
+    expect(assert(again:get(30)).body).toBe('new')
+    again:close()
+    -- The WAL is bound to the exact ordered list, not merely the set of files.
+    local reboundOk = pcall(function() sql.hybrid.open(base .. '.wal', { secondPath, firstPath }, 'events') end)
+    expect(reboundOk).toBe(false)
+
+    local recovered = sql.hybrid.open(base .. '.wal', { firstPath, secondPath }, 'events')
+    recovered:close() -- Failed open must release the exclusive WAL lock.
+    cleanup(base)
+  end)
+
+  suite.it('compacts streaming generations without touching sources or publishing the result', function()
+    local firstPath, secondPath, thirdPath, base = files('compact')
+    snapshot(firstPath, 1, 60, 1)
+    snapshot(secondPath, 21, 80, 2)
+    snapshot(thirdPath, 41, 90, 3)
+    sql.segments.compact(base .. '.out', { firstPath, secondPath, thirdPath }, { cachePages = 1, pageBytes = 512 })
+    local compacted = sql.paged.open(base .. '.out', { cachePages = 1 })
+    expect(compacted.count).toBe(90)
+    expect(assert(compacted:get(10)).body).toBe('1:10')
+    expect(assert(compacted:get(35)).body).toBe('2:35')
+    expect(assert(compacted:get(50)).body).toBe('3:50')
+    compacted:close()
+    local original = sql.paged.open(firstPath)
+    expect(assert(original:get(50)).body).toBe('1:50')
+    original:close()
+    -- Compaction never overwrites a previously published output.
+    local existingOk = pcall(function()
+      sql.segments.compact(base .. '.out', { firstPath, secondPath, thirdPath })
+    end)
+    expect(existingOk).toBe(false)
+    cleanup(base)
+  end)
+
+  suite.it('merges UTF-8 event IDs over multiple generations and preserves exact sorted pagination', function()
+    local firstPath, secondPath, thirdPath, base = files('string-keys')
+    local groups = { { 1, 60 }, { 30, 80 }, { 50, 100 } }
+    local paths = { firstPath, secondPath, thirdPath }
+    local expected: { [string]: number } = {}
+    for generation, bounds in groups do
+      local position = bounds[1] - 1
+      sql.paged.create(paths[generation], { 'id', 'generation' }, 'id', function()
+        position += 1
+        if position > bounds[2] then return nil end
+        local id = string.format('$event-%04d:matrïx', position)
+        expected[id] = generation
+        return { id = id, generation = generation }
+      end, { pageBytes = 512 })
+    end
+    local opened = sql.segments.open(paths, { cachePages = 1 })
+    local db = sql.new()
+    db:register('events', opened:provider())
+    expect(db:query('SELECT COUNT(*) AS n FROM events').rows[1].n).toBe(100)
+    local rows = db:query('SELECT id, generation FROM events ORDER BY id DESC LIMIT 7').rows
+    expect(#rows).toBe(7)
+    for index, row in rows do
+      local id = string.format('$event-%04d:matrïx', 101 - index)
+      expect(row.id).toBe(id)
+      expect(row.generation).toBe(expected[id])
+    end
+    local bounded = db:query('SELECT id FROM events WHERE id > ? AND id < ? ORDER BY id LIMIT 5',
+      { '$event-0065:matrïx', '$event-0080:matrïx' }).rows
+    expect(#bounded).toBe(5)
+    expect(bounded[1].id).toBe('$event-0066:matrïx')
+    opened:close()
+    cleanup(base)
+  end)
+
+  suite.it('rejects incompatible schemas, duplicate paths, sidecar misbinding and excess fan-in', function()
+    local firstPath, secondPath, _, base = files('invalid')
+    snapshot(firstPath, 1, 5, 1)
+    sql.paged.create(secondPath, { 'id', 'other' }, 'id', function()
+      return nil
+    end)
+    -- Incompatible schemas must release previously opened file handles.
+    local schemaOk = pcall(function() sql.segments.open({ firstPath, secondPath }) end)
+    expect(schemaOk).toBe(false)
+    -- Duplicate source paths must never be silently accepted.
+    local duplicateOk = pcall(function() sql.segments.open({ firstPath, firstPath }) end)
+    expect(duplicateOk).toBe(false)
+    -- Limit simultaneously opened page readers to a bounded fan-in.
+    local fanInOk = pcall(function()
+      sql.segments.open({ firstPath, firstPath, firstPath, firstPath, firstPath,
+        firstPath, firstPath, firstPath, firstPath })
+    end)
+    expect(fanInOk).toBe(false)
+    -- A sidecar bound to one generation cannot index a different list.
+    local sidecarOk = pcall(function()
+      sql.hybrid.open(base .. '.wal', { firstPath }, 'events', { secondaryIndexPath = 'absent' })
+    end)
+    expect(sidecarOk).toBe(false)
+    local valid = sql.segments.open({ firstPath })
+    expect(assert(valid:get(1)).body).toBe('1:1')
+    valid:close()
+    cleanup(base)
+  end)
+end)
+
+return suite

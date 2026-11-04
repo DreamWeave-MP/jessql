@@ -243,3 +243,13 @@ the existing JQLP2 sidecar and its read behavior; large index construction
 requires temporary disk space and may take longer than the original
 all-in-memory sort. See `docs/SECONDARY-INDEXES.md` and
 `bench/secondary-build.jsl` for measured RSS/CPU tradeoffs.
+
+### Experimental immutable segment views
+
+`sql.segments.open({ 'old.cold', 'new.cold' })` combines up to eight immutable
+snapshots with newest-row-wins reads and ordered streaming SQL. `sql.hybrid.open`
+accepts the same ordered path list, keeping transactional changes and deletions
+in its existing WAL. `sql.segments.compact('merged.cold', { ... })` produces a
+new candidate snapshot without publishing it or retiring inputs. See
+[docs/SEGMENTS.md](docs/SEGMENTS.md) for the physical-row count caveat,
+recovery boundary, unsupported multi-segment sidecars, and safe cutover rules.

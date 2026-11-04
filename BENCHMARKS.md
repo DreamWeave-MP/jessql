@@ -538,3 +538,47 @@ The benchmark is `bench/secondary-build.jsl`; its fifth positional argument
 selects `paged` (the backwards-compatible default) or `compact`. This
 experiment changes *index representation only*. It does not change the WAL,
 snapshot row format, query semantics, or cross-platform durability guarantees.
+
+## Experimental multi-segment cold storage — Jess 0.3.0
+
+`bench/segments.jsl` prepares four JQLP2 generations of 20,000 rows each,
+whose primary-key ranges overlap by 5,000 rows: **80,000 physical records,
+65,000 logical records**. It then measures 500 random lookups, 80 bounded
+keyset-pagination queries returning 30 rows each, and one full logical count.
+`compact` separately merges all generations to a new immutable snapshot.
+Run each phase in a separate process, with process RSS recorded by GNU time:
+
+```bash
+jess run --package . --trusted bench/segments.jsl prepare 20000 /tmp/jessql-segs
+/usr/bin/time -f 'RSS_KiB=%M' jess run --package . --trusted bench/segments.jsl read 20000 /tmp/jessql-segs
+/usr/bin/time -f 'RSS_KiB=%M' jess run --package . --trusted bench/segments.jsl compact 20000 /tmp/jessql-segs
+jess run --package . --trusted bench/segments.jsl cleanup 20000 /tmp/jessql-segs
+```
+
+Three independent read-phase processes, Linux x64, identical result checksum
+`35455850` and 694 page loads each:
+
+| Read-phase measurement | Median | Range |
+|---|---:|---:|
+| Total CPU, including 65K-row count | 0.570 s | 0.509–0.622 s |
+| 80 bounded ranges only | 0.0278 s | 0.0273–0.0393 s |
+| Peak process RSS | 37,492 KiB | 37,352–38,076 KiB |
+
+Three compaction processes, same inputs, same 65,000 logical output rows:
+
+| Compaction measurement | Median | Range |
+|---|---:|---:|
+| CPU | 0.606 s | 0.523–0.699 s |
+| Peak process RSS | 38,032 KiB | 37,816–38,292 KiB |
+
+The prototype's *initial*, non-index-aware ordered provider took ~26 seconds
+for the read phase because it scanned each generation for every short ordered
+page. Respecting the primary-key ordering and range constraints reduced that
+same workload to under 0.7 seconds wall time. This is an optimization against
+an internal prototype, **not** a comparison with an external database.
+
+Only one decoded row per generation is held by the merge iterator; the sparse
+page directories still grow with file size. The compaction output remains
+unpublished and does not establish power-loss durability or bounded disk
+reclamation. These results do not benchmark segment-aware composite indexes,
+which are not yet supported.
