@@ -40,7 +40,10 @@ export type MutationPlan = {
   inTransaction: (tx: Transaction, params: { unknown }?) -> number,
 }
 export type CacheMetrics = { entries: number, capacity: number, hits: number, misses: number, evictions: number }
-export type TableMetrics = { rows: number, keySlots: number, indexSlots: { [string]: number }, indexKeys: { [string]: number }, compositePartitions: { [string]: number } }
+export type TableMetrics = {
+  rows: number, keySlots: number, indexSlots: { [string]: number }, indexKeys: { [string]: number },
+  indexNullSlots: { [string]: number }, compositePartitions: { [string]: number },
+}
 export type Transaction = {
   createTable: (self: Transaction, name: string, columns: { string }, primaryKey: string) -> (),
   createIndex: (self: Transaction, name: string, column: string) -> (),
@@ -62,7 +65,9 @@ export type Transaction = {
 }
 
 type Schema = { columns: { string }, primaryKey: string, allowed: { [string]: boolean } }
-type Bucket = { keys: { string }, seen: { [string]: boolean }, live: { [string]: boolean }, count: number }
+-- Dense ordered posting slots plus one primary-key -> slot map; deleted slots
+-- use the impossible encoded key '' so no second hash set is retained.
+type Bucket = { keys: { string }, positions: { [string]: number }, count: number }
 type Posting = string | Bucket
 type Index = {
   -- The common single-row posting is the encoded primary key itself. A bucket
@@ -182,35 +187,31 @@ end
 local function postingKeys(posting: Posting?): ({ string }, { [string]: boolean }?)
   if not posting then return {}, nil end
   if type(posting) == 'string' then return { posting }, nil end
-  return posting.keys, posting.live
+  return posting.keys, nil -- Deleted entries are empty-string tombstones.
 end
 
-local function compactBucket(index: Index, encoded: string, bucket: Bucket)
-  if bucket.count == 0 then
-    index.buckets[encoded] = nil
-  elseif #bucket.keys > 64 + 2 * bucket.count then
-    local liveKeys, liveSeen = {} :: { string }, {} :: { [string]: boolean }
-    for _, key in bucket.keys do
-      if bucket.live[key] then
-        liveKeys[#liveKeys + 1] = key
-        liveSeen[key] = true
-      end
+local function compactBucket(bucket: Bucket)
+  if #bucket.keys <= 64 + 2 * bucket.count then return end
+  local liveKeys, positions = {} :: { string }, {} :: { [string]: number }
+  for _, key in bucket.keys do
+    if key ~= '' then
+      liveKeys[#liveKeys + 1] = key
+      positions[key] = #liveKeys
     end
-    bucket.keys = liveKeys
-    bucket.seen = liveSeen
   end
+  bucket.keys = liveKeys
+  bucket.positions = positions
 end
 
--- Yield each live encoded primary key without allocating a result table.
+-- Yield live encoded primary keys without allocating a result table.
 local function eachPosting(posting: Posting?, visit: (string) -> ())
   if not posting then return end
 
   if type(posting) == 'string' then
     visit(posting)
-
   else
     for _, key in posting.keys do
-      if posting.live[key] then visit(key) end
+      if key ~= '' then visit(key) end
     end
   end
 end
@@ -254,17 +255,12 @@ local function indexSet(index: Index, value: unknown, key: string, present: bool
       if posting == key then return end
       -- Promote to a real posting list only on the second distinct row.
       local other = posting
-      set({ keys = { other, key }, seen = { [other] = true, [key] = true },
-        live = { [other] = true, [key] = true }, count = 2 })
+      set({ keys = { other, key }, positions = { [other] = 1, [key] = 2 }, count = 2 })
     else
-      if posting.live[key] then return end
+      if posting.positions[key] then return end
 
-      if not posting.seen[key] then
-        posting.seen[key] = true
-        posting.keys[#posting.keys + 1] = key
-      end
-
-      posting.live[key] = true
+      posting.keys[#posting.keys + 1] = key
+      posting.positions[key] = #posting.keys
       posting.count += 1
     end
 
@@ -290,9 +286,11 @@ local function indexSet(index: Index, value: unknown, key: string, present: bool
     return
   end
 
-  if not posting.live[key] then return end
+  local position = posting.positions[key]
+  if not position then return end
 
-  posting.live[key] = nil
+  posting.positions[key] = nil
+  posting.keys[position] = ''
   posting.count -= 1
   if index.ordered and value ~= nil and (kind == 'number' or kind == 'string') then
     index.tree = ordered.adjust(index.tree, value :: string | number, -1)
@@ -302,7 +300,7 @@ local function indexSet(index: Index, value: unknown, key: string, present: bool
   -- guarantee tie order; no indexed iterator survives a synchronous write.
   if posting.count == 1 then
     for _, survivor in posting.keys do
-      if posting.live[survivor] then set(survivor); break end
+      if survivor ~= '' then set(survivor); break end
     end
   elseif posting.count == 0 then
     set(nil)
@@ -313,8 +311,9 @@ local function indexSet(index: Index, value: unknown, key: string, present: bool
         index.tree = ordered.remove(index.tree, value :: string | number)
       end
     end
-  elseif value ~= nil then
-    compactBucket(index, encoded, posting)
+  else
+    -- NULL postings need the same compaction bound as ordinary values.
+    compactBucket(posting)
   end
 end
 
@@ -438,7 +437,7 @@ local function orderedCursor(current: TableState, request: queryEngine.Request):
     while nullPosition < #nullBucket.keys do
       nullPosition += 1
       local key = nullBucket.keys[nullPosition]
-      if nullBucket.live[key] then
+      if key ~= '' then
         local row = current.rows[key]
         if row then return row end
       end
@@ -469,7 +468,7 @@ local function orderedCursor(current: TableState, request: queryEngine.Request):
             while postingPosition < #bucket.keys do
               postingPosition += 1
               local key = bucket.keys[postingPosition]
-              if bucket.live[key] then
+              if key ~= '' then
                 local row = current.rows[key]
                 if row then return row end
               end
@@ -1757,7 +1756,9 @@ function storage.open(path: string, options: Options?): Store
     ready()
     local output: { [string]: TableMetrics } = {}
     for name, current in state.tables do
-      local metrics: TableMetrics = { rows = current.count, keySlots = #current.order, indexSlots = {}, indexKeys = {}, compositePartitions = {} }
+      local metrics: TableMetrics = { rows = current.count, keySlots = #current.order,
+        indexSlots = {}, indexKeys = {}, indexNullSlots = {}, compositePartitions = {} }
+
       for column, index in current.secondary do
         local slots, keys = 0, 0
         for _, bucket in index.buckets do
@@ -1766,6 +1767,9 @@ function storage.open(path: string, options: Options?): Store
         end
         metrics.indexSlots[column] = slots
         metrics.indexKeys[column] = keys
+        local nullPosting = index.nulls
+        metrics.indexNullSlots[column] = if type(nullPosting) == 'string' then 1
+          elseif nullPosting then #nullPosting.keys else 0
       end
 
       for id, composite in current.composites do
