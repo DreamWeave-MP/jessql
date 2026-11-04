@@ -21,8 +21,7 @@ export type Snapshot = {
 }
 
 type Page = { first: unknown, last: unknown, offset: number, length: number, rows: number, checksum: number }
-type Entry = { key: unknown, position: number, length: number }
-type Cached = { entries: { Entry }, body: string, age: number }
+type Cached = { keys: { unknown }, offsets: { number }, lengths: { number }, body: string, age: number }
 type Directory = { version: number, columns: { string }, primaryKey: string, count: number,
   pages: { Page }, keyKind: string }
 local Magic = 'JQLP2\n'
@@ -61,6 +60,66 @@ local function numberAt(value: string, offset: number): number
   if offset < 1 or offset + 3 > #value then error('jessql paged: truncated record', 3) end
   local b0, b1, b2, b3 = string.byte(value, offset, offset + 3)
   return b0 + b1 * 256 + b2 * 65536 + b3 * 16777216
+end
+
+-- A numeric snapshot stores keys as JSON objects of the form {"key":<number>}.
+-- Decode that narrow, validated grammar without constructing one JSON table
+-- per key on every cold-page miss. Unrecognized keys use the normal decoder.
+local function numericKey(body: string, first: number, length: number): number?
+  if length < 9 or string.sub(body, first, first + 6) ~= '{"key":'
+    or string.byte(body, first + length - 1) ~= 125 then return nil end
+  local last = first + length - 2
+  local index = first + 7
+  local char = string.byte(body, index)
+  if char == 45 then index += 1; char = string.byte(body, index) end
+
+  if char == 48 then index += 1
+  elseif char ~= nil and char >= 49 and char <= 57 then
+    repeat
+      index += 1
+      char = string.byte(body, index)
+    until char == nil or char < 48 or char > 57
+  else return nil end
+
+  char = string.byte(body, index)
+  if char == 46 then
+    index += 1
+    char = string.byte(body, index)
+    if char == nil or char < 48 or char > 57 then return nil end
+
+    repeat
+      index += 1
+      char = string.byte(body, index)
+    until char == nil or char < 48 or char > 57
+  end
+
+  char = string.byte(body, index)
+  if char == 69 or char == 101 then
+    index += 1
+    char = string.byte(body, index)
+    if char == 43 or char == 45 then index += 1; char = string.byte(body, index) end
+    if char == nil or char < 48 or char > 57 then return nil end
+
+    repeat
+      index += 1
+      char = string.byte(body, index)
+    until char == nil or char < 48 or char > 57
+  end
+
+  if index ~= last + 1 then return nil end
+  local result = tonumber(string.sub(body, first + 7, last))
+  if result == nil or result ~= result or math.abs(result) == math.huge then return nil end
+  return result
+end
+
+-- Most event IDs and Matrix keys are UTF-8 with no JSON escapes. Keep
+-- those byte strings intact; escaped strings still use the full JSON parser.
+local function plainStringKey(body: string, first: number, length: number): string?
+  if length < 10 or string.sub(body, first, first + 7) ~= '{"key":"'
+    or string.sub(body, first + length - 2, first + length - 1) ~= '"}' then return nil end
+  local value = string.sub(body, first + 8, first + length - 3)
+  if string.find(value, '[\\"%c]') or utf8.len(value) == nil then return nil end
+  return value
 end
 
 local function validateColumns(columns: { string }, primaryKey: string)
@@ -257,7 +316,8 @@ function paged.open(path: string, options: Options?): Snapshot
     if numberAt(frame, 5) ~= page.checksum or page.checksum ~= bytes.crc32(body) then
       error('jessql paged: page checksum mismatch', 2)
     end
-    local entries: { Entry } = {}
+    local keys: { unknown } = {}
+    local offsets: { number }, lengths: { number } = {}, {}
     local offset = 1
     local previous: unknown = nil
     while offset <= #body do
@@ -265,18 +325,29 @@ function paged.open(path: string, options: Options?): Snapshot
       if keySize == 0 or rowSize == 0 or offset + 7 + keySize + rowSize > #body then
         error('jessql paged: invalid row lengths', 2)
       end
-      local keyObject = json.decode(string.sub(body, offset + 8, offset + 7 + keySize)) :: Row
-      local key = keyObject.key
+      local keyStart = offset + 8
+      local key: unknown = nil
+      if directory.keyKind == 'number' then key = numericKey(body, keyStart, keySize)
+      elseif directory.keyKind == 'string' then key = plainStringKey(body, keyStart, keySize) end
+
+      if key == nil then
+        local keyObject = json.decode(string.sub(body, keyStart, keyStart + keySize - 1)) :: Row
+        if type(keyObject) ~= 'table' then error('jessql paged: invalid key object', 2) end
+        key = keyObject.key
+      end
+
       if key == nil or not scalar(key) or (previous ~= nil and compare(previous, key) >= 0) then
         error('jessql paged: invalid row key ordering', 2)
       end
-      entries[#entries + 1] = { key = key, position = offset + 8 + keySize, length = rowSize }
+      keys[#keys + 1] = key
+      offsets[#offsets + 1] = offset + 8 + keySize
+      lengths[#lengths + 1] = rowSize
       previous = key
       offset += 8 + keySize + rowSize
     end
 
-    if #entries ~= page.rows or compare(entries[1].key, page.first) ~= 0
-      or compare(entries[#entries].key, page.last) ~= 0 then
+    if #keys ~= page.rows or compare(keys[1], page.first) ~= 0
+      or compare(keys[#keys], page.last) ~= 0 then
       error('jessql paged: page directory mismatch', 2)
     end
 
@@ -288,7 +359,7 @@ function paged.open(path: string, options: Options?): Snapshot
       cache[oldest] = nil
       cacheSize -= 1
     end
-    local item = { entries = entries, body = body, age = ticks }
+    local item = { keys = keys, offsets = offsets, lengths = lengths, body = body, age = ticks }
     cache[index] = item
     cacheSize += 1
     pageReads += 1
@@ -296,9 +367,9 @@ function paged.open(path: string, options: Options?): Snapshot
   end
 
   local function rowAt(page: Cached, position: number, columns: { string }?): Row
-    local entry = page.entries[position]
-    local row = json.decode(string.sub(page.body, entry.position, entry.position + entry.length - 1)) :: Row
-    if type(row) ~= 'table' or row[snapshot.primaryKey] ~= entry.key then
+    local start = page.offsets[position]
+    local row = json.decode(string.sub(page.body, start, start + page.lengths[position] - 1)) :: Row
+    if type(row) ~= 'table' or row[snapshot.primaryKey] ~= page.keys[position] then
       error('jessql paged: row/key mismatch', 2)
     end
     return project(row, columns)
@@ -314,10 +385,10 @@ function paged.open(path: string, options: Options?): Snapshot
       elseif compare(key, item.last) > 0 then low = middle + 1
       else
         local page = pageAt(middle)
-        local left, right = 1, #page.entries
+        local left, right = 1, #page.keys
         while left <= right do
           local position = math.floor((left + right) / 2)
-          local comparison = compare(key, page.entries[position].key)
+          local comparison = compare(key, page.keys[position])
           if comparison == 0 then return rowAt(page, position, nil) end
           if comparison < 0 then right = position - 1 else left = position + 1 end
         end
@@ -364,14 +435,14 @@ function paged.open(path: string, options: Options?): Snapshot
 
       while pageNumber >= 1 and pageNumber <= #pages do
         local page = pageAt(pageNumber)
-        if backwards and index == math.huge then index = #page.entries + 1 end
+        if backwards and index == math.huge then index = #page.keys + 1 end
         index += step
-        if index < 1 or index > #page.entries then
+        if index < 1 or index > #page.keys then
           pageNumber += step
           index = if backwards then math.huge else 0
           continue
         end
-        local key = page.entries[index].key
+        local key = page.keys[index]
         if lower ~= nil then
           local comparison = compare(key, lower)
           if comparison < 0 or (comparison == 0 and lowerStrict == true) then
