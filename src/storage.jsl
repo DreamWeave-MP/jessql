@@ -8,10 +8,11 @@ local bytes = require('@dream/bytes')
 local json = require('@jess/json')
 local queryEngine = require('@jessql/engine')
 local ordered = require('@jessql/ordered')
+local packed = require('@jessql/packed')
 local mutations = require('@jessql/mutations')
 
 export type Row = { [string]: unknown }
-export type Options = { maxFrameBytes: number?, recoverTail: boolean?, queryCacheEntries: number? }
+export type Options = { maxFrameBytes: number?, recoverTail: boolean?, queryCacheEntries: number?, rowLayout: string? }
 export type Store = {
   createTable: (self: Store, name: string, columns: { string }, primaryKey: string) -> (),
   createIndex: (self: Store, name: string, column: string) -> (),
@@ -43,6 +44,7 @@ export type CacheMetrics = { entries: number, capacity: number, hits: number, mi
 export type TableMetrics = {
   rows: number, keySlots: number, indexSlots: { [string]: number }, indexKeys: { [string]: number },
   indexNullSlots: { [string]: number }, compositePartitions: { [string]: number },
+  resident: packed.Metrics?,
 }
 export type Transaction = {
   createTable: (self: Transaction, name: string, columns: { string }, primaryKey: string) -> (),
@@ -85,6 +87,7 @@ type TableState = {
   secondary: { [string]: Index },
   composites: { [string]: Composite },
   available: { [string]: boolean },
+  packed: packed.Store?,
 }
 type Operation = { kind: string, table: string, columns: { string }?, primaryKey: string?, column: string?, suffix: string?, ordered: boolean?, row: Row?, key: unknown }
 type Pending = { [string]: { [string]: Row | boolean } }
@@ -99,6 +102,7 @@ type DatabaseState = {
   closed: boolean,
   busy: boolean,
   poisoned: boolean,
+  rowLayout: string,
 }
 
 local Magic = 'JQLW1\n'
@@ -220,13 +224,32 @@ local function compactOrder(current: TableState)
   if #current.order <= 64 + 2 * current.count then return end
   local liveOrder, liveSeen = {} :: { string }, {} :: { [string]: boolean }
   for _, key in current.order do
-    if current.rows[key] then
+    if (current.packed and current.packed:has(key)) or current.rows[key] then
       liveOrder[#liveOrder + 1] = key
       liveSeen[key] = true
     end
   end
   current.order = liveOrder
   current.seen = liveSeen
+end
+
+-- Read only the columns requested by the query. Packed tables otherwise
+-- materialize full row dictionaries just to return one projected scalar.
+local function readRow(current: TableState, key: string, columns: { string }?): Row?
+  local resident = current.packed
+  return if resident then resident:read(key, columns) else current.rows[key]
+end
+
+local function hasRow(current: TableState, key: string): boolean
+  local resident = current.packed
+  return if resident then resident:has(key) else current.rows[key] ~= nil
+end
+
+local function columnValue(current: TableState, key: string, column: string): unknown
+  local resident = current.packed
+  if resident then return resident:value(key, column) end
+  local row = current.rows[key]
+  return if row then row[column] else nil
 end
 
 local function indexSet(index: Index, value: unknown, key: string, present: boolean)
@@ -424,6 +447,12 @@ local function orderedCursor(current: TableState, request: queryEngine.Request):
   local posting: Posting? = nil
   local postingPosition = 0
   local finished = false
+  local resident = current.packed
+  local reusable: Row? = if resident and request.allowVolatileRows then {} else nil
+  local function nextRow(key: string): Row?
+    if resident and reusable then return resident:readInto(key, request.columns, reusable) end
+    return readRow(current, key, request.columns)
+  end
 
   local function nextNull(): queryEngine.SourceRow?
     if not nullBucket then return nil end
@@ -431,14 +460,14 @@ local function orderedCursor(current: TableState, request: queryEngine.Request):
     if type(nullBucket) == 'string' then
       if nullPosition > 0 then return nil end
       nullPosition = 1
-      return current.rows[nullBucket]
+      return nextRow(nullBucket)
     end
 
     while nullPosition < #nullBucket.keys do
       nullPosition += 1
       local key = nullBucket.keys[nullPosition]
       if key ~= '' then
-        local row = current.rows[key]
+        local row = nextRow(key)
         if row then return row end
       end
     end
@@ -447,7 +476,7 @@ local function orderedCursor(current: TableState, request: queryEngine.Request):
   end
 
   return {
-    _jessqlIter = 'v1', ordered = order ~= nil,
+    _jessqlIter = 'v1', ordered = order ~= nil, volatileRows = reusable ~= nil,
     next = function(): queryEngine.SourceRow?
       if order and not hasRange and not descending and not finished then
         local row = nextNull()
@@ -461,7 +490,7 @@ local function orderedCursor(current: TableState, request: queryEngine.Request):
           if type(posting) == 'string' then
             local key = posting :: string
             posting = nil
-            local row = current.rows[key]
+            local row = nextRow(key)
             if row then return row end
           else
             local bucket = posting :: Bucket
@@ -469,7 +498,7 @@ local function orderedCursor(current: TableState, request: queryEngine.Request):
               postingPosition += 1
               local key = bucket.keys[postingPosition]
               if key ~= '' then
-                local row = current.rows[key]
+                local row = nextRow(key)
                 if row then return row end
               end
             end
@@ -699,7 +728,7 @@ local function tableProvider(state: DatabaseState, name: string): queryEngine.Pr
       if #request.constraints == 1 then
         local only = request.constraints[1]
         if only.column == tableState.schema.primaryKey then
-          return if tableState.rows[keys[1]] then 1 else 0
+          return if hasRow(tableState, keys[1]) then 1 else 0
         end
         local bucket = tableState.secondary[only.column].buckets[keyOf(only.value)]
         return postingCount(bucket)
@@ -710,7 +739,7 @@ local function tableProvider(state: DatabaseState, name: string): queryEngine.Pr
       local count = 0
       for _, key in keys do
         if live and not (live :: { [string]: boolean })[key] then continue end
-        local row = tableState.rows[key]
+        local row = readRow(tableState, key, request.columns)
         if not row then continue end
         local matches = true
         for _, constraint in request.constraints do
@@ -730,7 +759,7 @@ local function tableProvider(state: DatabaseState, name: string): queryEngine.Pr
       local rows: { queryEngine.Row } = {}
       for _, key in keys do
         if live and not (live :: { [string]: boolean })[key] then continue end
-        local row = tableState.rows[key]
+        local row = readRow(tableState, key, request.columns)
         if row then rows[#rows + 1] = row end
       end
       return rows
@@ -741,14 +770,17 @@ local function tableProvider(state: DatabaseState, name: string): queryEngine.Pr
       if sorted then return sorted end
       local keys, live = indexedKeys(tableState, request)
       local cursor = 0
+      local resident = tableState.packed
+      local reusable: Row? = if resident and request.allowVolatileRows then {} else nil
       local iterator: queryEngine.Iterator = {
-        _jessqlIter = 'v1',
+        _jessqlIter = 'v1', volatileRows = reusable ~= nil,
         next = function(): queryEngine.SourceRow?
           while cursor < #keys do
             cursor += 1
             local key = keys[cursor]
             if live and not (live :: { [string]: boolean })[key] then continue end
-            local row = tableState.rows[key]
+            local row = if resident and reusable then (resident :: packed.Store):readInto(key, request.columns, reusable :: Row)
+              else readRow(tableState, key, request.columns)
             if row then return row end
           end
           return nil
@@ -761,7 +793,7 @@ local function tableProvider(state: DatabaseState, name: string): queryEngine.Pr
       if value == nil or not scalar(value) then return nil end
 
       if column == tableState.schema.primaryKey then
-        local row = tableState.rows[keyOf(value)]
+        local row = readRow(tableState, keyOf(value), _request.columns)
         return if row then { row } else {}
       end
       local index = tableState.secondary[column]
@@ -769,7 +801,7 @@ local function tableProvider(state: DatabaseState, name: string): queryEngine.Pr
       local bucket = index.buckets[keyOf(value)]
       local rows: { queryEngine.Row } = {}
       eachPosting(bucket, function(key)
-        local row = tableState.rows[key]
+        local row = readRow(tableState, key, _request.columns)
         if row then rows[#rows + 1] = row end
       end)
       return rows
@@ -783,8 +815,10 @@ local function apply(state: DatabaseState, operations: { Operation })
     local name = operation.table
     if operation.kind == 'create' then
       local schema = makeSchema(operation.columns :: { string }, operation.primaryKey :: string)
+      local columns = if state.rowLayout == 'packed' then packed.new(schema.columns) else nil
       state.tables[name] = {
-        schema = schema, rows = {}, order = {}, seen = {}, count = 0,
+        schema = schema, rows = if columns then columns.rows else {}, packed = columns,
+        order = {}, seen = {}, count = 0,
         secondary = {}, composites = {}, available = { [schema.primaryKey] = true },
       }
 
@@ -794,6 +828,7 @@ local function apply(state: DatabaseState, operations: { Operation })
       local column = operation.column :: string
       current.schema.columns[#current.schema.columns + 1] = column
       current.schema.allowed[column] = true
+      if current.packed then current.packed:addColumn(column) end
     elseif operation.kind == 'index' then
       local current = state.tables[name] :: TableState
       local column = operation.column :: string
@@ -801,8 +836,9 @@ local function apply(state: DatabaseState, operations: { Operation })
         types = if operation.ordered == true then {} else nil }
 
       for _, key in current.order do
-        local row = current.rows[key]
-        if row then indexSet(index, row[column], key, true) end
+        if hasRow(current, key) then
+          indexSet(index, columnValue(current, key, column), key, true)
+        end
       end
       current.secondary[column] = index
       current.available[column] = true
@@ -812,15 +848,20 @@ local function apply(state: DatabaseState, operations: { Operation })
       local suffix = operation.suffix :: string
       local composite: Composite = { prefix = prefix, suffix = suffix, partitions = {} }
       for _, key in current.order do
-        local row = current.rows[key]
-        if row then compositeSet(composite, row, key, true) end
+        if hasRow(current, key) then
+          local prefixValue = columnValue(current, key, prefix)
+          if prefixValue ~= nil then
+            compositeSet(composite, { [prefix] = prefixValue,
+              [suffix] = columnValue(current, key, suffix) }, key, true)
+          end
+        end
       end
       current.composites[compositeName(prefix, suffix)] = composite
     elseif operation.kind == 'put' then
       local current = state.tables[name] :: TableState
       local row = operation.row :: Row
       local key = keyOf(row[current.schema.primaryKey])
-      if current.rows[key] == nil then current.count += 1 end
+      if not hasRow(current, key) then current.count += 1 end
       updateIndexes(current, key, current.rows[key], row)
 
       if not current.seen[key] then
@@ -831,7 +872,7 @@ local function apply(state: DatabaseState, operations: { Operation })
     elseif operation.kind == 'del' then
       local current = state.tables[name] :: TableState
       local key = keyOf(operation.key)
-      if current.rows[key] ~= nil then
+      if hasRow(current, key) then
         updateIndexes(current, key, current.rows[key], nil)
         current.rows[key] = nil
         current.count -= 1
@@ -1533,12 +1574,18 @@ function storage.open(path: string, options: Options?): Store
     error('jessql storage: invalid query cache size', 2)
   end
 
+  local rowLayout = if options then options.rowLayout else nil
+  if rowLayout ~= nil and rowLayout ~= 'row' and rowLayout ~= 'packed' then
+    error('jessql storage: rowLayout must be row or packed', 2)
+  end
+
   local lock, err = fs.lock(path .. '.lock', { createParents = true })
   if not lock then error('jessql storage: database locked: ' .. tostring(err), 2) end
 
   local state: DatabaseState = {
     path = path, lock = lock, engine = queryEngine.new(), tables = {}, sequence = 0, schemaVersion = 0,
     maxFrameBytes = max or DefaultMaxFrame, closed = false, busy = false, poisoned = false,
+    rowLayout = rowLayout or 'row',
   }
 
   -- Opening can fail on invalid frames; release the advisory lock on failure.
@@ -1777,6 +1824,8 @@ function storage.open(path: string, options: Options?): Store
         for _ in composite.partitions do partitions += 1 end
         metrics.compositePartitions[id] = partitions
       end
+
+      if current.packed then metrics.resident = current.packed:stats() end
       output[name] = metrics
     end
     return output
@@ -1870,7 +1919,7 @@ function storage.open(path: string, options: Options?): Store
       local liveOrder: { string } = {}
       local liveSeen: { [string]: boolean } = {}
       for _, key in current.order do
-        if current.rows[key] then
+        if hasRow(current, key) then
           liveOrder[#liveOrder + 1] = key
           liveSeen[key] = true
         end
@@ -1880,7 +1929,15 @@ function storage.open(path: string, options: Options?): Store
       for _, composite in current.composites do
         composite.partitions = {}
         for _, key in liveOrder do
-          compositeSet(composite, current.rows[key], key, true)
+          if current.packed then
+            local prefix = columnValue(current, key, composite.prefix)
+            if prefix ~= nil then
+              compositeSet(composite, { [composite.prefix] = prefix,
+                [composite.suffix] = columnValue(current, key, composite.suffix) }, key, true)
+            end
+          else
+            compositeSet(composite, current.rows[key], key, true)
+          end
         end
       end
 
@@ -1890,7 +1947,7 @@ function storage.open(path: string, options: Options?): Store
           types = if wasOrdered then {} else nil }
 
         for _, key in liveOrder do
-          indexSet(index, current.rows[key][column], key, true)
+          indexSet(index, columnValue(current, key, column), key, true)
         end
         current.secondary[column] = index
       end

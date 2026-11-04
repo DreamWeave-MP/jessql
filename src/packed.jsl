@@ -1,0 +1,359 @@
+--!strict
+--!native
+-- Packed, purely resident column storage for JessQL. The journal format is unchanged.
+-- Numeric scalars live in f64 buffers, booleans in byte buffers, repeated
+-- strings in u32 dictionary codes, and high-cardinality/mixed cells in arrays.
+-- A row is materialized only when a caller reads it.
+
+export type Row = { [string]: unknown }
+export type Metrics = { rows: number, slots: number, freeSlots: number,
+  kinds: { [string]: string }, dictionaryEntries: { [string]: number },
+  liveStringBytes: { [string]: number }, allocatedStringBytes: { [string]: number } }
+export type Store = {
+  rows: { [string]: Row },
+  read: (self: Store, key: string, columns: { string }?) -> Row?,
+  readInto: (self: Store, key: string, columns: { string }, destination: Row) -> Row?,
+  has: (self: Store, key: string) -> boolean,
+  value: (self: Store, key: string, column: string) -> unknown,
+  addColumn: (self: Store, name: string) -> (),
+  stats: (self: Store) -> Metrics,
+}
+
+type Column = {
+  kind: string,
+  blocks: { buffer },
+  values: { [number]: unknown },
+  dictionary: { [string]: number },
+  strings: { [number]: string },
+  refs: { [number]: number },
+  distinct: number,
+  population: number,
+  nextCode: number,
+  freeCodes: { number },
+  blobs: { buffer },
+  byteUsed: number,
+  byteLive: number,
+}
+
+local Chunk = 512
+local BlobChunk = 65536
+local NumericNull = 0 / 0
+local packed = {}
+
+local function newColumn(): Column
+  return { kind = 'unset', blocks = {}, values = {}, dictionary = {},
+    strings = {}, refs = {}, distinct = 0, population = 0, nextCode = 1, freeCodes = {}, blobs = {}, byteUsed = 0, byteLive = 0 }
+end
+
+local function getBlock(column: Column, slot: number, width: number, create: boolean): (buffer?, number)
+  local index = math.floor((slot - 1) / Chunk) + 1
+  local block = column.blocks[index]
+  if not block and create then
+    block = buffer.create(Chunk * width)
+    column.blocks[index] = block
+    -- Numeric NULL is NaN, because the public scalar contract prohibits NaN.
+    -- Fresh buffer bytes are zero (a valid SQL numeric value), not NULL.
+    if width == 8 and column.kind == 'number' then
+      for offset = 0, Chunk * width - width, width do
+        buffer.writef64(block, offset, NumericNull)
+      end
+    end
+  end
+  return block, ((slot - 1) % Chunk) * width
+end
+
+local function getValue(column: Column, slot: number): unknown
+  if column.kind == 'number' then
+    local block, offset = getBlock(column, slot, 8, false)
+    if not block then return nil end
+    local value = buffer.readf64(block, offset)
+    return if value == value then value else nil
+  elseif column.kind == 'boolean' then
+    local block, offset = getBlock(column, slot, 1, false)
+    if not block then return nil end
+    local value = buffer.readu8(block, offset)
+    return if value == 0 then nil else value == 2
+  elseif column.kind == 'dictionary' then
+    local block, offset = getBlock(column, slot, 4, false)
+    if not block then return nil end
+    local code = buffer.readu32(block, offset)
+    return if code == 0 then nil else column.strings[code]
+  elseif column.kind == 'bytes' then
+    local block, offset = getBlock(column, slot, 8, false)
+    if not block then return nil end
+    local address = buffer.readu32(block, offset)
+    if address == 0 then return nil end
+    local length = buffer.readu32(block, offset + 4)
+    local position = address - 1
+    local chunk = math.floor(position / BlobChunk) + 1
+    return buffer.readstring(column.blobs[chunk], position % BlobChunk, length)
+  elseif column.kind == 'direct' then
+    return column.values[slot]
+  end
+  return nil
+end
+
+local function direct(column: Column, slots: number)
+  local values: { [number]: unknown } = {}
+  for slot = 1, slots do
+    local value = getValue(column, slot)
+    if value ~= nil then values[slot] = value end
+  end
+  column.kind = 'direct'
+  column.values = values
+  column.blocks = {}
+  column.dictionary = {}
+  column.strings = {}
+  column.refs = {}
+  column.distinct = 0
+  column.freeCodes = {}
+  column.nextCode = 1
+  column.blobs = {}
+  column.byteUsed = 0
+  column.byteLive = 0
+end
+
+local function appendBytes(column: Column, slot: number, value: string?)
+  local block, offset = getBlock(column, slot, 8, true)
+  if not value then
+    buffer.writeu32(block :: buffer, offset, 0)
+    buffer.writeu32(block :: buffer, offset + 4, 0)
+    return
+  end
+
+  local length = #value
+  local position = column.byteUsed
+  local within = position % BlobChunk
+  if length > BlobChunk - within then
+    position += BlobChunk - within
+    within = 0
+  end
+
+  local chunk = math.floor(position / BlobChunk) + 1
+  if not column.blobs[chunk] then column.blobs[chunk] = buffer.create(BlobChunk) end
+  if length > 0 then buffer.writestring(column.blobs[chunk], within, value) end
+  buffer.writeu32(block :: buffer, offset, position + 1)
+  buffer.writeu32(block :: buffer, offset + 4, length)
+  column.byteUsed = position + length
+  column.byteLive += length
+end
+
+-- Columnar byte storage is append-only until obsolete string bytes exceed twice
+-- live bytes (with a floor to avoid rebuilding tiny arenas during hot churn).
+local function repackBytes(column: Column, slots: number)
+  local values: { [number]: string } = {}
+  for slot = 1, slots do
+    local value = getValue(column, slot)
+    if value ~= nil then values[slot] = value :: string end
+  end
+
+  column.blocks = {}
+  column.blobs = {}
+  column.byteUsed = 0
+  column.byteLive = 0
+  for slot, value in values do appendBytes(column, slot, value) end
+end
+
+local function packStrings(column: Column, slots: number)
+  local values: { [number]: string } = {}
+  for slot = 1, slots do
+    local value = getValue(column, slot)
+    if value ~= nil then
+      if #(value :: string) > BlobChunk then
+        direct(column, slots)
+        return
+      end
+      values[slot] = value :: string
+    end
+  end
+
+  column.kind = 'bytes'
+  column.blocks = {}
+  column.dictionary = {}
+  column.strings = {}
+  column.refs = {}
+  column.freeCodes = {}
+  column.distinct = 0
+  column.blobs = {}
+  column.byteUsed = 0
+  column.byteLive = 0
+  for slot, value in values do appendBytes(column, slot, value) end
+end
+
+local function setValue(column: Column, slot: number, value: unknown, slots: number)
+  local was = getValue(column, slot)
+  if column.kind == 'unset' and value ~= nil then
+    local kind = type(value)
+    column.kind = if kind == 'number' or kind == 'boolean' then kind
+      elseif kind == 'string' then 'dictionary' else 'direct'
+  end
+
+  if value ~= nil and (column.kind == 'number' and type(value) ~= 'number'
+    or column.kind == 'boolean' and type(value) ~= 'boolean'
+    or column.kind == 'dictionary' and type(value) ~= 'string'
+    or column.kind == 'bytes' and type(value) ~= 'string') then
+    direct(column, slots)
+  end
+
+  if column.kind == 'bytes' and value ~= nil and #(value :: string) > BlobChunk then
+    direct(column, slots)
+  end
+
+  if column.kind == 'number' then
+    local block, offset = getBlock(column, slot, 8, true)
+    buffer.writef64(block :: buffer, offset, if value == nil then NumericNull else value :: number)
+  elseif column.kind == 'boolean' then
+    local block, offset = getBlock(column, slot, 1, true)
+    buffer.writeu8(block :: buffer, offset, if value == nil then 0 elseif value == true then 2 else 1)
+  elseif column.kind == 'dictionary' then
+    if was ~= nil then
+      local previous = column.dictionary[was :: string]
+      column.refs[previous] -= 1
+      if column.refs[previous] == 0 then
+        column.refs[previous] = nil
+        column.strings[previous] = nil
+        column.dictionary[was :: string] = nil
+        column.distinct -= 1
+        column.freeCodes[#column.freeCodes + 1] = previous
+      end
+    end
+    local code = 0
+    if value ~= nil then
+      local stringValue = value :: string
+      code = column.dictionary[stringValue]
+      if not code then
+        -- Reuse retired codes so alternating updates cannot leak dictionary IDs.
+        if #column.freeCodes > 0 then
+          code = column.freeCodes[#column.freeCodes]
+          column.freeCodes[#column.freeCodes] = nil
+        else
+          code = column.nextCode
+          column.nextCode += 1
+        end
+        column.strings[code] = stringValue
+        column.dictionary[stringValue] = code
+        column.refs[code] = 0
+        column.distinct += 1
+      end
+      column.refs[code] += 1
+    end
+    local block, offset = getBlock(column, slot, 4, true)
+    buffer.writeu32(block :: buffer, offset, code)
+  elseif column.kind == 'bytes' then
+    if was ~= nil then column.byteLive -= #(was :: string) end
+    appendBytes(column, slot, value :: string?)
+    if column.byteUsed > 1024 * 1024 and column.byteUsed > 3 * column.byteLive then
+      repackBytes(column, slots)
+    end
+  elseif column.kind == 'direct' then
+    column.values[slot] = value
+  end
+
+  if was == nil and value ~= nil then column.population += 1 end
+  if was ~= nil and value == nil then column.population -= 1 end
+
+  -- Dictionary maps win on repetition, but are a loss for unique event IDs.
+  -- Switch to a simple dense vector before the dictionary becomes expensive.
+  if column.kind == 'dictionary' and column.distinct >= 256
+    and column.distinct * 2 >= column.population then
+    packStrings(column, slots)
+  end
+end
+
+function packed.new(columns: { string }): Store
+  local fields: { [string]: Column } = {}
+  local names = table.clone(columns)
+  for _, name in names do fields[name] = newColumn() end
+  local slots: { [string]: number } = {}
+  local free: { number } = {}
+  local allocated, live = 0, 0
+  local store = {} :: Store
+  local function read(_self: Store, key: string, requested: { string }?): Row?
+    local slot = slots[key]
+    if not slot then return nil end
+    local row: Row = {}
+    for _, name in requested or names do
+      local column = fields[name]
+      if column then
+        local value = getValue(column, slot)
+        if value ~= nil then row[name] = value end
+      end
+    end
+    return row
+  end
+  store.read = read
+  store.readInto = function(_self: Store, key: string, requested: { string }, destination: Row): Row?
+    local slot = slots[key]
+    if not slot then return nil end
+
+    for _, name in requested do
+      local column = fields[name]
+      destination[name] = if column then getValue(column, slot) else nil
+    end
+    return destination
+  end
+
+  store.value = function(_self: Store, key: string, column: string): unknown
+    local slot = slots[key]
+    if not slot then return nil end
+    local field = fields[column]
+    return if field then getValue(field, slot) else nil
+  end
+  store.has = function(_self: Store, key: string): boolean return slots[key] ~= nil end
+  store.addColumn = function(_self: Store, name: string)
+    if fields[name] then return end
+    names[#names + 1] = name
+    fields[name] = newColumn()
+  end
+
+  store.stats = function(_self: Store): Metrics
+    local kinds, entries = {} :: { [string]: string }, {} :: { [string]: number }
+    local liveBytes, allocatedBytes = {} :: { [string]: number }, {} :: { [string]: number }
+    for name, column in fields do
+      kinds[name] = column.kind
+      entries[name] = column.distinct
+      liveBytes[name] = column.byteLive
+      allocatedBytes[name] = column.byteUsed
+    end
+
+    return { rows = live, slots = allocated, freeSlots = #free,
+      kinds = kinds, dictionaryEntries = entries,
+      liveStringBytes = liveBytes, allocatedStringBytes = allocatedBytes }
+  end
+
+  local proxy: { [string]: Row } = setmetatable({}, {
+    __index = function(_table: { [string]: Row }, key: string): Row?
+      return read(store, key)
+    end,
+    __newindex = function(_table: { [string]: Row }, key: string, row: Row?)
+      local slot = slots[key]
+      if not row then
+        if not slot then return end
+        for _, name in names do setValue(fields[name], slot, nil, allocated) end
+
+        slots[key] = nil
+        free[#free + 1] = slot
+        live -= 1
+        return
+      end
+
+      if not slot then
+        if #free > 0 then
+          slot = free[#free]
+          free[#free] = nil
+        else
+          allocated += 1
+          slot = allocated
+        end
+        slots[key] = slot
+        live += 1
+      end
+
+      for _, name in names do setValue(fields[name], slot, row[name], allocated) end
+    end,
+  })
+  store.rows = proxy
+  return store
+end
+
+return packed
