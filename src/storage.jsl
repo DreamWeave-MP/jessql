@@ -49,6 +49,7 @@ export type Transaction = {
   primaryKey: (self: Transaction, name: string) -> string,
   hasColumn: (self: Transaction, name: string, column: string) -> boolean,
   keysWhere: (self: Transaction, name: string, column: string, value: unknown) -> { unknown },
+  keysRange: (self: Transaction, name: string, column: string, op: string, value: unknown) -> { unknown },
   exec: (self: Transaction, sql: string, params: { unknown }?) -> number,
   executeMutation: (self: Transaction, statement: mutations.Statement, params: { unknown }?) -> number,
   addColumn: (self: Transaction, name: string, column: string) -> (),
@@ -1108,6 +1109,100 @@ local function buildTransaction(state: DatabaseState)
     table.sort(matched) -- Stable log ordering across hash iteration orders.
     for _, key in matched do
       local change = if stagedTable then stagedTable[key] else nil
+      local row: Row = if type(change) == 'table' then change :: Row
+        else (current :: TableState).rows[key]
+      result[#result + 1] = row[schema.primaryKey]
+    end
+    return result
+  end
+
+  -- Bounded range mutations require a committed ordered index. Seeking the
+  -- AVL tree avoids scanning unrelated records, while staging is reconciled
+  -- before any mutation so index changes cannot disturb the key set.
+  function transaction.keysRange(_self: Transaction, name: string, column: string,
+      op: string, value: unknown): { unknown }
+    writable()
+    name = requireName(name)
+    column = requireName(column)
+    local schema = findSchema(name)
+    if not schema.allowed[column] then error('jessql storage: no such column', 2) end
+
+    if op ~= '<' and op ~= '<=' and op ~= '>' and op ~= '>=' then
+      error('jessql storage: unsupported range operator', 2)
+    end
+
+    if value == nil then return {} end -- SQL comparisons with NULL never match
+
+    if type(value) ~= 'number' and type(value) ~= 'string' then
+      error('jessql storage: range requires a number or string', 2)
+    end
+
+    if not scalar(value) then error('jessql storage: invalid range value', 2) end
+
+    local current = state.tables[name]
+    local index = if current then current.secondary[column] else nil
+    if current and (not index or not index.ordered) then
+      error('jessql storage: range mutation requires an ordered index on WHERE column', 2)
+    end
+
+    if index then
+      local kind = orderType(index)
+      if kind == nil or (kind ~= 'empty' and kind ~= type(value)) then
+        error('jessql storage: indexed range has incompatible value types', 2)
+      end
+    end
+
+    local result: { unknown } = {}
+    local matched: { string } = {}
+    local visited: { [string]: boolean } = {}
+    local pending = staged[name]
+    local limit = 10000
+    local target = value :: string | number
+    local function consider(key: string)
+      if visited[key] then return end
+      visited[key] = true
+      local change = if pending then pending[key] else nil
+      local row: Row? = if change == Deleted then nil
+        elseif type(change) == 'table' then change :: Row
+        else if current then current.rows[key] else nil
+      if not row then return end
+      local cell = row[column]
+      if cell == nil then return end
+
+      if type(cell) ~= type(target) then
+        error('jessql storage: indexed range has incompatible value types', 2)
+      end
+
+      local comparison = ordered.compare(cell :: string | number, target)
+      local matches = if op == '<' then comparison < 0 elseif op == '<=' then comparison <= 0
+        elseif op == '>' then comparison > 0 else comparison >= 0
+      if not matches then return end
+      matched[#matched + 1] = key
+      if #matched > limit then error('jessql storage: bulk mutation exceeds 10000 rows', 2) end
+    end
+
+    if index then
+      local lower = if op == '>' or op == '>=' then target else nil
+      local upper = if op == '<' or op == '<=' then target else nil
+      local scan = ordered.iterate(index.tree, false, lower, op == '>', upper, op == '<')
+      while true do
+        local node = scan()
+        if not node then break end
+        local bucket = index.buckets[node.encoded]
+        if not bucket then error('jessql storage: index bucket missing', 2) end
+
+        for _, key in bucket.keys do
+          if bucket.live[key] then consider(key) end
+        end
+      end
+    end
+
+    if pending then
+      for key in pending do consider(key) end
+    end
+    table.sort(matched)
+    for _, key in matched do
+      local change = if pending then pending[key] else nil
       local row: Row = if type(change) == 'table' then change :: Row
         else (current :: TableState).rows[key]
       result[#result + 1] = row[schema.primaryKey]

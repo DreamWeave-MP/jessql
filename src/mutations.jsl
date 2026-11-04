@@ -12,7 +12,7 @@ export type Value = { kind: string, value: unknown, slot: number?, column: strin
 export type Assignment = { column: string, value: Value }
 export type Statement = {
   kind: string, table: string, columns: { string }, valueRows: { { Value } },
-  assignments: { Assignment }, whereColumn: string?, whereValue: Value?, parameterCount: number,
+  assignments: { Assignment }, whereColumn: string?, whereOp: string?, whereValue: Value?, parameterCount: number,
   ignoreConflict: boolean, conflictColumn: string?,
 }
 
@@ -23,6 +23,7 @@ export type Writer = {
   insert: (self: Writer, name: string, row: { [string]: unknown }) -> (),
   get: (self: Writer, name: string, key: unknown) -> { [string]: unknown }?,
   keysWhere: (self: Writer, name: string, column: string, value: unknown) -> { unknown },
+  keysRange: (self: Writer, name: string, column: string, op: string, value: unknown) -> { unknown },
   update: (self: Writer, name: string, key: unknown, changes: { [string]: unknown }, unset: { string }?) -> boolean,
   delete: (self: Writer, name: string, key: unknown) -> boolean,
 }
@@ -101,6 +102,7 @@ function mutations.parse(sql: string): Statement
   local valueRows: { { Value } } = {}
   local assignments: { Assignment } = {}
   local whereColumn: string? = nil
+  local whereOp: string? = nil
   local whereValue: Value? = nil
   local ignoreConflict = false
   local conflictColumn: string? = nil
@@ -162,7 +164,13 @@ function mutations.parse(sql: string): Statement
     until not accept(',')
     requireWord('WHERE')
     whereColumn = readIdentifier()
-    requireSymbol('=')
+    local operator = peek()
+    if operator.kind ~= 'symbol' or (operator.text ~= '=' and operator.text ~= '<'
+      and operator.text ~= '<=' and operator.text ~= '>' and operator.text ~= '>=') then
+      error('jessql DML: expected indexed comparison (=, <, <=, >, >=)', 0)
+    end
+    whereOp = operator.text
+    position += 1
     whereValue = readValue()
   elseif isWord('DELETE') then
     position += 1
@@ -171,7 +179,13 @@ function mutations.parse(sql: string): Statement
     name = readIdentifier()
     requireWord('WHERE')
     whereColumn = readIdentifier()
-    requireSymbol('=')
+    local operator = peek()
+    if operator.kind ~= 'symbol' or (operator.text ~= '=' and operator.text ~= '<'
+      and operator.text ~= '<=' and operator.text ~= '>' and operator.text ~= '>=') then
+      error('jessql DML: expected indexed comparison (=, <, <=, >, >=)', 0)
+    end
+    whereOp = operator.text
+    position += 1
     whereValue = readValue()
   else
     error('jessql DML: expected INSERT, UPDATE or DELETE', 0)
@@ -184,7 +198,7 @@ function mutations.parse(sql: string): Statement
 
   return {
     kind = kind, table = name, columns = columns, valueRows = valueRows,
-    assignments = assignments, whereColumn = whereColumn,
+    assignments = assignments, whereColumn = whereColumn, whereOp = whereOp,
     whereValue = whereValue, parameterCount = parameterCount,
     ignoreConflict = ignoreConflict, conflictColumn = conflictColumn,
   }
@@ -235,7 +249,10 @@ function mutations.execute(statement: Statement, tx: Writer, params: { unknown }
   -- Collect a bounded, stable key snapshot before changing secondary indexes.
   -- Non-PK predicates must have a declared secondary index.
   local value = resolve(statement.whereValue :: Value)
-  local keys = tx:keysWhere(statement.table, statement.whereColumn :: string, value)
+  local keys = if statement.whereOp == '=' then
+    tx:keysWhere(statement.table, statement.whereColumn :: string, value)
+    else tx:keysRange(statement.table, statement.whereColumn :: string,
+      statement.whereOp :: string, value)
   if statement.kind == 'delete' then
     local affected = 0
     for _, key in keys do
