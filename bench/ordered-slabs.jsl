@@ -1,0 +1,54 @@
+--!strict
+-- Isolated AVL metadata benchmark: inserts, weighted ranges, recycling, iteration.
+-- Run: jess run --trusted --package . bench/ordered-slabs.jsl 80000
+local ordered = require('@jessql/ordered')
+local fs = require('@dream/fs')
+local count = tonumber((...)) or 80000
+assert(count > 0 and count <= 500000)
+
+local function rss(): number
+  local status = fs.readFileString('/proc/self/status')
+  return if status then tonumber(string.match(status, 'VmHWM:%s*(%d+)')) or -1 else -1
+end
+
+local start = os.clock()
+local tree: ordered.Tree? = nil
+for value = 1, count do
+  tree = ordered.insert(tree, value, 'n' .. tostring(value))
+  if value % 7 == 0 then tree = ordered.adjust(tree, value, 2) end
+end
+local built = os.clock()
+local expected = count + math.floor(count / 7) * 2
+assert(ordered.countRange(tree, nil, false, nil, false) == expected)
+
+local checksum = 0
+for query = 1, 4000 do
+  local lower = query * 367 % count
+  local upper = math.min(count, lower + 1000)
+  checksum += ordered.countRange(tree, lower, false, upper, true)
+end
+local countsDone = os.clock()
+
+for value = 1, count do
+  if value % 2 == 0 then tree = ordered.remove(tree, value) end
+end
+
+for value = count + 1, count + math.floor(count / 2) do
+  tree = ordered.insert(tree, value, 'n' .. tostring(value))
+end
+local last = -math.huge
+local iterator = ordered.iterate(tree, false, nil, false, nil, false)
+local visited = 0
+while true do
+  local node = iterator()
+  if not node then break end
+  local value = node.value
+  assert(type(value) == 'number')
+  assert(value > last)
+  last = value
+  visited += 1
+end
+assert(visited == count)
+local finish = os.clock()
+print(string.format('nodes=%d rss_peak_kb=%d build_s=%.5f count_s=%.5f mutate_iter_s=%.5f checksum=%d visited=%d',
+  count, rss(), built - start, countsDone - built, finish - countsDone, checksum, visited))

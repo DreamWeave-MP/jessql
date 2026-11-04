@@ -419,3 +419,28 @@ script is not used by JessQL's query planner and does not contribute to the
 packed-row RSS improvement. One possible future application is fuzzy event or
 moderation similarity search; every candidate would require application-side
 verification against stored data. See `BENCHMARKS.md` for measurements.
+
+## Compact ordered indexes
+
+The native ordered-index implementation now stores AVL node links, heights,
+posting cardinalities and subtree counts in **20 bytes per node** using Luau's
+native `buffer` API. Key values and encoded lookup keys remain in separate Luau
+arrays; the WAL, SQL, index API and query results are unchanged. The structure
+supports exact range counts, forward/reverse cursors, rebalancing, and node-slot
+recycling on deletion. Capacity grows geometrically; obsolete nodes are recycled
+until the index is reconstructed at checkpoint. The same structure serves both
+`row` and `packed` layouts.
+
+Each field is currently a u32: per-node weights and aggregate subtree counts
+are therefore limited to 2^32−1. The engine is still memory-resident and does
+not yet provide disk-backed B+ trees, bounded RSS, synchronized commits or
+cross-platform physical-durability guarantees. An index build can temporarily
+hold both the old and enlarged buffer during geometric growth. This is an
+*internal physical index representation*, not a new on-disk format.
+
+`bench/ordered-slabs.jsl` exercises indexed insertions, weighted range counts,
+node deletion/reuse, and full ordered iteration. `bench/packed-rss.jsl` compares
+end-to-end indexed SQL workloads. Both must be evaluated together: the compact
+structure cuts RSS substantially, but isolated mutation-heavy index operations
+can be slower due to repeated buffer accesses. Refer to `BENCHMARKS.md` for
+measured tradeoffs rather than assuming a universal performance improvement.

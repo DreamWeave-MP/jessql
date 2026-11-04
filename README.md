@@ -53,6 +53,9 @@ packed column representation with `sql.open(path, { rowLayout = 'packed' })`.
 It uses f64/boolean buffers, dictionary-coded repeated strings and chunked byte
 arenas for unique strings, and lazily constructs row dictionaries on reads.
 The default remains `row`; both layouts reopen the **same WAL** without migration.
+The ordered AVL indexes now use 20-byte native-buffer node metadata instead of
+per-node Luau dictionaries for both resident layouts, with reusable node slots.
+See [compact ordered indexes](docs/PERSISTENCE.md#compact-ordered-indexes).
 See [packed resident columns](docs/PERSISTENCE.md#optional-packed-resident-columns-experimental)
 and [benchmarks](BENCHMARKS.md#experimental-packed-resident-columns--hypervectors-jess-030).
 A standalone `bench/hypervectors.jsl` explores approximate binary hypervector

@@ -342,3 +342,50 @@ resident memory if stored alongside exact SQL fields; it is not part of the
 RSS optimization. To scale similarity search, we would need an explicit
 candidate-retrieval index and evaluate false matches, cost and recall under
 realistic distributions.
+
+## Compact native-buffer AVL nodes (Jess 0.3.0)
+
+Compared the unchanged packed-column/reusable-posting baseline
+`1674f8c400b5ddb85c858d162ddcf044032a51ce` with AVL nodes stored as
+20-byte buffer records. Each of three `packed` runs used a fresh Jess process
+in alternating before/after order; two `row` runs per configuration supplement
+the comparison. Same 80,000 rows, four indexes, 5,000 equality queries and 800
+room-scoped bounded range queries. Both sides returned **checksum 49295** and
+**16000 range results** on every run.
+
+| 80K-row metric (median) | Baseline | Compact AVL | Change |
+|---|---:|---:|---:|
+| Packed peak process RSS | 153,824 KiB | 116,812 KiB | **−24.1%** |
+| Packed RSS after indexes | 133,352 KiB | 114,292 KiB | −14.3% |
+| Packed total benchmark CPU | 2.259 s | 2.264 s | +0.2% |
+| Packed 5K equality queries | 0.0335 s | 0.0394 s | +17.7% |
+| Packed 800 composite range queries | 0.0392 s | 0.0326 s | −17.0% |
+| Ordinary-row peak RSS (2 runs) | 185,028 KiB | 154,994 KiB | **−16.2%** |
+| Ordinary-row total CPU (2 runs) | 2.535 s | 2.563 s | +1.1% |
+
+An isolated 80,000-node AVL benchmark additionally tests 4,000 weighted
+range counts, removes half the nodes, inserts replacements and iterates the
+entire tree. Its three-run medians were:
+
+| Isolated tree measurement | Previous | Compact | Change |
+|---|---:|---:|---:|
+| Peak process RSS | 60,596 KiB | 49,292 KiB | −18.7% |
+| 4,000 range-count probes | 0.01265 s | 0.00625 s | −50.6% |
+| Delete/reinsert plus iteration | 0.15795 s | 0.20244 s | **+28.2%** |
+
+**This is a memory/performance tradeoff.** The isolated mutation-heavy index
+microbenchmark got slower. The mixed SQL workload stayed approximately level
+in total CPU, but its short-query timings vary widely between runs. Do not
+infer production speedups from them. RSS includes Jess VM and allocator
+residency; the measured reduction depends on index cardinality and workload.
+These are Linux x64 measurements with buffered writes and no fsync, cold-disk
+paging, multi-worker contention or power-loss testing. Raw alternating-run
+logs are included in the replay archive.
+
+For repeatability:
+
+```bash
+jess run --trusted --package . bench/packed-rss.jsl packed 80000
+jess run --trusted --package . bench/packed-rss.jsl row 80000
+jess run --trusted --package . bench/ordered-slabs.jsl 80000
+```
