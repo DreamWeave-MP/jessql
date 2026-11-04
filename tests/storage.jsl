@@ -980,6 +980,43 @@ suite.describe('native persistent store', function()
     clean(path)
   end)
 
+  suite.it('applies numeric SQL expressions from stable pre-update row values', function()
+    local path = fixture('dml-counters')
+    local db = sql.open(path)
+    db:createTable('queue', { 'id', 'destination', 'attempts', 'mirror' }, 'id')
+    db:transaction(function(tx)
+      tx:insert('queue', { id = 1, destination = 'a', attempts = 3, mirror = 4 })
+      tx:insert('queue', { id = 2, destination = 'a', attempts = 5, mirror = 1 })
+      tx:insert('queue', { id = 3, destination = 'b', mirror = 10 })
+    end)
+    db:createIndex('queue', 'destination')
+    expect(db:exec([[UPDATE queue
+      SET attempts = attempts + ?, mirror = attempts - 1
+      WHERE destination = ?]], { 2, 'a' })).toBe(2)
+    expect(db:get('queue', 1).attempts).toBe(5)
+    expect(db:get('queue', 1).mirror).toBe(2) -- old attempts, not new
+    expect(db:get('queue', 2).attempts).toBe(7)
+    expect(db:get('queue', 2).mirror).toBe(4)
+    expect(db:exec('UPDATE queue SET attempts = attempts + 1 WHERE id = ?', { 3 })).toBe(1)
+    expect(db:get('queue', 3).attempts).toBe(nil) -- NULL arithmetic stays NULL
+
+    -- Unknown columns must fail even when the predicate matches zero rows.
+    expect(pcall(function()
+      db:exec('UPDATE queue SET absent = 1 WHERE id = ?', { 9999 })
+    end)).toBe(false)
+
+    -- Strictly numeric arithmetic; no implicit coercion of strings to numbers.
+    expect(pcall(function()
+      db:exec('UPDATE queue SET attempts = attempts + ? WHERE id = ?', { '2', 1 })
+    end)).toBe(false)
+    expect(db:get('queue', 1).attempts).toBe(5)
+    db:close()
+    db = sql.open(path)
+    expect(db:get('queue', 2).mirror).toBe(4)
+    db:close()
+    clean(path)
+  end)
+
   suite.it('refuses a second writer while the first lock is held', function()
     local path = fixture('lock')
     local db = sql.open(path)

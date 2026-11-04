@@ -47,6 +47,7 @@ export type Transaction = {
   createOrderedIndex: (self: Transaction, name: string, column: string) -> (),
   createCompositeIndex: (self: Transaction, name: string, prefix: string, suffix: string) -> (),
   primaryKey: (self: Transaction, name: string) -> string,
+  hasColumn: (self: Transaction, name: string, column: string) -> boolean,
   keysWhere: (self: Transaction, name: string, column: string, value: unknown) -> { unknown },
   exec: (self: Transaction, sql: string, params: { unknown }?) -> number,
   executeMutation: (self: Transaction, statement: mutations.Statement, params: { unknown }?) -> number,
@@ -800,6 +801,11 @@ local function buildTransaction(state: DatabaseState)
   function transaction.primaryKey(_self: Transaction, name: string): string
     writable()
     return findSchema(requireName(name)).primaryKey
+  end
+
+  function transaction.hasColumn(_self: Transaction, name: string, column: string): boolean
+    writable()
+    return findSchema(requireName(name)).allowed[requireName(column)] == true
   end
 
   function transaction.executeMutation(_self: Transaction, statement: mutations.Statement, params: { unknown }?): number

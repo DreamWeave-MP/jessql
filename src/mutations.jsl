@@ -8,7 +8,7 @@ local mutations = {}
 local Null = {}
 mutations.NULL = Null -- explicit parameter NULL; nil holes are not valid parameter arrays
 
-export type Value = { kind: string, value: unknown, slot: number? }
+export type Value = { kind: string, value: unknown, slot: number?, column: string?, op: string?, rhs: Value? }
 export type Assignment = { column: string, value: Value }
 export type Statement = {
   kind: string, table: string, columns: { string }, valueRows: { { Value } },
@@ -19,6 +19,7 @@ export type Statement = {
 -- Keep this interface independent of the storage module to avoid a dependency cycle.
 export type Writer = {
   primaryKey: (self: Writer, name: string) -> string,
+  hasColumn: (self: Writer, name: string, column: string) -> boolean,
   insert: (self: Writer, name: string, row: { [string]: unknown }) -> (),
   get: (self: Writer, name: string, key: unknown) -> { [string]: unknown }?,
   keysWhere: (self: Writer, name: string, column: string, value: unknown) -> { unknown },
@@ -146,7 +147,18 @@ function mutations.parse(sql: string): Statement
     repeat
       local column = readIdentifier()
       requireSymbol('=')
-      assignments[#assignments + 1] = { column = column, value = readValue() }
+      local token = peek()
+      local value: Value
+      if (token.kind == 'word' or token.kind == 'ident')
+        and token.value ~= 'TRUE' and token.value ~= 'FALSE' and token.value ~= 'NULL' then
+        local source = readIdentifier()
+        local operator = if accept('+') then '+' elseif accept('-') then '-' else nil
+        if not operator then error('jessql DML: expected + or - after column reference', 0) end
+        value = ({ kind = 'arithmetic', value = nil, column = source, op = operator, rhs = readValue() } :: Value)
+      else
+        value = readValue()
+      end
+      assignments[#assignments + 1] = { column = column, value = value }
     until not accept(',')
     requireWord('WHERE')
     whereColumn = readIdentifier()
@@ -198,6 +210,7 @@ function mutations.execute(statement: Statement, tx: Writer, params: { unknown }
     local seen: { [string]: boolean } = {}
     for _, column in statement.columns do
       if seen[column] then error('jessql DML: duplicate INSERT column', 2) end
+      if not tx:hasColumn(statement.table, column) then error('jessql DML: unknown INSERT column', 2) end
       seen[column] = true
     end
     local pk = tx:primaryKey(statement.table)
@@ -230,18 +243,58 @@ function mutations.execute(statement: Statement, tx: Writer, params: { unknown }
     end
     return affected
   end
-  local changes: { [string]: unknown } = {}
-  local unset: { string } = {}
   local seen: { [string]: boolean } = {}
+  local pk = tx:primaryKey(statement.table)
+  -- Validate even if the WHERE predicate matches zero rows. In particular,
+  -- an invalid assignment must not be silently accepted on an empty table.
   for _, assignment in statement.assignments do
     if seen[assignment.column] then error('jessql DML: duplicate UPDATE column', 2) end
     seen[assignment.column] = true
-    local value = resolve(assignment.value)
-    if value == nil then unset[#unset + 1] = assignment.column
-    else changes[assignment.column] = value end
+    if assignment.column == pk or not tx:hasColumn(statement.table, assignment.column) then
+      error('jessql DML: cannot update column', 2)
+    end
+    local expression = assignment.value
+    if expression.kind == 'arithmetic' then
+      if not tx:hasColumn(statement.table, expression.column :: string) then
+        error('jessql DML: unknown arithmetic source column', 2)
+      end
+      local delta = resolve(expression.rhs :: Value)
+      if delta ~= nil and type(delta) ~= 'number' then
+        error('jessql DML: arithmetic operand must be a number', 2)
+      end
+    else
+      resolve(expression)
+    end
   end
+
   local affected = 0
   for _, key in keys do
+    local original = tx:get(statement.table, key)
+    if not original then continue end
+    local changes: { [string]: unknown } = {}
+    local unset: { string } = {}
+    for _, assignment in statement.assignments do
+      local expression = assignment.value
+      local nextValue: unknown
+      if expression.kind == 'arithmetic' then
+        local previous = original[expression.column :: string]
+        local delta = resolve(expression.rhs :: Value)
+        if previous == nil or delta == nil then
+          nextValue = nil
+        else
+          if type(previous) ~= 'number' or type(delta) ~= 'number' then
+            error('jessql DML: arithmetic requires numeric columns', 2)
+          end
+          nextValue = if expression.op == '+' then previous + delta else previous - delta
+        end
+      else
+        nextValue = resolve(expression)
+      end
+
+      if nextValue == nil then unset[#unset + 1] = assignment.column
+      else changes[assignment.column] = nextValue end
+    end
+
     if tx:update(statement.table, key, changes, unset) then affected += 1 end
   end
   return affected
