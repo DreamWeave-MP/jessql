@@ -81,6 +81,8 @@ export type Iterator = {
 --- A table as the engine sees it: what a registering package implements. `columns` and `scan`
 --- are required; `scan` returns the rows, or a `ScanResult` around them.
 ---   count    the exact number of rows, unfiltered: answers a bare `SELECT COUNT(*)`
+---   countFiltered  optional exact count for a fully pushable conjunctive WHERE; nil declines
+---                  and falls back to ordinary SQL evaluation
 ---   indexes  the columns `lookup` can find rows by
 ---   lookup   the rows whose `column` equals `value`, for an indexed join
 ---   iterate  a lazy scan, used in place of `scan` to drive a single-table query or an indexed join
@@ -88,6 +90,7 @@ export type Provider = {
   read columns: { string },
   read scan: (request: Request) -> SourceRows | ScanResult,
   read count: (() -> number)?,
+  read countFiltered: ((request: Request) -> number?)?,
   read indexes: { [string]: boolean }?,
   read lookup: ((column: string, value: unknown, request: Request) -> (SourceRows | ScanResult)?)?,
   read iterate: ((request: Request) -> Iterator)?,
@@ -1754,6 +1757,17 @@ local function prepare(db: Database, sql: string): Plan
   -- Binding happened while compiling WHERE/select/etc.; extract safe provider hints now.
   local constraints, constraintsComplete = constraintFrom(ast.where)
 
+  -- Exact filtered cardinality is an optional provider fast path. It may decline
+  -- a request by returning nil; the general executor then handles the WHERE.
+  local directFilteredCount = false
+
+  if directSingle and ast.where ~= nil and constraintsComplete and #ast.groupBy == 0
+    and ast.having == nil and #ast.orderBy == 0 and ast.limit == nil and ast.offset == 0
+    and #ast.select == 1 and type(sources[1].provider.countFiltered) == 'function' then
+    local expression = ast.select[1].expr
+    directFilteredCount = expression.tag == 'call' and expression.name == 'COUNT' and expression.star == true
+  end
+
   local providerOrder = nil
 
   if directSingle and not aggregate and #ast.orderBy > 0 then
@@ -1823,6 +1837,30 @@ local function prepare(db: Database, sql: string): Plan
       local row = {}
       row[resultColumns[1]] = sources[1].provider.count()
       return { columns = resultColumns, rows = { row } }
+    end
+
+    if directFilteredCount then
+      local sourceConstraints = [
+        for constraint in constraints => {
+          column = constraint.column,
+          op = constraint.op,
+          value = if constraint.param then params[constraint.param] else constraint.value,
+        }
+      ]
+
+      local request: Request = {
+        columns = {}, constraints = sourceConstraints, whereComplete = true,
+        allowVolatileRows = false,
+      }
+      local counted = sources[1].provider.countFiltered(request)
+      if counted ~= nil then
+        if type(counted) ~= 'number' or counted < 0 or counted % 1 ~= 0 then
+          error('jessql: invalid provider filtered count', 0)
+        end
+        local row = {}
+        row[resultColumns[1]] = counted
+        return { columns = resultColumns, rows = { row } }
+      end
     end
 
     local rowsBySource = table.create(#sources)
@@ -2595,7 +2633,7 @@ local function prepare(db: Database, sql: string): Plan
       grouped = aggregate,
       compactGroup = compactGroupColumn ~= nil,
       aggregateCount = #aggregateSpecs,
-      providerCount = directProviderCount,
+      providerCount = directProviderCount or directFilteredCount,
       parameterCount = ast.params,
     }
   end

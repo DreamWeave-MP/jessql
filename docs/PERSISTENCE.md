@@ -81,7 +81,11 @@ The in-memory rows are stored in a primary-key hash map. Secondary hash indexes
 maintain posting lists on insert, update and delete; the JessQL provider uses
 indexed equality constraints to narrow scans, and exposes indexed lookup for
 joins. Other SQL predicates and joins continue through JessQL's existing
-planner. `COUNT(*)` without predicates uses exact stored cardinality.
+planner. `COUNT(*)` without predicates uses exact stored cardinality. Indexed equality
+counts (`WHERE indexed_column = ?`) use direct posting-list cardinality, avoiding
+materializing or scanning the matching rows. Conjunctions of equalities can use
+the smallest index and verify remaining predicates. Unsupported filters fall
+back to normal query execution; this remains optional for other providers.
 
 `checkpoint()` streams a compact logical snapshot into a sibling `.checkpoint.tmp`
 file, bounded by the frame size, and renames it over the previous log only

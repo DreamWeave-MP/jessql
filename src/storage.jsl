@@ -203,6 +203,48 @@ local function tableProvider(state: DatabaseState, name: string): queryEngine.Pr
     columns = current.schema.columns,
     indexes = current.available,
     count = function() return (state.tables[name] :: TableState).count end,
+    countFiltered = function(request)
+      if not request.whereComplete or #request.constraints == 0 then return nil end
+      local tableState = state.tables[name] :: TableState
+      local indexed = false
+      for _, constraint in request.constraints do
+        if constraint.op ~= '=' then return nil end
+        if constraint.value == nil then return 0 end
+        if not scalar(constraint.value) then return nil end
+        if tableState.available[constraint.column] then indexed = true end
+      end
+
+      if not indexed then return nil end
+
+      local keys, live = indexedKeys(tableState, request)
+      if #request.constraints == 1 then
+        local only = request.constraints[1]
+        if only.column == tableState.schema.primaryKey then
+          return if tableState.rows[keys[1]] then 1 else 0
+        end
+        local bucket = tableState.secondary[only.column].buckets[keyOf(only.value)]
+        return if bucket then bucket.count else 0
+      end
+
+      -- More than one predicate: use the smallest available posting list, then
+      -- verify every equality against the original row (including non-indexed columns).
+      local count = 0
+      for _, key in keys do
+        if live and not (live :: { [string]: boolean })[key] then continue end
+        local row = tableState.rows[key]
+        if not row then continue end
+        local matches = true
+        for _, constraint in request.constraints do
+          if row[constraint.column] == nil or row[constraint.column] ~= constraint.value then
+            matches = false
+            break
+          end
+        end
+
+        if matches then count += 1 end
+      end
+      return count
+    end,
     scan = function(request)
       local tableState = state.tables[name] :: TableState
       local keys, live = indexedKeys(tableState, request)
