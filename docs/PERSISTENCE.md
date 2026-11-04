@@ -37,8 +37,10 @@ nullable column (existing rows read as NULL); it works inside transactions and
 survives journal replay and checkpoint. `update(table, key, changes, unset?)`
 changes only listed columns of an existing row and returns `false` when absent.
 `unset` is an optional array of column names to set to NULL; primary keys cannot
-be changed or unset. New column definitions are not retroactive defaults. Build
-fresh prepared queries after schema changes.
+be changed or unset. New column definitions are not retroactive defaults.
+A prepared plan validates the store schema generation and rejects execution or
+explanation after `createTable`, `addColumn`, or `createIndex`. Re-prepare queries
+after schema changes. Plans also reject use after database close.
 
 SQL `INSERT`, `UPDATE`, `DELETE`, `CREATE TABLE`, and `CREATE INDEX` syntax are
 **not yet parsed**; use the typed mutation API. SQL reads within an in-progress

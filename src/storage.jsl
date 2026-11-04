@@ -59,6 +59,7 @@ type DatabaseState = {
   engine: queryEngine.Database,
   tables: { [string]: TableState },
   sequence: number,
+  schemaVersion: number,
   maxFrameBytes: number,
   closed: boolean,
   busy: boolean,
@@ -383,6 +384,10 @@ local function apply(state: DatabaseState, operations: { Operation })
     else
       error('jessql storage: unknown log operation', 2)
     end
+
+    if operation.kind == 'create' or operation.kind == 'addcol' or operation.kind == 'index' then
+      state.schemaVersion += 1
+    end
   end
 end
 
@@ -644,7 +649,7 @@ function storage.open(path: string, options: Options?): Store
   if not lock then error('jessql storage: database locked: ' .. tostring(err), 2) end
 
   local state: DatabaseState = {
-    path = path, lock = lock, engine = queryEngine.new(), tables = {}, sequence = 0,
+    path = path, lock = lock, engine = queryEngine.new(), tables = {}, sequence = 0, schemaVersion = 0,
     maxFrameBytes = max or DefaultMaxFrame, closed = false, busy = false, poisoned = false,
   }
 
@@ -730,7 +735,28 @@ function storage.open(path: string, options: Options?): Store
 
   function db.prepare(_self: Store, sql: string): queryEngine.Plan
     ready()
-    return state.engine:prepare(sql)
+    local plan = state.engine:prepare(sql)
+    local generation = state.schemaVersion
+    local run, explain = plan.run, plan.explain
+
+    local function valid()
+      ready()
+      if state.schemaVersion ~= generation then
+        error('jessql storage: prepared plan invalidated by schema change; prepare again', 3)
+      end
+    end
+
+    function plan.run(params)
+      valid()
+      return run(params)
+    end
+
+    function plan.explain()
+      valid()
+      return explain()
+    end
+
+    return plan
   end
 
   function db.tables(_self: Store): { queryEngine.TableInfo }
