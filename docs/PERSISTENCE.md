@@ -27,10 +27,18 @@ db:close()      -- release the exclusive writer lock
 
 `sql.new()` and existing virtual providers are unchanged. `sql.open(path, options?)`
 returns a separate store backed by JessQL's existing SQL SELECT planner/executor.
-Its mutations are `createTable`, `createIndex`, `insert` (fail if duplicate),
-`upsert`, and `delete` (returns whether the key existed). `get` reads by primary
+Its mutations are `createTable`, `createIndex`, `addColumn`, `insert` (fail if duplicate),
+`upsert`, `update` and `delete` (returns whether the key existed). `get` reads by primary
 key and returns a defensive row copy. `transaction(fn)` groups these operations
 into one log record, and `tx:get` observes staged writes and deletes.
+
+`addColumn(table, column)` is an atomic, metadata-only migration that adds a
+nullable column (existing rows read as NULL); it works inside transactions and
+survives journal replay and checkpoint. `update(table, key, changes, unset?)`
+changes only listed columns of an existing row and returns `false` when absent.
+`unset` is an optional array of column names to set to NULL; primary keys cannot
+be changed or unset. New column definitions are not retroactive defaults. Build
+fresh prepared queries after schema changes.
 
 SQL `INSERT`, `UPDATE`, `DELETE`, `CREATE TABLE`, and `CREATE INDEX` syntax are
 **not yet parsed**; use the typed mutation API. SQL reads within an in-progress

@@ -13,6 +13,8 @@ export type Options = { maxFrameBytes: number?, recoverTail: boolean? }
 export type Store = {
   createTable: (self: Store, name: string, columns: { string }, primaryKey: string) -> (),
   createIndex: (self: Store, name: string, column: string) -> (),
+  addColumn: (self: Store, name: string, column: string) -> (),
+  update: (self: Store, name: string, key: unknown, changes: Row, unset: { string }?) -> boolean,
   insert: (self: Store, name: string, row: Row) -> (),
   upsert: (self: Store, name: string, row: Row) -> (),
   delete: (self: Store, name: string, key: unknown) -> boolean,
@@ -27,6 +29,8 @@ export type Store = {
 export type Transaction = {
   createTable: (self: Transaction, name: string, columns: { string }, primaryKey: string) -> (),
   createIndex: (self: Transaction, name: string, column: string) -> (),
+  addColumn: (self: Transaction, name: string, column: string) -> (),
+  update: (self: Transaction, name: string, key: unknown, changes: Row, unset: { string }?) -> boolean,
   insert: (self: Transaction, name: string, row: Row) -> (),
   upsert: (self: Transaction, name: string, row: Row) -> (),
   delete: (self: Transaction, name: string, key: unknown) -> boolean,
@@ -264,6 +268,11 @@ local function apply(state: DatabaseState, operations: { Operation })
         secondary = {}, available = { [schema.primaryKey] = true },
       }
       state.engine:register(name, tableProvider(state, name))
+    elseif operation.kind == 'addcol' then
+      local current = state.tables[name] :: TableState
+      local column = operation.column :: string
+      current.schema.columns[#current.schema.columns + 1] = column
+      current.schema.allowed[column] = true
     elseif operation.kind == 'index' then
       local current = state.tables[name] :: TableState
       local column = operation.column :: string
@@ -303,7 +312,7 @@ end
 local function buildTransaction(state: DatabaseState)
   local operations: { Operation } = {}
   local staged: Pending = {}
-  local created: { [string]: Schema } = {}
+  local created, altered = {} :: { [string]: Schema }, {} :: { [string]: Schema }
   local indexed: { [string]: { [string]: boolean } } = {}
   local active = true
   local transaction = {} :: Transaction
@@ -313,7 +322,7 @@ local function buildTransaction(state: DatabaseState)
   end
 
   local function findSchema(name: string): Schema
-    local schema = created[name]
+    local schema = created[name] or altered[name]
     if schema then return schema end
     local current = state.tables[name]
     if not current then error('jessql storage: no such table: ' .. name, 3) end
@@ -327,6 +336,31 @@ local function buildTransaction(state: DatabaseState)
     local schema = makeSchema(columns, pk)
     created[name] = schema
     operations[#operations + 1] = { kind = 'create', table = name, columns = schema.columns, primaryKey = schema.primaryKey, key = nil }
+  end
+
+  -- A nullable column is a metadata-only migration. Rows predating it read as NULL.
+  function transaction.addColumn(_self: Transaction, name: string, column: string)
+    writable()
+    name = requireName(name)
+    column = requireName(column)
+    local schema = findSchema(name)
+    if schema.allowed[column] then error('jessql storage: column already exists', 2) end
+    if #schema.columns >= 256 then error('jessql storage: column limit exceeded', 2) end
+
+    if created[name] then
+      -- CREATE and subsequent inserts share this schema; amend its logged column array.
+      schema.allowed[column] = true
+      schema.columns[#schema.columns + 1] = column
+    else
+      local nextSchema = altered[name]
+      if not nextSchema then
+        nextSchema = makeSchema(schema.columns, schema.primaryKey)
+        altered[name] = nextSchema
+      end
+      nextSchema.allowed[column] = true
+      nextSchema.columns[#nextSchema.columns + 1] = column
+      operations[#operations + 1] = { kind = 'addcol', table = name, column = column, key = nil }
+    end
   end
 
   function transaction.createIndex(_self: Transaction, name: string, column: string)
@@ -377,6 +411,42 @@ local function buildTransaction(state: DatabaseState)
   function transaction.insert(_self: Transaction, name: string, row: Row) put(name, row, true) end
   function transaction.upsert(_self: Transaction, name: string, row: Row) put(name, row, false) end
 
+  -- Update selected fields without clearing unspecified columns. Use `unset` to write NULL.
+  -- The primary key is immutable and updates to absent records return false.
+  function transaction.update(_self: Transaction, name: string, key: unknown, changes: Row, unset: { string }?): boolean
+    writable()
+    name = requireName(name)
+    local schema = findSchema(name)
+    local existing = transaction:get(name, key)
+    if not existing then return false end
+    if type(changes) ~= 'table' then error('jessql storage: changes must be a table', 2) end
+
+    for column, value in changes do
+      if type(column) ~= 'string' then error('jessql storage: invalid column', 2) end
+      local normalized = requireName(column)
+      if not schema.allowed[normalized] or normalized == schema.primaryKey then
+        error('jessql storage: cannot update column', 2)
+      end
+
+      if not scalar(value) then error('jessql storage: unsupported value', 2) end
+      existing[normalized] = value
+    end
+
+    if unset then
+      if type(unset) ~= 'table' then error('jessql storage: invalid unset columns', 2) end
+
+      for _, column in unset do
+        local normalized = requireName(column)
+        if not schema.allowed[normalized] or normalized == schema.primaryKey then
+          error('jessql storage: cannot unset column', 2)
+        end
+        existing[normalized] = nil
+      end
+    end
+    put(name, existing, false)
+    return true
+  end
+
   function transaction.delete(_self: Transaction, name: string, key: unknown): boolean
     writable()
     name = requireName(name)
@@ -401,6 +471,8 @@ local function replay(state: DatabaseState, operations: { Operation })
       tx:createTable(operation.table, operation.columns :: { string }, operation.primaryKey :: string)
     elseif operation.kind == 'index' then
       tx:createIndex(operation.table, operation.column :: string)
+    elseif operation.kind == 'addcol' then
+      tx:addColumn(operation.table, operation.column :: string)
     elseif operation.kind == 'put' then
       tx:upsert(operation.table, operation.row :: Row)
     elseif operation.kind == 'del' then
@@ -540,6 +612,16 @@ function storage.open(path: string, options: Options?): Store
 
   function db.createIndex(self: Store, name: string, column: string)
     self:transaction(function(tx) tx:createIndex(name, column) end)
+  end
+
+  function db.addColumn(self: Store, name: string, column: string)
+    self:transaction(function(tx) tx:addColumn(name, column) end)
+  end
+
+  function db.update(self: Store, name: string, key: unknown, changes: Row, unset: { string }?): boolean
+    local updated = false
+    self:transaction(function(tx) updated = tx:update(name, key, changes, unset) end)
+    return updated
   end
 
   function db.insert(self: Store, name: string, row: Row)
