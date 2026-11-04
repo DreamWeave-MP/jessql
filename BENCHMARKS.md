@@ -582,3 +582,41 @@ page directories still grow with file size. The compaction output remains
 unpublished and does not establish power-loss durability or bounded disk
 reclamation. These results do not benchmark segment-aware composite indexes,
 which are not yet supported.
+
+## Segmented cold secondary-index merge
+
+`bench/segment-index.jsl` creates four overlapping 6,000-row JQLP2 snapshots
+and one compact composite `(room, stream)` sidecar per snapshot. It then
+compares 24 bounded, room-scoped ordered queries with and without sidecar
+merging. The fixture uses **unique ordered values** so LIMIT ties cannot
+produce different but equally valid SQL results. The 12 hot updates and 6
+deletions in the shared WAL exercise masking during both paths.
+
+```bash
+jess run --trusted --package . bench/segment-index.jsl prepare 6000 24 /tmp/jessql-si
+/usr/bin/time -f 'RSS_KiB=%M' jess run --trusted --package . bench/segment-index.jsl plain 6000 24 /tmp/jessql-si
+/usr/bin/time -f 'RSS_KiB=%M' jess run --trusted --package . bench/segment-index.jsl indexed 6000 24 /tmp/jessql-si
+jess run --trusted --package . bench/segment-index.jsl cleanup 6000 24 /tmp/jessql-si
+```
+
+Jess 0.3.0, Linux x64, six alternating fresh-process executions (three per
+configuration), with identical checksum **53,581,730**:
+
+| Measurement | Unindexed generation merge | Indexed generation merge |
+|---|---:|---:|
+| Median query CPU | 3.565 s | **0.0685 s** |
+| Query CPU range | 3.343–3.572 s | 0.0648–0.0777 s |
+| Median peak RSS | 35,460 KiB | 37,568 KiB |
+| Query count | 24 | 24 |
+
+**~52× less CPU** in this scoped workload, at roughly **2 MiB more RSS**.
+This compares an indexed generation merge against the previous full cold
+scan; it does not establish superiority over another indexed database. Builds
+of the four sidecars are done in the separate `prepare` phase and are not
+included in query CPU or RSS. Immutable deletion sidecars are checked by the
+regression suite but are not used in this specific performance fixture.
+
+The merger maintains one candidate per indexed generation but must consult
+newer snapshots for shadowed primary keys; heavy overlap can increase page
+reads. There is still no online generation publication, reclaiming of old
+files, or power-loss-durable WAL rotation.

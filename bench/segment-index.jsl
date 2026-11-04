@@ -1,0 +1,78 @@
+--!strict
+--!native
+-- Multi-generation cold index benchmark. Prepare once, then benchmark each
+-- mode in a fresh process against the identical generations and WAL.
+local sql = require('@jessql')
+local fs = require('@dream/fs')
+
+local mode = arg[1] or 'indexed'
+local rows = tonumber(arg[2]) or 6000
+local queries = tonumber(arg[3]) or 24
+local base = arg[4] or '.jessql-segment-index-bench'
+local sources: { string } = {}
+local sidecars: { string } = {}
+for generation = 1, 4 do
+  sources[generation] = base .. '.' .. tostring(generation)
+  sidecars[generation] = base .. '.' .. tostring(generation) .. '.idx'
+end
+local wal = base .. '.wal'
+
+if mode == 'prepare' then
+  fs.remove(wal)
+  fs.remove(wal .. '.lock')
+  for generation, path in sources do
+    fs.remove(path)
+    fs.remove(sidecars[generation])
+    local first = 1 + (generation - 1) * math.floor(rows * 5 / 6)
+    local cursor = 0
+    sql.paged.create(path, { 'id', 'room', 'stream', 'body' }, 'id', function()
+      cursor += 1
+      if cursor > rows then return nil end
+      local key = first + cursor - 1
+      return { id = key, room = 'room-' .. tostring(key % 64),
+        stream = key * 16 + generation, body = 'event-' .. tostring(key) }
+    end)
+    sql.secondary.create(sidecars[generation], path, 'room', 'stream',
+      { format = 'compact', runRows = 1024, mergeFanIn = 4 })
+  end
+  local db = sql.hybrid.open(wal, sources, 'events')
+  db:transaction(function(tx)
+    for key = 1, 12 do
+      tx:upsert({ id = key, room = 'room-17', stream = key * 16 + 9, body = 'new-room' })
+    end
+
+    for key = 13, 18 do tx:delete(key) end
+  end)
+  db:close()
+  print('prepared', rows, 'rows_per_generation', #sources, 'generations')
+  return
+end
+
+if mode == 'cleanup' then
+  for generation, path in sources do
+    fs.remove(path)
+    fs.remove(sidecars[generation])
+  end
+  fs.remove(wal)
+  fs.remove(wal .. '.lock')
+  return
+end
+
+if mode ~= 'plain' and mode ~= 'indexed' then error('expected plain or indexed') end
+local start = os.clock()
+local db = sql.hybrid.open(wal, sources, 'events', {
+  cachePages = 2, secondaryIndexPaths = if mode == 'indexed' then sidecars else nil,
+})
+local opened = os.clock() - start
+local sum = 0
+start = os.clock()
+for number = 1, queries do
+  local room = 'room-' .. tostring((number * 13) % 64)
+  local cursor = math.floor(rows * 16 * 3 * ((number * 5) % 7) / 7)
+  local selected = db:query('SELECT id, stream FROM events WHERE room = ? AND stream >= ? ORDER BY stream LIMIT 16',
+    { room, cursor }).rows
+  for _, row in selected do sum += (row.id :: number) + (row.stream :: number) end
+end
+print('mode', mode, 'open_cpu_s', opened, 'query_cpu_s', os.clock() - start,
+  'query_count', queries, 'checksum', sum)
+db:close()

@@ -28,6 +28,19 @@ See [Hybrid storage details and limitations](docs/HYBRID.md) before using this
 experimental API. Power-loss durability, automatic segment promotion, and
 bounded total RSS are **not yet provided**.
 
+## Experimental segmented cold indexes and immutable deletions
+
+JessQL can now merge `secondaryIndexPaths` across up to eight immutable cold
+generations, with newest-generation-wins behavior, WAL shadowing, and a
+bounded sorted cursor for Matrix-style `(room, stream)` reads. It also supports
+**explicit immutable deletion sidecars** attached to individual generations;
+compaction respects deleted keys without silently resurrecting old rows.
+
+These APIs do **not** automatically rotate or retire the WAL, switch active
+generation lists, delete cold files, or claim power-loss durability. See
+[segment semantics and safety](docs/SEGMENTS.md) and
+[segment-index benchmark](BENCHMARKS.md#segmented-cold-secondary-index-merge).
+
 ## Package
 
 - package: `org.dreamweave.jessql` 0.1.6
