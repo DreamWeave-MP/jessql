@@ -1,0 +1,243 @@
+--!strict
+--!native
+-- Bounded-fan-in read-only view over immutable JQLP2 snapshots.
+-- Later snapshots shadow earlier rows with the same primary key. No file is
+-- replaced, retired, or published by opening or compacting this view.
+local paged = require('@jessql/paged')
+local engine = require('@jessql/engine')
+
+export type Row = { [string]: unknown }
+export type Options = { cachePages: number?, pageBytes: number? }
+export type Snapshot = paged.Snapshot
+
+local MaxSources = 8
+local segments = {}
+
+local function compare(leftValue: unknown, rightValue: unknown): number
+  local left, right = type(leftValue), type(rightValue)
+  local ranks = { boolean = 1, number = 2, string = 3 }
+  if left ~= right then return if (ranks[left] or 9) < (ranks[right] or 9) then -1 else 1 end
+  if leftValue == rightValue then return 0 end
+  if left == 'boolean' then return if leftValue == false then -1 else 1 end
+  if left == 'number' then return if (leftValue :: number) < (rightValue :: number) then -1 else 1 end
+  return if (leftValue :: string) < (rightValue :: string) then -1 else 1
+end
+
+local function project(row: Row, columns: { string }?): Row
+  if not columns then return row end
+  local result: Row = {}
+  for _, column in columns do result[column] = row[column] end
+  return result
+end
+
+local function identical(left: { string }, right: { string }): boolean
+  if #left ~= #right then return false end
+  for index, name in left do if right[index] ~= name then return false end end
+  return true
+end
+
+-- Snapshot paths are ordered oldest to newest. The exact list and order are
+-- part of the hybrid WAL identity; a changed generation list cannot silently
+-- reuse an old overlay. No lossy hash is used to combine identity tokens.
+function segments.open(paths: { string }, options: Options?): Snapshot
+  if type(paths) ~= 'table' or #paths < 1 or #paths > MaxSources then
+    error('jessql segments: expected 1 to 8 snapshot paths', 2)
+  end
+  local readers: { paged.Snapshot } = {}
+  local seen: { [string]: boolean } = {}
+  local cachePages = if options then options.cachePages else nil
+  -- Snapshot opens and schema validation can throw; close prior readers on failure.
+  local valid, failure = pcall(function()
+    for _, path in paths do
+      if type(path) ~= 'string' or path == '' or seen[path] then
+        error('jessql segments: invalid or duplicate snapshot path')
+      end
+      seen[path] = true
+      local reader = paged.open(path, { cachePages = cachePages or 1 })
+      if #readers > 0 then
+        if reader.primaryKey ~= readers[1].primaryKey
+          or not identical(reader.columns, readers[1].columns) then
+          reader:close()
+          error('jessql segments: incompatible snapshot schema')
+        end
+      end
+      readers[#readers + 1] = reader
+    end
+  end)
+
+  if not valid then
+    for _, reader in readers do reader:close() end
+    error(failure, 2)
+  end
+
+  local first = readers[1]
+  local count, keyKind = 0, 'empty'
+  local identities: { string } = { 'JQLM1' }
+  for _, reader in readers do
+    count += reader.count
+    local token = reader.identity
+    identities[#identities + 1] = tostring(#token) .. ':' .. token
+    if reader.keyKind ~= 'empty' then
+      if keyKind == 'empty' then keyKind = reader.keyKind
+      elseif keyKind ~= reader.keyKind then keyKind = 'mixed' end
+    end
+  end
+  local identity = table.concat(identities, '|')
+  local primaryKey = first.primaryKey
+  local closed = false
+  local snapshot = {} :: Snapshot
+  snapshot.columns, snapshot.primaryKey = first.columns, primaryKey
+  -- Physical row count; duplicate keys in older generations are included.
+  -- SQL COUNT never uses this upper bound: the provider streams exact rows.
+  snapshot.count, snapshot.keyKind, snapshot.identity = count, keyKind, identity
+
+  local function ready()
+    if closed then error('jessql segments: snapshot closed', 3) end
+  end
+
+  function snapshot.get(_self: Snapshot, key: unknown): Row?
+    ready()
+    for index = #readers, 1, -1 do
+      local row = readers[index]:get(key)
+      if row then return row end
+    end
+    return nil
+  end
+
+  function snapshot.iterateRows(_self: Snapshot, columns: { string }?, descending: boolean?,
+    lower: unknown?, upper: unknown?, lowerStrict: boolean?, upperStrict: boolean?): () -> Row?
+    ready()
+    local descendingOrder = descending == true
+    local iterators: { () -> Row? } = {}
+    local heads: { Row? } = {}
+    -- Each open iterator holds at most one decoded row. One page per source
+    -- is cached by default, independent of the total number of input rows.
+    for index, reader in readers do
+      local nextRow = reader:iterateRows(nil, descending, lower, upper, lowerStrict, upperStrict)
+      iterators[index] = nextRow
+      heads[index] = nextRow()
+    end
+
+    return function(): Row?
+      ready()
+      local winner = 0
+      local selected: Row? = nil
+      for index = 1, #readers do
+        local row = heads[index]
+        if not row then continue end
+
+        if not selected then
+          selected, winner = row, index
+        else
+          local difference = compare(row[primaryKey], selected[primaryKey])
+          if (if descendingOrder then difference > 0 else difference < 0)
+            or (difference == 0 and index > winner) then
+            selected, winner = row, index
+          end
+        end
+      end
+
+      if not selected then return nil end
+      local key = selected[primaryKey]
+      -- Advance *all* matching heads before yielding the newest row.
+      -- Older generations cannot resurrect shadowed values.
+      for index = 1, #readers do
+        local row = heads[index]
+        if row and compare(row[primaryKey], key) == 0 then
+          heads[index] = iterators[index]()
+        end
+      end
+      return project(selected, columns)
+    end
+  end
+
+  function snapshot.provider(self: Snapshot): engine.Provider
+    local function queryIterator(request: engine.Request): engine.Iterator
+      local order = request.orderBy
+      local ordered = order ~= nil and #order == 1 and order[1].column == primaryKey
+        and (keyKind == 'number' or keyKind == 'string')
+      local descending = ordered and (order :: { engine.Order })[1].desc
+      local lower: unknown = nil
+      local upper: unknown = nil
+      local lowerStrict, upperStrict = false, false
+      if ordered then
+        for _, constraint in request.constraints do
+          if constraint.column ~= primaryKey then continue end
+          local value = constraint.value
+          if value == nil or type(value) ~= keyKind then continue end
+
+          if constraint.op == '>' or constraint.op == '>=' then
+            if lower == nil or compare(value, lower) > 0
+              or (compare(value, lower) == 0 and constraint.op == '>') then
+              lower, lowerStrict = value, constraint.op == '>'
+            end
+          elseif constraint.op == '<' or constraint.op == '<=' then
+            if upper == nil or compare(value, upper) < 0
+              or (compare(value, upper) == 0 and constraint.op == '<') then
+              upper, upperStrict = value, constraint.op == '<'
+            end
+          end
+        end
+      end
+
+      return { _jessqlIter = 'v1', ordered = ordered,
+        next = self:iterateRows(request.columns, descending, lower, upper, lowerStrict, upperStrict) }
+    end
+
+    return {
+      columns = self.columns,
+      indexes = { [primaryKey] = true },
+      -- `count` intentionally absent: physical rows are not logical rows.
+      lookup = function(column, key, request)
+        if column ~= primaryKey then return nil end
+        local row = self:get(key)
+        return if row then { project(row, request.columns) } else {}
+      end,
+      scan = function(request)
+        local rows: { Row } = {}
+        local nextRow = self:iterateRows(request.columns)
+        while true do
+          local row = nextRow()
+          if not row then break end
+          rows[#rows + 1] = row
+        end
+        return rows
+      end,
+      iterate = queryIterator,
+    }
+  end
+
+  function snapshot.stats(_self: Snapshot): paged.Metrics
+    ready()
+    local pages, cached, reads = 0, 0, 0
+    for _, reader in readers do
+      local metrics = reader:stats()
+      pages += metrics.pages
+      cached += metrics.cachedPages
+      reads += metrics.pageReads
+    end
+    return { pages = pages, rows = count, cachedPages = cached, pageReads = reads }
+  end
+
+  function snapshot.close(_self: Snapshot)
+    if closed then return end
+    closed = true
+    for _, reader in readers do reader:close() end
+  end
+  return snapshot
+end
+
+-- Bounded-memory explicit compaction. Inputs remain untouched. Caller must
+-- separately publish the resulting generation and rotate its WAL safely.
+function segments.compact(path: string, sources: { string }, options: Options?)
+  local snapshot = segments.open(sources, { cachePages = if options then options.cachePages else 1 })
+  -- Snapshot publication can fail during file creation or source streaming.
+  local succeeded, failure = pcall(function()
+    paged.create(path, snapshot.columns, snapshot.primaryKey,
+      snapshot:iterateRows(), { pageBytes = if options then options.pageBytes else nil })
+  end)
+  snapshot:close()
+  if not succeeded then error(failure, 2) end
+end
+
+return segments
