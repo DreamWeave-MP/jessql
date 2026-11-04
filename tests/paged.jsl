@@ -1,0 +1,75 @@
+--!strict
+local sql = require('@jessql')
+local fs = require('@dream/fs')
+local test = require('@jess/test')
+local expect = test.expect
+local suite = test.new()
+
+local function fixture(name: string): string
+  local path = fs.join(assert(fs.cwd()), '.jessql-page-' .. name .. '.bin')
+  fs.remove(path)
+  return path
+end
+
+suite.describe('immutable page provider', function()
+  suite.it('creates, reopens, seeks and streams sorted rows without full row residency', function()
+    local path = fixture('rows')
+    local index = 0
+    sql.paged.create(path, { 'id', 'room', 'body' }, 'id', function()
+      index += 1
+      if index > 300 then return nil end
+      return { id = index, room = 'a', body = tostring(index) }
+    end, { pageBytes = 1024 })
+    local opened = sql.paged.open(path, { cachePages = 2 })
+    expect(opened.count).toBe(300)
+    expect(opened:get(291).body).toBe('291')
+    expect(opened:get(1).body).toBe('1')
+    expect(opened:get(301)).toBe(nil)
+    local db = sql.new()
+    db:register('events', opened:provider())
+    expect(db:query('SELECT COUNT(*) AS n FROM events').rows[1].n).toBe(300)
+    expect(db:query('SELECT id FROM events WHERE id >= ? ORDER BY id DESC LIMIT 2', { 299 }).rows[1].id).toBe(300)
+    expect(opened:stats().cachedPages <= 2).toBe(true)
+    opened:close()
+    -- The snapshot must reject reads after close.
+    expect(pcall(function() opened:get(1) end)).toBe(false)
+    fs.remove(path)
+  end)
+
+  suite.it('rejects duplicate and nonascending keys and incomplete snapshots', function()
+    local path = fixture('invalid')
+    local counter = 0
+    -- An invalid ordering must abort creation without leaving the file behind.
+    expect(pcall(function()
+      sql.paged.create(path, { 'id' }, 'id', function()
+        counter += 1
+        if counter == 1 then return { id = 2 } end
+        if counter == 2 then return { id = 1 } end
+        return nil
+      end)
+    end)).toBe(false)
+    expect(fs.exists(path)).toBe(false)
+  end)
+
+  suite.it('refuses corrupt page bytes before returning any affected row', function()
+    local path = fixture('corrupt')
+    local counter = 0
+    sql.paged.create(path, { 'id', 'text' }, 'id', function()
+      counter += 1
+      if counter > 8 then return nil end
+      return { id = counter, text = 'abc' }
+    end)
+    local raw = assert(fs.readFileString(path))
+    local pos = string.find(raw, 'abc', 1, true)
+    expect(pos ~= nil).toBe(true)
+    local mutated = string.sub(raw, 1, (pos :: number) - 1) .. 'XYZ' .. string.sub(raw, (pos :: number) + 3)
+    assert(fs.writeFile(path, mutated, { offset = 0, create = false }))
+    local opened = sql.paged.open(path)
+    -- The snapshot must reject reads after close.
+    -- A corrupt page must throw before it can be interpreted as a row.
+    expect(pcall(function() opened:get(1) end)).toBe(false)
+    opened:close()
+    fs.remove(path)
+  end)
+end)
+return suite

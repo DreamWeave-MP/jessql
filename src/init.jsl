@@ -5,6 +5,7 @@ local parser = require('@jessql/parser')
 local lexer = require('@jessql/lexer')
 local storage = require('@jessql/storage')
 local mutations = require('@jessql/mutations')
+local paged = require('@jessql/paged')
 
 export type Database = engine.Database
 export type PersistentDatabase = storage.Store
@@ -34,6 +35,7 @@ export type Token = lexer.Token
 return {
   new = engine.new,
   open = storage.open,
+  paged = paged,
   NULL = mutations.NULL,
   parse = parser.parse,
   lex = lexer.lex,
