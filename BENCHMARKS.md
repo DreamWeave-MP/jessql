@@ -247,3 +247,20 @@ Building the composite index took 0.08586 seconds. These are one-run CPU-time
 microbenchmarks, not reliable p99 measurements. Rows, indexes, and range
 queries execute in memory after buffered log appends; they are **not**
 fsync-protected and do not imply disk-B-tree performance.
+
+## Reused ad-hoc SELECT plan cache (Jess 0.3.0, buffered)
+
+`jess run --trusted --package . bench/query-cache.jsl 3000` performs 3,000
+identical parameterized primary-key SELECT texts with varied bind parameters
+against a 1,000-row persistent table, reopening between runs to compare
+`queryCacheEntries = 0` versus 64. Checksums are compared for correctness.
+
+| Cache configuration | 3,000 `db:query` calls |
+|---|---:|
+| Disabled (`0`) | 0.03745 s |
+| LRU (`64`) | 0.00810 s |
+
+This measured run shows **4.63× lower total CPU time** for the specific hot-
+query microbenchmark. No disk-sync or network I/O is involved. SQL texts are
+identical except for bound parameters; random diverse SQL may show little
+benefit and may evict cached plans.

@@ -226,3 +226,26 @@ for diagnostics. All partitions and rows are still memory-resident. Only a
 this is not a general multi-column B-tree or a disk index.
 
 Benchmark with `jess run --trusted --package . bench/composite.jsl 25000 150`.
+
+## Bounded query-plan reuse
+
+`db:query(sql, params?)` now caches prepared SELECT plans in an LRU with a
+default capacity of **64 distinct SQL texts**, avoiding repeated lexing,
+parsing, and planning in hot services. `sql.open(path, { queryCacheEntries = N })`
+sets the capacity (integer 0–1024); `0` disables the cache. SQL texts longer
+than 8192 bytes are deliberately never cached. Parameter values are **not**
+part of the cache key: a prepared plan is reused with fresh bound parameters,
+and **query results are never cached**. Subsequent queries see committed writes.
+
+Adding a table, column, or index changes the schema generation; the next query
+invalidates the entire plan cache. This includes composite index creation.
+`db:cacheStats()` returns `entries`, `capacity`, `hits`, `misses`, `evictions`
+so deployments can measure cache effectiveness. The maximum eviction scan
+cost is O(N), where N is the configured capacity (at most 1024), and a hot
+cache hit is a hash lookup. Plans prepared through `db:prepare()` remain
+explicitly owned by the caller and keep their existing invalidation rules.
+
+The cache is intentionally per-open-database and in memory only; it does not
+persist SQL text or share plans across worker instances. It is not a SQL
+injection defense: callers must continue to bind untrusted values with `?`.
+Benchmark with `jess run --trusted --package . bench/query-cache.jsl 3000`.

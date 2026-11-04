@@ -174,3 +174,8 @@ An experimental two-column `db:createCompositeIndex('events', 'room_id', 'stream
 keeps per-room ordered stream indexes, including bounded ascending/descending
 queries and exact range counts. This is pure JSL and uses the existing WAL;
 see `docs/PERSISTENCE.md` and `bench/composite.jsl` for guarantees and limits.
+
+Repeated persistent `db:query(sql, params)` calls now reuse bounded LRU
+compiled plans (`queryCacheEntries`, default 64, 0 disables), invalidating on
+schema changes. The cache never retains results. Use `db:cacheStats()` and
+`bench/query-cache.jsl` to assess hot-query benefits.

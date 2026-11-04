@@ -1,0 +1,37 @@
+--!strict
+-- Compare repeated ad-hoc SQL recompilation with bounded LRU plan reuse.
+local sql = require('@jessql')
+local fs = require('@dream/fs')
+
+local probes = tonumber((...)) or 3000
+local path = fs.join(assert(fs.cwd()), '.jessql-query-cache-bench.wal')
+fs.remove(path)
+fs.remove(path .. '.lock')
+local db = sql.open(path)
+db:createTable('records', { 'id', 'value' }, 'id')
+db:transaction(function(tx)
+  for id = 1, 1000 do tx:insert('records', { id = id, value = id * 3 }) end
+end)
+db:close()
+
+local Statement = 'SELECT value FROM records WHERE id = ?'
+local function measure(capacity: number): (number, number)
+  local current = sql.open(path, { queryCacheEntries = capacity })
+  local started = os.clock()
+  local checksum = 0
+  for iteration = 1, probes do
+    local id = iteration % 1000 + 1
+    checksum += current:query(Statement, { id }).rows[1].value
+  end
+  local elapsed = os.clock() - started
+  current:close()
+  return elapsed, checksum
+end
+
+local uncached, original = measure(0)
+local cached, optimized = measure(64)
+assert(original == optimized)
+print(string.format('probes=%d checksum=%d uncached_s=%.5f cached_s=%.5f speedup=%.2fx',
+  probes, optimized, uncached, cached, uncached / cached))
+fs.remove(path)
+fs.remove(path .. '.lock')

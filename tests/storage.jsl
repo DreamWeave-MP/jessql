@@ -803,6 +803,59 @@ suite.describe('native persistent store', function()
     clean(path)
   end)
 
+  suite.it('caches hot SELECT plans across binds and invalidates them on schema changes', function()
+    local path = fixture('query-cache')
+    local db = sql.open(path, { queryCacheEntries = 2 })
+    db:createTable('records', { 'id', 'value' }, 'id')
+    db:insert('records', { id = 1, value = 'a' })
+    db:insert('records', { id = 2, value = 'b' })
+    local statement = 'SELECT value FROM records WHERE id = ?'
+    expect(db:query(statement, { 1 }).rows[1].value).toBe('a')
+    expect(db:query(statement, { 2 }).rows[1].value).toBe('b')
+    local stats = db:cacheStats()
+    expect(stats.entries).toBe(1)
+    expect(stats.hits).toBe(1)
+    expect(stats.misses).toBe(1)
+
+    db:update('records', 1, { value = 'changed' })
+    expect(db:query(statement, { 1 }).rows[1].value).toBe('changed')
+    expect(db:cacheStats().hits).toBe(2)
+
+    db:query('SELECT id FROM records')
+    db:query('SELECT COUNT(*) AS n FROM records')
+    expect(db:cacheStats().entries).toBe(2)
+    expect(db:cacheStats().evictions).toBe(1)
+    db:query(statement, { 2 }) -- evicted statement must compile again
+    expect(db:cacheStats().misses).toBe(4)
+
+    db:addColumn('records', 'extra')
+    expect(db:cacheStats().entries).toBe(0)
+    local projection = db:query('SELECT * FROM records')
+    expect(#projection.columns).toBe(3)
+    db:update('records', 2, { extra = 'new' })
+    expect(db:query('SELECT * FROM records WHERE id = ?', { 2 }).rows[1].extra).toBe('new')
+    db:close()
+    clean(path)
+  end)
+
+  suite.it('supports disabling the plan cache and rejects invalid capacities', function()
+    local path = fixture('query-cache-off')
+    -- Negative capacity must fail without opening or writing a journal.
+    expect(pcall(function() sql.open(path, { queryCacheEntries = -1 }) end)).toBe(false)
+    -- Nonintegral capacities must fail before a filesystem lock is acquired.
+    expect(pcall(function() sql.open(path, { queryCacheEntries = 2.5 }) end)).toBe(false)
+    local db = sql.open(path, { queryCacheEntries = 0 })
+    db:createTable('data', { 'id' }, 'id')
+    db:insert('data', { id = 1 })
+    for _ = 1, 20 do
+      expect(db:query('SELECT COUNT(*) AS n FROM data').rows[1].n).toBe(1)
+    end
+    expect(db:cacheStats().capacity).toBe(0)
+    expect(db:cacheStats().entries).toBe(0)
+    db:close()
+    clean(path)
+  end)
+
   suite.it('refuses a second writer while the first lock is held', function()
     local path = fixture('lock')
     local db = sql.open(path)
