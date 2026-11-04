@@ -196,6 +196,11 @@ local function indexSet(index: Index, value: unknown, key: string, present: bool
       if kind == 'number' or kind == 'string' then
         index.tree = ordered.insert(index.tree, value :: string | number, encoded)
       end
+    elseif index.ordered and value ~= nil then
+      local kind = type(value)
+      if kind == 'number' or kind == 'string' then
+        index.tree = ordered.adjust(index.tree, value :: string | number, 1)
+      end
     end
 
     if not entry.seen[key] then
@@ -215,6 +220,11 @@ local function indexSet(index: Index, value: unknown, key: string, present: bool
       kinds[kind] -= 1
       if kind == 'number' or kind == 'string' then
         index.tree = ordered.remove(index.tree, value :: string | number)
+      end
+    elseif index.ordered and value ~= nil then
+      local kind = type(value)
+      if kind == 'number' or kind == 'string' then
+        index.tree = ordered.adjust(index.tree, value :: string | number, -1)
       end
     end
 
@@ -393,6 +403,52 @@ local function tableProvider(state: DatabaseState, name: string): queryEngine.Pr
     countFiltered = function(request)
       if not request.whereComplete or #request.constraints == 0 then return nil end
       local tableState = state.tables[name] :: TableState
+      -- A fully covered range over one ordered column can be counted by AVL
+      -- subtree cardinalities without reading or materializing any rows.
+      local rangeColumn: string? = nil
+      local rangeCompatible = true
+      local lower: (string | number)? = nil
+      local upper: (string | number)? = nil
+      local lowerStrict, upperStrict = false, false
+      for _, constraint in request.constraints do
+        if constraint.op ~= '<' and constraint.op ~= '<=' and constraint.op ~= '>' and constraint.op ~= '>=' then
+          rangeCompatible = false
+          break
+        end
+
+        if rangeColumn and rangeColumn ~= constraint.column then rangeCompatible = false; break end
+
+        rangeColumn = constraint.column
+        if constraint.value == nil then return 0 end
+        if not scalar(constraint.value) then rangeCompatible = false; break end
+        local value = constraint.value
+        if type(value) ~= 'string' and type(value) ~= 'number' then rangeCompatible = false; break end
+
+        local bound = value :: string | number
+        if constraint.op == '>' or constraint.op == '>=' then
+          if not lower or ordered.compare(bound, lower) > 0
+            or (bound == lower and constraint.op == '>') then
+            lower, lowerStrict = bound, constraint.op == '>'
+          end
+        else
+          if not upper or ordered.compare(bound, upper) < 0
+            or (bound == upper and constraint.op == '<') then
+            upper, upperStrict = bound, constraint.op == '<'
+          end
+        end
+      end
+
+      if rangeCompatible and rangeColumn then
+        local index = tableState.secondary[rangeColumn]
+        if index and index.ordered then
+          local kind = orderType(index)
+          if kind and (kind == 'empty' or ((not lower or type(lower) == kind)
+            and (not upper or type(upper) == kind))) then
+            return ordered.countRange(index.tree, lower, lowerStrict, upper, upperStrict)
+          end
+        end
+      end
+
       local indexed = false
       for _, constraint in request.constraints do
         if constraint.op ~= '=' then return nil end

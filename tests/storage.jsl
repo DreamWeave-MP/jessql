@@ -509,6 +509,50 @@ suite.describe('native persistent store', function()
     clean(path)
   end)
 
+  suite.it('counts ordered numeric ranges exactly through duplicate-value churn', function()
+    local path = fixture('ordered-count')
+    local db = sql.open(path)
+    db:createTable('sample', { 'id', 'value' }, 'id')
+    db:createOrderedIndex('sample', 'value')
+    local reference = {}
+    for id = 1, 180 do
+      db:insert('sample', { id = id, value = if id % 19 == 0 then nil else id % 31 })
+      if id % 19 ~= 0 then reference[id] = id % 31 end
+    end
+
+    local function verify()
+      for low = -2, 31, 7 do
+        for high = low - 1, 35, 9 do
+          local expected = 0
+          for _, value in reference do
+            if value > low and value <= high then expected += 1 end
+          end
+          local count = db:query('SELECT COUNT(*) AS n FROM sample WHERE value > ? AND value <= ?', { low, high })
+          expect(count.rows[1].n).toBe(expected)
+        end
+      end
+    end
+
+    verify()
+    for id = 1, 70 do
+      if id % 5 == 0 then
+        db:delete('sample', id)
+        reference[id] = nil
+      else
+        local value = id % 4
+        db:update('sample', id, { value = value })
+        reference[id] = value
+      end
+    end
+    verify()
+    db:checkpoint()
+    db:close()
+    db = sql.open(path)
+    verify()
+    db:close()
+    clean(path)
+  end)
+
   suite.it('refuses a second writer while the first lock is held', function()
     local path = fixture('lock')
     local db = sql.open(path)

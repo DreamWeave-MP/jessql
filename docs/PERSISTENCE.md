@@ -134,3 +134,24 @@ index maintenance after deletes/updates, model-based transaction parity, and
 invalid values. Work still needed: OS fault injection around *every* syscall,
 large-scale fuzzing, page-oriented disk indexes, buffered streaming cursors,
 file+directory sync, and cross-platform power-loss testing.
+
+## Ordered range indexes and bounded reads
+
+`db:createOrderedIndex(table, column)` (or `tx:createOrderedIndex`) adds an
+ordered AVL index alongside the existing hash-index API. Each distinct non-NULL
+number/string value is stored in a balanced tree; duplicate values reuse a
+posting list. Insert/remove and range seek take O(log distinct values); reads
+stream matching rows without allocating a full table scan. One-column indexed
+`ORDER BY` (ascending or descending) and single-column bounds (`<`, `<=`, `>`,
+`>=`) can use the cursor. Nullable rows participate in ORDER BY with the same
+NULL ordering as JessQL's executor. Mixed incomparable types or unsupported
+ordering fall back to the existing evaluator.
+
+Exact `COUNT(*)` on fully-covered, single-column bounded ranges can use AVL
+subtree cardinalities in O(log distinct values), including duplicate values.
+The tree and count metadata are rebuilt on reopen/checkpoint from durable log
+records; schema mutations invalidate prepared SQL plans. The tree and its
+posting lists are still entirely in memory, *not* a disk B-tree. There is no
+composite `(room_id, stream_id)` index yet, so a separate room equality predicate
+may still require filtering or sorting many rows. The implementation never
+claims to have fully evaluated a residual SQL WHERE condition that it did not.

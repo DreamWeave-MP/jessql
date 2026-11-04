@@ -190,3 +190,28 @@ index. Numbers vary with hardware, filesystem and cache state; no `fsync` is per
 These numbers are **not a claim of durable commits per second**. `@dream/fs` currently lacks a
 documented stable-storage barrier, and the 50k rows are entirely resident in memory. The
 benchmark is for comparing native JSL engine revisions, not production deployment estimates.
+
+### Native JSL ordered-index ranges (new prototype)
+
+Jess 0.3.0 Linux x64, 30,000 stored records, 500 prepared probes, identical SQL
+and data within each comparison. Run with:
+
+```
+jess run --trusted --package . bench/ordered.jsl 30000 500
+```
+
+One observed run:
+
+```
+rows=30000 queries=500 result_rows=10000
+hash_baseline_s=2.9937 ordered_s=0.0166 build_s=0.1231 speedup=179.91x
+count_hash_s=2.5635 count_ordered_s=0.0018 count_speedup=1433.96x
+```
+
+The baseline has only the primary-key hash index and must scan/filter/sort for
+range queries; the experimental version adds an in-memory AVL ordered index.
+These are *workload-specific algorithmic* improvements, not comparisons with
+other DBMSs, full-database throughput figures, or fsync/power-loss measurements.
+Build cost is measured separately. More representative write-heavy and mixed
+room workloads, disk-backed indexes, and multi-run statistical benchmarks are
+still needed before performance claims in production.

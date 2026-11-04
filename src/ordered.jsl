@@ -5,7 +5,7 @@
 -- Type rank only maintains the tree invariant; SQL uses this order only for
 -- homogeneous comparable columns. It never defines cross-type SQL ordering.
 export type Node = {
-  value: string | number, encoded: string, height: number,
+  value: string | number, encoded: string, height: number, weight: number, size: number,
   left: Node?, right: Node?,
 }
 export type Tree = Node?
@@ -30,8 +30,13 @@ local function height(node: Node?): number
   return if node then node.height else 0
 end
 
+local function size(node: Node?): number
+  return if node then node.size else 0
+end
+
 local function refresh(node: Node)
   node.height = math.max(height(node.left), height(node.right)) + 1
+  node.size = size(node.left) + size(node.right) + node.weight
 end
 
 local function right(node: Node): Node
@@ -68,12 +73,48 @@ local function balance(node: Node): Node
 end
 
 function ordered.insert(root: Node?, value: string | number, encoded: string): Node
-  if not root then return { value = value, encoded = encoded, height = 1, left = nil, right = nil } end
+  if not root then return { value = value, encoded = encoded, height = 1, weight = 1, size = 1, left = nil, right = nil } end
   local cmp = compare(value, root.value)
   if cmp < 0 then root.left = ordered.insert(root.left, value, encoded)
   elseif cmp > 0 then root.right = ordered.insert(root.right, value, encoded)
   else return root end
   return balance(root)
+end
+
+-- Posting-list cardinality changes without rebalancing distinct value nodes.
+function ordered.adjust(root: Node?, value: string | number, delta: number): Node?
+  if not root then error('jessql ordered: missing node during cardinality update', 2) end
+  local cmp = compare(value, root.value)
+  if cmp < 0 then root.left = ordered.adjust(root.left, value, delta)
+  elseif cmp > 0 then root.right = ordered.adjust(root.right, value, delta)
+  else
+    root.weight += delta
+    if root.weight < 1 then error('jessql ordered: invalid node cardinality', 2) end
+  end
+  refresh(root)
+  return root
+end
+
+-- Exact O(log N) count over distinct value bounds, summing posting cardinalities.
+local function prefix(root: Node?, bound: string | number, inclusive: boolean): number
+  local count = 0
+  while root do
+    local cmp = compare(root.value, bound)
+    if cmp < 0 or (cmp == 0 and inclusive) then
+      count += size(root.left) + root.weight
+      root = root.right
+    else
+      root = root.left
+    end
+  end
+  return count
+end
+
+function ordered.countRange(root: Node?, lower: (string | number)?, lowerStrict: boolean,
+    upper: (string | number)?, upperStrict: boolean): number
+  local aboveLower = if lower then prefix(root, lower, lowerStrict) else 0
+  local belowUpper = if upper then prefix(root, upper, not upperStrict) else size(root)
+  return math.max(0, belowUpper - aboveLower)
 end
 
 local function popMin(root: Node): (Node?, Node)
