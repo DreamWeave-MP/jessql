@@ -115,10 +115,16 @@ local function rotateLeft(tree: Tree, node: number): number
 end
 
 local function balance(tree: Tree, node: number): number
-  refresh(tree, node)
+  -- Refresh height/weight once: the old path read both children twice
+  -- (inside refresh and again to compute the balance factor).
   local left = read(tree, node, LeftOffset)
   local right = read(tree, node, RightOffset)
-  local delta = height(tree, left) - height(tree, right)
+  local leftHeight = height(tree, left)
+  local rightHeight = height(tree, right)
+  write(tree, node, HeightOffset, math.max(leftHeight, rightHeight) + 1)
+  write(tree, node, SizeOffset, cardinality(tree, left) + cardinality(tree, right)
+    + read(tree, node, WeightOffset))
+  local delta = leftHeight - rightHeight
   if delta > 1 then
     local child = left
     if height(tree, read(tree, child, LeftOffset)) < height(tree, read(tree, child, RightOffset)) then
@@ -235,9 +241,9 @@ function ordered.remove(root: Tree?, value: string | number): Tree?
   return root
 end
 
-function ordered.iterate(root: Tree?, desc: boolean, lower: (string | number)?, lowerStrict: boolean,
-    upper: (string | number)?, upperStrict: boolean): () -> Node?
-  if not root then return function(): Node? return nil end end
+function ordered.iteratePairs(root: Tree?, desc: boolean, lower: (string | number)?, lowerStrict: boolean,
+    upper: (string | number)?, upperStrict: boolean): () -> ((string | number)?, string?)
+  if not root then return function(): ((string | number)?, string?) return nil, nil end end
   local tree = root
   local stack: { number } = {}
   local function below(value: string | number): boolean
@@ -266,13 +272,24 @@ function ordered.iterate(root: Tree?, desc: boolean, lower: (string | number)?, 
   end
 
   advance(tree.root)
-  return function(): Node?
+  return function(): ((string | number)?, string?)
     local top = #stack
-    if top == 0 then return nil end
+    if top == 0 then return nil, nil end
     local node = stack[top]
     stack[top] = nil
     advance(if desc then read(tree, node, LeftOffset) else read(tree, node, RightOffset))
-    return { value = tree.values[node], encoded = tree.keys[node] }
+    return tree.values[node], tree.keys[node]
+  end
+end
+
+-- Preserve the original public iterator for callers expecting node records.
+function ordered.iterate(root: Tree?, desc: boolean, lower: (string | number)?, lowerStrict: boolean,
+    upper: (string | number)?, upperStrict: boolean): () -> Node?
+  local nextPair = ordered.iteratePairs(root, desc, lower, lowerStrict, upper, upperStrict)
+  return function(): Node?
+    local value, encoded = nextPair()
+    if value == nil then return nil end
+    return { value = value, encoded = encoded :: string }
   end
 end
 return ordered

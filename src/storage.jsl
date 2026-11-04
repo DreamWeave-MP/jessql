@@ -441,7 +441,7 @@ local function orderedCursor(current: TableState, request: queryEngine.Request):
 
   if not order and not hasRange then return nil end
 
-  local advance = ordered.iterate(index.tree, descending, lower, lowerStrict, upper, upperStrict)
+  local advance = ordered.iteratePairs(index.tree, descending, lower, lowerStrict, upper, upperStrict)
   local nullBucket = index.nulls
   local nullPosition = 0
   local posting: Posting? = nil
@@ -505,10 +505,10 @@ local function orderedCursor(current: TableState, request: queryEngine.Request):
           end
         end
 
-        local node = advance()
-        if not node then break end
+        local _value, encoded = advance()
+        if not encoded then break end
 
-        posting = index.buckets[node.encoded]
+        posting = index.buckets[encoded]
         postingPosition = 0
       end
 
@@ -1347,11 +1347,11 @@ local function buildTransaction(state: DatabaseState)
     if index then
       local lower = if op == '>' or op == '>=' then target else nil
       local upper = if op == '<' or op == '<=' then target else nil
-      local scan = ordered.iterate(index.tree, false, lower, op == '>', upper, op == '<')
+      local scan = ordered.iteratePairs(index.tree, false, lower, op == '>', upper, op == '<')
       while true do
-        local node = scan()
-        if not node then break end
-        local bucket = index.buckets[node.encoded]
+        local _value, encoded = scan()
+        if not encoded then break end
+        local bucket = index.buckets[encoded]
         if not bucket then error('jessql storage: index bucket missing', 2) end
 
         eachPosting(bucket, consider)
