@@ -1395,4 +1395,183 @@ suite.describe('native persistent store', function()
   end)
 end)
 
+suite.describe('packed resident layout', function()
+  suite.it('round trips buffered numeric nullable columns, strings and booleans', function()
+    local path = fixture('packed-roundtrip')
+    local db = sql.open(path, { rowLayout = 'packed' })
+    db:createTable('data', { 'id', 'room', 'value', 'enabled', 'label' }, 'id')
+    db:transaction(function(tx)
+      for id = 1, 1200 do
+        tx:insert('data', { id = id, room = 'r' .. tostring(id % 8),
+          value = if id % 3 == 0 then nil else id + 0.5,
+          enabled = if id % 4 == 0 then nil else id % 2 == 0,
+          label = if id % 5 == 0 then nil else 'l' .. tostring(id) })
+      end
+    end)
+    db:createIndex('data', 'room')
+    db:createOrderedIndex('data', 'value')
+    local metrics = db:stats().data.resident
+    expect(metrics ~= nil).toBe(true)
+    expect(metrics.kinds.id).toBe('number')
+    expect(metrics.kinds.room).toBe('dictionary')
+    expect(metrics.kinds.value).toBe('number')
+    expect(metrics.kinds.enabled).toBe('boolean')
+    expect(metrics.kinds.label).toBe('bytes')
+    expect(db:get('data', 3).value).toBe(nil)
+    expect(db:get('data', 4).value).toBe(4.5)
+    expect(db:get('data', 4).enabled).toBe(nil)
+    expect(db:get('data', 5).enabled).toBe(false)
+    expect(db:get('data', 1199).label).toBe('l1199')
+    expect(db:query('SELECT COUNT(*) AS n FROM data WHERE room = ?', { 'r1' }).rows[1].n).toBe(150)
+    db:checkpoint()
+    db:close()
+    local reopened = sql.open(path, { rowLayout = 'packed' })
+    expect(reopened:get('data', 3).value).toBe(nil)
+    expect(reopened:get('data', 4).value).toBe(4.5)
+    expect(reopened:get('data', 1199).label).toBe('l1199')
+    expect(reopened:query('SELECT COUNT(*) AS n FROM data').rows[1].n).toBe(1200)
+    reopened:close()
+    clean(path)
+  end)
+
+  suite.it('supports schema migration, type switches, reinsertions and staged reads', function()
+    local path = fixture('packed-mixed')
+    local db = sql.open(path, { rowLayout = 'packed' })
+    db:createTable('items', { 'id', 'value', 'tag' }, 'id')
+    db:insert('items', { id = 1, value = 0, tag = 'same' })
+    db:insert('items', { id = 2, value = 2, tag = 'same' })
+    db:addColumn('items', 'extra')
+    db:transaction(function(tx)
+      tx:update('items', 1, { value = 'string', extra = true })
+      expect(tx:get('items', 1).value).toBe('string')
+      tx:delete('items', 2)
+      tx:insert('items', { id = 3, value = -0.5, extra = false })
+      expect(#tx:query('SELECT id FROM items WHERE id = ?', { 3 }).rows).toBe(1)
+    end)
+    expect(db:get('items', 1).value).toBe('string')
+    expect(db:get('items', 2)).toBe(nil)
+    expect(db:get('items', 3).extra).toBe(false)
+    db:insert('items', { id = 2, value = 22, tag = 'again' })
+    expect(db:query('SELECT SUM(id) AS total FROM items').rows[1].total).toBe(6)
+    db:checkpoint()
+    db:close()
+    local reopened = sql.open(path, { rowLayout = 'row' })
+    expect(reopened:get('items', 1).value).toBe('string')
+    expect(reopened:get('items', 2).tag).toBe('again')
+    reopened:close()
+    clean(path)
+  end)
+
+  suite.it('reclaims dictionary entries across repeated delete and insert', function()
+    local path = fixture('packed-churn')
+    local db = sql.open(path, { rowLayout = 'packed' })
+    db:createTable('items', { 'id', 'tag', 'value' }, 'id')
+    for iteration = 1, 300 do
+      db:upsert('items', { id = 1, tag = 'value-' .. tostring(iteration), value = iteration })
+      db:upsert('items', { id = 2, tag = 'fixed', value = -iteration })
+      if iteration % 4 == 0 then
+        db:delete('items', 2)
+        db:insert('items', { id = 2, tag = 'fixed', value = -iteration })
+      end
+    end
+    expect(db:get('items', 1).tag).toBe('value-300')
+    expect(db:get('items', 2).tag).toBe('fixed')
+    db:close()
+    clean(path)
+  end)
+
+  suite.it('reclaims obsolete byte-arena storage after repeated updates', function()
+    local path = fixture('packed-arena-churn')
+    local db = sql.open(path, { rowLayout = 'packed' })
+    db:createTable('items', { 'id', 'payload' }, 'id')
+    db:transaction(function(tx)
+      for id = 1, 500 do
+        tx:insert('items', { id = id, payload = 'initial-' .. tostring(id) })
+      end
+    end)
+    expect(db:stats().items.resident.kinds.payload).toBe('bytes')
+    for iteration = 1, 2600 do
+      local id = iteration % 500 + 1
+      db:update('items', id, { payload = string.rep('x', 700) .. tostring(iteration) })
+    end
+    local resident = db:stats().items.resident
+    expect(resident.kinds.payload).toBe('bytes')
+    expect(resident.allocatedStringBytes.payload < 3 * resident.liveStringBytes.payload + 1024 * 1024).toBe(true)
+    expect(db:get('items', 500).payload ~= nil).toBe(true)
+    db:checkpoint()
+    db:close()
+    local reopened = sql.open(path, { rowLayout = 'packed' })
+    expect(reopened:query('SELECT COUNT(*) AS n FROM items').rows[1].n).toBe(500)
+    reopened:close()
+    clean(path)
+  end)
+
+
+  suite.it('matches resident row SQL across joins, grouped aggregates and nullable scans', function()
+    local path = fixture('packed-query-parity')
+    local row = sql.open(path, { rowLayout = 'row' })
+    row:createTable('events', { 'id', 'room', 'priority', 'tag', 'body' }, 'id')
+    row:createTable('rooms', { 'room', 'label' }, 'room')
+    row:transaction(function(tx)
+      for room = 0, 6 do
+        tx:insert('rooms', { room = 'r' .. tostring(room), label = 'Room' .. tostring(room) })
+      end
+
+      for id = 1, 1100 do
+        tx:insert('events', { id = id, room = 'r' .. tostring(id % 7),
+          priority = if id % 9 == 0 then nil else id % 17,
+          tag = if id % 4 == 0 then 'shared' else 'event-' .. tostring(id),
+          body = if id % 13 == 0 then '' else 'body ' .. tostring(id) .. ' Ω' })
+      end
+    end)
+    row:createIndex('events', 'room')
+    row:createIndex('events', 'tag')
+    row:createOrderedIndex('events', 'priority')
+    row:createCompositeIndex('events', 'room', 'priority')
+
+    local questions = {
+      'SELECT COUNT(*) AS n FROM events',
+      "SELECT COUNT(*) AS n FROM events WHERE room = 'r2'",
+      'SELECT id, body FROM events ORDER BY id LIMIT 30',
+      'SELECT id, tag FROM events WHERE priority > 8 ORDER BY priority LIMIT 25',
+      'SELECT room, COUNT(*) AS n, SUM(priority) AS total FROM events GROUP BY room ORDER BY room',
+      'SELECT COUNT(*) AS n FROM events WHERE priority >= 4 AND priority < 11',
+      "SELECT events.id, rooms.label FROM events INNER JOIN rooms ON events.room = rooms.room WHERE events.room = 'r3' ORDER BY events.id LIMIT 25",
+    }
+    local expected = {}
+    for index, question in questions do expected[index] = row:query(question) end
+    row:close()
+
+    local db = sql.open(path, { rowLayout = 'packed' })
+    for index, question in questions do
+      local actual = db:query(question)
+      local baseline = expected[index]
+      expect(#actual.rows).toBe(#baseline.rows)
+      for position, item in actual.rows do
+        for key, value in baseline.rows[position] do
+          expect(item[key]).toBe(value)
+        end
+      end
+    end
+
+    db:transaction(function(tx)
+      tx:update('events', 41, { tag = 'modified', priority = nil }, { 'priority' })
+      tx:delete('events', 43)
+      tx:insert('events', { id = 1101, room = 'r1', priority = 4, tag = 'fresh', body = 'new' })
+      expect(tx:query('SELECT COUNT(*) AS n FROM events').rows[1].n).toBe(1100)
+    end)
+    expect(db:get('events', 41).priority).toBe(nil)
+    expect(db:get('events', 41).tag).toBe('modified')
+    expect(db:get('events', 43)).toBe(nil)
+    db:checkpoint()
+    db:close()
+    local legacy = sql.open(path, { rowLayout = 'row' })
+    expect(legacy:get('events', 41).tag).toBe('modified')
+    expect(legacy:get('events', 1101).body).toBe('new')
+    legacy:close()
+    clean(path)
+  end)
+
+end)
+
 return suite
