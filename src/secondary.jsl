@@ -1,0 +1,202 @@
+--!strict
+--!native
+-- Immutable partition/ordered-value/primary-key index bound to a cold snapshot.
+-- The existing checksummed JQLP2 page format is reused for this sidecar.
+local paged = require('@jessql/paged')
+
+export type Row = { [string]: unknown }
+export type Index = {
+  partitionColumn: string, orderColumn: string, orderKind: string,
+  complete: boolean, count: number,
+  iterate: (self: Index, prefix: unknown, descending: boolean?,
+    lower: unknown?, upper: unknown?, lowerStrict: boolean?, upperStrict: boolean?) -> () -> Row?,
+  close: (self: Index) -> (),
+  stats: (self: Index) -> paged.Metrics,
+}
+
+local secondary = {}
+
+local function findColumn(columns: { string }, name: string): boolean
+  for _, column in columns do if column == name then return true end end
+  return false
+end
+
+local function component(value: unknown): string
+  local kind = type(value)
+  if kind == 'boolean' then return if value == true then 'b1' else 'b0' end
+
+  if kind == 'number' then
+    local number = value :: number
+    if number ~= number or math.abs(number) == math.huge then error('jessql secondary: invalid number', 3) end
+    if number == 0 then number = 0 end
+    local bits = buffer.create(8)
+    buffer.writef64(bits, 0, number)
+    local hi, lo = buffer.readu32(bits, 4), buffer.readu32(bits, 0)
+    if bit32.band(hi, 0x80000000) ~= 0 then
+      hi, lo = bit32.bnot(hi), bit32.bnot(lo)
+    else
+      hi = bit32.bxor(hi, 0x80000000)
+    end
+    return string.format('n%08x%08x', hi, lo)
+  end
+
+  if kind == 'string' then
+    local valueString = value :: string
+    if utf8.len(valueString) == nil then error('jessql secondary: invalid UTF-8', 3) end
+    -- Hex encoding preserves unsigned UTF-8 byte order, including prefixes.
+    local parts: { string } = {}
+    parts[1] = 's'
+    for index = 1, #valueString do
+      parts[index + 1] = string.format('%02x', string.byte(valueString, index))
+    end
+    return table.concat(parts) .. '!'
+  end
+  error('jessql secondary: invalid indexed value', 3)
+end
+
+local function prefixKey(prefix: unknown): string
+  return 'z' .. component(prefix) .. '|'
+end
+
+function secondary.create(path: string, snapshotPath: string, partitionColumn: string,
+  orderColumn: string, options: paged.Options?)
+  local snapshot = paged.open(snapshotPath, options)
+  -- Always close the source snapshot even if the builder or writer throws.
+  local ok, failure = pcall(function()
+    if partitionColumn == orderColumn or partitionColumn == snapshot.primaryKey
+      or orderColumn == snapshot.primaryKey or not findColumn(snapshot.columns, partitionColumn)
+      or not findColumn(snapshot.columns, orderColumn) then
+      error('jessql secondary: invalid index columns')
+    end
+
+    -- Initial builder is bounded by input row count, not by snapshot size.
+    -- Query/open paths remain bounded by the JQLP2 page cache.
+    local keys: { Row } = {}
+    local nextRow = snapshot:iterateRows({ snapshot.primaryKey, partitionColumn, orderColumn })
+    local count, skipped, orderKind = 0, 0, ''
+    while true do
+      local row = nextRow()
+      if not row then break end
+      local partition, ordered = row[partitionColumn], row[orderColumn]
+      if partition == nil or ordered == nil then
+        skipped += 1
+      else
+        local currentKind = type(ordered)
+        if orderKind == '' then orderKind = currentKind
+        elseif orderKind ~= currentKind then orderKind = 'mixed' end
+
+        keys[#keys + 1] = {
+          id = prefixKey(partition) .. component(ordered) .. '|' .. component(row[snapshot.primaryKey]),
+          pk = row[snapshot.primaryKey],
+        }
+      end
+      count += 1
+    end
+    table.sort(keys, function(left, right) return (left.id :: string) < (right.id :: string) end)
+    local marker: { Row } = {
+      { id = '!identity', pk = snapshot.identity },
+      { id = '!partition', pk = partitionColumn },
+      { id = '!order', pk = orderColumn },
+      { id = '!kind', pk = orderKind },
+      { id = '!complete', pk = skipped == 0 },
+      { id = '!count', pk = count },
+      { id = '!entries', pk = #keys },
+    }
+    table.sort(marker, function(left, right) return (left.id :: string) < (right.id :: string) end)
+    local index = 0
+    paged.create(path, { 'id', 'pk' }, 'id', function(): Row?
+      index += 1
+      if index <= #marker then return marker[index] end
+      return keys[index - #marker]
+    end, options)
+  end)
+  snapshot:close()
+  if not ok then error(failure, 2) end
+end
+
+function secondary.open(path: string, snapshot: paged.Snapshot, options: paged.Options?): Index
+  local pages = paged.open(path, options)
+  -- Close the reader after *any* metadata failure, including a corrupt
+  -- non-first metadata page. Never leak a failed sidecar-open handle.
+  local ok, metadata = pcall(function(): Row
+    if pages.primaryKey ~= 'id' or #pages.columns ~= 2
+      or pages.columns[1] ~= 'id' or pages.columns[2] ~= 'pk'
+      or pages.keyKind ~= 'string' then error('jessql secondary: invalid index schema') end
+    local identity = pages:get('!identity')
+    if not identity or identity.pk ~= snapshot.identity then
+      error('jessql secondary: snapshot identity mismatch')
+    end
+    local partition = pages:get('!partition')
+    local ordered = pages:get('!order')
+    local kind = pages:get('!kind')
+    local complete = pages:get('!complete')
+    local count = pages:get('!count')
+    local entries = pages:get('!entries')
+    if not partition or not ordered or not kind or not complete or not count or not entries
+      or type(partition.pk) ~= 'string' or type(ordered.pk) ~= 'string'
+      or type(kind.pk) ~= 'string' or type(complete.pk) ~= 'boolean'
+      or count.pk ~= snapshot.count or type(entries.pk) ~= 'number'
+      or (entries.pk :: number) ~= pages.count - 7
+      or ((complete.pk :: boolean) and entries.pk ~= snapshot.count)
+      or not findColumn(snapshot.columns, partition.pk :: string)
+      or not findColumn(snapshot.columns, ordered.pk :: string) then
+      error('jessql secondary: damaged index metadata')
+    end
+
+    return { partition = partition.pk, ordered = ordered.pk,
+      kind = kind.pk, complete = complete.pk, count = count.pk }
+  end)
+
+  if not ok then pages:close(); error(metadata, 2) end
+  local info = metadata :: Row
+  local partitionName, orderName = info.partition :: string, info.ordered :: string
+  local closed = false
+  local result = {} :: Index
+  result.partitionColumn, result.orderColumn = partitionName, orderName
+  result.orderKind, result.complete, result.count = info.kind :: string, info.complete :: boolean, info.count :: number
+
+  function result.iterate(_self: Index, prefix: unknown, descending: boolean?,
+    lower: unknown?, upper: unknown?, lowerStrict: boolean?, upperStrict: boolean?): () -> Row?
+    if closed then error('jessql secondary: index closed', 2) end
+    local root = prefixKey(prefix)
+    local start, finish = root, root .. '~'
+    if lower ~= nil then
+      start = root .. component(lower) .. (if lowerStrict then '|~' else '|')
+    end
+
+    if upper ~= nil then
+      finish = root .. component(upper) .. (if upperStrict then '|' else '|~')
+    end
+    local nextEntry = pages:iterateRows(nil, descending, start, finish, false, true)
+    return function(): Row?
+      if closed then error('jessql secondary: index closed', 2) end
+
+      while true do
+        local entry = nextEntry()
+        if not entry then return nil end
+        local key = entry.pk
+        local row = snapshot:get(key)
+        if not row or row[partitionName] ~= prefix
+          or row[orderName] == nil
+          or entry.id ~= root .. component(row[orderName]) .. '|' .. component(key) then
+          error('jessql secondary: index row mismatch', 2)
+        end
+        return row
+      end
+    end
+  end
+
+  function result.stats(_self: Index): paged.Metrics
+    if closed then error('jessql secondary: index closed', 2) end
+    return pages:stats()
+  end
+
+  function result.close(_self: Index)
+    if closed then return end
+    closed = true
+    pages:close()
+  end
+  return result
+end
+
+return secondary

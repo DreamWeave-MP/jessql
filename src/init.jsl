@@ -7,6 +7,7 @@ local storage = require('@jessql/storage')
 local mutations = require('@jessql/mutations')
 local paged = require('@jessql/paged')
 local hybrid = require('@jessql/hybrid')
+local secondary = require('@jessql/secondary')
 
 export type Database = engine.Database
 export type PersistentDatabase = storage.Store
@@ -39,6 +40,7 @@ return {
   open = storage.open,
   paged = paged,
   hybrid = hybrid,
+  secondary = secondary,
   NULL = mutations.NULL,
   parse = parser.parse,
   lex = lexer.lex,
