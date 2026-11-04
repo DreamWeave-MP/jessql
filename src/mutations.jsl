@@ -11,14 +11,16 @@ mutations.NULL = Null -- explicit parameter NULL; nil holes are not valid parame
 export type Value = { kind: string, value: unknown, slot: number? }
 export type Assignment = { column: string, value: Value }
 export type Statement = {
-  kind: string, table: string, columns: { string }, values: { Value },
+  kind: string, table: string, columns: { string }, valueRows: { { Value } },
   assignments: { Assignment }, whereColumn: string?, whereValue: Value?, parameterCount: number,
+  ignoreConflict: boolean, conflictColumn: string?,
 }
 
 -- Keep this interface independent of the storage module to avoid a dependency cycle.
 export type Writer = {
   primaryKey: (self: Writer, name: string) -> string,
   insert: (self: Writer, name: string, row: { [string]: unknown }) -> (),
+  get: (self: Writer, name: string, key: unknown) -> { [string]: unknown }?,
   update: (self: Writer, name: string, key: unknown, changes: { [string]: unknown }, unset: { string }?) -> boolean,
   delete: (self: Writer, name: string, key: unknown) -> boolean,
 }
@@ -94,10 +96,12 @@ function mutations.parse(sql: string): Statement
 
   local kind, name
   local columns: { string } = {}
-  local values: { Value } = {}
+  local valueRows: { { Value } } = {}
   local assignments: { Assignment } = {}
   local whereColumn: string? = nil
   local whereValue: Value? = nil
+  local ignoreConflict = false
+  local conflictColumn: string? = nil
 
   if isWord('INSERT') then
     position += 1
@@ -110,12 +114,29 @@ function mutations.parse(sql: string): Statement
     until not accept(',')
     requireSymbol(')')
     requireWord('VALUES')
-    requireSymbol('(')
     repeat
-      values[#values + 1] = readValue()
+      requireSymbol('(')
+      local values: { Value } = {}
+      repeat
+        values[#values + 1] = readValue()
+      until not accept(',')
+      requireSymbol(')')
+      if #columns ~= #values then error('jessql DML: column/value arity mismatch', 0) end
+      valueRows[#valueRows + 1] = values
+      if #valueRows > 1024 then error('jessql DML: too many VALUES rows (max 1024)', 0) end
     until not accept(',')
-    requireSymbol(')')
-    if #columns ~= #values then error('jessql DML: column/value arity mismatch', 0) end
+
+    if isWord('ON') then
+      position += 1
+      requireWord('CONFLICT')
+      if accept('(') then
+        conflictColumn = readIdentifier()
+        requireSymbol(')')
+      end
+      requireWord('DO')
+      requireWord('NOTHING')
+      ignoreConflict = true
+    end
   elseif isWord('UPDATE') then
     position += 1
     kind = 'update'
@@ -149,9 +170,10 @@ function mutations.parse(sql: string): Statement
   end
 
   return {
-    kind = kind, table = name, columns = columns, values = values,
+    kind = kind, table = name, columns = columns, valueRows = valueRows,
     assignments = assignments, whereColumn = whereColumn,
     whereValue = whereValue, parameterCount = parameterCount,
+    ignoreConflict = ignoreConflict, conflictColumn = conflictColumn,
   }
 end
 
@@ -172,16 +194,28 @@ function mutations.execute(statement: Statement, tx: Writer, params: { unknown }
   end
 
   if statement.kind == 'insert' then
-    local row: { [string]: unknown } = {}
     local seen: { [string]: boolean } = {}
-    for index, column in statement.columns do
+    for _, column in statement.columns do
       if seen[column] then error('jessql DML: duplicate INSERT column', 2) end
       seen[column] = true
-      row[column] = resolve(statement.values[index])
     end
-
-    tx:insert(statement.table, row)
-    return 1
+    local pk = tx:primaryKey(statement.table)
+    if statement.conflictColumn and statement.conflictColumn ~= pk then
+      error('jessql DML: conflict target must be the primary key', 2)
+    end
+    local affected = 0
+    for _, values in statement.valueRows do
+      local row: { [string]: unknown } = {}
+      for index, column in statement.columns do
+        row[column] = resolve(values[index])
+      end
+      local key = row[pk]
+      if not (statement.ignoreConflict and key ~= nil and tx:get(statement.table, key) ~= nil) then
+        tx:insert(statement.table, row)
+        affected += 1
+      end
+    end
+    return affected
   end
 
   -- Update/delete are intentionally primary-key bounded. General multi-row
