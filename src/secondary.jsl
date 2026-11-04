@@ -20,6 +20,8 @@ export type BuildMetrics = { rows: number, entries: number, spilledRuns: number,
   mergeOperations: number, maxBufferedEntries: number, maxOpenReaders: number }
 
 local secondary = {}
+local HexBytes: { string } = {}
+for value = 0, 255 do HexBytes[value + 1] = string.format('%02x', value) end
 
 local function findColumn(columns: { string }, name: string): boolean
   for _, column in columns do if column == name then return true end end
@@ -52,7 +54,7 @@ local function component(value: unknown): string
     local parts: { string } = {}
     parts[1] = 's'
     for index = 1, #valueString do
-      parts[index + 1] = string.format('%02x', string.byte(valueString, index))
+      parts[index + 1] = HexBytes[string.byte(valueString, index) + 1]
     end
     return table.concat(parts) .. '!'
   end
@@ -173,6 +175,28 @@ function secondary.create(path: string, snapshotPath: string, partitionColumn: s
     end
 
     local keys: { Row } = {}
+    -- A fixed-size cache avoids repeatedly hex-encoding shared partitions,
+    -- without growing proportionally to high-cardinality partition columns.
+    local cachedPrefixes: { [string]: string } = {}
+    local cachedKeys: { string } = {}
+    local nextEvict = 1
+    local function partitionPrefix(partition: unknown): string
+      if type(partition) ~= 'string' then return prefixKey(partition) end
+      local value = partition :: string
+      local cached = cachedPrefixes[value]
+      if cached then return cached end
+      local encoded = prefixKey(value)
+      if #cachedKeys < 128 then
+        cachedKeys[#cachedKeys + 1] = value
+      else
+        cachedPrefixes[cachedKeys[nextEvict]] = nil
+        cachedKeys[nextEvict] = value
+        nextEvict = if nextEvict == 128 then 1 else nextEvict + 1
+      end
+      cachedPrefixes[value] = encoded
+      return encoded
+    end
+
     local tiers: { { string } } = {}
     local suffix = 0
     local function newRun(): string
@@ -238,7 +262,7 @@ function secondary.create(path: string, snapshotPath: string, partitionColumn: s
         elseif orderKind ~= currentKind then orderKind = 'mixed' end
 
         keys[#keys + 1] = {
-          id = prefixKey(partition) .. component(ordered) .. '|' .. component(row[snapshot.primaryKey]),
+          id = partitionPrefix(partition) .. component(ordered) .. '|' .. component(row[snapshot.primaryKey]),
           pk = row[snapshot.primaryKey],
         }
 
