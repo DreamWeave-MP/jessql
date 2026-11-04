@@ -764,6 +764,45 @@ suite.describe('native persistent store', function()
     clean(path)
   end)
 
+  suite.it('uses exact composite equality keys without leaking neighboring partitions', function()
+    local path = fixture('composite-equality')
+    local db = sql.open(path)
+    db:createTable('data', { 'id', 'room', 'sequence', 'tag' }, 'id')
+    db:createIndex('data', 'room')
+    db:transaction(function(tx)
+      for id = 1, 80 do
+        local room = if id % 2 == 0 then 'a' else 'a:extra'
+        tx:insert('data', { id = id, room = room, sequence = id % 10,
+          tag = if id % 3 == 0 then 'match' else 'other' })
+      end
+      tx:insert('data', { id = 81, room = 'a' }) -- SQL NULL suffix
+    end)
+
+    local exact = 'SELECT COUNT(*) AS n FROM data WHERE room = ? AND sequence = ?'
+    local residual = 'SELECT COUNT(*) AS n FROM data WHERE room = ? AND sequence = ? AND tag = ?'
+    local original = db:query(exact, { 'a', 4 }).rows[1].n
+    db:createCompositeIndex('data', 'room', 'sequence')
+    expect(db:query(exact, { 'a', 4 }).rows[1].n).toBe(original)
+    expect(db:query(exact, { 'a:extra', 4 }).rows[1].n).toBe(0)
+    expect(db:query(exact, { 'missing', 4 }).rows[1].n).toBe(0)
+    expect(db:query(exact, { 'a', sql.NULL }).rows[1].n).toBe(0)
+    expect(db:query(residual, { 'a', 4, 'match' }).rows[1].n).toBe(2)
+    expect(db:query(residual, { 'a', 4, 'other' }).rows[1].n).toBe(6)
+
+    db:delete('data', 4)
+    expect(db:query(exact, { 'a', 4 }).rows[1].n).toBe(original - 1)
+    db:update('data', 14, { room = 'a:extra' })
+    expect(db:query(exact, { 'a', 4 }).rows[1].n).toBe(original - 2)
+    expect(db:query(exact, { 'a:extra', 4 }).rows[1].n).toBe(1)
+    db:checkpoint()
+    db:close()
+    db = sql.open(path)
+    expect(db:query(exact, { 'a', 4 }).rows[1].n).toBe(original - 2)
+    expect(db:query(exact, { 'a:extra', 4 }).rows[1].n).toBe(1)
+    db:close()
+    clean(path)
+  end)
+
   suite.it('refuses a second writer while the first lock is held', function()
     local path = fixture('lock')
     local db = sql.open(path)

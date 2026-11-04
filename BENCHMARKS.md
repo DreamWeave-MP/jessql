@@ -231,16 +231,19 @@ required to assess concurrency and long-term regressions.
 ## Native two-column scoped ordered indexes (Jess 0.3.0, buffered)
 
 `jess run --trusted --package . bench/composite.jsl 25000 150` compares
-single-column `stream_id` ordered indexing to `room_id, stream_id` composite
-indexing on the **same 25,000 persisted rows in 64 rooms**, using the same
-prepared SQL and verifying identical SELECT row counts and COUNT(*) totals.
+standalone `stream_id` AVL + `room_id` hash indexes against the two-column
+`room_id, stream_id` composite index on the **same 25,000 persisted rows in 64
+rooms**. It uses identical prepared SQL on both sides and checks returned row
+counts and count totals for equality.
 
-| Query workload (150 repetitions) | Global ordered index | Composite ordered index | Improvement |
+| Workload (150 repetitions) | Separate ordered/hash indexes | Composite ordered index | Speedup |
 |---|---:|---:|---:|
-| `room_id = ? AND stream_id > ? ORDER BY stream_id LIMIT 20` | 0.08621 s | 0.00622 s | 13.87× |
-| `room_id = ? AND stream_id >= ? AND stream_id < ?` exact count | 0.09081 s | 0.00068 s | 134.17× |
+| `room_id = ? AND stream_id > ? ORDER BY stream_id LIMIT 20` | 0.08039 s | 0.00636 s | 12.65× |
+| `room_id = ? AND stream_id >= ? AND stream_id < ?` exact count | 0.09327 s | 0.00065 s | 143.34× |
+| `room_id = ? AND stream_id = ?` point SELECT | 0.00163 s | 0.00098 s | 1.67× |
+| `room_id = ? AND stream_id = ?` exact count | 0.00065 s | 0.00025 s | 2.55× |
 
-Building the composite index took 0.09321 seconds. These are one-run CPU-time
+Building the composite index took 0.08586 seconds. These are one-run CPU-time
 microbenchmarks, not reliable p99 measurements. Rows, indexes, and range
 queries execute in memory after buffered log appends; they are **not**
 fsync-protected and do not imply disk-B-tree performance.

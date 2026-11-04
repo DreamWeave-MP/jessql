@@ -450,6 +450,22 @@ local function indexedKeys(current: TableState, request: queryEngine.Request): (
   local bestKeys = current.order
   local bestSet = nil
   local bestCount = current.count + 1
+  -- A pair of equalities can use the narrowest composite posting list,
+  -- even when neither field has a standalone hash index.
+  for _, composite in current.composites do
+    local prefix = equalityValue(request, composite.prefix)
+    local suffix = equalityValue(request, composite.suffix)
+    if prefix == nil or suffix == nil then continue end
+    local index = composite.partitions[keyOf(prefix)]
+    local bucket = if index then index.buckets[keyOf(suffix)] else nil
+    local count = if bucket then bucket.count else 0
+    if count < bestCount then
+      bestCount = count
+      bestKeys = if bucket then bucket.keys else {}
+      bestSet = if bucket then bucket.live else nil
+    end
+  end
+
   for _, constraint in request.constraints do
     if constraint.op ~= '=' or constraint.value == nil or not scalar(constraint.value) then continue end
     local column = constraint.column
@@ -575,7 +591,23 @@ local function tableProvider(state: DatabaseState, name: string): queryEngine.Pr
         end
       end
 
-      local indexed = false
+      -- Composite equality lookups support exact counts without scanning rows.
+      -- With additional equalities, indexedKeys narrows candidates then the
+      -- existing residual verifier checks the complete conjunction.
+      local compositeIndexed = false
+      for _, composite in tableState.composites do
+        local prefix = equalityValue(request, composite.prefix)
+        local suffix = equalityValue(request, composite.suffix)
+        if prefix == nil or suffix == nil then continue end
+        compositeIndexed = true
+        if #request.constraints == 2 then
+          local index = composite.partitions[keyOf(prefix)]
+          local bucket = if index then index.buckets[keyOf(suffix)] else nil
+          return if bucket then bucket.count else 0
+        end
+      end
+
+      local indexed = compositeIndexed
       for _, constraint in request.constraints do
         if constraint.op ~= '=' then return nil end
         if constraint.value == nil then return 0 end

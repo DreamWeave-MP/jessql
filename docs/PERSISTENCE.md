@@ -209,7 +209,9 @@ local rows = page.run({ '!room', lastStreamId }).rows
 `ORDER BY` can be ascending or descending. Exact prefix-equality and suffix
 range predicates (`<`, `<=`, `>`, `>=`) can seek within one partition, rather
 than iterating through events belonging to other rooms. Fully covered
-`COUNT(*)` queries of the same shape can use subtree cardinalities. The SQL
+`COUNT(*)` queries of the same shape can use subtree cardinalities. Two-column
+equality lookups (`prefix = ? AND suffix = ?`) can also seek the exact posting
+list; additional equalities are verified against matching rows. The SQL
 executor retains responsibility for all residual filters and SQL type
 semantics. NULL-prefix records do not match prefix equality; NULL suffixes
 follow the same sort order as the existing ordered provider. Heterogeneous

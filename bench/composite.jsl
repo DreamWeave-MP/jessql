@@ -14,7 +14,7 @@ fs.remove(path .. '.lock')
 
 local db = sql.open(path)
 db:createTable('events', { 'id', 'room_id', 'stream_id', 'payload' }, 'id')
-for first = 1, total, batchSize do
+for first = 1, total, BatchSize do
   db:transaction(function(tx)
     for id = first, math.min(first + BatchSize - 1, total) do
       tx:insert('events', { id = id, room_id = 'room' .. (id % Rooms), stream_id = id, payload = 'x' })
@@ -23,9 +23,12 @@ for first = 1, total, batchSize do
 end
 
 db:createOrderedIndex('events', 'stream_id')
+db:createIndex('events', 'room_id')
 local selection = db:prepare('SELECT stream_id FROM events WHERE room_id = ? AND stream_id > ? ORDER BY stream_id LIMIT 20')
 local counting = db:prepare('SELECT COUNT(*) AS n FROM events WHERE room_id = ? AND stream_id >= ? AND stream_id < ?')
-local function measure(): (number, number, number, number)
+local point = db:prepare('SELECT payload FROM events WHERE room_id = ? AND stream_id = ?')
+local pointCount = db:prepare('SELECT COUNT(*) AS n FROM events WHERE room_id = ? AND stream_id = ?')
+local function measure(): (number, number, number, number, number, number, number, number)
   local selectedRows, countedRows = 0, 0
   local start = os.clock()
   for iteration = 1, probes do
@@ -39,23 +42,44 @@ local function measure(): (number, number, number, number)
     local minimum = (iteration * 97) % (total - 2000)
     countedRows += counting.run({ 'room' .. (iteration % Rooms), minimum, minimum + 1500 }).rows[1].n
   end
-  return selectTime, os.clock() - start, selectedRows, countedRows
+  local countTime = os.clock() - start
+  local matchedRows, matchedCounts = 0, 0
+  start = os.clock()
+  for iteration = 1, probes do
+    local id = (iteration * 97) % total + 1
+    matchedRows += #point.run({ 'room' .. (id % Rooms), id }).rows
+  end
+  local pointTime = os.clock() - start
+  start = os.clock()
+  for iteration = 1, probes do
+    local id = (iteration * 97) % total + 1
+    matchedCounts += pointCount.run({ 'room' .. (id % Rooms), id }).rows[1].n
+  end
+  return selectTime, countTime, pointTime, os.clock() - start,
+    selectedRows, countedRows, matchedRows, matchedCounts
 end
 
-local baselineRead, baselineCount, baselineRows, baselineTotals = measure()
+local baselineRead, baselineCount, baselinePoint, baselinePointCount, baselineRows, baselineTotals, baselineFound, baselineMatches = measure()
 local buildStart = os.clock()
 db:createCompositeIndex('events', 'room_id', 'stream_id')
 local buildTime = os.clock() - buildStart
 selection = db:prepare('SELECT stream_id FROM events WHERE room_id = ? AND stream_id > ? ORDER BY stream_id LIMIT 20')
 counting = db:prepare('SELECT COUNT(*) AS n FROM events WHERE room_id = ? AND stream_id >= ? AND stream_id < ?')
-local indexedRead, indexedCount, indexedRows, indexedTotals = measure()
+point = db:prepare('SELECT payload FROM events WHERE room_id = ? AND stream_id = ?')
+pointCount = db:prepare('SELECT COUNT(*) AS n FROM events WHERE room_id = ? AND stream_id = ?')
+local indexedRead, indexedCount, indexedPoint, indexedPointCount, indexedRows, indexedTotals, indexedFound, indexedMatches = measure()
 assert(baselineRows == indexedRows and baselineTotals == indexedTotals)
+assert(baselineFound == indexedFound and baselineMatches == indexedMatches)
 
 print(string.format('rows=%d rooms=%d probes=%d selected=%d counted=%d', total, Rooms, probes, indexedRows, indexedTotals))
 print(string.format('global_range_read_s=%.5f composite_read_s=%.5f read_speedup=%.2fx',
   baselineRead, indexedRead, baselineRead / indexedRead))
 print(string.format('global_range_count_s=%.5f composite_count_s=%.5f count_speedup=%.2fx',
   baselineCount, indexedCount, baselineCount / indexedCount))
+print(string.format('indexed_prefix_point_s=%.5f composite_point_s=%.5f point_speedup=%.2fx',
+  baselinePoint, indexedPoint, baselinePoint / indexedPoint))
+print(string.format('indexed_prefix_count_s=%.5f composite_exact_count_s=%.5f exact_count_speedup=%.2fx',
+  baselinePointCount, indexedPointCount, baselinePointCount / indexedPointCount))
 print(string.format('composite_build_s=%.5f', buildTime))
 
 db:close()
