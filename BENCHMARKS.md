@@ -466,3 +466,13 @@ Medians from alternating runs; CPU and RSS vary with the host and GC. **Hybrid
 is significantly slower for hot queries**, and only its decoded-page cache is
 bounded. The massive reopen improvement comes from not reconstructing the full
 resident table and index. Buffered I/O, not fsync-backed durability.
+
+## Cold-page key lookup optimization (Jess 0.3.0)
+
+The immutable `JQLP2` provider now coalesces page reads and decodes simple
+numeric / unescaped string keys without allocating JSON objects per indexed
+row. The file format and CRC checks are unchanged. For 3,000 deterministic
+random misses against 30K rows and a four-page cache, median CPU from five
+alternating runs improved **2.84x** with numeric keys and **1.75x** with
+Matrix-style string keys. All query checksums and page-read counts matched.
+See [full benchmark methodology and limitations](docs/COLD-PAGE-LOOKUPS.md).

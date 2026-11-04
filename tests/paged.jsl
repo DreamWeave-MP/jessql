@@ -36,6 +36,60 @@ suite.describe('immutable page provider', function()
     fs.remove(path)
   end)
 
+  suite.it('seeks exact numeric keys including fractional and exponent forms', function()
+    local path = fixture('numeric-keys')
+    local keys = { -1e30, -12.125, -0.01, 0, 1e-9, 1.5, 1e20 }
+    local position = 0
+    sql.paged.create(path, { 'id', 'payload' }, 'id', function()
+      position += 1
+      if position > #keys then return nil end
+      return { id = keys[position], payload = string.rep('z', 230) }
+    end, { pageBytes = 512 })
+    local opened = sql.paged.open(path, { cachePages = 1 })
+    expect(opened.count).toBe(#keys)
+    for _, key in keys do
+      expect(opened:get(key).id).toBe(key)
+    end
+    expect(opened:get(1e10)).toBe(nil)
+    local descending = opened:iterateRows({ 'id' }, true)
+    for index = #keys, 1, -1 do expect((descending() :: { [string]: unknown }).id).toBe(keys[index]) end
+    expect(descending()).toBe(nil)
+    opened:close()
+    fs.remove(path)
+  end)
+
+  suite.it('preserves string key escaping, UTF-8 and mixed-key fallback decoding', function()
+    local path = fixture('string-keys')
+    local keys = { '$abc:matrix.org', 'back\\slash', 'quote"here', 'unicodé', '🦊' }
+    table.sort(keys)
+    local position = 0
+    sql.paged.create(path, { 'id', 'value' }, 'id', function()
+      position += 1
+      if position > #keys then return nil end
+      return { id = keys[position], value = position }
+    end, { pageBytes = 512 })
+    local opened = sql.paged.open(path, { cachePages = 1 })
+    for index, key in keys do
+      expect(opened:get(key).value).toBe(index)
+    end
+    expect(opened:get('missing')).toBe(nil)
+    opened:close()
+    fs.remove(path)
+
+    path = fixture('mixed-keys')
+    local mixed: { unknown } = { false, true, -5, 0.5, 'a', 'b' }
+    position = 0
+    sql.paged.create(path, { 'id', 'value' }, 'id', function()
+      position += 1
+      if position > #mixed then return nil end
+      return { id = mixed[position], value = position }
+    end, { pageBytes = 512 })
+    opened = sql.paged.open(path, { cachePages = 1 })
+    for index, key in mixed do expect(opened:get(key).value).toBe(index) end
+    opened:close()
+    fs.remove(path)
+  end)
+
   suite.it('rejects duplicate and nonascending keys and incomplete snapshots', function()
     local path = fixture('invalid')
     local counter = 0

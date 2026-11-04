@@ -1,0 +1,59 @@
+--!strict
+-- Cold point-lookup CPU, RSS and page-read comparison for numeric and string keys.
+local sql = require('@jessql')
+local fs = require('@dream/fs')
+
+local mode = arg[1] or 'measure'
+local kind = arg[2] or 'number'
+local count = tonumber(arg[3]) or 30000
+local probes = tonumber(arg[4]) or 3000
+local root = fs.cwd() :: string
+local path = fs.join(root, '.jessql-cold-lookup-' .. kind .. '.bin')
+if kind ~= 'number' and kind ~= 'string' then error('expected number or string keys') end
+if count < 1 or count > 1000000 then error('count out of range') end
+
+local function key(index: number): unknown
+  if kind == 'number' then return index end
+  return string.format('$%08d:example.org', index)
+end
+
+if mode == 'prepare' then
+  fs.remove(path)
+  local index = 0
+  sql.paged.create(path, { 'id', 'seq', 'body' }, 'id', function()
+    index += 1
+    if index > count then return nil end
+    return { id = key(index), seq = index, body = 'event-' .. tostring(index) }
+  end)
+  print('prepared', kind, count)
+  return
+end
+
+if mode ~= 'measure' then error('expected prepare or measure') end
+
+local function rss(): number
+  -- /proc is absent on non-Linux; RSS is optional for this benchmark.
+  local ok, text = pcall(fs.readFileString, '/proc/self/status')
+  if not ok or type(text) ~= 'string' then return -1 end
+  local value = string.match(text, 'VmRSS:%s+(%d+)')
+  return if value then tonumber(value) or -1 else -1
+end
+
+local opened = sql.paged.open(path, { cachePages = 4 })
+local checksum = 0
+local start = os.clock()
+for index = 1, probes do
+  local ordinal = ((index * 7919) % count) + 1
+  local row = opened:get(key(ordinal))
+  if not row then error('missing row') end
+  checksum += row.seq :: number
+end
+local elapsed = os.clock() - start
+local stats = opened:stats()
+print('kind', kind)
+print('probes', probes)
+print('seconds', elapsed)
+print('page_reads', stats.pageReads)
+print('rss_KiB', rss())
+print('checksum', checksum)
+opened:close()
