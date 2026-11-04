@@ -14,6 +14,8 @@ export type Store = {
   read: (self: Store, key: string, columns: { string }?) -> Row?,
   readInto: (self: Store, key: string, columns: { string }, destination: Row) -> Row?,
   has: (self: Store, key: string) -> boolean,
+  wasSeen: (self: Store, key: string) -> boolean,
+  clearDeadKeys: (self: Store) -> (),
   value: (self: Store, key: string, column: string) -> unknown,
   addColumn: (self: Store, name: string) -> (),
   stats: (self: Store) -> Metrics,
@@ -270,7 +272,7 @@ function packed.new(columns: { string }): Store
   local store = {} :: Store
   local function read(_self: Store, key: string, requested: { string }?): Row?
     local slot = slots[key]
-    if not slot then return nil end
+    if not slot or slot < 1 then return nil end
     local row: Row = {}
     for _, name in requested or names do
       local column = fields[name]
@@ -284,7 +286,7 @@ function packed.new(columns: { string }): Store
   store.read = read
   store.readInto = function(_self: Store, key: string, requested: { string }, destination: Row): Row?
     local slot = slots[key]
-    if not slot then return nil end
+    if not slot or slot < 1 then return nil end
 
     for _, name in requested do
       local column = fields[name]
@@ -295,11 +297,25 @@ function packed.new(columns: { string }): Store
 
   store.value = function(_self: Store, key: string, column: string): unknown
     local slot = slots[key]
-    if not slot then return nil end
+    if not slot or slot < 1 then return nil end
     local field = fields[column]
     return if field then getValue(field, slot) else nil
   end
-  store.has = function(_self: Store, key: string): boolean return slots[key] ~= nil end
+
+  store.has = function(_self: Store, key: string): boolean
+    local slot = slots[key]
+    return slot ~= nil and slot > 0
+  end
+
+  -- The slot dictionary also remembers deleted keys until an order compaction.
+  -- This avoids a second O(rows) "ever seen" hash table in packed mode.
+  store.wasSeen = function(_self: Store, key: string): boolean return slots[key] ~= nil end
+  store.clearDeadKeys = function(_self: Store)
+    for key, slot in slots do
+      if slot < 0 then slots[key] = nil end
+    end
+  end
+
   store.addColumn = function(_self: Store, name: string)
     if fields[name] then return end
     names[#names + 1] = name
@@ -328,16 +344,16 @@ function packed.new(columns: { string }): Store
     __newindex = function(_table: { [string]: Row }, key: string, row: Row?)
       local slot = slots[key]
       if not row then
-        if not slot then return end
+        if not slot or slot < 1 then return end
         for _, name in names do setValue(fields[name], slot, nil, allocated) end
 
-        slots[key] = nil
+        slots[key] = -1
         free[#free + 1] = slot
         live -= 1
         return
       end
 
-      if not slot then
+      if not slot or slot < 1 then
         if #free > 0 then
           slot = free[#free]
           free[#free] = nil
