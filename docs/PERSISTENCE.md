@@ -358,3 +358,64 @@ state still reside in RAM**. The overlay does not make this engine paged or
 MVCC-capable. Large transactions also accumulate staged rows and operations
 until commit; secondary-index lookups may still examine all staged keys. A
 page cache, disk-backed indexes and bounded staging require separate work.
+
+## Optional packed resident columns (experimental)
+
+The new **resident layout** is independent of the WAL and of the durability
+protocol. Turn it on per *database handle*:
+
+```luau
+local db = sql.open('data/matrix.wal', { rowLayout = 'packed' })
+-- Default remains `row` while cross-workload benchmarks and hardening continue.
+```
+
+`rowLayout = 'packed'` replaces one Luau dictionary per committed row with a
+primary-key-to-slot map and column storage. It uses available Jess 0.3.0
+`buffer` primitives without a runtime update:
+
+- Homogeneous finite numeric columns: chunked f64 slabs with NaN as an internal
+  NULL marker (user NaN remains invalid).
+- Boolean columns: compact byte-coded slabs with a distinct NULL state.
+- Repeated strings: u32 dictionary codes with reference counts and retired-ID
+  reuse, avoiding one Luau string field per repeated value.
+- High-cardinality short strings: 64 KiB append-only byte arenas plus per-row
+  offsets and lengths. Dead bytes trigger bounded-space arena repacking once
+  their overhead becomes material. Strings over one arena chunk revert that
+  column to direct storage.
+- Mixed-type columns: lossless direct column vectors when a specialized
+  representation can no longer encode every value.
+
+SQL providers read only columns requested by the planner. Where JessQL's
+single-table iterator explicitly allows volatile rows, packed reads reuse a
+single projected table rather than allocating a new row for every scan step.
+Other scans, indexed joins, `get`, and SQL result rows have ordinary stable
+values and semantics. Query results and transaction rollback are unchanged.
+
+`db:stats().table_name.resident` reports the packed slot count, free slots,
+representation for each column, active dictionary entries, and live/allocated
+string-arena byte counts. This is an introspection aid, not an exact heap-size
+accounting system.
+
+A WAL created in either layout may be reopened using the other layout; the
+journal format, hashes and CRCs have **not changed**. Indexes and rows are
+still entirely memory resident, and packed slots do **not** make database
+memory usage bounded. This is experimental and opt-in; evaluate update rates,
+query projections, and startup/replay time on your own workload before changing
+production defaults. The existing buffered-write durability limitation is
+unaltered.
+
+Measure both modes with the same benchmark and runtime:
+
+```bash
+jess run --trusted --package . bench/packed-rss.jsl row 80000
+jess run --trusted --package . bench/packed-rss.jsl packed 80000
+```
+
+`bench/hypervectors.jsl` is a separate **research-only** hyperdimensional
+computing demonstration: randomized token vectors, majority bundling, 256-bit
+binary signatures and Hamming comparisons. A signature is *approximate* and
+cannot replace a SQL key, a journal record or an exact secondary index. The
+script is not used by JessQL's query planner and does not contribute to the
+packed-row RSS improvement. One possible future application is fuzzy event or
+moderation similarity search; every candidate would require application-side
+verification against stored data. See `BENCHMARKS.md` for measurements.

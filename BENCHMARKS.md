@@ -293,3 +293,52 @@ production benchmarks. RSS includes the Jess binary, allocator arenas, and
 heap objects awaiting collection. CPU timings vary materially between runs;
 no universal query speedup is claimed. No fsync durability or disk paging is
 measured. The independent replay archive includes machine-readable raw runs.
+
+## Experimental packed resident columns + hypervectors (Jess 0.3.0)
+
+Compared the ordinary `row` layout with `rowLayout = 'packed'`, on the exact
+same SQL/data/query workload in `bench/packed-rss.jsl`: 80,000 rows, 256 inserts
+per transaction, a unique-code equality index, room hash index, numeric AVL
+index and room/stream composite index, 5,000 point probes and 800 range
+queries. Same query checksum `49295`, same range result count `16000`.
+Both modes use **identical buffered WAL semantics** and entirely resident
+indexes. Six fresh child processes ran in alternating order, three per mode.
+The medians are:
+
+| Measurement | Ordinary rows | Packed columns | Difference |
+|---|---:|---:|---:|
+| RSS after inserts | 120,900 KiB | 72,660 KiB | **−39.9%** |
+| RSS after index builds | 170,876 KiB | 140,000 KiB | **−18.1%** |
+| Peak RSS after queries | 184,824 KiB | 149,288 KiB | **−19.2%** |
+| Populate + index CPU | 2.328 s | 2.067 s | −11.2% |
+| 5,000 point probes CPU | 0.0886 s | 0.0297 s | −66.4% |
+| 800 range reads CPU | 0.0621 s | 0.0634 s | +2.0% |
+| Total benchmark CPU | 2.399 s | 2.165 s | −9.8% |
+
+Memory ranges were ordinary peak 184,784–189,564 KiB and packed peak
+148,764–150,684 KiB. CPU times varied significantly across runs (especially
+short queries), so they are **not** throughput guarantees; the exact raw runs
+are in the replay archive. RSS includes Jess and the allocator; it does not
+measure live Luau heap alone. These are microbenchmarks from one Linux x64 host,
+not cross-platform memory results. See `docs/PERSISTENCE.md` for representation
+and correctness limits. No fsync, disk-page I/O, compression ratio, or
+power-loss behavior is measured.
+
+### Hypervector sandbox
+
+`jess run --trusted --package . bench/hypervectors.jsl` constructs 2,000
+256-dimensional randomized binary token signatures (32 raw payload bytes per
+signature, excluding Luau `buffer` object overhead). On one development run:
+
+```
+dimensions=256 vectors=2000 payload_bytes_per_vector=32 build_s=0.07159
+pairs=200 compare_s=0.01243 near_wins=200 near_mean=48.2 unrelated_mean=129.6
+```
+
+Near matches share four of five synthetic tags. This demonstrates a similarity
+signal for *this generated dataset only*, not recall guarantees, a fast ANN
+index, or a lossless encoding of source text. A hypervector would **add**
+resident memory if stored alongside exact SQL fields; it is not part of the
+RSS optimization. To scale similarity search, we would need an explicit
+candidate-retrieval index and evaluate false matches, cost and recall under
+realistic distributions.

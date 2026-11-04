@@ -48,6 +48,16 @@ db:checkpoint()
 db:close()
 ```
 
+For lower resident memory use on large event tables, opt into the experimental
+packed column representation with `sql.open(path, { rowLayout = 'packed' })`.
+It uses f64/boolean buffers, dictionary-coded repeated strings and chunked byte
+arenas for unique strings, and lazily constructs row dictionaries on reads.
+The default remains `row`; both layouts reopen the **same WAL** without migration.
+See [packed resident columns](docs/PERSISTENCE.md#optional-packed-resident-columns-experimental)
+and [benchmarks](BENCHMARKS.md#experimental-packed-resident-columns--hypervectors-jess-030).
+A standalone `bench/hypervectors.jsl` explores approximate binary hypervector
+similarity but does not participate in SQL correctness or row compression.
+
 No SQLite bindings are involved. The engine uses Jess filesystem, bytes and JSON primitives.
 **Buffered writes are not power-loss durable without a real file/directory sync primitive.**
 See [docs/PERSISTENCE.md](docs/PERSISTENCE.md) for the full contract and limitations.
