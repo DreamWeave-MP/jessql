@@ -47,6 +47,7 @@ export type Transaction = {
   createOrderedIndex: (self: Transaction, name: string, column: string) -> (),
   createCompositeIndex: (self: Transaction, name: string, prefix: string, suffix: string) -> (),
   primaryKey: (self: Transaction, name: string) -> string,
+  keysWhere: (self: Transaction, name: string, column: string, value: unknown) -> { unknown },
   exec: (self: Transaction, sql: string, params: { unknown }?) -> number,
   executeMutation: (self: Transaction, statement: mutations.Statement, params: { unknown }?) -> number,
   addColumn: (self: Transaction, name: string, column: string) -> (),
@@ -920,6 +921,69 @@ local function buildTransaction(state: DatabaseState)
     local current = state.tables[name]
     local row = if current then current.rows[encoded] else nil
     return if row then table.clone(row) else nil
+  end
+
+  -- Return a statement-stable set of keys for an indexed equality predicate.
+  -- Merge the committed index with staged rows: an UPDATE of the predicate
+  -- column must not accidentally visit a row twice or miss a newly matching row.
+  function transaction.keysWhere(_self: Transaction, name: string, column: string, value: unknown): { unknown }
+    writable()
+    name = requireName(name)
+    column = requireName(column)
+    local schema = findSchema(name)
+    if not schema.allowed[column] then error('jessql storage: no such column', 2) end
+    if value == nil then return {} end -- SQL = NULL never matches
+    if not scalar(value) then error('jessql storage: unsupported predicate value', 2) end
+    local current = state.tables[name]
+    local result: { unknown } = {}
+    if column == schema.primaryKey then
+      local row = transaction:get(name, value)
+      if row then result[1] = row[schema.primaryKey] end
+      return result
+    end
+
+    local index = if current then current.secondary[column] else nil
+    -- New tables can be queried from their staged rows. Persistent tables
+    -- require a real index so an UPDATE cannot silently scan all rows.
+    if current and not index then
+      error('jessql storage: bulk mutation requires an index on WHERE column', 2)
+    end
+    local seen: { [string]: boolean } = {}
+    local matched: { string } = {}
+    local stagedTable = staged[name]
+    local function consider(key: string)
+      if seen[key] then return end
+      seen[key] = true
+      local change = if stagedTable then stagedTable[key] else nil
+      local row: Row? = if change == Deleted then nil
+        elseif type(change) == 'table' then change :: Row
+        else if current then current.rows[key] else nil
+      if row and row[column] == value then
+        matched[#matched + 1] = key
+        if #matched > 10000 then error('jessql storage: bulk mutation exceeds 10000 rows', 2) end
+      end
+    end
+
+    if index then
+      local bucket = index.buckets[keyOf(value)]
+      if bucket then
+        for _, key in bucket.keys do
+          if bucket.live[key] then consider(key) end
+        end
+      end
+    end
+
+    if stagedTable then
+      for key in stagedTable do consider(key) end
+    end
+    table.sort(matched) -- Stable log ordering across hash iteration orders.
+    for _, key in matched do
+      local change = if stagedTable then stagedTable[key] else nil
+      local row: Row = if type(change) == 'table' then change :: Row
+        else (current :: TableState).rows[key]
+      result[#result + 1] = row[schema.primaryKey]
+    end
+    return result
   end
 
   local function put(name: string, row: Row, insertOnly: boolean)

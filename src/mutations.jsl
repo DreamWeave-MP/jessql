@@ -21,6 +21,7 @@ export type Writer = {
   primaryKey: (self: Writer, name: string) -> string,
   insert: (self: Writer, name: string, row: { [string]: unknown }) -> (),
   get: (self: Writer, name: string, key: unknown) -> { [string]: unknown }?,
+  keysWhere: (self: Writer, name: string, column: string, value: unknown) -> { unknown },
   update: (self: Writer, name: string, key: unknown, changes: { [string]: unknown }, unset: { string }?) -> boolean,
   delete: (self: Writer, name: string, key: unknown) -> boolean,
 }
@@ -218,17 +219,16 @@ function mutations.execute(statement: Statement, tx: Writer, params: { unknown }
     return affected
   end
 
-  -- Update/delete are intentionally primary-key bounded. General multi-row
-  -- WHERE support must be added separately with snapshot semantics and limits.
-  if statement.whereColumn ~= tx:primaryKey(statement.table) then
-    error('jessql DML: UPDATE/DELETE WHERE must match the primary key', 2)
-  end
-
-  local key = resolve(statement.whereValue :: Value)
-  if key == nil then return 0 end -- SQL equality to NULL matches no rows
-
+  -- Collect a bounded, stable key snapshot before changing secondary indexes.
+  -- Non-PK predicates must have a declared secondary index.
+  local value = resolve(statement.whereValue :: Value)
+  local keys = tx:keysWhere(statement.table, statement.whereColumn :: string, value)
   if statement.kind == 'delete' then
-    return if tx:delete(statement.table, key) then 1 else 0
+    local affected = 0
+    for _, key in keys do
+      if tx:delete(statement.table, key) then affected += 1 end
+    end
+    return affected
   end
   local changes: { [string]: unknown } = {}
   local unset: { string } = {}
@@ -240,7 +240,11 @@ function mutations.execute(statement: Statement, tx: Writer, params: { unknown }
     if value == nil then unset[#unset + 1] = assignment.column
     else changes[assignment.column] = value end
   end
-  return if tx:update(statement.table, key, changes, unset) then 1 else 0
+  local affected = 0
+  for _, key in keys do
+    if tx:update(statement.table, key, changes, unset) then affected += 1 end
+  end
+  return affected
 end
 
 return mutations
