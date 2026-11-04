@@ -553,6 +553,90 @@ suite.describe('native persistent store', function()
     clean(path)
   end)
 
+  suite.it('executes parameterized INSERT UPDATE and DELETE using the same atomic journal', function()
+    local path = fixture('sql-dml')
+    local db = sql.open(path)
+    db:createTable('messages', { 'id', 'room', 'body' }, 'id')
+    db:createIndex('messages', 'room')
+    expect(db:exec("INSERT INTO messages (id, room, body) VALUES (1, 'one', ?)", { 'hi' })).toBe(1)
+    expect(db:exec('INSERT INTO messages (id, room, body) VALUES (?, ?, ?)', { 2, 'two', sql.NULL })).toBe(1)
+    expect(db:exec('UPDATE messages SET body = ?, room = ? WHERE id = ?', { 'updated', 'one', 2 })).toBe(1)
+    expect(db:get('messages', 2).body).toBe('updated')
+    expect(db:exec('UPDATE messages SET body = NULL WHERE id = 1')).toBe(1)
+    expect(db:get('messages', 1).body).toBeNil()
+    expect(db:exec('UPDATE messages SET body = 9 WHERE id = 999')).toBe(0)
+    expect(db:exec('DELETE FROM messages WHERE id = ?', { sql.NULL })).toBe(0)
+    expect(db:query("SELECT COUNT(*) AS n FROM messages WHERE room = 'one'").rows[1].n).toBe(2)
+    expect(db:exec('DELETE FROM messages WHERE id = ?', { 1 })).toBe(1)
+    expect(db:exec('DELETE FROM messages WHERE id = ?', { 1 })).toBe(0)
+    db:close()
+
+    local reopened = sql.open(path)
+    expect(reopened:get('messages', 1)).toBeNil()
+    expect(reopened:get('messages', 2).body).toBe('updated')
+    reopened:close()
+    clean(path)
+  end)
+
+  suite.it('reuses prepared mutation plans in batches and invalidates on schema evolution', function()
+    local path = fixture('prepared-dml')
+    local db = sql.open(path)
+    db:createTable('records', { 'id', 'value' }, 'id')
+    local insert = db:prepareExec('INSERT INTO records (id, value) VALUES (?, ?)')
+    local update = db:prepareExec('UPDATE records SET value = ? WHERE id = ?')
+    expect(insert.parameterCount).toBe(2)
+    db:transaction(function(tx)
+      for id = 1, 100 do insert.inTransaction(tx, { id, id * 2 }) end
+      for id = 1, 10 do update.inTransaction(tx, { id * 5, id }) end
+      expect(tx:get('records', 9).value).toBe(45)
+    end)
+    expect(db:query('SELECT COUNT(*) AS n FROM records').rows[1].n).toBe(100)
+    expect(update.run({ 111, 3 })).toBe(1)
+    db:addColumn('records', 'extra')
+    -- The prepared INSERT is invalidated because addColumn changed its schema.
+    expect(pcall(function() insert.run({ 101, 101 }) end)).toBe(false)
+    -- The prepared UPDATE likewise refuses to execute against an old schema.
+    expect(pcall(function() update.run({ 1, 1 }) end)).toBe(false)
+    db:exec('INSERT INTO records (id, value, extra) VALUES (?, ?, ?)', { 101, 5, 'a' })
+    expect(db:get('records', 101).extra).toBe('a')
+    db:close()
+    clean(path)
+  end)
+
+  suite.it('rejects injected SQL, unsafe DML predicates, duplicates and incomplete binds', function()
+    local path = fixture('dml-security')
+    local db = sql.open(path)
+    db:createTable('a', { 'id', 'value' }, 'id')
+    db:exec('INSERT INTO a (id, value) VALUES (?, ?)', { 1, 'initial' })
+    local unsupported = {
+      'DELETE FROM a',
+      'DELETE FROM a WHERE value = ?',
+      'UPDATE a SET value = 99 WHERE value = 1',
+      'UPDATE a SET value = 1 WHERE id > 0',
+      'UPDATE a SET id = 5 WHERE id = 1',
+      'UPDATE a SET missing = 3 WHERE id = 999',
+      'UPDATE a SET id = 5 WHERE id = 999',
+      'INSERT INTO a (id, id) VALUES (2, 3)',
+      'INSERT INTO a (id, value) VALUES (2, 3); DELETE FROM a WHERE id = 1',
+      'INSERT INTO a (id, value) VALUES (2, 3 + 4)',
+    }
+
+    for _, statement in unsupported do
+      -- Each unsupported or unsafe SQL mutation must reject before writing.
+      expect(pcall(function() db:exec(statement, { 2 }) end)).toBe(false)
+    end
+    -- Missing parameters must not silently bind as SQL NULL.
+    expect(pcall(function() db:exec('INSERT INTO a (id, value) VALUES (?, ?)', { 2 }) end)).toBe(false)
+    -- Duplicate primary-key inserts must fail without replacing the stored row.
+    expect(pcall(function() db:exec('INSERT INTO a (id, value) VALUES (?, ?)', { 1, 'dup' }) end)).toBe(false)
+    local valid = db:exec('INSERT INTO a (id, value) VALUES (?, ?)', { 2, 'safe; DROP TABLE a' })
+    expect(valid).toBe(1)
+    expect(db:get('a', 1).value).toBe('initial')
+    expect(db:get('a', 2).value).toBe('safe; DROP TABLE a')
+    db:close()
+    clean(path)
+  end)
+
   suite.it('refuses a second writer while the first lock is held', function()
     local path = fixture('lock')
     local db = sql.open(path)

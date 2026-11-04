@@ -4,10 +4,12 @@ local engine = require('@jessql/engine')
 local parser = require('@jessql/parser')
 local lexer = require('@jessql/lexer')
 local storage = require('@jessql/storage')
+local mutations = require('@jessql/mutations')
 
 export type Database = engine.Database
 export type PersistentDatabase = storage.Store
 export type Transaction = storage.Transaction
+export type MutationPlan = storage.MutationPlan
 export type Plan = engine.Plan
 export type Result = engine.Result
 export type Row = engine.Row
@@ -32,6 +34,7 @@ export type Token = lexer.Token
 return {
   new = engine.new,
   open = storage.open,
+  NULL = mutations.NULL,
   parse = parser.parse,
   lex = lexer.lex,
 }

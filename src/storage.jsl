@@ -8,6 +8,7 @@ local bytes = require('@dream/bytes')
 local json = require('@jess/json')
 local queryEngine = require('@jessql/engine')
 local ordered = require('@jessql/ordered')
+local mutations = require('@jessql/mutations')
 
 export type Row = { [string]: unknown }
 export type Options = { maxFrameBytes: number?, recoverTail: boolean? }
@@ -15,6 +16,8 @@ export type Store = {
   createTable: (self: Store, name: string, columns: { string }, primaryKey: string) -> (),
   createIndex: (self: Store, name: string, column: string) -> (),
   createOrderedIndex: (self: Store, name: string, column: string) -> (),
+  exec: (self: Store, sql: string, params: { unknown }?) -> number,
+  prepareExec: (self: Store, sql: string) -> MutationPlan,
   addColumn: (self: Store, name: string, column: string) -> (),
   update: (self: Store, name: string, key: unknown, changes: Row, unset: { string }?) -> boolean,
   insert: (self: Store, name: string, row: Row) -> (),
@@ -29,11 +32,18 @@ export type Store = {
   checkpoint: (self: Store) -> (),
   close: (self: Store) -> (),
 }
+export type MutationPlan = {
+  parameterCount: number,
+  run: (params: { unknown }?) -> number,
+  inTransaction: (tx: Transaction, params: { unknown }?) -> number,
+}
 export type TableMetrics = { rows: number, keySlots: number, indexSlots: { [string]: number }, indexKeys: { [string]: number } }
 export type Transaction = {
   createTable: (self: Transaction, name: string, columns: { string }, primaryKey: string) -> (),
   createIndex: (self: Transaction, name: string, column: string) -> (),
   createOrderedIndex: (self: Transaction, name: string, column: string) -> (),
+  primaryKey: (self: Transaction, name: string) -> string,
+  exec: (self: Transaction, sql: string, params: { unknown }?) -> number,
   addColumn: (self: Transaction, name: string, column: string) -> (),
   update: (self: Transaction, name: string, key: unknown, changes: Row, unset: { string }?) -> boolean,
   insert: (self: Transaction, name: string, row: Row) -> (),
@@ -624,6 +634,17 @@ local function buildTransaction(state: DatabaseState)
     return current.schema
   end
 
+  function transaction.primaryKey(_self: Transaction, name: string): string
+    writable()
+    return findSchema(requireName(name)).primaryKey
+  end
+
+  function transaction.exec(_self: Transaction, sql: string, params: { unknown }?): number
+    writable()
+    local statement = mutations.parse(sql)
+    return mutations.execute(statement, transaction :: mutations.Writer, params)
+  end
+
   function transaction.createTable(_self: Transaction, name: string, columns: { string }, pk: string)
     writable()
     name = requireName(name)
@@ -716,36 +737,49 @@ local function buildTransaction(state: DatabaseState)
 
   -- Update selected fields without clearing unspecified columns. Use `unset` to write NULL.
   -- The primary key is immutable and updates to absent records return false.
+  -- Validate the statement against schema even when no row matches. SQL DML
+  -- must not silently accept an unknown column on an absent primary key.
   function transaction.update(_self: Transaction, name: string, key: unknown, changes: Row, unset: { string }?): boolean
     writable()
     name = requireName(name)
     local schema = findSchema(name)
-    local existing = transaction:get(name, key)
-    if not existing then return false end
     if type(changes) ~= 'table' then error('jessql storage: changes must be a table', 2) end
-
+    local normalized: Row = {}
+    local seen: { [string]: boolean } = {}
     for column, value in changes do
       if type(column) ~= 'string' then error('jessql storage: invalid column', 2) end
-      local normalized = requireName(column)
-      if not schema.allowed[normalized] or normalized == schema.primaryKey then
+
+      local canonical = requireName(column)
+      if not schema.allowed[canonical] or canonical == schema.primaryKey then
         error('jessql storage: cannot update column', 2)
       end
 
+      if seen[canonical] then error('jessql storage: duplicate update column', 2) end
       if not scalar(value) then error('jessql storage: unsupported value', 2) end
-      existing[normalized] = value
+      seen[canonical] = true
+      normalized[canonical] = value
     end
 
+    local unsetColumns: { string } = {}
     if unset then
       if type(unset) ~= 'table' then error('jessql storage: invalid unset columns', 2) end
 
       for _, column in unset do
-        local normalized = requireName(column)
-        if not schema.allowed[normalized] or normalized == schema.primaryKey then
+        local canonical = requireName(column)
+        if not schema.allowed[canonical] or canonical == schema.primaryKey then
           error('jessql storage: cannot unset column', 2)
         end
-        existing[normalized] = nil
+
+        if seen[canonical] then error('jessql storage: conflicting update column', 2) end
+        seen[canonical] = true
+        unsetColumns[#unsetColumns + 1] = canonical
       end
     end
+
+    local existing = transaction:get(name, key)
+    if not existing then return false end
+    for column, value in normalized do existing[column] = value end
+    for _, column in unsetColumns do existing[column] = nil end
     put(name, existing, false)
     return true
   end
@@ -911,6 +945,44 @@ function storage.open(path: string, options: Options?): Store
     local committed, commitError = pcall(write, state, ops)
     state.busy = false
     if not committed then error(commitError, 2) end
+  end
+
+  function db.exec(self: Store, sql: string, params: { unknown }?): number
+    ready()
+    local statement = mutations.parse(sql)
+    local affected = 0
+    self:transaction(function(tx)
+      affected = mutations.execute(statement, tx :: mutations.Writer, params)
+    end)
+    return affected
+  end
+
+  function db.prepareExec(self: Store, sql: string): MutationPlan
+    ready()
+    local statement = mutations.parse(sql)
+    local generation = state.schemaVersion
+    local function valid()
+      ready()
+      if state.schemaVersion ~= generation then
+        error('jessql storage: prepared mutation invalidated by schema change; prepare again', 3)
+      end
+    end
+
+    return {
+      parameterCount = statement.parameterCount,
+      run = function(params: { unknown }?): number
+        valid()
+        local affected = 0
+        self:transaction(function(tx)
+          affected = mutations.execute(statement, tx :: mutations.Writer, params)
+        end)
+        return affected
+      end,
+      inTransaction = function(tx: Transaction, params: { unknown }?): number
+        valid()
+        return mutations.execute(statement, tx :: mutations.Writer, params)
+      end,
+    }
   end
 
   function db.createTable(self: Store, name: string, columns: { string }, primaryKey: string)

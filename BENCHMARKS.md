@@ -215,3 +215,15 @@ other DBMSs, full-database throughput figures, or fsync/power-loss measurements.
 Build cost is measured separately. More representative write-heavy and mixed
 room workloads, disk-backed indexes, and multi-run statistical benchmarks are
 still needed before performance claims in production.
+
+Prepared primary-key UPDATE microbenchmark, 5,000 updates per mode in one
+transaction, same table and statement (run `jess run --trusted --package .
+bench/mutations.jsl 5000`):
+
+```
+updates_per_mode=5000 parse_each_s=0.0630 prepared_s=0.0442 speedup=1.43x
+```
+
+These are single-run observations, including row copy/index maintenance and
+journal commit, not parser-only timings. A larger representative DML suite is
+required to assess concurrency and long-term regressions.

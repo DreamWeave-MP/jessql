@@ -148,3 +148,22 @@ paths, including indexed joins grouped by a value from the lookup side.
 `db:table()` exposes exact cardinality automatically. The optimization is intentionally narrow so a
 provider cannot accidentally claim it handled filtered/grouped SQL. This was added under MJ12/Gaia
 pressure: asking how many catalog rows exist should not decode a billion stars.
+
+
+### Native ordered storage and SQL writes (experimental)
+
+The native JSL WAL store now provides ordered range indexes and strictly
+parameterized SQL mutations without SQLite or any additional native driver:
+
+```luau
+local db = require('@jessql').open('events.wal')
+db:createTable('events', { 'id', 'stream', 'room' }, 'id')
+db:createOrderedIndex('events', 'stream')
+db:exec('INSERT INTO events (id, stream, room) VALUES (?, ?, ?)', { 1, 10, '!test' })
+local rows = db:query('SELECT id FROM events WHERE stream >= ? ORDER BY stream LIMIT 10', { 5 })
+db:close()
+```
+
+See [the persistence documentation](docs/PERSISTENCE.md) for supported SQL,
+NULL binding, transaction semantics, range index limitations and the missing
+power-loss durability barrier.

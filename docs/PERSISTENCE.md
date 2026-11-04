@@ -155,3 +155,37 @@ posting lists are still entirely in memory, *not* a disk B-tree. There is no
 composite `(room_id, stream_id)` index yet, so a separate room equality predicate
 may still require filtering or sorting many rows. The implementation never
 claims to have fully evaluated a residual SQL WHERE condition that it did not.
+
+## Parameterized SQL mutations
+
+`db:exec(sql, params?) -> affectedRows` and `db:prepareExec(sql)` execute a
+**restricted, single-statement DML grammar** against the same native JSL
+transaction log. `tx:exec(sql, params?)` works inside an atomic batch.
+
+```luau
+local insert = db:prepareExec('INSERT INTO events (id, room_id, body) VALUES (?, ?, ?)')
+db:transaction(function(tx)
+  insert.inTransaction(tx, { '$1', '!room', 'hello' })
+  tx:exec('UPDATE events SET body = ? WHERE id = ?', { 'edited', '$1' })
+end)
+local changed = db:exec('DELETE FROM events WHERE id = ?', { '$1' })
+```
+
+Supported: explicit-column `INSERT INTO ... VALUES (...)`, `UPDATE ... SET
+column = literal_or_? [, ...] WHERE primary_key = literal_or_?`, and `DELETE
+FROM ... WHERE primary_key = literal_or_?`; literal strings, finite numeric
+literals, booleans, `NULL`, and positional `?` parameters. Optional trailing
+semicolon. `sql.NULL` is the explicit binding sentinel: Luau array holes are
+rejected rather than silently interpreted as NULL. DML returns an affected-row
+count, and prepared mutation plans reject schema changes or closed handles.
+
+Intentionally unsupported: `INSERT ... SELECT`, arbitrary expressions,
+`RETURNING`, `ON CONFLICT`, multi-row VALUES, partial WHERE expressions,
+UPDATE/DELETE without a primary-key equality, multiple SQL statements, and SQL
+DDL. Use the typed schema methods for DDL and the typed transaction methods
+for broader application logic. No SQL text is constructed from bound parameters.
+
+The restriction is intentional: we do not yet have statement-level predicate
+snapshots, row-level constraints, or multi-row mutation limits. A failed DML
+statement inside a transaction throws; if the caller does not catch it, the
+whole callback rolls back without appending the journal frame.

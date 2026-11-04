@@ -1,0 +1,33 @@
+--!strict
+-- Prepared DML versus parsing SQL in every call, with the same transaction shape.
+local sql = require('@jessql')
+local fs = require('@dream/fs')
+
+local total = tonumber((...)) or 5000
+local path = fs.join(assert(fs.cwd()), '.jessql-mutation-bench.wal')
+fs.remove(path)
+fs.remove(path .. '.lock')
+local db = sql.open(path)
+db:createTable('values', { 'id', 'value' }, 'id')
+db:transaction(function(tx)
+  for id = 1, total do tx:insert('values', { id = id, value = 0 }) end
+end)
+
+local Statement = 'UPDATE values SET value = ? WHERE id = ?'
+local started = os.clock()
+db:transaction(function(tx)
+  for id = 1, total do tx:exec(Statement, { id, id }) end
+end)
+local parsed = os.clock()
+local prepared = db:prepareExec(Statement)
+db:transaction(function(tx)
+  for id = 1, total do prepared.inTransaction(tx, { id * 2, id }) end
+end)
+local cached = os.clock()
+assert(db:query('SELECT COUNT(*) AS n FROM values').rows[1].n == total)
+assert(db:get('values', total).value == total * 2)
+print(string.format('updates_per_mode=%d parse_each_s=%.4f prepared_s=%.4f speedup=%.2fx',
+  total, parsed - started, cached - parsed, (parsed - started) / (cached - parsed)))
+db:close()
+fs.remove(path)
+fs.remove(path .. '.lock')
