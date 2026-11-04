@@ -55,6 +55,8 @@ arenas for unique strings, and lazily constructs row dictionaries on reads.
 The default remains `row`; both layouts reopen the **same WAL** without migration.
 The ordered AVL indexes now use 20-byte native-buffer node metadata instead of
 per-node Luau dictionaries for both resident layouts, with reusable node slots.
+Indexed scans can use allocation-free ordered key pairs, and packed rows share
+slot lookup with deleted-key history instead of keeping a second key hash map.
 See [compact ordered indexes](docs/PERSISTENCE.md#compact-ordered-indexes).
 See [packed resident columns](docs/PERSISTENCE.md#optional-packed-resident-columns-experimental)
 and [benchmarks](BENCHMARKS.md#experimental-packed-resident-columns--hypervectors-jess-030).

@@ -444,3 +444,25 @@ end-to-end indexed SQL workloads. Both must be evaluated together: the compact
 structure cuts RSS substantially, but isolated mutation-heavy index operations
 can be slower due to repeated buffer accesses. Refer to `BENCHMARKS.md` for
 measured tradeoffs rather than assuming a universal performance improvement.
+
+## Compact packed key history and allocation-free ordered scans
+
+The experimental `rowLayout = 'packed'` now shares its slot lookup and
+insertion-history tracking. An in-memory negative slot marker identifies a
+previously seen but currently deleted key; reads, writes, and `has()` reject
+that marker as absent. Reinsertion can safely reuse a free physical slot
+without duplicating the key in the table's insertion-order list. When that
+list is compacted, or a checkpoint is completed, obsolete key-history entries
+are removed. This reduces resident key maps, not the on-disk record size.
+
+Ordered AVL scans in persistent query providers use an allocation-free
+`iteratePairs(...)` cursor returning `(value, encodedKey)` without creating a
+small Luau node table for each value. The original `iterate(...)` function is
+still available for callers relying on its node-record return type. AVL
+rebalancing also reuses child heights computed for the subtree refresh.
+
+These optimizations require only the existing Luau buffer API. They preserve
+SQL semantics, journal compatibility and the existing single-writer contract;
+they do not introduce disk-backed paging, hardware durability, or a bounded
+RSS guarantee. See `BENCHMARKS.md` for both improvements and observed
+query-phase RSS/performance variance.

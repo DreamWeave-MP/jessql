@@ -1682,4 +1682,98 @@ suite.describe('compact ordered index nodes', function()
   end)
 end)
 
+
+suite.describe('low-allocation ordered and packed storage', function()
+  suite.it('streams ordered value/key pairs with exact legacy bounds and ordering', function()
+    local ordered = require('@jessql/ordered')
+    local empty = ordered.iteratePairs(nil, false, nil, false, nil, false)
+    local value, encoded = empty()
+    expect(value).toBe(nil)
+    expect(encoded).toBe(nil)
+
+    local tree = nil
+    for _, value in { -11, 0, 1, 4, 12, '0', 'a', 'z' } do
+      tree = ordered.insert(tree, value, 'k' .. tostring(value))
+    end
+
+    for _, options in {
+      { false, nil, false, nil, false },
+      { true, nil, false, nil, false },
+      { false, 0, true, 'z', true },
+      { true, -11, false, 12, false },
+      { false, '0', false, 'z', false },
+    } do
+      local descending = options[1] :: boolean
+      local lower = options[2] :: (number | string)?
+      local lowerStrict = options[3] :: boolean
+      local upper = options[4] :: (number | string)?
+      local upperStrict = options[5] :: boolean
+      local pairs = ordered.iteratePairs(tree, descending, lower, lowerStrict, upper, upperStrict)
+      local legacy = ordered.iterate(tree, descending, lower, lowerStrict, upper, upperStrict)
+      while true do
+        local actualValue, actualKey = pairs()
+        local old = legacy()
+        if not old then
+          expect(actualValue).toBe(nil)
+          expect(actualKey).toBe(nil)
+          break
+        end
+        expect(actualValue).toBe(old.value)
+        expect(actualKey).toBe(old.encoded)
+      end
+    end
+  end)
+
+  suite.it('reuses packed slot history without duplicating key order after churn', function()
+    local path = fixture('packed-slot-history')
+    local db = sql.open(path, { rowLayout = 'packed' })
+    db:createTable('entries', { 'id', 'group_id', 'name' }, 'id')
+    db:transaction(function(tx)
+      for id = 1, 180 do
+        tx:insert('entries', { id = id, group_id = id % 5, name = `value-{id}` })
+      end
+    end)
+    db:createOrderedIndex('entries', 'group_id')
+
+    -- Rows deleted and then reinserted before compaction must retain one
+    -- insertion-order slot, while their physical data slots can be recycled.
+    for cycle = 1, 7 do
+      db:transaction(function(tx)
+        for id = 1, 180 do
+          if id % 3 == cycle % 3 then
+            tx:delete('entries', id)
+            tx:insert('entries', { id = id, group_id = (id + cycle) % 5, name = `cycle-{cycle}` })
+          end
+        end
+      end)
+      expect(db:query('SELECT COUNT(*) AS n FROM entries').rows[1].n).toBe(180)
+      expect(db:stats().entries.keySlots).toBe(180)
+    end
+
+    -- Removal of most rows forces order and deleted-key history compaction.
+    db:transaction(function(tx)
+      for id = 1, 145 do tx:delete('entries', id) end
+    end)
+    expect(db:query('SELECT COUNT(*) AS n FROM entries').rows[1].n).toBe(35)
+    expect(db:stats().entries.keySlots <= 145).toBe(true)
+    db:transaction(function(tx)
+      for id = 1, 145 do
+        tx:insert('entries', { id = id, group_id = id % 5, name = `again-{id}` })
+      end
+    end)
+    expect(db:stats().entries.keySlots).toBe(180)
+    expect(db:query('SELECT COUNT(*) AS n FROM entries').rows[1].n).toBe(180)
+    expect(db:query('SELECT COUNT(*) AS n FROM entries WHERE group_id = 4').rows[1].n).toBe(36)
+
+    db:checkpoint()
+    db:close()
+    local reopened = sql.open(path, { rowLayout = 'packed' })
+    expect(reopened:stats().entries.keySlots).toBe(180)
+    expect(reopened:query('SELECT COUNT(*) AS n FROM entries').rows[1].n).toBe(180)
+    expect(reopened:get('entries', 17).name).toBe('again-17')
+    reopened:close()
+    clean(path)
+  end)
+end)
+
 return suite

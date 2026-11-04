@@ -389,3 +389,58 @@ jess run --trusted --package . bench/packed-rss.jsl packed 80000
 jess run --trusted --package . bench/packed-rss.jsl row 80000
 jess run --trusted --package . bench/ordered-slabs.jsl 80000
 ```
+
+## Ordered scan and packed key-map follow-up (Jess 0.3.0)
+
+The compact-AVL baseline (`58d1e3aaf3be45c8e4d60d5612b0badbe652eaa1`)
+was compared against this revision with an unchanged Jess 0.3.0 executable
+and identical data, using fresh processes in alternating baseline/revision order.
+The internal ordered iterator now yields `(value, encodedKey)` pairs instead of
+allocating a `{value, encoded}` table per visited distinct key. The old iterator
+remains supported as a wrapper for external callers. AVL rebalancing computes
+child heights once per node rather than reading them twice. The packed row
+slot map also records deleted-key history using an internal negative sentinel,
+removing the separate `seen` hash table without losing insertion-order identity.
+Deleted-key history is purged with order compaction and checkpoint cleanup.
+
+| 80,000 packed rows, three alternating runs each (median) | Baseline | Revised |
+|---|---:|---:|
+| RSS after inserts | 72,420 KiB | 64,204 KiB |
+| RSS after building four indexes | 112,968 KiB | 108,140 KiB |
+| Peak RSS after queries | 116,976 KiB | 120,128 KiB |
+| Total CPU, including inserts/index builds and queries | 2.583 s | 2.046 s |
+| 5,000 indexed equality SQL queries | 0.0322 s | 0.0842 s |
+| 800 bounded composite range SQL queries | 0.0403 s | 0.0313 s |
+
+**Interpretation:** resident storage after inserts fell 11.3%, and RSS after
+index construction fell 4.3%. Peak process RSS **did not consistently improve**;
+query-phase allocator and GC behavior produced overlapping ranges. Small CPU
+numbers are volatile on this shared host, and the point-query result in this
+batch is a regression; earlier alternating trials did not reproduce it. Do not
+infer an overall SQL throughput win without a quieter, controlled workload.
+All six runs returned checksum 49,295 and 16,000 range rows.
+
+A separate 80,000-key AVL benchmark, with five alternating runs per revision,
+reported these medians:
+
+| Isolated benchmark | Before | After |
+|---|---:|---:|
+| AVL construction | 0.2170 s | 0.1755 s |
+| 4,000 range counts | 0.0069 s | 0.0063 s |
+| Delete half, reinsert and iterate 80,000 keys | 0.2152 s | 0.1635 s |
+| Peak RSS | 47,768 KiB | 48,912 KiB |
+
+The original compact-node deletion slowdown is reduced here, without reverting
+to per-node Lua tables. Memory readings for this isolated benchmark are too
+close to separate from allocator noise.
+
+To isolate cursor allocation, `bench/ordered-pairs.jsl` walks 40,000 keys eight
+times using the allocating compatibility cursor and the new pair cursor.
+Five same-process runs reported a median of **0.0861 s vs 0.0442 s**,
+respectively, with checksum 6,400,160,000 for both. This measures the iterator
+itself, not end-to-end SQL performance.
+
+The new regression tests cover mixed number/string AVL bounds and ascending/
+descending parity, packed deleted-key history, reinsertion without duplicate
+order slots, index counts, compaction, checkpoint and reopen. Neither the WAL
+format nor the buffered-write durability contract changed.
