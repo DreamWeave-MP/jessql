@@ -1,0 +1,515 @@
+--!strict
+--!native
+-- Single-table hybrid: immutable cold pages + transactional WAL overlay.
+-- Only the WAL is mutable; cold rows are masked by durable-in-WAL tombstones.
+local engine = require('@jessql/engine')
+local storage = require('@jessql/storage')
+local paged = require('@jessql/paged')
+
+export type Row = { [string]: unknown }
+export type Options = { cachePages: number?, rowLayout: string? }
+export type Transaction = {
+  get: (self: Transaction, key: unknown) -> Row?,
+  insert: (self: Transaction, row: Row) -> (),
+  upsert: (self: Transaction, row: Row) -> (),
+  update: (self: Transaction, key: unknown, changes: Row) -> boolean,
+  delete: (self: Transaction, key: unknown) -> boolean,
+  query: (self: Transaction, sql: string, params: { unknown }?) -> engine.Result,
+}
+export type Database = {
+  get: (self: Database, key: unknown) -> Row?,
+  insert: (self: Database, row: Row) -> (),
+  upsert: (self: Database, row: Row) -> (),
+  update: (self: Database, key: unknown, changes: Row) -> boolean,
+  delete: (self: Database, key: unknown) -> boolean,
+  transaction: (self: Database, callback: (Transaction) -> ()) -> (),
+  query: (self: Database, sql: string, params: { unknown }?) -> engine.Result,
+  prepare: (self: Database, sql: string) -> engine.Plan,
+  stats: (self: Database) -> { coldRows: number, hotRows: number, tombstones: number, cachedPages: number },
+  exportSnapshot: (self: Database, path: string, options: paged.Options?) -> (),
+  close: (self: Database) -> (),
+}
+
+local Tombstones = '__jessql_hybrid_deleted'
+local Identity = '__jessql_hybrid_identity'
+local hybrid = {}
+
+-- Do not depend on JSON serialization of floating point keys for equality.
+-- The WAL uses the same 17-significant-digit number normalization.
+local function encodeKey(key: unknown): string
+  if key == nil then error('jessql hybrid: NULL primary key', 3) end
+  local kind = type(key)
+  if kind == 'string' then return 's' .. (key :: string) end
+  if kind == 'boolean' then return if key == true then 'b1' else 'b0' end
+
+  if kind ~= 'number' or key ~= key or math.abs(key :: number) == math.huge then
+    error('jessql hybrid: invalid primary key', 3)
+  end
+  local value = key :: number
+  if value == 0 then value = 0 end
+  return 'n' .. string.format('%.17g', value)
+end
+
+local function validTable(name: string): string
+  if type(name) ~= 'string' or not string.match(name, '^[%a_][%w_]*$') then
+    error('jessql hybrid: invalid table name', 3)
+  end
+  name = string.lower(name)
+  if name == Tombstones then error('jessql hybrid: reserved table name', 3) end
+  return name
+end
+
+local function selectAll(tableName: string): string
+  return 'SELECT * FROM ' .. tableName
+end
+
+local function sameColumns(left: { string }, right: { string }): boolean
+  if #left ~= #right then return false end
+
+  for index, column in left do
+    if column ~= right[index] then return false end
+  end
+  return true
+end
+
+local function keyLess(left: unknown, right: unknown): boolean
+  local leftType, rightType = type(left), type(right)
+  if leftType ~= rightType then
+    local ranks = { boolean = 1, number = 2, string = 3 }
+    return (ranks[leftType] or 9) < (ranks[rightType] or 9)
+  end
+
+  if leftType == 'boolean' then return left == false and right == true end
+  if leftType == 'number' then return (left :: number) < (right :: number) end
+  return (left :: string) < (right :: string)
+end
+
+local function provider(cold: paged.Snapshot, tableName: string, primaryKey: string,
+  hotGet: (string, unknown) -> Row?, hotQuery: (string) -> engine.Result): engine.Provider
+  local columns = cold.columns
+
+  local function get(key: unknown): Row?
+    local hotRow = hotGet(tableName, key)
+    if hotRow then return hotRow end
+    if hotGet(Tombstones, encodeKey(key)) then return nil end
+    return cold:get(key)
+  end
+
+  local function iterate(request: engine.Request): engine.Iterator
+    -- A key-equality seek only loads one cold page. All residual predicates
+    -- remain the SQL executor's responsibility.
+    for _, constraint in request.constraints do
+      if constraint.column ~= primaryKey or constraint.op ~= '=' then continue end
+      local key = constraint.value
+      local selected = if key == nil then nil else get(key)
+      local emitted = false
+      return {
+        _jessqlIter = 'v1',
+        next = function(): Row?
+          if emitted then return nil end
+          emitted = true
+          if not selected then return nil end
+          local result: Row = {}
+          for _, column in request.columns do result[column] = selected[column] end
+          return result
+        end,
+      }
+    end
+
+    -- Only hot data is gathered into memory. Cold records remain streaming,
+    -- with a bounded decoded-page cache. Hot keys mask their cold versions.
+    local hotRows = hotQuery(selectAll(tableName)).rows
+    local deletedRows = hotQuery('SELECT id FROM ' .. Tombstones).rows
+    local masked: { [string]: boolean } = {}
+    for _, row in hotRows do masked[encodeKey(row[primaryKey])] = true end
+    for _, row in deletedRows do masked[row.id :: string] = true end
+    local readColumns: { string } = {}
+    local hasPrimaryKey = false
+    for _, column in request.columns do
+      readColumns[#readColumns + 1] = column
+      if column == primaryKey then hasPrimaryKey = true end
+    end
+
+    if not hasPrimaryKey then readColumns[#readColumns + 1] = primaryKey end
+
+    local order = request.orderBy
+    local orderedRead = order ~= nil and #order == 1 and order[1].column == primaryKey
+      and (cold.keyKind == 'number' or cold.keyKind == 'string')
+    if orderedRead then
+      for _, row in hotRows do
+        if type(row[primaryKey]) ~= cold.keyKind then orderedRead = false; break end
+      end
+    end
+
+    if orderedRead then
+      local descending = (order :: { engine.Order })[1].desc
+      table.sort(hotRows, function(left, right)
+        if descending then return keyLess(right[primaryKey], left[primaryKey]) end
+        return keyLess(left[primaryKey], right[primaryKey])
+      end)
+      local lower: unknown = nil
+      local upper: unknown = nil
+      local lowerStrict, upperStrict = false, false
+      for _, constraint in request.constraints do
+        if constraint.column ~= primaryKey or type(constraint.value) ~= cold.keyKind then continue end
+        local value = constraint.value
+        if constraint.op == '>' or constraint.op == '>=' then
+          if lower == nil or keyLess(lower, value)
+            or (lower == value and constraint.op == '>') then
+            lower, lowerStrict = value, constraint.op == '>'
+          end
+        elseif constraint.op == '<' or constraint.op == '<=' then
+          if upper == nil or keyLess(value, upper)
+            or (upper == value and constraint.op == '<') then
+            upper, upperStrict = value, constraint.op == '<'
+          end
+        end
+      end
+      local nextCold = cold:iterateRows(readColumns, descending, lower, upper, lowerStrict, upperStrict)
+      local coldRow = nextCold()
+      local hotIndex = 1
+
+      local function nextMerged(): Row?
+        while coldRow ~= nil do
+          local current = coldRow :: Row
+          if not masked[encodeKey(current[primaryKey])] then break end
+          coldRow = nextCold()
+        end
+        local hotRow = hotRows[hotIndex]
+        if not hotRow and not coldRow then return nil end
+        local selectHot = not coldRow or (hotRow ~= nil and
+          (if descending then keyLess(coldRow[primaryKey], hotRow[primaryKey])
+            else keyLess(hotRow[primaryKey], coldRow[primaryKey])))
+        local selected: Row
+        if selectHot then
+          selected = hotRow :: Row
+          hotIndex += 1
+        else
+          selected = coldRow :: Row
+          coldRow = nextCold()
+        end
+        local result: Row = {}
+        for _, column in request.columns do result[column] = selected[column] end
+        return result
+      end
+
+      return { _jessqlIter = 'v1', ordered = true, next = nextMerged }
+    end
+
+    local cursor = 0
+    local nextCold = cold:iterateRows(readColumns)
+    return {
+      _jessqlIter = 'v1',
+      next = function(): Row?
+        cursor += 1
+        if cursor <= #hotRows then
+          local result: Row = {}
+          for _, column in request.columns do result[column] = hotRows[cursor][column] end
+          return result
+        end
+
+        while true do
+          local row = nextCold()
+          if not row then return nil end
+
+          if not masked[encodeKey(row[primaryKey])] then
+            local result: Row = {}
+            for _, column in request.columns do result[column] = row[column] end
+            return result
+          end
+        end
+      end,
+    }
+
+  end
+
+  return {
+    columns = columns,
+    indexes = { [primaryKey] = true },
+    scan = function(request)
+      local rows: { engine.SourceRow } = {}
+      local nextRow = iterate(request).next
+      while true do
+        local row = nextRow()
+        if not row then break end
+        rows[#rows + 1] = row
+      end
+      return rows
+    end,
+    iterate = iterate,
+    lookup = function(column, key, request)
+      if column ~= primaryKey then return nil end
+      local found = if key == nil then nil else get(key)
+      if not found then return {} end
+      local row: Row = {}
+      for _, name in request.columns do row[name] = found[name] end
+      return { row }
+    end,
+  }
+end
+
+-- Opens an existing immutable snapshot plus a private mutable WAL.
+-- The snapshot is never modified or deleted by this API.
+function hybrid.open(walPath: string, snapshotPath: string, tableName: string, options: Options?): Database
+  local name = validTable(tableName)
+  local cold = paged.open(snapshotPath, { cachePages = if options then options.cachePages else nil })
+  local hot: storage.Store? = nil
+  -- If the WAL is locked or invalid, close the cold reader before propagating.
+  local ok, failure = pcall(function()
+    hot = storage.open(walPath, { rowLayout = if options then options.rowLayout else 'packed' })
+  end)
+
+  if not ok then cold:close(); error(failure, 2) end
+  local store = hot :: storage.Store
+  local closed = false
+
+  local function ready()
+    if closed then error('jessql hybrid: database closed', 3) end
+  end
+
+  -- Initialization may fail after creating one of the internal WAL tables.
+  -- Always release the lock and cold handle before reporting the error.
+  local initialized, initFailure = pcall(function()
+    local existing: { [string]: { string } } = {}
+    for _, info in store:tables() do existing[info.name] = info.columns end
+
+    if existing[name] and not sameColumns(existing[name], cold.columns) then
+      error('jessql hybrid: WAL schema does not match snapshot')
+    end
+
+    if existing[name] then
+      local primaryKey = ''
+      store:transaction(function(tx)
+        primaryKey = tx:primaryKey(name)
+      end)
+
+      if primaryKey ~= cold.primaryKey then error('jessql hybrid: WAL primary key mismatch') end
+    end
+
+    if existing[Tombstones] and not sameColumns(existing[Tombstones], { 'id' }) then
+      error('jessql hybrid: incompatible tombstone schema')
+    end
+
+    if existing[Identity] and not sameColumns(existing[Identity], { 'id', 'token', 'name' }) then
+      error('jessql hybrid: incompatible identity schema')
+    end
+
+    if not existing[name] then store:createTable(name, cold.columns, cold.primaryKey) end
+    if not existing[Tombstones] then store:createTable(Tombstones, { 'id' }, 'id') end
+    if not existing[Identity] then store:createTable(Identity, { 'id', 'token', 'name' }, 'id') end
+
+    local binding = store:get(Identity, 'snapshot')
+    if binding then
+      if binding.token ~= cold.identity or binding.name ~= name then
+        error('jessql hybrid: snapshot identity mismatch; refuse to replay overlay')
+      end
+    else
+      store:insert(Identity, { id = 'snapshot', token = cold.identity, name = name })
+    end
+  end)
+
+  if not initialized then
+    -- Cleanup must not hide the original initialization error.
+    pcall(function() store:close() end)
+    cold:close()
+    error(initFailure, 2)
+  end
+  local activeTransaction = false
+
+  local function apply(callback: (storage.Transaction) -> ())
+    ready()
+    store:transaction(callback)
+  end
+
+  local function newView(getter: (string, unknown) -> Row?, query: (string) -> engine.Result): engine.Database
+    local view = engine.new()
+    view:register(name, provider(cold, name, cold.primaryKey, getter, query))
+    return view
+  end
+
+  local view = newView(function(table, key) return store:get(table, key) end,
+    function(sql) return store:query(sql) end)
+  local db = {} :: Database
+
+  function db.get(_self: Database, key: unknown): Row?
+    ready()
+    local row = store:get(name, key)
+    if row then return row end
+    if store:get(Tombstones, encodeKey(key)) then return nil end
+    return cold:get(key)
+  end
+
+  function db.query(_self: Database, sql: string, params: { unknown }?): engine.Result
+    ready()
+    return view:query(sql, params)
+  end
+
+  function db.prepare(_self: Database, sql: string): engine.Plan
+    ready()
+    local plan = view:prepare(sql)
+    local run, explain = plan.run, plan.explain
+    function plan.run(params)
+      ready()
+      return run(params)
+    end
+
+    function plan.explain()
+      ready()
+      return explain()
+    end
+    return plan
+  end
+
+  function db.transaction(_self: Database, callback: (Transaction) -> ())
+    ready()
+    if activeTransaction then error('jessql hybrid: nested transaction', 2) end
+    activeTransaction = true
+    -- A callback can throw; the underlying store discards staged WAL mutations.
+    local succeeded, failure = pcall(function()
+      apply(function(tx)
+      local transaction = {} :: Transaction
+      local txView = newView(function(table, key) return tx:get(table, key) end,
+        function(sql) return tx:query(sql) end)
+      local plans: { [string]: engine.Plan } = {}
+
+      local function get(key: unknown): Row?
+        local row = tx:get(name, key)
+        if row then return row end
+        if tx:get(Tombstones, encodeKey(key)) then return nil end
+        return cold:get(key)
+      end
+
+      function transaction.get(_self: Transaction, key: unknown): Row?
+        return get(key)
+      end
+
+      function transaction.upsert(_self: Transaction, row: Row)
+        local key = row[cold.primaryKey]
+        encodeKey(key)
+        tx:upsert(name, row)
+        tx:delete(Tombstones, encodeKey(key))
+      end
+
+      function transaction.insert(self: Transaction, row: Row)
+        if get(row[cold.primaryKey]) then error('jessql hybrid: duplicate primary key', 2) end
+        self:upsert(row)
+      end
+
+      function transaction.update(self: Transaction, key: unknown, changes: Row): boolean
+        local original = get(key)
+        if not original then return false end
+        local updated: Row = {}
+        for column, value in original do updated[column] = value end
+
+        for column, value in changes do
+          if column == cold.primaryKey then
+            if value ~= key then error('jessql hybrid: primary key cannot change', 2) end
+          else
+            updated[column] = value
+          end
+        end
+        self:upsert(updated)
+        return true
+      end
+
+      function transaction.delete(_self: Transaction, key: unknown): boolean
+        if not get(key) then return false end
+        tx:delete(name, key)
+        if cold:get(key) then tx:upsert(Tombstones, { id = encodeKey(key) }) end
+        return true
+      end
+
+      function transaction.query(_self: Transaction, sql: string, params: { unknown }?): engine.Result
+        local plan = plans[sql]
+        if not plan then
+          plan = txView:prepare(sql)
+          plans[sql] = plan
+        end
+        return plan.run(params)
+      end
+
+      callback(transaction)
+      end)
+    end)
+    activeTransaction = false
+    if not succeeded then error(failure, 2) end
+  end
+
+  function db.insert(self: Database, row: Row)
+    self:transaction(function(tx) tx:insert(row) end)
+  end
+
+  function db.upsert(self: Database, row: Row)
+    self:transaction(function(tx) tx:upsert(row) end)
+  end
+
+  function db.update(self: Database, key: unknown, changes: Row): boolean
+    local changed = false
+    self:transaction(function(tx) changed = tx:update(key, changes) end)
+    return changed
+  end
+
+  function db.delete(self: Database, key: unknown): boolean
+    local deleted = false
+    self:transaction(function(tx) deleted = tx:delete(key) end)
+    return deleted
+  end
+
+  function db.stats(_self: Database)
+    ready()
+    return { coldRows = cold.count,
+      hotRows = store:query('SELECT COUNT(*) AS n FROM ' .. name).rows[1].n :: number,
+      tombstones = store:query('SELECT COUNT(*) AS n FROM ' .. Tombstones).rows[1].n :: number,
+      cachedPages = cold:stats().cachedPages }
+  end
+
+
+  function db.exportSnapshot(_self: Database, path: string, options: paged.Options?)
+    ready()
+    if activeTransaction then error('jessql hybrid: cannot export inside transaction', 2) end
+    -- Hot rows and tombstones are bounded by the overlay, not by cold size.
+    -- No namespace publication or WAL retirement is attempted here.
+    local hotRows = store:query(selectAll(name)).rows
+    local removed = store:query('SELECT id FROM ' .. Tombstones).rows
+    local masked: { [string]: boolean } = {}
+    for _, row in hotRows do masked[encodeKey(row[cold.primaryKey])] = true end
+    for _, row in removed do masked[row.id :: string] = true end
+
+
+    table.sort(hotRows, function(left, right)
+      return keyLess(left[cold.primaryKey], right[cold.primaryKey])
+    end)
+    local nextCold = cold:iterateRows()
+    local nextColdRow = nextCold()
+    local hotIndex = 1
+    local function nextRow(): Row?
+      while nextColdRow ~= nil do
+        local current = nextColdRow :: Row
+        if not masked[encodeKey(current[cold.primaryKey])] then break end
+        nextColdRow = nextCold()
+      end
+      local hotRow = hotRows[hotIndex]
+      if not hotRow and not nextColdRow then return nil end
+
+      if not nextColdRow or (hotRow and keyLess(hotRow[cold.primaryKey], nextColdRow[cold.primaryKey])) then
+        hotIndex += 1
+        return hotRow
+      end
+      local row = nextColdRow
+      nextColdRow = nextCold()
+      return row
+    end
+    paged.create(path, cold.columns, cold.primaryKey, nextRow, options)
+  end
+
+  function db.close(_self: Database)
+    if closed then return end
+    if activeTransaction then error('jessql hybrid: cannot close during transaction', 2) end
+    closed = true
+    store:close()
+    cold:close()
+  end
+  return db
+end
+
+return hybrid

@@ -1000,8 +1000,12 @@ local function buildTransaction(state: DatabaseState)
     local schema = findSchema(name)
     if not schema.allowed[column] then error('jessql storage: no such column', 2) end
     local current = state.tables[name]
-    if column == schema.primaryKey or (current and current.available[column])
-      or (indexed[name] and indexed[name][column]) then
+    -- Equality on the primary key is already indexed, but a separate AVL
+    -- index is useful for ordered keyset pagination. Do not duplicate it.
+    local existing = if column == schema.primaryKey then
+      not makeOrdered or (current ~= nil and current.secondary[column] ~= nil)
+      else current ~= nil and current.available[column] == true
+    if existing or (indexed[name] and indexed[name][column]) then
       error('jessql storage: index already exists', 2)
     end
 

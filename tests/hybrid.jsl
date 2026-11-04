@@ -1,0 +1,225 @@
+--!strict
+local sql = require('@jessql')
+local fs = require('@dream/fs')
+local test = require('@jess/test')
+local expect = test.expect
+local suite = test.new()
+
+local function fixture(name: string): (string, string)
+  local base = fs.join(assert(fs.cwd()), '.jessql-hybrid-' .. name)
+  fs.remove(base .. '.cold')
+  fs.remove(base .. '.wal')
+  fs.remove(base .. '.wal.lock')
+  return base .. '.cold', base .. '.wal'
+end
+
+local function clear(cold: string, wal: string)
+  fs.remove(cold)
+  fs.remove(wal)
+  fs.remove(wal .. '.lock')
+end
+
+local function snapshot(path: string, count: number)
+  local index = 0
+  sql.paged.create(path, { 'id', 'room', 'body' }, 'id', function()
+    index += 1
+    if index > count then return nil end
+    return { id = index, room = if index % 2 == 0 then 'a' else 'b', body = 'old-' .. tostring(index) }
+  end, { pageBytes = 1024 })
+end
+
+suite.describe('hybrid WAL overlay with immutable cold pages', function()
+  suite.it('merges hot insert/update/delete with cold data without double counting', function()
+    local cold, wal = fixture('merge')
+    snapshot(cold, 300)
+    local db = sql.hybrid.open(wal, cold, 'events', { cachePages = 2 })
+    expect(db:query('SELECT COUNT(*) AS n FROM events').rows[1].n).toBe(300)
+    expect(db:get(40).body).toBe('old-40')
+    db:upsert({ id = 40, room = 'c', body = 'replacement' })
+    db:insert({ id = 301, room = 'c', body = 'new' })
+    expect(db:delete(20)).toBe(true)
+    expect(db:delete(20)).toBe(false)
+    expect(db:get(20)).toBe(nil)
+    expect(db:get(40).body).toBe('replacement')
+    expect(db:query('SELECT COUNT(*) AS n FROM events').rows[1].n).toBe(300)
+    expect(db:query('SELECT COUNT(*) AS n FROM events WHERE room = ?', { 'c' }).rows[1].n).toBe(2)
+    expect(db:query('SELECT body FROM events WHERE id = ?', { 40 }).rows[1].body).toBe('replacement')
+    expect(db:query('SELECT id FROM events ORDER BY id LIMIT 3').rows[1].id).toBe(1)
+    expect(db:query('SELECT id FROM events ORDER BY id DESC LIMIT 3').rows[1].id).toBe(301)
+    expect(db:query('SELECT id FROM events WHERE id >= ? ORDER BY id LIMIT 3', { 298 }).rows[1].id).toBe(298)
+    expect(db:query('SELECT id FROM events WHERE id <= ? ORDER BY id DESC LIMIT 3', { 3 }).rows[1].id).toBe(3)
+    expect(db:stats().cachedPages <= 2).toBe(true)
+    db:close()
+
+    local reopened = sql.hybrid.open(wal, cold, 'events')
+    expect(reopened:get(20)).toBe(nil)
+    expect(reopened:get(40).body).toBe('replacement')
+    expect(reopened:get(301).body).toBe('new')
+    expect(reopened:query('SELECT COUNT(*) AS n FROM events').rows[1].n).toBe(300)
+    reopened:close()
+    clear(cold, wal)
+  end)
+
+  suite.it('preserves staged read-your-writes and atomic rollback across tiers', function()
+    local cold, wal = fixture('transaction')
+    snapshot(cold, 30)
+    local db = sql.hybrid.open(wal, cold, 'events')
+    db:transaction(function(tx)
+      tx:upsert({ id = 8, room = 'a', body = 'modified' })
+      expect(tx:get(8).body).toBe('modified')
+      expect(tx:query('SELECT body FROM events WHERE id = ?', { 8 }).rows[1].body).toBe('modified')
+      expect(tx:delete(1)).toBe(true)
+      expect(tx:query('SELECT COUNT(*) AS n FROM events').rows[1].n).toBe(29)
+      tx:insert({ id = 45, room = 'c', body = 'new' })
+      expect(tx:query('SELECT COUNT(*) AS n FROM events').rows[1].n).toBe(30)
+      expect(tx:update(45, { body = 'updated' })).toBe(true)
+      expect(tx:get(45).body).toBe('updated')
+    end)
+    expect(db:get(1)).toBe(nil)
+    expect(db:get(45).body).toBe('updated')
+
+    -- A callback failure must roll back both tombstones and replacement rows.
+    local ok = pcall(function()
+      db:transaction(function(tx)
+        tx:delete(8)
+        tx:upsert({ id = 99, room = 'a', body = 'no' })
+        error('abort')
+      end)
+    end)
+    expect(ok).toBe(false)
+    expect(db:get(8).body).toBe('modified')
+    expect(db:get(99)).toBe(nil)
+    db:close()
+    clear(cold, wal)
+  end)
+
+  suite.it('enforces uniqueness across tiers and supports delete-then-reinsert', function()
+    local cold, wal = fixture('unique')
+    snapshot(cold, 5)
+    local db = sql.hybrid.open(wal, cold, 'events')
+    -- Cold keys are still subject to the primary-key constraint.
+    expect(pcall(function() db:insert({ id = 2, room = 'x', body = 'bad' }) end)).toBe(false)
+    expect(db:get(2).body).toBe('old-2')
+    db:delete(2)
+    db:insert({ id = 2, room = 'x', body = 'reinserted' })
+    expect(db:query('SELECT COUNT(*) AS n FROM events').rows[1].n).toBe(5)
+    expect(db:get(2).body).toBe('reinserted')
+    db:close()
+    clear(cold, wal)
+  end)
+
+  suite.it('matches a reference model through deterministic cold/hot churn', function()
+    local cold, wal = fixture('model')
+    snapshot(cold, 100)
+    local expected: { [number]: string } = {}
+    for index = 1, 100 do expected[index] = 'old-' .. tostring(index) end
+    local db = sql.hybrid.open(wal, cold, 'events', { cachePages = 2 })
+    for step = 1, 120 do
+      local key = ((step * 37) % 140) + 1
+      if step % 3 == 0 then
+        db:delete(key)
+        expected[key] = nil
+      else
+        local body = 'new-' .. tostring(step)
+        db:upsert({ id = key, room = 'changed', body = body })
+        expected[key] = body
+      end
+
+      if step % 10 == 0 then
+        local rows = db:query('SELECT id, body FROM events ORDER BY id').rows
+        local sorted: { number } = {}
+        for id in expected do sorted[#sorted + 1] = id end
+        table.sort(sorted)
+        expect(#rows).toBe(#sorted)
+        for index, id in sorted do
+          expect(rows[index].id).toBe(id)
+          expect(rows[index].body).toBe(expected[id])
+        end
+      end
+    end
+    db:close()
+    local reopened = sql.hybrid.open(wal, cold, 'events')
+    local count = 0
+    for _ in expected do count += 1 end
+    expect(reopened:query('SELECT COUNT(*) AS n FROM events').rows[1].n).toBe(count)
+    reopened:close()
+    clear(cold, wal)
+  end)
+
+  suite.it('exports an exact new snapshot and refuses wrong snapshot replay', function()
+    local cold, wal = fixture('export')
+    snapshot(cold, 50)
+    local db = sql.hybrid.open(wal, cold, 'events')
+    db:delete(2)
+    db:upsert({ id = 9, room = 'new', body = 'changed' })
+    db:insert({ id = 90, room = 'new', body = 'inserted' })
+    local exported = cold .. '.export'
+    fs.remove(exported)
+    db:exportSnapshot(exported, { pageBytes = 1024 })
+    local archive = sql.paged.open(exported)
+    expect(archive.count).toBe(50)
+    expect(archive:get(2)).toBe(nil)
+    expect(archive:get(9).body).toBe('changed')
+    expect(archive:get(90).body).toBe('inserted')
+    archive:close()
+    db:close()
+
+    -- An old WAL cannot be rebound to the newly exported snapshot.
+    expect(pcall(function() sql.hybrid.open(wal, exported, 'events') end)).toBe(false)
+    local freshWal = wal .. '.new'
+    fs.remove(freshWal)
+    fs.remove(freshWal .. '.lock')
+    local fresh = sql.hybrid.open(freshWal, exported, 'events')
+    expect(fresh:query('SELECT COUNT(*) AS n FROM events').rows[1].n).toBe(50)
+    expect(fresh:get(9).body).toBe('changed')
+    fresh:close()
+    fs.remove(freshWal)
+    fs.remove(freshWal .. '.lock')
+    fs.remove(exported)
+    clear(cold, wal)
+  end)
+
+  suite.it('indexes the resident primary key for ordered keyset pagination', function()
+    local cold, wal = fixture('resident-key')
+    local resident = sql.open(wal, { rowLayout = 'packed' })
+    resident:createTable('events', { 'id', 'room' }, 'id')
+    resident:createOrderedIndex('events', 'id')
+    for index = 1, 40 do resident:insert('events', { id = index, room = 'a' }) end
+    expect(resident:query('SELECT id FROM events WHERE id > ? ORDER BY id LIMIT 3', { 35 }).rows[1].id).toBe(36)
+    resident:delete('events', 37)
+    expect(#resident:query('SELECT id FROM events WHERE id >= 36 ORDER BY id LIMIT 3').rows).toBe(3)
+    resident:checkpoint()
+    resident:close()
+    local reopened = sql.open(wal, { rowLayout = 'packed' })
+    expect(reopened:query('SELECT id FROM events ORDER BY id DESC LIMIT 1').rows[1].id).toBe(40)
+    reopened:close()
+    clear(cold, wal)
+  end)
+
+  suite.it('rejects WAL tables with the same columns but a different primary key', function()
+    local cold, wal = fixture('primary-key')
+    snapshot(cold, 4)
+    local existing = sql.open(wal)
+    existing:createTable('events', { 'id', 'room', 'body' }, 'room')
+    existing:close()
+    -- A same-column but differently keyed WAL is not a compatible overlay.
+    expect(pcall(function() sql.hybrid.open(wal, cold, 'events') end)).toBe(false)
+    local released = sql.open(wal)
+    released:close()
+    clear(cold, wal)
+  end)
+
+  suite.it('rejects schema mismatches without leaving the WAL lock held', function()
+    local cold, wal = fixture('schema')
+    snapshot(cold, 3)
+    local incompatible = sql.open(wal)
+    incompatible:createTable('events', { 'id', 'other' }, 'id')
+    incompatible:close()
+    -- Schema mismatch must not leak the exclusive WAL lock.
+    expect(pcall(function() sql.hybrid.open(wal, cold, 'events') end)).toBe(false)
+    local recovered = sql.open(wal)
+    recovered:close()
+    clear(cold, wal)
+  end)
+end)
+return suite
