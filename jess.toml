@@ -13,7 +13,8 @@ tests = ["tests/run.jsl", "tests/semantics.jsl", "tests/style.jsl", "tests/stora
 "@jessql/parser" = "src/parser.jsl"
 "@jessql/engine" = "src/engine.jsl"
 "@jessql/storage" = "src/storage.jsl"
+"@jessql/ordered" = "src/ordered.jsl"
 
 [[layer]]
 id = "jessql.core"
-exports = ["@jessql", "@jessql/lexer", "@jessql/parser", "@jessql/engine", "@jessql/storage"]
+exports = ["@jessql", "@jessql/lexer", "@jessql/parser", "@jessql/engine", "@jessql/storage", "@jessql/ordered"]

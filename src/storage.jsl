@@ -7,12 +7,14 @@ local fs = require('@dream/fs')
 local bytes = require('@dream/bytes')
 local json = require('@jess/json')
 local queryEngine = require('@jessql/engine')
+local ordered = require('@jessql/ordered')
 
 export type Row = { [string]: unknown }
 export type Options = { maxFrameBytes: number?, recoverTail: boolean? }
 export type Store = {
   createTable: (self: Store, name: string, columns: { string }, primaryKey: string) -> (),
   createIndex: (self: Store, name: string, column: string) -> (),
+  createOrderedIndex: (self: Store, name: string, column: string) -> (),
   addColumn: (self: Store, name: string, column: string) -> (),
   update: (self: Store, name: string, key: unknown, changes: Row, unset: { string }?) -> boolean,
   insert: (self: Store, name: string, row: Row) -> (),
@@ -31,6 +33,7 @@ export type TableMetrics = { rows: number, keySlots: number, indexSlots: { [stri
 export type Transaction = {
   createTable: (self: Transaction, name: string, columns: { string }, primaryKey: string) -> (),
   createIndex: (self: Transaction, name: string, column: string) -> (),
+  createOrderedIndex: (self: Transaction, name: string, column: string) -> (),
   addColumn: (self: Transaction, name: string, column: string) -> (),
   update: (self: Transaction, name: string, key: unknown, changes: Row, unset: { string }?) -> boolean,
   insert: (self: Transaction, name: string, row: Row) -> (),
@@ -41,7 +44,10 @@ export type Transaction = {
 
 type Schema = { columns: { string }, primaryKey: string, allowed: { [string]: boolean } }
 type Bucket = { keys: { string }, seen: { [string]: boolean }, live: { [string]: boolean }, count: number }
-type Index = { buckets: { [string]: Bucket } }
+type Index = {
+  buckets: { [string]: Bucket }, ordered: boolean?, tree: ordered.Tree?,
+  types: { [string]: number }?, nulls: Bucket?,
+}
 type TableState = {
   schema: Schema,
   rows: { [string]: Row },
@@ -51,7 +57,7 @@ type TableState = {
   secondary: { [string]: Index },
   available: { [string]: boolean },
 }
-type Operation = { kind: string, table: string, columns: { string }?, primaryKey: string?, column: string?, row: Row?, key: unknown }
+type Operation = { kind: string, table: string, columns: { string }?, primaryKey: string?, column: string?, ordered: boolean?, row: Row?, key: unknown }
 type Pending = { [string]: { [string]: Row | boolean } }
 type DatabaseState = {
   path: string,
@@ -170,38 +176,184 @@ local function compactOrder(current: TableState)
 end
 
 local function indexSet(index: Index, value: unknown, key: string, present: boolean)
-  if value == nil then return end
-  local encoded = keyOf(value)
-  local bucket = index.buckets[encoded]
+  if value == nil and not index.ordered then return end
+  local encoded = if value ~= nil then keyOf(value) else ''
+  local bucket = if value == nil then index.nulls else index.buckets[encoded]
   if not bucket then
     if not present then return end
     bucket = { keys = {}, seen = {}, live = {}, count = 0 }
-    index.buckets[encoded] = bucket
+    if value == nil then index.nulls = bucket else index.buckets[encoded] = bucket end
   end
 
   if present then
-    if bucket.live[key] then return end
+    local entry = bucket :: Bucket
+    if entry.live[key] then return end
 
-    if not bucket.seen[key] then
-      bucket.seen[key] = true
-      bucket.keys[#bucket.keys + 1] = key
+    if entry.count == 0 and index.ordered and value ~= nil then
+      local kind = type(value)
+      local kinds = index.types :: { [string]: number }
+      kinds[kind] = (kinds[kind] or 0) + 1
+      if kind == 'number' or kind == 'string' then
+        index.tree = ordered.insert(index.tree, value :: string | number, encoded)
+      end
     end
-    bucket.live[key] = true
-    bucket.count += 1
-  elseif bucket.live[key] then
-    bucket.live[key] = nil
-    bucket.count -= 1
-    compactBucket(index, encoded, bucket)
+
+    if not entry.seen[key] then
+      entry.seen[key] = true
+      entry.keys[#entry.keys + 1] = key
+    end
+
+    entry.live[key] = true
+    entry.count += 1
+  elseif bucket and bucket.live[key] then
+    local entry = bucket :: Bucket
+    entry.live[key] = nil
+    entry.count -= 1
+    if entry.count == 0 and index.ordered and value ~= nil then
+      local kind = type(value)
+      local kinds = index.types :: { [string]: number }
+      kinds[kind] -= 1
+      if kind == 'number' or kind == 'string' then
+        index.tree = ordered.remove(index.tree, value :: string | number)
+      end
+    end
+
+    if value ~= nil then compactBucket(index, encoded, entry) end
+
+    if entry.count == 0 and value == nil then index.nulls = nil end
   end
+end
+
+-- Only let the ordered provider claim SQL sorting if *all* non-NULL entries
+-- have one comparable type. Otherwise the SQL engine retains its own semantics.
+local function orderType(index: Index): string?
+  local kinds = index.types
+  if not kinds then return nil end
+  if (kinds.boolean or 0) > 0 then return nil end
+
+  if (kinds.number or 0) > 0 then
+    return if (kinds.string or 0) == 0 then 'number' else nil
+  end
+
+  if (kinds.string or 0) > 0 then return 'string' end
+  return 'empty'
+end
+
+-- An ordered index can supply a direct range cursor for simple predicates.
+-- Never claim that a partial WHERE has been evaluated: JessQL handles it.
+local function orderedCursor(current: TableState, request: queryEngine.Request): queryEngine.Iterator?
+  local order = request.orderBy
+  local column: string? = nil
+  local descending = false
+  if order and #order == 1 then
+    column, descending = order[1].column, order[1].desc
+  elseif not order then
+    for _, constraint in request.constraints do
+      if constraint.op == '<' or constraint.op == '<=' or constraint.op == '>' or constraint.op == '>=' then
+        local index = current.secondary[constraint.column]
+        if index and index.ordered then column = constraint.column; break end
+      end
+    end
+  end
+
+  if not column then return nil end
+  local index = current.secondary[column]
+  if not index or not index.ordered then return nil end
+
+  local kind = orderType(index)
+  if not kind then return nil end
+  local lower: (string | number)? = nil
+  local upper: (string | number)? = nil
+  local lowerStrict, upperStrict = false, false
+  local hasRange = false
+  for _, constraint in request.constraints do
+    if constraint.column ~= column then continue end
+    local op, value = constraint.op, constraint.value
+    if op ~= '<' and op ~= '<=' and op ~= '>' and op ~= '>=' then continue end
+
+    if value == nil or (kind ~= 'empty' and type(value) ~= kind)
+      or (type(value) ~= 'string' and type(value) ~= 'number') then
+      return nil -- retain errors/null semantics in the SQL executor
+    end
+    local bound = value :: string | number
+    if op == '>' or op == '>=' then
+      if not lower or ordered.compare(bound, lower) > 0 or (bound == lower and op == '>') then
+        lower, lowerStrict = bound, op == '>'
+      end
+    else
+      if not upper or ordered.compare(bound, upper) < 0 or (bound == upper and op == '<') then
+        upper, upperStrict = bound, op == '<'
+      end
+    end
+
+    hasRange = true
+  end
+
+  if not order and not hasRange then return nil end
+
+  local advance = ordered.iterate(index.tree, descending, lower, lowerStrict, upper, upperStrict)
+  local nullBucket = index.nulls
+  local nullPosition = 0
+  local posting: Bucket? = nil
+  local postingPosition = 0
+  local finished = false
+  local function nextNull(): queryEngine.SourceRow?
+    if not nullBucket then return nil end
+
+    while nullPosition < #nullBucket.keys do
+      nullPosition += 1
+      local key = nullBucket.keys[nullPosition]
+      if nullBucket.live[key] then
+        local row = current.rows[key]
+        if row then return row end
+      end
+    end
+
+    return nil
+  end
+
+  return {
+    _jessqlIter = 'v1', ordered = order ~= nil,
+    next = function(): queryEngine.SourceRow?
+      if order and not hasRange and not descending and not finished then
+        local row = nextNull()
+        if row then return row end
+
+        finished = true
+      end
+
+      while true do
+        if posting then
+          while postingPosition < #(posting :: Bucket).keys do
+            postingPosition += 1
+            local key = (posting :: Bucket).keys[postingPosition]
+            if (posting :: Bucket).live[key] then
+              local row = current.rows[key]
+              if row then return row end
+            end
+          end
+        end
+
+        local node = advance()
+        if not node then break end
+
+        posting = index.buckets[node.encoded]
+        postingPosition = 0
+      end
+
+      if order and not hasRange and descending then return nextNull() end
+      return nil
+    end,
+  }
 end
 
 local function updateIndexes(current: TableState, key: string, before: Row?, after: Row?)
   for column, index in current.secondary do
     local oldValue = if before then before[column] else nil
     local newValue = if after then after[column] else nil
-    if oldValue ~= newValue then
-      indexSet(index, oldValue, key, false)
-      indexSet(index, newValue, key, true)
+    if oldValue ~= newValue or (index.ordered and (not before or not after)) then
+      if before then indexSet(index, oldValue, key, false) end
+      if after then indexSet(index, newValue, key, true) end
     end
   end
 end
@@ -293,6 +445,8 @@ local function tableProvider(state: DatabaseState, name: string): queryEngine.Pr
     end,
     iterate = function(request)
       local tableState = state.tables[name] :: TableState
+      local sorted = orderedCursor(tableState, request)
+      if sorted then return sorted end
       local keys, live = indexedKeys(tableState, request)
       local cursor = 0
       local iterator: queryEngine.Iterator = {
@@ -344,6 +498,7 @@ local function apply(state: DatabaseState, operations: { Operation })
         schema = schema, rows = {}, order = {}, seen = {}, count = 0,
         secondary = {}, available = { [schema.primaryKey] = true },
       }
+
       state.engine:register(name, tableProvider(state, name))
     elseif operation.kind == 'addcol' then
       local current = state.tables[name] :: TableState
@@ -353,7 +508,9 @@ local function apply(state: DatabaseState, operations: { Operation })
     elseif operation.kind == 'index' then
       local current = state.tables[name] :: TableState
       local column = operation.column :: string
-      local index: Index = { buckets = {} }
+      local index: Index = { buckets = {}, ordered = operation.ordered == true,
+        types = if operation.ordered == true then {} else nil }
+
       for _, key in current.order do
         local row = current.rows[key]
         if row then indexSet(index, row[column], key, true) end
@@ -445,7 +602,7 @@ local function buildTransaction(state: DatabaseState)
     end
   end
 
-  function transaction.createIndex(_self: Transaction, name: string, column: string)
+  local function index(name: string, column: string, makeOrdered: boolean)
     writable()
     name = requireName(name)
     column = requireName(column)
@@ -459,7 +616,15 @@ local function buildTransaction(state: DatabaseState)
 
     if not indexed[name] then indexed[name] = {} end
     indexed[name][column] = true
-    operations[#operations + 1] = { kind = 'index', table = name, column = column, key = nil }
+    operations[#operations + 1] = { kind = 'index', table = name, column = column, ordered = makeOrdered, key = nil }
+  end
+
+  function transaction.createIndex(_self: Transaction, name: string, column: string)
+    index(name, column, false)
+  end
+
+  function transaction.createOrderedIndex(_self: Transaction, name: string, column: string)
+    index(name, column, true)
   end
 
   function transaction.get(_self: Transaction, name: string, key: unknown): Row?
@@ -552,7 +717,11 @@ local function replay(state: DatabaseState, operations: { Operation })
     if operation.kind == 'create' then
       tx:createTable(operation.table, operation.columns :: { string }, operation.primaryKey :: string)
     elseif operation.kind == 'index' then
-      tx:createIndex(operation.table, operation.column :: string)
+      if operation.ordered == true then
+        tx:createOrderedIndex(operation.table, operation.column :: string)
+      else
+        tx:createIndex(operation.table, operation.column :: string)
+      end
     elseif operation.kind == 'addcol' then
       tx:addColumn(operation.table, operation.column :: string)
     elseif operation.kind == 'put' then
@@ -696,6 +865,10 @@ function storage.open(path: string, options: Options?): Store
     self:transaction(function(tx) tx:createIndex(name, column) end)
   end
 
+  function db.createOrderedIndex(self: Store, name: string, column: string)
+    self:transaction(function(tx) tx:createOrderedIndex(name, column) end)
+  end
+
   function db.addColumn(self: Store, name: string, column: string)
     self:transaction(function(tx) tx:addColumn(name, column) end)
   end
@@ -835,7 +1008,8 @@ function storage.open(path: string, options: Options?): Store
         for column in current.secondary do indexColumns[#indexColumns + 1] = column end
         table.sort(indexColumns)
         for _, column in indexColumns do
-          add({ kind = 'index', table = name, column = column, key = nil })
+          add({ kind = 'index', table = name, column = column,
+            ordered = current.secondary[column].ordered == true, key = nil })
         end
 
         for _, key in current.order do
@@ -871,7 +1045,10 @@ function storage.open(path: string, options: Options?): Store
       current.order = liveOrder
       current.seen = liveSeen
       for column in current.secondary do
-        local index: Index = { buckets = {} }
+        local wasOrdered = current.secondary[column].ordered == true
+        local index: Index = { buckets = {}, ordered = wasOrdered,
+          types = if wasOrdered then {} else nil }
+
         for _, key in liveOrder do
           indexSet(index, current.rows[key][column], key, true)
         end

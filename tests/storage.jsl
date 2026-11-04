@@ -433,6 +433,82 @@ suite.describe('native persistent store', function()
     clean(path)
   end)
 
+  suite.it('streams ordered numeric and nullable key ranges across mutation and checkpoint', function()
+    local path = fixture('ordered-ranges')
+    local db = sql.open(path)
+    db:createTable('events', { 'id', 'seq', 'room' }, 'id')
+    db:transaction(function(tx)
+      for id = 1, 400 do
+        tx:insert('events', { id = id, seq = if id % 67 == 0 then nil else 401 - id, room = 'a' })
+      end
+      tx:createOrderedIndex('events', 'seq')
+    end)
+
+    local function reference(query: string, params: { unknown }?)
+      local rows = db:query(query, params).rows
+      return rows
+    end
+
+    local ascending = reference('SELECT seq FROM events WHERE seq >= ? AND seq < ? ORDER BY seq LIMIT 7 OFFSET 3', { 210, 280 })
+    expect([for row in ascending => row.seq]).toEqual { 213, 214, 215, 216, 217, 218, 219 }
+    local descending = reference('SELECT seq FROM events WHERE seq > 0 ORDER BY seq DESC LIMIT 4')
+    expect([for row in descending => row.seq]).toEqual { 400, 399, 398, 397 }
+    local nullRows = reference('SELECT id FROM events WHERE seq IS NULL ORDER BY seq')
+    expect(#nullRows).toBe(5)
+    expect(#reference('SELECT id FROM events WHERE seq = ? ORDER BY seq', { 111 })).toBe(1)
+
+    -- Old primary-key entries and index postings must be removed on deletes.
+    db:delete('events', 200)
+    db:update('events', 201, { seq = 1000 })
+    db:update('events', 202, {}, { 'seq' })
+    expect(#reference('SELECT id FROM events WHERE seq > 999')).toBe(1)
+    expect(#reference('SELECT id FROM events WHERE seq IS NULL')).toBe(5)
+
+    db:checkpoint()
+    db:close()
+    db = sql.open(path)
+    expect([for row in reference('SELECT seq FROM events WHERE seq >= 210 AND seq < 280 ORDER BY seq LIMIT 7 OFFSET 3') => row.seq])
+      .toEqual { 213, 214, 215, 216, 217, 218, 219 }
+    expect(#reference('SELECT id FROM events WHERE seq > 999')).toBe(1)
+    db:close()
+    clean(path)
+  end)
+
+  suite.it('maintains ordered indexes through deterministic update/delete churn', function()
+    local path = fixture('ordered-churn')
+    local db = sql.open(path)
+    db:createTable('items', { 'id', 'value' }, 'id')
+    db:createOrderedIndex('items', 'value')
+    local reference = {}
+    for cycle = 1, 15 do
+      db:transaction(function(tx)
+        for step = 1, 45 do
+          local id = (cycle * 37 + step * 19) % 101
+          if step % 7 == 0 then
+            tx:delete('items', id)
+            reference[id] = nil
+          else
+            local value = (cycle * step + id) % 67
+            tx:upsert('items', { id = id, value = value })
+            reference[id] = value
+          end
+        end
+      end)
+
+      if cycle % 5 == 0 then db:checkpoint() end
+      local expected = {}
+      for id, value in reference do
+        if value >= 10 and value <= 40 then expected[#expected + 1] = value end
+      end
+
+      table.sort(expected)
+      local got = [for row in db:query('SELECT value FROM items WHERE value >= 10 AND value <= 40 ORDER BY value').rows => row.value]
+      expect(got).toEqual(expected)
+    end
+    db:close()
+    clean(path)
+  end)
+
   suite.it('refuses a second writer while the first lock is held', function()
     local path = fixture('lock')
     local db = sql.open(path)

@@ -1,0 +1,140 @@
+--!strict
+--!native
+-- An AVL tree of distinct non-NULL string/number values. Posting lists live in storage.
+-- Tree mutations are O(log distinct-values); range seek is O(log N) and streaming O(K).
+-- Type rank only maintains the tree invariant; SQL uses this order only for
+-- homogeneous comparable columns. It never defines cross-type SQL ordering.
+export type Node = {
+  value: string | number, encoded: string, height: number,
+  left: Node?, right: Node?,
+}
+export type Tree = Node?
+
+local ordered = {}
+
+local function rank(value: string | number): number
+  return if type(value) == 'number' then 0 else 1
+end
+
+local function compare(first: string | number, second: string | number): number
+  local ra, rb = rank(first), rank(second)
+  if ra ~= rb then return if ra < rb then -1 else 1 end
+  if first == second then return 0 end
+  if type(first) == 'number' then return if first < (second :: number) then -1 else 1 end
+  return if (first :: string) < (second :: string) then -1 else 1
+end
+
+ordered.compare = compare
+
+local function height(node: Node?): number
+  return if node then node.height else 0
+end
+
+local function refresh(node: Node)
+  node.height = math.max(height(node.left), height(node.right)) + 1
+end
+
+local function right(node: Node): Node
+  local pivot = node.left :: Node
+  node.left = pivot.right
+  pivot.right = node
+  refresh(node)
+  refresh(pivot)
+  return pivot
+end
+
+local function left(node: Node): Node
+  local pivot = node.right :: Node
+  node.right = pivot.left
+  pivot.left = node
+  refresh(node)
+  refresh(pivot)
+  return pivot
+end
+
+local function balance(node: Node): Node
+  refresh(node)
+  local delta = height(node.left) - height(node.right)
+  if delta > 1 then
+    local child = node.left :: Node
+    if height(child.left) < height(child.right) then node.left = left(child) end
+    return right(node)
+  elseif delta < -1 then
+    local child = node.right :: Node
+    if height(child.right) < height(child.left) then node.right = right(child) end
+    return left(node)
+  end
+  return node
+end
+
+function ordered.insert(root: Node?, value: string | number, encoded: string): Node
+  if not root then return { value = value, encoded = encoded, height = 1, left = nil, right = nil } end
+  local cmp = compare(value, root.value)
+  if cmp < 0 then root.left = ordered.insert(root.left, value, encoded)
+  elseif cmp > 0 then root.right = ordered.insert(root.right, value, encoded)
+  else return root end
+  return balance(root)
+end
+
+local function popMin(root: Node): (Node?, Node)
+  if not root.left then return root.right, root end
+  local newRoot, minimum = popMin(root.left)
+  root.left = newRoot
+  return balance(root), minimum
+end
+
+function ordered.remove(root: Node?, value: string | number): Node?
+  if not root then return nil end
+  local cmp = compare(value, root.value)
+  if cmp < 0 then root.left = ordered.remove(root.left, value)
+  elseif cmp > 0 then root.right = ordered.remove(root.right, value)
+  else
+    if not root.left then return root.right end
+    if not root.right then return root.left end
+    local newRight, successor = popMin(root.right)
+    successor.left = root.left
+    successor.right = newRight
+    return balance(successor)
+  end
+  return balance(root)
+end
+
+-- Returns distinct values in order, seeking directly into a bounded interval.
+-- The iterator does not allocate a complete result set or use recursion per row.
+function ordered.iterate(root: Node?, desc: boolean, lower: (string | number)?, lowerStrict: boolean,
+    upper: (string | number)?, upperStrict: boolean): () -> Node?
+  local stack: { Node } = {}
+  local function below(value: string | number): boolean
+    if not lower then return false end
+    local cmp = compare(value, lower)
+    return cmp < 0 or (cmp == 0 and lowerStrict)
+  end
+
+  local function above(value: string | number): boolean
+    if not upper then return false end
+    local cmp = compare(value, upper)
+    return cmp > 0 or (cmp == 0 and upperStrict)
+  end
+
+  local function advance(node: Node?)
+    while node do
+      if below(node.value) then node = node.right
+      elseif above(node.value) then node = node.left
+      else
+        stack[#stack + 1] = node
+        node = if desc then node.right else node.left
+      end
+    end
+  end
+  advance(root)
+  return function(): Node?
+    local size = #stack
+    if size == 0 then return nil end
+    local node = stack[size]
+    stack[size] = nil
+    advance(if desc then node.left else node.right)
+    return node
+  end
+end
+
+return ordered
