@@ -42,9 +42,20 @@ ordered stream; hot primary keys and WAL tombstones shadow cold entries.
 
 - Only one optional sidecar can be mounted through `secondaryIndexPath` in this
   revision. The sidecar must be regenerated for a new cold snapshot generation.
-- Index creation currently collects and sorts **all composite keys in memory**;
-  it is not a bounded-memory external merge sort. The *reader* uses the existing
-  bounded page cache. Build memory and sidecar disk size must be budgeted.
+- Index construction now spills sorted runs once the configurable `runRows`
+  budget is reached, and merges immutable checksummed runs using at most
+  `mergeFanIn` simultaneously open readers. The default is 16,384 keys per
+  run and a fan-in of 8; indexes smaller than one run retain the faster
+  in-memory path. Intermediate sorted runs are tier-compacted and deleted
+  on success or a caught failure. A hard process kill can leave temporary
+  files, identified by the `<index>.sort-*` prefix, for manual cleanup.
+  The cold snapshot's sparse page directory, individual key sizes, and
+  the temporary disk footprint are not fixed-size; this is bounded *key
+  sorting memory*, not a constant-RSS guarantee independent of everything.
+- `secondary.create()` returns construction metrics including spill count,
+  merge count, maximum buffered key count, and maximum concurrent readers.
+  Tune `runRows` to trade build speed against peak RSS; do not assume
+  external sorting is faster than a fully resident sort.
 - The sidecar stores encoded keys and may exceed the cold data file in size for
   very short rows. Cold lookups also fetch the primary-key page and can incur
   random I/O. Performance depends strongly on query selectivity.
@@ -78,3 +89,32 @@ sidecar about 3.3 MiB. A one-time 24K-row sidecar build took ~0.44 seconds.
 These measurements are not a general JessQL speedup, a durability benchmark, or
 an apples-to-apples comparison against another indexed database. They mainly
 measure replacing a cold full scan with a selective persisted index range.
+
+## Bounded-memory sidecar construction (Jess 0.3.0)
+
+```lua
+local metrics = sql.secondary.create('events.room-stream.index', 'events.cold',
+  'room_id', 'stream_id', { runRows = 16384, mergeFanIn = 8 })
+print(metrics.spilledRuns, metrics.maxBufferedEntries, metrics.maxOpenReaders)
+```
+
+Use `bench/secondary-build.jsl` to isolate construction from cold snapshot
+creation (`prepare`), and run the same prepared snapshot using old and new
+package trees in separate processes (`build`). Linux peak RSS is measured by
+`/usr/bin/time`; the benchmark itself prints `/proc/self/status` RSS when
+available, plus a deterministic indexed lookup checksum.
+
+On a prepared **100,000-row** snapshot (48 room partitions), the previous
+in-memory builder took 2.24 seconds of CPU and peaked at **95,644 KiB** RSS.
+The external builder with 16,384-key runs took 3.08 seconds and peaked at
+**64,480 KiB** in an initial matched run (**32.6% lower peak RSS**, with
+approximately **38% greater build CPU**). Using 4,096-key runs reduced peak
+RSS further to 57,684 KiB but increased build CPU to 4.64 seconds.
+Host timing varies; do not generalize these to storage devices or workloads.
+
+The output `.idx` sidecar was **byte-for-byte identical** to the previous
+builder's sidecar for this 100K-row dataset, including its 14,394,086-byte
+file size and SHA-256 digest
+`40d1e6f02855ece63b462c81f0e9c591217cfe6649aea231ba70061399ccdd52`.
+Query checksum also matched (`34358907`). This is a build-time RSS
+optimization, not a smaller index file or a faster indexed query.

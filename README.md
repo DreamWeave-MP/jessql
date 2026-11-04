@@ -233,3 +233,13 @@ Immutable snapshots can now have a separate `(partition, ordered value)`
 sidecar, including correct WAL overlay merging for selected hybrid SQL queries.
 See [docs/SECONDARY-INDEXES.md](docs/SECONDARY-INDEXES.md) for API use,
 measured latency/RSS tradeoffs, and the unbounded build-memory limitation.
+
+## Bounded secondary-index construction (experimental)
+
+`sql.secondary.create(path, snapshotPath, partition, order, { runRows = 16384,
+mergeFanIn = 8 })` sorts immutable cold sidecars using bounded in-memory
+runs and tiered on-disk merging. It returns build diagnostics. This preserves
+the existing JQLP2 sidecar and its read behavior; large index construction
+requires temporary disk space and may take longer than the original
+all-in-memory sort. See `docs/SECONDARY-INDEXES.md` and
+`bench/secondary-build.jsl` for measured RSS/CPU tradeoffs.

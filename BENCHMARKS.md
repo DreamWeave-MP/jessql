@@ -492,3 +492,23 @@ stream >= ? ORDER BY stream LIMIT 12`, with identical result checksums:
 Sidecar build ~0.437 s, cold file ~1.9 MiB, sidecar ~3.3 MiB. This is a
 scan-avoidance result, not a universal performance claim. See
 `docs/SECONDARY-INDEXES.md` and `bench/secondary.jsl`.
+
+## Bounded-memory external sidecar builder
+
+A snapshot-bound composite sidecar can now be built with external sorted
+runs, tiered merges, at most `mergeFanIn` concurrent source readers, and
+`runRows` maximum unsorted keys in memory. The small-index case uses the
+original in-memory fast path. Repro: `bench/secondary-build.jsl`.
+
+| 100K rows | Previous resident builder | External, 16K keys | External, 4K keys |
+| --- | ---: | ---: | ---: |
+| CPU build (s), one run | 2.24 | 3.08 | 4.64 |
+| Process peak RSS (KiB), one run | 95,644 | 64,480 | 57,684 |
+| Sidecar bytes | 14,394,086 | 14,394,086 | 14,394,086 |
+| Query checksum | 34,358,907 | 34,358,907 | 34,358,907 |
+
+These measurements include the Jess process and runtime residency, not
+just live sorter objects. Runs were performed on the same host with the
+same prepared snapshot but are not an exhaustive benchmark. The external
+builder trades increased build time and temporary disk I/O for lower peak
+RSS. No change to the JQLP2 format or WAL; durability is still buffered.
