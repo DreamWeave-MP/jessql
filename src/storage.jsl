@@ -785,6 +785,13 @@ local function buildTransaction(state: DatabaseState)
   local created, altered = {} :: { [string]: Schema }, {} :: { [string]: Schema }
   local indexed, composites = {} :: { [string]: { [string]: boolean } }, {} :: { [string]: { [string]: boolean } }
   local active, aborted = true, false
+  -- A transaction owns its short-lived SQL plan cache; pending row changes
+  -- never invalidate plans, but schema and index changes always do.
+  local schemaRevision, viewRevision = 0, -1
+  local queryView: queryEngine.Database? = nil
+  local queryPlans: { [string]: queryEngine.Plan } = {}
+  local queryPlanAges: { [string]: number } = {}
+  local queryCount, queryAge = 0, 0
   local transaction = {} :: Transaction
 
   local function writable()
@@ -842,6 +849,7 @@ local function buildTransaction(state: DatabaseState)
     if created[name] or state.tables[name] then error('jessql storage: table already exists', 2) end
     local schema = makeSchema(columns, pk)
     created[name] = schema
+    schemaRevision += 1
     operations[#operations + 1] = { kind = 'create', table = name, columns = schema.columns, primaryKey = schema.primaryKey, key = nil }
   end
 
@@ -854,6 +862,7 @@ local function buildTransaction(state: DatabaseState)
     if schema.allowed[column] then error('jessql storage: column already exists', 2) end
     if #schema.columns >= 256 then error('jessql storage: column limit exceeded', 2) end
 
+    schemaRevision += 1
     if created[name] then
       -- CREATE and subsequent inserts share this schema; amend its logged column array.
       schema.allowed[column] = true
@@ -884,6 +893,7 @@ local function buildTransaction(state: DatabaseState)
 
     if not indexed[name] then indexed[name] = {} end
     indexed[name][column] = true
+    schemaRevision += 1
     operations[#operations + 1] = { kind = 'index', table = name, column = column, ordered = makeOrdered, key = nil }
   end
 
@@ -914,6 +924,7 @@ local function buildTransaction(state: DatabaseState)
 
     if not composites[name] then composites[name] = {} end
     composites[name][id] = true
+    schemaRevision += 1
     operations[#operations + 1] = { kind = 'composite', table = name, column = prefix, suffix = suffix, key = nil }
   end
 
@@ -937,36 +948,51 @@ local function buildTransaction(state: DatabaseState)
   -- They do not claim ordered scans: pending changes may invalidate ordering.
   function transaction.query(_self: Transaction, sql: string, params: { unknown }?): queryEngine.Result
     writable()
-    local view = queryEngine.new()
-    local names: { [string]: boolean } = {}
+    if not queryView or schemaRevision ~= viewRevision then
+      local view = queryEngine.new()
+      local names: { [string]: boolean } = {}
     for name in state.tables do names[name] = true end
     for name in created do names[name] = true end
 
     for name in names do
       local schema = findSchema(name)
       local current = state.tables[name]
-      local pending = staged[name]
       local indexes: { [string]: boolean } = { [schema.primaryKey] = true }
       if current then
         for column in current.available do indexes[column] = true end
       end
 
-      if indexed[name] then
-        for column in indexed[name] do indexes[column] = true end
-      end
+      -- Staged index declarations are not populated until commit. Advertising
+      -- them as physical lookup indexes would cause expensive fake indexed joins.
 
       -- The iterator first walks committed candidates (possibly indexed),
       -- then appends staged inserts/moves missing from that candidate set.
       -- It checks pending values at consumption time, not construction time.
       local function rows(request: queryEngine.Request): queryEngine.Iterator
+        local pending = staged[name]
         local candidates: { string } = {}
         local live: { [string]: boolean }? = nil
         if current then candidates, live = indexedKeys(current, request) end
         local cursor = 0
         local visited: { [string]: boolean } = {}
         local pendingKeys: { string } = {}
+        -- A primary-key equality needs at most one pending key, even with a
+        -- transaction staging thousands of unrelated inserts.
+        local primary: string? = nil
+        for _, constraint in request.constraints do
+          if constraint.column == schema.primaryKey and constraint.op == '='
+            and constraint.value ~= nil and scalar(constraint.value) then
+            primary = keyOf(constraint.value)
+            break
+          end
+        end
+
         if pending then
-          for key in pending do pendingKeys[#pendingKeys + 1] = key end
+          if primary then
+            if pending[primary] ~= nil then pendingKeys[1] = primary end
+          else
+            for key in pending do pendingKeys[#pendingKeys + 1] = key end
+          end
         end
         local pendingCursor = 0
 
@@ -1007,6 +1033,7 @@ local function buildTransaction(state: DatabaseState)
         columns = schema.columns,
         indexes = indexes,
         count = function(): number
+          local pending = staged[name]
           local total = if current then current.count else 0
           if pending then
             for key, changed in pending do
@@ -1048,9 +1075,40 @@ local function buildTransaction(state: DatabaseState)
           return result
         end,
       }
-      view:register(name, provider)
+        view:register(name, provider)
+      end
+      queryView = view
+      viewRevision = schemaRevision
+      queryPlans = {}
+      queryPlanAges = {}
+      queryCount, queryAge = 0, 0
     end
-    return view:query(sql, params)
+
+    -- Bounded by the transaction lifetime and a fixed number of statements.
+    -- Changed row values are read by the provider on every plan invocation.
+    if #sql > 8192 then return (queryView :: queryEngine.Database):query(sql, params) end
+    queryAge += 1
+    local plan = queryPlans[sql]
+    if not plan then
+      plan = (queryView :: queryEngine.Database):prepare(sql)
+      if queryCount >= 32 then
+        local oldest: string? = nil
+        local age = math.huge
+        for text, last in queryPlanAges do
+          if last < age then oldest, age = text, last end
+        end
+
+        if oldest then
+          queryPlans[oldest] = nil
+          queryPlanAges[oldest] = nil
+          queryCount -= 1
+        end
+      end
+      queryPlans[sql] = plan
+      queryCount += 1
+    end
+    queryPlanAges[sql] = queryAge
+    return plan.run(params)
   end
 
   -- Return a statement-stable set of keys for an indexed equality predicate.
