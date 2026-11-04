@@ -48,6 +48,7 @@ export type Transaction = {
   createCompositeIndex: (self: Transaction, name: string, prefix: string, suffix: string) -> (),
   primaryKey: (self: Transaction, name: string) -> string,
   exec: (self: Transaction, sql: string, params: { unknown }?) -> number,
+  executeMutation: (self: Transaction, statement: mutations.Statement, params: { unknown }?) -> number,
   addColumn: (self: Transaction, name: string, column: string) -> (),
   update: (self: Transaction, name: string, key: unknown, changes: Row, unset: { string }?) -> boolean,
   insert: (self: Transaction, name: string, row: Row) -> (),
@@ -779,11 +780,12 @@ local function buildTransaction(state: DatabaseState)
   local staged: Pending = {}
   local created, altered = {} :: { [string]: Schema }, {} :: { [string]: Schema }
   local indexed, composites = {} :: { [string]: { [string]: boolean } }, {} :: { [string]: { [string]: boolean } }
-  local active = true
+  local active, aborted = true, false
   local transaction = {} :: Transaction
 
   local function writable()
     if not active then error('jessql storage: transaction is no longer active', 3) end
+    if aborted then error('jessql storage: transaction aborted after failed DML', 3) end
   end
 
   local function findSchema(name: string): Schema
@@ -799,10 +801,30 @@ local function buildTransaction(state: DatabaseState)
     return findSchema(requireName(name)).primaryKey
   end
 
+  function transaction.executeMutation(_self: Transaction, statement: mutations.Statement, params: { unknown }?): number
+    writable()
+    -- DML execution can throw after staging rows; latch the failure so a
+    -- caller's pcall cannot accidentally commit a partially applied statement.
+    local ok, affected = pcall(mutations.execute, statement, transaction :: mutations.Writer, params)
+    if not ok then
+      -- A SQL statement may have staged some rows before encountering an error.
+      -- Even if the caller catches the exception, never commit a partial statement.
+      aborted = true
+      error(affected, 2)
+    end
+    return affected :: number
+  end
+
   function transaction.exec(_self: Transaction, sql: string, params: { unknown }?): number
     writable()
-    local statement = mutations.parse(sql)
-    return mutations.execute(statement, transaction :: mutations.Writer, params)
+    -- Parsing can throw; an intercepted syntax error must also abort the
+    -- transaction rather than allow previous staged operations to commit.
+    local ok, parsed = pcall(mutations.parse, sql)
+    if not ok then
+      aborted = true
+      error(parsed, 2)
+    end
+    return transaction:executeMutation(parsed :: mutations.Statement, params)
   end
 
   function transaction.createTable(_self: Transaction, name: string, columns: { string }, pk: string)
@@ -979,7 +1001,10 @@ local function buildTransaction(state: DatabaseState)
     return exists
   end
 
-  return transaction, operations, function() active = false end
+  return transaction, operations, function(): boolean
+    active = false
+    return aborted
+  end
 end
 
 local function replay(state: DatabaseState, operations: { Operation })
@@ -1076,7 +1101,13 @@ local function write(state: DatabaseState, ops: { Operation })
     state.poisoned = true
     error('jessql storage: append failed (reopen required): ' .. tostring(err), 2)
   end
-  apply(state, ops)
+  -- The append is already visible. A subsequent apply failure is uncertain
+  -- state, never an ordinary rollback: close/reopen before any further work.
+  local ok, applyError = pcall(apply, state, ops)
+  if not ok then
+    state.poisoned = true
+    error('jessql storage: post-append apply failed (reopen required): ' .. tostring(applyError), 2)
+  end
   state.sequence += 1
 end
 
@@ -1133,10 +1164,10 @@ function storage.open(path: string, options: Options?): Store
     local tx, ops, finish = buildTransaction(state)
     -- A user callback may throw; discard its staged writes on failure.
     local succeeded, callbackError = pcall(callback, tx)
-    finish()
-    if not succeeded then
+    local aborted = finish()
+    if not succeeded or aborted then
       state.busy = false
-      error(callbackError, 2)
+      error(if not succeeded then callbackError else 'jessql storage: transaction aborted after failed DML', 2)
     end
     -- I/O can fail; leave in-memory state untouched and poison uncertain append outcomes.
     local committed, commitError = pcall(write, state, ops)
@@ -1177,7 +1208,7 @@ function storage.open(path: string, options: Options?): Store
       end,
       inTransaction = function(tx: Transaction, params: { unknown }?): number
         valid()
-        return mutations.execute(statement, tx :: mutations.Writer, params)
+        return tx:executeMutation(statement, params)
       end,
     }
   end
