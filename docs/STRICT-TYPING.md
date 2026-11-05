@@ -12,21 +12,34 @@ package's pinned API:
 
 ```sh
 jess package check . --format json
-python3 scripts/check-strict.py /path/to/jess
+jess run --trusted scripts/check_strict.jsl
 jess package test .
 ```
 
 The first command is the underlying Jess compiler/type checker. The gate
-script verifies that *all* shipped JSL paths under `src/`, `tests/`, and
-`bench/` begin with `--!strict`, checks that the native package checker visited
+script verifies that *all* shipped JSL paths under `src/`, `tests/`, `bench/`,
+and `scripts/` begin with `--!strict`, checks that the native package checker visited
 all of them, and fails on **any** diagnostic or nonzero checker exit status.
 The last command runs source and packaged-JPK behavioral tests, including the
 repository style suite; static checks are not a substitute for executing code.
 
-At the time of this pass, the package includes **78 JSL files** and the
+At the time of this pass, the package includes **79 JSL files** and the
 behavioral suite includes **274 tests in each of source and packaged mode**.
 These counts are observations, not hard-coded limits: newly added files must be
-covered automatically.
+covered automatically. The release script is itself included in the packaged JSL inventory
+and checked under the same policy.
+
+The gate uses Jess filesystem and process APIs directly; no Python installation is
+required. For narrower capability grants instead of `--trusted`, run:
+
+```sh
+jess run --capability filesystem.read --capability process.spawn \
+  --capability process.stdio scripts/check_strict.jsl
+```
+
+You may pass an explicit Jess executable path as the script argument. Jess's
+current `process.run` API has no child-process timeout option, so CI must
+enforce a job-level timeout for potentially stalled type-checking.
 
 ## Fixing types without weakening the contract
 

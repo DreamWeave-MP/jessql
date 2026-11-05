@@ -388,7 +388,7 @@ operational state. Jess application hosts may explicitly use
 interface/event systems without callbacks in the transaction path.
 
 **Strict typing is a zero-exception release requirement.** Run
-`python3 scripts/check-strict.py /path/to/jess` to check all 78 shipped JSL
+`jess run --trusted scripts/check_strict.jsl` to check all shipped JSL
 modules, tests, and benchmarks with Jess's native package checker. All files
 explicitly declare `--!strict`. The gate rejects missing directives, a
 partial package check, and **any** diagnostic; there is no legacy debt allowance.

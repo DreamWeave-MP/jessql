@@ -157,7 +157,7 @@ relational transaction engine, or a general clustered storage service.
    after replacement, after directory sync).
 2. Run both source and packaged tests: `jess package test .`.
 3. Run the **whole-package zero-error strict gate**:
-   `python3 scripts/check-strict.py /path/to/jess`. Individual-file checks
+   `jess run --trusted scripts/check_strict.jsl`. Individual-file checks
    are useful during editing but do not satisfy the release requirement.
 4. Cover a restart, an injected failure, and an existing-format reopen for any
    disk-format or lifecycle change. Never update active disk files in place.

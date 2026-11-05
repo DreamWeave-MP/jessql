@@ -143,7 +143,7 @@ must establish explicit evidence-preservation and idempotency guarantees.
 - Pin the Jess runtime and JessQL package revision. Reproduce
   `jess package test .` (source and packaged-JPK modes).
 - Run the zero-tolerance package-wide strict gate:
-  `python3 scripts/check-strict.py /path/to/jess` (no permitted diagnostics).
+  `jess run --trusted scripts/check_strict.jsl` (no permitted diagnostics).
 - Restore a test backup. Exercise missing-manifest, corrupted-WAL, disk-full,
   and interrupted-publication paths in a disposable environment.
 - Verify exact filesystem replacement and directory sync semantics on each

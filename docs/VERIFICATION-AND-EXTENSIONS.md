@@ -152,16 +152,16 @@ participate in database scheduling.
 ## Strict type-checking policy
 
 **JessQL requires zero native strict diagnostics across the complete package.**
-This covers `src/`, `tests/`, and `bench/`, not just individually modified
+This covers `src/`, `tests/`, `bench/`, and `scripts/`, not just individually modified
 files. Each shipped `.jsl` file explicitly begins with `--!strict`.
 
 ```sh
 jess package test .
-python3 scripts/check-strict.py /path/to/jess
+jess run --trusted scripts/check_strict.jsl
 ```
 
 The zero-tolerance checker invokes `jess package check . --format json`,
-requires that the checker visit all 78 shipped JSL files, and fails on any
+requires that the checker visit all shipped JSL files, and fails on any
 reported diagnostic, missing strict directive, incomplete run or abnormal exit.
 The former 427-error `engine.jsl` allowance has been **removed**. All files
 now pass; this is a static-type release gate, not proof of runtime correctness,
