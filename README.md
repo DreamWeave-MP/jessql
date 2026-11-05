@@ -339,3 +339,20 @@ safe generation publication and recovery are implemented. Cold snapshots and
 hybrid views can opt into `readMode = 'positional'` to avoid memory mapping.
 See [New Runtime Integration](docs/NEW-RUNTIME-INTEGRATION.md) for the API,
 limitations, and measured tradeoffs.
+
+## Offline verification and versioned extensions
+
+Before deploying managed JessQL, review [Offline verification, diagnostics, and
+versioned integrations](docs/VERIFICATION-AND-EXTENSIONS.md).
+`sql.managed.inspect(base)` remains a quick cold metadata inventory;
+`sql.managed.verify(base)` / `diagnose(base)` perform an offline read-only scan
+of physical cold pages and WAL structure with structured issue codes. These
+checks do not certify semantic replay or physical power-loss durability.
+
+The pull-only `db:events(cursor)` and `db:observe()` APIs expose version-1
+operational state. Jess application hosts may explicitly use
+`sql.managed.extensions.v1.relay(...)` to forward telemetry into their
+interface/event systems without callbacks in the transaction path.
+
+The strict regression gate is `python3 scripts/check-strict.py /path/to/jess`;
+it records remaining `engine.jsl` debt rather than hiding it.

@@ -154,3 +154,13 @@ reads this state and emits best-effort notifications after acknowledgment.
 These events must never sit on the durability path and must never become the
 sole record of a committed mutation. Durable changefeeds require WAL-derived
 sequence positions and replayable subscriber offsets.
+
+## Offline integrity verification (experimental)
+
+After stopping all managed writers, use `sql.managed.verify(base)` or
+`sql.managed.diagnose(base)` for a lock-protected, non-repairing full scan of
+physical cold pages and the WAL frame stream. An issue contains a stable code
+and recovery guidance. The result does **not** validate full semantic replay
+or determine uncertain transaction acknowledgments. See
+[verification and extension protocol](VERIFICATION-AND-EXTENSIONS.md) for
+examples, report fields, limitations and the incident workflow.

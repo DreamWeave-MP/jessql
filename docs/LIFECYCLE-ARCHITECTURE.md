@@ -12,6 +12,8 @@ For practical incident response, see [operator runbook](OPERATIONS.md).
        ├─ @jessql/managed_manifest — pure JQLM1 codec, schema invariants
        ├─ @jessql/managed_policy   — pure resource-budget decision
        ├─ @jessql/managed_publication — durable sealing + manifest cutover
+       ├─ @jessql/managed_verification — offline, non-mutating integrity scan
+       ├─ @jessql/managed_observability — bounded events + explicit host adapter
        ├─ @jessql/hybrid           — WAL overlay + cold provider
        ├─ @jessql/paged            — immutable page reader / snapshot writer
        ├─ @jessql/segments         — generation precedence + tombstones
@@ -181,3 +183,14 @@ test, or a synchronous-durability power-fault test. The opt-in WAL-only path
 still avoids `live:stats()` after each commit; otherwise the refactor would
 introduce avoidable query work. Keep this benchmark as a regression guard as
 more providers, observers, and worker systems are introduced.
+
+## Verified extension and diagnostic boundaries
+
+The managed kernel offers two separately versioned, **non-durable** services:
+`managed.verify` / `managed.diagnose` (read-only offline structural report v1),
+and `db:events` / `db:observe` plus `managed.extensions.v1.relay`
+(pull-only in-process telemetry v1). Neither exposes publication internals to
+application mods. The host calls `relay` outside critical sections; no event
+callbacks run on transaction commit or filesystem publication. See
+[Verification and Extensions](VERIFICATION-AND-EXTENSIONS.md) for limits and
+recovery contracts.
