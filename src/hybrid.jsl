@@ -33,6 +33,10 @@ export type Database = {
   exportSnapshot: (self: Database, path: string, options: paged.Options?) -> (),
   exportDelta: (self: Database, rowsPath: string, deletePath: string,
     options: delta.Options?) -> { rows: delta.Metrics, deletions: delta.Metrics },
+  exportIndexedDelta: (self: Database, rowsPath: string, deletePath: string, indexPath: string,
+    partition: string, orderColumn: string, deltaOptions: delta.Options?,
+    indexOptions: secondary.BuildOptions?) -> { rows: delta.Metrics,
+      deletions: delta.Metrics, index: secondary.BuildMetrics },
   close: (self: Database) -> (),
 }
 
@@ -699,6 +703,60 @@ function hybrid.open(walPath: string, snapshotPath: string | { string }, tableNa
       error(failure, 2)
     end
     return { rows = rowMetrics :: delta.Metrics, deletions = deleteMetrics :: delta.Metrics }
+  end
+
+  -- Build a complete candidate generation, including its snapshot-bound
+  -- composite sidecar. Never publish or retire the current WAL. On failure
+  -- discard the entire unpublished triple, including an incomplete index.
+  function db.exportIndexedDelta(self: Database, rowsPath: string, deletePath: string,
+    indexPath: string, partition: string, orderColumn: string,
+    deltaOptions: delta.Options?, indexOptions: secondary.BuildOptions?):
+    { rows: delta.Metrics, deletions: delta.Metrics, index: secondary.BuildMetrics }
+    ready()
+    if activeTransaction then error('jessql hybrid: cannot export inside transaction', 2) end
+
+    if type(indexPath) ~= 'string' or indexPath == '' or indexPath == walPath
+      or indexPath == rowsPath or indexPath == deletePath or fs.exists(indexPath) then
+      error('jessql hybrid: invalid index candidate path', 2)
+    end
+
+    -- Validate schema before producing the first output. The sidecar builder
+    -- still validates its own column types and snapshot identity.
+    local hasPartition, hasOrder = false, false
+    for _, column in cold.columns do
+      if column == partition then hasPartition = true end
+      if column == orderColumn then hasOrder = true end
+    end
+
+    if not hasPartition or not hasOrder or partition == orderColumn then
+      error('jessql hybrid: invalid indexed delta columns', 2)
+    end
+
+    local result: { rows: delta.Metrics, deletions: delta.Metrics }? = nil
+    local indexMetrics: secondary.BuildMetrics? = nil
+    -- Candidate export and indexing can fail; cleanup all three files together.
+    local created, failure = pcall(function()
+      result = self:exportDelta(rowsPath, deletePath, deltaOptions)
+      indexMetrics = secondary.create(indexPath, rowsPath, partition, orderColumn, indexOptions)
+      local candidate = paged.open(rowsPath, { cachePages = 1 })
+      -- Verify the built sidecar against its exact snapshot before returning.
+      local verified, verifyError = pcall(function()
+        local check = secondary.open(indexPath, candidate, { cachePages = 1 })
+        check:close()
+      end)
+      candidate:close()
+      if not verified then error(verifyError) end
+    end)
+
+    if not created then
+      fs.remove(indexPath)
+      fs.remove(deletePath)
+      fs.remove(rowsPath)
+      error(failure, 2)
+    end
+    local finished = result :: { rows: delta.Metrics, deletions: delta.Metrics }
+    return { rows = finished.rows, deletions = finished.deletions,
+      index = indexMetrics :: secondary.BuildMetrics }
   end
 
   function db.close(_self: Database)

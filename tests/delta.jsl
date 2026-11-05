@@ -17,7 +17,7 @@ end
 
 local function clear(base: string)
   for _, ending in { '.base', '.rows', '.deletes', '.wal', '.wal.lock',
-    '.new.wal', '.new.wal.lock', '.other' } do
+    '.new.wal', '.new.wal.lock', '.other', '.idx', '.base.idx', '.rows.idx' } do
     fs.remove(base .. ending)
   end
 end
@@ -213,6 +213,74 @@ suite.describe('bounded delta candidates', function()
     db:close()
     clear(base)
   end)
+
+  suite.it('builds verified indexed delta triples and rejects partial publication', function()
+    local base = basePath('indexed')
+    clear(base)
+    local cursor = 0
+    sql.paged.create(base .. '.base', { 'id', 'room', 'stream' }, 'id', function()
+      cursor += 1
+      if cursor > 100 then return nil end
+      return { id = cursor, room = if cursor % 2 == 0 then 'even' else 'odd', stream = cursor * 10 }
+    end)
+    sql.secondary.create(base .. '.base.idx', base .. '.base', 'room', 'stream',
+      { format = 'compact', runRows = 7 })
+    local db = sql.hybrid.open(base .. '.wal', base .. '.base', 'events', { rowLayout = 'packed' })
+    db:transaction(function(tx)
+      for id = 1, 35 do
+        if id % 5 == 0 then tx:delete(id)
+        else tx:upsert({ id = id, room = 'hot', stream = id * 10 + 1 }) end
+      end
+
+      for id = 101, 170 do tx:insert({ id = id, room = 'hot', stream = id * 10 }) end
+    end)
+    local metrics = db:exportIndexedDelta(base .. '.rows', base .. '.deletes', base .. '.idx',
+      'room', 'stream', { runRows = 7, mergeFanIn = 3, pageBytes = 512 },
+      { format = 'compact', runRows = 7, mergeFanIn = 3, pageBytes = 512 })
+    expect(metrics.rows.rows).toBe(98)
+    expect(metrics.deletions.rows).toBe(8)
+    expect(metrics.index.entries).toBe(98)
+    local sources = { base .. '.base', base .. '.rows' }
+    local rebased = sql.hybrid.open(base .. '.new.wal', sources, 'events', {
+      secondaryIndexPaths = { base .. '.base.idx', base .. '.idx' },
+      deletePaths = { [2] = base .. '.deletes' }, cachePages = 1,
+    })
+    local oldRows = db:query('SELECT id, stream FROM events WHERE room = ? AND stream > ? ORDER BY stream',
+      { 'hot', 200 }).rows
+    local newRows = rebased:query('SELECT id, stream FROM events WHERE room = ? AND stream > ? ORDER BY stream',
+      { 'hot', 200 }).rows
+    expect(#newRows).toBe(#oldRows)
+    for position, row in oldRows do
+      expect(newRows[position].id).toBe(row.id)
+      expect(newRows[position].stream).toBe(row.stream)
+    end
+    rebased:close()
+    db:close()
+    clear(base)
+
+    -- If the sidecar builder fails after producing the pair, the entire
+    -- unpublished candidate triple must disappear.
+    cursor = 0
+    sql.paged.create(base .. '.base', { 'id', 'room', 'stream' }, 'id', function()
+      cursor += 1
+      return if cursor <= 3 then { id = cursor, room = 'room', stream = cursor } else nil
+    end)
+    local failing = sql.hybrid.open(base .. '.wal', base .. '.base', 'events')
+    failing:insert({ id = 4, room = 'room', stream = 4 })
+    -- Deliberately trigger sidecar validation after both delta files exist.
+    local valid = pcall(function()
+      failing:exportIndexedDelta(base .. '.rows', base .. '.deletes', base .. '.idx',
+        'id', 'stream', { runRows = 2 }, { format = 'compact' })
+    end)
+    expect(valid).toBe(false)
+    expectAbsent(base .. '.rows')
+    expectAbsent(base .. '.deletes')
+    expectAbsent(base .. '.idx')
+    expect((assert(failing:get(4))).stream).toBe(4)
+    failing:close()
+    clear(base)
+  end)
+
 end)
 
 return suite
