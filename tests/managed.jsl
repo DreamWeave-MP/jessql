@@ -269,7 +269,7 @@ suite.describe('durable managed generation publication', function()
     removeFixture(base)
   end)
 
-  suite.it('recovers an interrupted first publication without adopting stale bootstrap files', function()
+  suite.it('refuses to reinitialize abandoned bootstrap files until an explicit reset', function()
     local base = fixture('bootstrap')
     -- A failure before initial manifest replacement cannot create an active DB.
     expect((pcall(function()
@@ -278,12 +278,38 @@ suite.describe('durable managed generation publication', function()
       end)
     end))).toBe(false)
     expect((fs.exists(base .. '.jql-manifest'))).toBe(false)
+    expect((fs.exists(base .. '.g00000001.rows'))).toBe(true)
+    -- The manifest is absent, but its first-generation files are not safe to delete.
+    expect((pcall(function() initial(base, nil) end))).toBe(false)
+    removeFixture(base) -- explicit operator reset of uncommitted initialization
     local db = initial(base, nil)
     expect(db:stats().epoch).toBe(1)
     db:insert({ id = 1, room = 'x', body = 'newly initialized' })
     db:close()
     local reopened = sql.managed.open(base)
     expect((assert(reopened:get(1))).body).toBe('newly initialized')
+    reopened:close()
+    removeFixture(base)
+  end)
+
+  suite.it('fails closed if the manifest disappears without truncating the acknowledged WAL', function()
+    local base = fixture('missing-manifest')
+    local db = initial(base, nil)
+    db:insert({ id = 'safe', room = 'r', body = 'acknowledged' })
+    db:close()
+    local manifest = assert((fs.readFileString(base .. '.jql-manifest')))
+    local wal = assert((fs.readFileString(base .. '.g00000001.wal')))
+    assert((fs.remove(base .. '.jql-manifest')))
+
+    -- A missing manifest is never permission to reset an acknowledged journal.
+    expect((pcall(function() initial(base, nil) end))).toBe(false)
+    expect(assert((fs.readFileString(base .. '.g00000001.wal')))).toBe(wal)
+    expect((fs.exists(base .. '.jql-manifest'))).toBe(false)
+
+    -- Restoring exactly the known-good manifest must recover the original row.
+    assert((fs.createDurable(base .. '.jql-manifest', manifest)))
+    local reopened = initial(base, nil)
+    expect((assert(reopened:get('safe'))).body).toBe('acknowledged')
     reopened:close()
     removeFixture(base)
   end)

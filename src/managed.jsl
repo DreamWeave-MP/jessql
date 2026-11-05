@@ -367,6 +367,25 @@ local function collectOrphans(base: string, parent: string, value: Manifest)
   end
 end
 
+-- An absent manifest is not proof this namespace has never held a database.
+-- In particular, replacing or losing CURRENT during recovery must never allow
+-- startup to erase its existing WAL and silently bootstrap empty storage.
+local function requireFreshNamespace(base: string, parent: string)
+  local names, listError = fs.list(parent)
+  if not names then error('jessql managed: initialization directory: ' .. tostring(listError), 3) end
+  local name = fs.fileName(base) :: string
+  local manifestCandidate = name .. '.jql-manifest.tmp'
+  local generationPrefix = name .. '.g'
+  for _, entry in names do
+    if entry == manifestCandidate or
+      (string.sub(entry, 1, #generationPrefix) == generationPrefix
+        and string.match(string.sub(entry, #generationPrefix + 1), '^%d%d%d%d%d%d%d%d')) then
+      error('jessql managed: manifest missing but database artifacts remain (' .. entry
+        .. '); refuse initialization until the manifest is recovered or files explicitly removed', 3)
+    end
+  end
+end
+
 local function durableManifest(base: string, parent: string, value: Manifest,
   hook: ((string) -> ())?, state: { started: boolean })
   local candidate = base .. '.jql-manifest.tmp'
@@ -439,9 +458,10 @@ function managed.open(path: string, options: Options?): Database
       local name = string.lower(options.tableName)
       -- Do not silently rename a user-supplied table.
       if name ~= options.tableName then error('tableName must be lowercase') end
+      -- Never interpret a lost manifest as a fresh database. Interrupted
+      -- first-time initialization requires an explicit operator reset.
+      requireFreshNamespace(base, parent)
       local initial = paths(base, 1)
-      clearCandidate(initial) -- an unreferenced, uncommitted interrupted initialization
-      removeIfPresent(base .. '.jql-manifest.tmp')
       paged.create(initial.snapshot, options.columns, options.primaryKey,
         function(): Row? return nil end, { pageBytes = options.pageBytes })
       seal(initial.snapshot, parent)
