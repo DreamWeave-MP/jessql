@@ -1,0 +1,76 @@
+--!strict
+-- Compare synchronous delta flushes with full snapshot checkpointing.
+-- Usage: jess run --trusted --package . bench/managed-delta.jsl [flush|checkpoint] [rows] [waves] [batch]
+local sql = require('@jessql')
+local fs = require('@dream/fs')
+
+local mode = arg[1] or 'flush'
+local total = tonumber(arg[2]) or 2000
+local waves = tonumber(arg[3]) or 4
+local batch = tonumber(arg[4]) or 50
+if mode ~= 'flush' and mode ~= 'checkpoint' then error('mode must be flush or checkpoint') end
+if total < 40 or total > 1000000 or total % 1 ~= 0 then error('rows out of range') end
+if waves < 2 or waves > 7 or waves % 1 ~= 0 then error('waves out of range') end
+if batch < 1 or batch > 100000 or batch % 1 ~= 0 then error('batch out of range') end
+local base = fs.join(fs.cwd() :: string, '.jessql-managed-delta-bench')
+
+local function clear()
+  for _, suffix in { '.jql-manifest', '.jql-manifest.tmp', '.jql-lock' } do
+    fs.remove(base .. suffix)
+  end
+
+  for epoch = 1, 9 do
+    local stem = base .. string.format('.g%08d', epoch)
+    for _, suffix in { '.rows', '.deleted', '.wal', '.wal.lock' } do
+      fs.remove(stem .. suffix)
+    end
+  end
+end
+
+clear()
+local db = sql.managed.open(base, { tableName = 'events',
+  columns = { 'id', 'room', 'payload' }, primaryKey = 'id',
+  cachePages = 4, readMode = 'positional', rowLayout = 'packed' })
+local runStart = os.clock()
+local mutationCpu, maintenanceCpu = 0, 0
+local current = 0
+
+for wave = 1, waves do
+  local last = math.floor(total * wave / waves)
+  local started = os.clock()
+  while current < last do
+    local batchEnd = math.min(last, current + batch)
+    db:transaction(function(tx)
+      for key = current + 1, batchEnd do
+        tx:insert({ id = key, room = 'room-' .. tostring(key % 16),
+          payload = string.rep('x', 64) })
+      end
+    end)
+    current = batchEnd
+  end
+
+  -- Exercise overwrite precedence on immutable cold data after wave one.
+  if wave > 1 then
+    db:upsert({ id = 1, room = 'updated', payload = 'wave-' .. tostring(wave) })
+  end
+  mutationCpu += os.clock() - started
+  started = os.clock()
+  if mode == 'flush' then db:flush() else db:checkpoint() end
+  maintenanceCpu += os.clock() - started
+end
+local finishedAt = os.clock()
+local generationCount = db:stats().generations
+db:close()
+local reopenedAt = os.clock()
+local reopened = sql.managed.open(base, { readMode = 'positional' })
+assert(reopened:query('SELECT COUNT(*) AS n FROM events').rows[1].n == total)
+assert((reopened:get(1) :: sql.Row).payload == 'wave-' .. tostring(waves))
+assert(reopened:stats().generations == generationCount)
+reopened:close()
+local verifiedAt = os.clock()
+clear()
+
+print('mode', mode, 'rows', total, 'waves', waves, 'batch', batch,
+  'generations', generationCount, 'mutations_cpu', mutationCpu,
+  'maintenance_cpu', maintenanceCpu, 'total_cpu', finishedAt - runStart,
+  'reopen_validate_cpu', verifiedAt - reopenedAt)

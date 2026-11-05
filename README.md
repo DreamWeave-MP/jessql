@@ -30,16 +30,19 @@ bounded total RSS are **not yet provided**.
 
 ## Experimental durable managed generations
 
-The new `sql.managed.open(base, { tableName, columns, primaryKey })` owns a
-synchronized WAL and an immutable JQLP2 snapshot under a checksum-framed,
-atomically replaced generation manifest. Its explicit `db:checkpoint()` seals
-and publishes a **full** replacement snapshot, creates a new bound WAL, and
-retires the previous generation only after a directory synchronization
-barrier. Interrupted publication is recoverable or fails closed; unknown
-outcomes require close/reopen. This is **not** automatic multi-level LSM
-compaction, a bounded-total-memory engine, or verified physical power-cut
-durability. The original `sql.open(..., { durability = 'sync' })` still refuses
-its legacy checkpoint. See [managed generations](docs/MANAGED-GENERATIONS.md).
+`sql.managed.open(base, { tableName, columns, primaryKey })` now owns a
+synchronized WAL and an ordered set of immutable JQLP2 generations under a
+checksum-framed, durably replaced manifest. `db:flush()` publishes a small
+hot-overlay delta and tombstone sidecar without rewriting older generations.
+`db:checkpoint()` collapses the full logical view into one new generation.
+Set `maxHotRows` to trigger synchronous automatic maintenance after committed
+operations; `maxGenerations` bounds the immutable generation count (2–8),
+falling back to a full checkpoint when that limit is reached. Interrupted
+publication is recoverable or fails closed; uncertain outcomes require
+close/reopen. This is **not** a hard total-memory limit, an online compaction
+scheduler, or verified physical power-cut durability. The original
+`sql.open(..., { durability = 'sync' })` still refuses its legacy checkpoint.
+See [managed generations](docs/MANAGED-GENERATIONS.md).
 
 ## Experimental segmented cold indexes and immutable deletions
 

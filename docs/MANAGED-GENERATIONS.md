@@ -30,9 +30,9 @@ reopened:close()
 ```
 
 The managed API provides `get`, `insert`, `upsert`, `update`, `delete`,
-`transaction`, `query`, `prepare`, `stats`, `checkpoint`, and `close` with the
-same one-table semantics as `sql.hybrid.open`. `stats()` additionally reports
-`epoch`. On first open `tableName`, ordered `columns`, and `primaryKey` are
+`transaction`, `query`, `prepare`, `stats`, `flush`, `checkpoint`,
+`maintenanceStatus`, and `close` with the same one-table semantics as
+`sql.hybrid.open`. `stats()` additionally reports `epoch` and `generations`. On first open `tableName`, ordered `columns`, and `primaryKey` are
 required; on later opens they may be omitted or supplied for validation.
 The parent directory must exist before first open. Only one managed owner
 may open a base path at a time; the parent is canonicalized before taking the
@@ -45,15 +45,22 @@ For a base path `data/events`:
 ```text
 data/events.jql-lock                  # stable managed-process lock
 data/events.jql-manifest              # checksum-framed JQLM1 current manifest
-data/events.g00000003.rows            # immutable, checksummed JQLP2 snapshot
-data/events.g00000003.wal             # synchronized JQLW1 mutation journal
+data/events.g00000001.rows            # immutable first full generation
+data/events.g00000002.rows            # immutable sorted WAL delta
+data/events.g00000002.deleted         # snapshot-bound tombstone sidecar
+data/events.g00000003.rows            # another immutable generation
+data/events.g00000003.deleted         # tombstones for this generation
+data/events.g00000003.wal             # only active synchronized JQLW1 journal
 data/events.g00000003.wal.lock        # lower-level journal lock
 ```
 
-The manifest records the epoch, table/schema, and immutable snapshot
-identity. It derives generation filenames from a fixed convention, rather
-than interpreting arbitrary paths stored on disk. The WAL contains the
-snapshot identity binding and cannot be silently rebound. A missing,
+The version-1 manifest records the epoch, table/schema, and immutable
+snapshot identity. Version 2 adds an ordered list of up to eight immutable
+generations, per-generation deletion-sidecar flags, and a composite identity
+which binds all referenced generations to one WAL. The new code reads v1
+manifests without migrating them until the first `flush()`. Filenames come
+from the epoch numbers, not arbitrary paths stored in a manifest. The WAL
+contains the complete cold-set identity and cannot be silently rebound. A missing,
 corrupt, uninitialized, or incorrectly bound active WAL fails closed. An
 unreadable or mismatched snapshot or manifest also fails closed.
 
@@ -91,35 +98,86 @@ and the handle reusable. An error **during or after** replacement is an
 uncertain outcome: the handle is poisoned, `close()` is required, and only a
 fresh `sql.managed.open()` may determine the authoritative generation. Neither
 a failed `replace()` nor a failed `syncDirectory()` authorizes retirement.
-Recovery first checks the manifest and its WAL binding; when it can synchronize
-the parent directory, it may retire the immediately preceding generation left
-by interrupted publication. Unreferenced next-generation candidate files
-are recycled only under the managed lock when a later checkpoint starts.
+Recovery first checks the manifest and its WAL binding, then synchronizes
+the parent directory before permitting writes. Under the managed lock, it
+best-effort removes every known unreferenced `.gNNNNNNNN` managed file in
+the parent directory, including abandoned candidate files. It never removes
+referenced generations or active WAL files. No other filename is touched.
+If cleanup fails, stale files may remain; the verified manifest and WAL
+still determine the authoritative state.
 
 `checkpoint()` invalidates plans held by the previous hybrid generation;
 reprepare queries after a cutover. External clients must not mutate the
 underlying WAL or remove a managed lock path while handles are live.
 
-## Not included in this phase
+## Delta flushes and bounded generation count
 
-- No automatic flush thresholds or compaction scheduler. A checkpoint **fully
-  rewrites the logical snapshot**, even for a small delta, and can be expensive.
-- No snapshotting in another worker, group commits, or cross-VM zero-copy pages.
-- No multiple published immutable generations, tombstone sidecar lists, or
-  compact indexed-delta activation. The existing candidate exporters remain
-  separate and are **not** automatically published by `managed`.
-- No bounded **total** resident memory guarantee. The full snapshot export
-  materializes the current hot overlay, and cold page directories remain
-  resident. The hot overlay is emptied on successful checkpoint, but a
-  growing live WAL can still consume substantial memory.
-- No live online migration from an existing standalone `sql.open` WAL or
-  from an operator-owned `sql.hybrid` snapshot. Do not rename one into the
-  managed namespace and assume the identity will match.
-- The manifest CRC catches accidental corruption, not malicious edits.
-  Page-level CRC validation remains in the existing cold reader.
-- No claim of physical power-cut validation or verified Windows/macOS
-  filesystem semantics. Jess `replace`/`syncDirectory` may reject particular
-  Windows filesystems or open-handle arrangements; failure is explicit.
+`flush()` publishes only the current WAL's hot rows and tombstones as two
+new immutable files (`.rows` and `.deleted`). It synchronizes both files,
+opens the complete generation set, starts an independent WAL bound to the
+composite identity, and durably replaces the manifest. The prior WAL remains
+authoritative until publication; on success it is retired, while all
+referenced cold generations remain. No-op `flush()` does not advance the epoch.
+
+```luau
+local db = sql.managed.open('data/events', {
+  tableName = 'events', columns = { 'id', 'room', 'body' }, primaryKey = 'id',
+  maxHotRows = 10000, maxGenerations = 6,
+  runRows = 4096, mergeFanIn = 4,
+})
+-- Each committed insert/transaction can trigger a synchronous delta flush.
+db:insert({ id = 42, room = 'lobby', body = 'hello' })
+-- Manual flush is always available, including when auto-flushing is off.
+local epoch = db:flush()
+print(epoch, db:stats().generations)
+-- Full logical compaction collapses the generation list to one file.
+db:checkpoint()
+print(db:stats().generations) -- 1
+db:close()
+```
+
+`maxHotRows` is optional (default: **disabled**). The threshold counts the
+current hot rows **plus** tombstones, and is inspected after each committed
+managed mutation or transaction. When crossed, maintenance runs synchronously
+at the request boundary. It is **not** a hard memory cap: a single large
+transaction can exceed it, and rows vary in memory cost. If automatic
+maintenance fails **after the user transaction committed**, the write still
+returns successfully; `db:maintenanceStatus()` reports `lastError` and whether
+the handle is poisoned. A poisoned handle must be closed and reopened. An
+operator should monitor/report maintenance errors so repeated failures cannot
+allow the hot overlay to grow without bound. A successful manual flush clears
+an earlier maintenance error.
+
+`maxGenerations` defaults to 8 (allowed: 2–8). Automatic maintenance uses a
+delta flush while a slot is available and falls back to a **full snapshot
+checkpoint** at the generation limit. This is a conservative full-rewrite
+fallback, not an optimized size-tiered or leveled compaction policy. Explicit
+`flush()` at the limit fails with an error; use `checkpoint()` instead. Any
+successful cutover invalidates plans bound to the previous hybrid reader.
+
+`runRows` and `mergeFanIn` configure the bounded external sorter used only for
+delta output (default 8192 rows and fan-in 8); `pageBytes` applies to new
+immutable snapshots. These parameters do not cap the memory of the live WAL
+index, and older cold directory metadata is still resident. The number of
+active generations is bounded but total database size is not.
+
+## Not yet implemented or verified
+
+- No background flush/compaction worker, smart compaction planner, group
+  commits, cross-VM zero-copy page processing, or guaranteed p99 latency.
+- No hard total memory-byte budget, no partial hot-state eviction, and no
+  disk-quota-enforced operation. A transaction can exceed `maxHotRows` until
+  it finishes; a persistent I/O failure can prevent automatic maintenance.
+- The manifest and page identities are integrity checks for metadata and
+  page directories. They do not eagerly verify the payload of every cold
+  data page when reopening a large database.
+- No live online migration from standalone `sql.open` or operator-owned
+  `sql.hybrid` stores. Do not rename those files into managed paths.
+- No physical power-cut validation or native Windows/macOS durability
+  certification. The filesystem primitives are called synchronously, but
+  their platform-specific guarantees still need fault/power testing.
+- The manifest CRC is not an authentication or tamper-resistance mechanism.
+  Do not expose the managed directory to untrusted local writers.
 
 Tests exercise pre-publication and post-publication fault hooks, retained
 commits, torn-tail recovery, missing/replaced WALs, stale candidates, and
@@ -128,6 +186,9 @@ inject deterministic faults at `candidate-sealed`, `wal-ready`,
 `before-replace`, `after-replace`, `after-directory-sync`, and `before-retire`;
 **do not** supply this option in normal applications.
 
-Try `jess run --trusted --package . bench/managed.jsl 2000 50` for a local
-CPU and restart-cost baseline. These numbers are machine-dependent, not a
-substitute for native crash or power-failure tests.
+Try `jess run --trusted --package . bench/managed.jsl 2000 50` for the
+full checkpoint baseline. Run `jess run --trusted --package .
+bench/managed-delta.jsl flush 2000 4 50` and repeat with `checkpoint` to
+compare the same write/update workload. These are CPU timings, not wall-clock
+p99 latencies, and depend on the machine and storage. They are not a
+substitute for real crash or power-failure validation.
