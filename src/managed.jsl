@@ -377,7 +377,7 @@ managed.restore = managed.backup
 
 -- Managed synchronous generation lifecycle. No background workers or group
 -- commits: each cutover happens while holding this database's exclusive lock.
-function managed.open(path: string, options: Options?): Database
+local function openManaged(path: string, options: Options?, intent: string): Database
   local base, parent = normalize(path)
   local limits = policy.limits(options)
   local maxHotRows, maxHotBytes, maxWalBytes = limits.maxHotRows, limits.maxHotBytes, limits.maxWalBytes
@@ -395,9 +395,12 @@ function managed.open(path: string, options: Options?): Database
     if exists == nil then error('manifest stat: ' .. tostring(existsError)) end
 
     if exists then
+      if intent == 'create' then error('database already exists; use openExisting to reopen it') end
       value = readManifest(manifestPath)
       manifest.sameSchema(value :: Manifest, options)
     else
+      if intent == 'existing' then error('database does not exist; use create to initialize it') end
+
       if not options or not options.tableName or not options.columns or not options.primaryKey then
         error('first open requires tableName, columns and primaryKey')
       end
@@ -809,6 +812,59 @@ function managed.open(path: string, options: Options?): Database
     if not ok then error(err, 2) end
   end
   return db
+end
+
+-- Explicit lifecycle intents avoid accidental empty database creation when an
+-- application points at the wrong namespace. The existence check is made
+-- *inside* the managed namespace lock, never as a racy preflight.
+function managed.open(path: string, options: Options?): Database
+  return openManaged(path, options, 'either')
+end
+
+function managed.openExisting(path: string, options: Options?): Database
+  return openManaged(path, options, 'existing')
+end
+
+function managed.create(path: string, options: Options?): Database
+  return openManaged(path, options, 'create')
+end
+
+-- A scoped database callback is guaranteed to release the managed lock even
+-- when application code throws. The first error remains authoritative;
+-- failure to close is never silently discarded if no earlier error occurred.
+local function scoped<T>(opener: (string, Options?) -> Database, path: string,
+  options: Options?, callback: (Database) -> T): T
+  if type(callback) ~= 'function' then
+    error('jessql managed: scoped use requires a callback', 3)
+  end
+  local db = opener(path, options)
+  -- Application callbacks may throw after some commits; always release the lock.
+  local success, outcome = pcall(function() return callback(db) end)
+  -- Even close can throw after a WAL/FS error; report it without losing callback failures.
+  local released, closeFailure = pcall(function() db:close() end)
+  if not success then
+    if not released then
+      error('jessql managed: callback failed: ' .. tostring(outcome)
+        .. '; close also failed: ' .. tostring(closeFailure), 3)
+    end
+    error(outcome, 3)
+  end
+
+  if not released then error('jessql managed: scoped close failed: ' .. tostring(closeFailure), 3) end
+
+  return outcome :: T
+end
+
+function managed.withOpen<T>(path: string, options: Options?, callback: (Database) -> T): T
+  return scoped(managed.open, path, options, callback)
+end
+
+function managed.withExisting<T>(path: string, options: Options?, callback: (Database) -> T): T
+  return scoped(managed.openExisting, path, options, callback)
+end
+
+function managed.withNew<T>(path: string, options: Options, callback: (Database) -> T): T
+  return scoped(managed.create, path, options, callback)
 end
 
 return managed
