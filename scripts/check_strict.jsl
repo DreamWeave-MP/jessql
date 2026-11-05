@@ -1,0 +1,104 @@
+--!strict
+-- Release gate: every bundled JSL file opts into strict mode, and Jess reports zero errors.
+-- Run from any directory: jess run --trusted /path/to/jessql/scripts/check_strict.jsl [jess-binary]
+local fs = require '@dream/fs'
+local process = require '@dream/process'
+local json = require '@jess/json'
+
+local StrictHeader = '--!strict\n'
+local SourceDirs = { 'src', 'tests', 'bench', 'scripts' }
+
+local function fail(message: string): never
+  error(`JessQL strict gate: {message}`, 0)
+end
+
+local function rootPath(): string
+  local source = debug.info(1, 's')
+  local first = string.sub(source, 1, 1)
+  local script = if first == '@' or first == '=' then string.sub(source, 2) else source
+  local absolute = fs.absolute(script) or fail('cannot resolve script path')
+
+  local scriptsDir = fs.parent(absolute)
+  local root = (if scriptsDir then fs.parent(scriptsDir) else nil)
+    or fail('cannot locate the JessQL repository root')
+
+  return root
+end
+
+local function shippedScripts(root: string): number
+  local total = 0
+  for _, folder in SourceDirs do
+    local directory = fs.join(root, folder)
+    local inventory = fs.walk(directory, {
+      include = 'files',
+      followLinks = false,
+      sort = true,
+      skipErrors = false,
+    }) or fail(`cannot enumerate {folder}`)
+
+    if #inventory.errors ~= 0 then fail(`incomplete filesystem walk in {folder}`) end
+
+    for _, relative in inventory.paths do
+      if fs.extension(relative) ~= 'jsl' then continue end
+
+      local path = fs.join(directory, relative)
+      local source = fs.readFileString(path) or fail(`cannot read {folder}/{relative}`)
+      if string.sub(source, 1, #StrictHeader) ~= StrictHeader then
+        fail(`missing --!strict directive: {folder}/{relative}`)
+      end
+      total += 1
+    end
+  end
+
+  if total == 0 then fail('no shipped JSL files found') end
+  return total
+end
+
+local function reportErrors(errors: { unknown }): ()
+  for _, item in errors do
+    if typeof(item) == 'table' then
+      local diagnostic = item :: { [string]: unknown }
+      local file = tostring(diagnostic.file or '?')
+      local line = tostring(diagnostic.line or '?')
+      local column = tostring(diagnostic.column or '?')
+      local message = tostring(diagnostic.message or '?')
+      process.write('stderr', `{file}:{line}:{column}: {message}\n`)
+    else
+      process.write('stderr', `Unexpected strict diagnostic: {tostring(item)}\n`)
+    end
+  end
+end
+
+local function check(root: string, binary: string, expected: number): ()
+  local result = process.run(binary, {
+    'package', 'check', '.', '--format', 'json',
+  }, { cwd = root, stdout = 'capture', stderr = 'capture' }) or fail('cannot execute Jess checker')
+
+  -- A failed child checker may emit non-JSON output; parse failure must reject the run.
+  local decodedOk, decoded = pcall(function(): unknown
+    return json.decode(result.stdout or '')
+  end)
+
+  if not decodedOk or typeof(decoded) ~= 'table' then
+    fail(`invalid Jess package check report: {result.stderr or '(no stderr)'}`)
+  end
+  local report = decoded :: { [string]: unknown }
+  local files = report.files
+  local errors = report.errors
+  if typeof(files) ~= 'number' or typeof(errors) ~= 'table' then
+    fail('unexpected Jess package check report shape')
+  end
+  local diagnostics = errors :: { unknown }
+  reportErrors(diagnostics)
+
+  if not result.success or files ~= expected or #diagnostics > 0 then
+    fail(`Jess checked {files}/{expected} JSL files; {#diagnostics} strict errors (exit {tostring(result.code)})`)
+  end
+
+  print(`PASS: {files} shipped JSL files, zero strict diagnostics`)
+end
+
+if select('#', ...) > 1 then fail('usage: jess run --trusted scripts/check_strict.jsl [jess-binary]') end
+local binary = (... :: string?) or 'jess'
+local root = rootPath()
+check(root, binary, shippedScripts(root))
