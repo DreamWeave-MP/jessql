@@ -4,13 +4,13 @@
 -- Flushes retain immutable generations; full checkpoints compact them.
 -- All transitions are synchronous under the managed lock.
 local fs = require('@dream/fs')
-local bytes = require('@dream/bytes')
-local json = require('@jess/json')
 local hybrid = require('@jessql/hybrid')
 local paged = require('@jessql/paged')
 local segments = require('@jessql/segments')
 local tiers = require('@jessql/tiers')
 local engine = require('@jessql/engine')
+local manifest = require('@jessql/managed_manifest')
+local policy = require('@jessql/managed_policy')
 
 export type Row = { [string]: unknown }
 export type Options = {
@@ -21,6 +21,11 @@ export type Options = {
   -- Deterministic fault injection for integration tests. Throws at a named stage.
   testHook: ((string) -> ())?,
 }
+export type InspectionGeneration = { epoch: number, deleted: boolean, rowsBytes: number,
+  deletedBytes: number? }
+export type Inspection = { version: number, epoch: number, tableName: string,
+  primaryKey: string, columns: { string }, generations: { InspectionGeneration },
+  walBytes: number, coldIdentity: string, walIdentityChecked: boolean }
 export type Transaction = hybrid.Transaction
 export type BatchResult = hybrid.BatchResult
 export type Database = {
@@ -42,15 +47,10 @@ export type Database = {
   close: (self: Database) -> (),
 }
 
-type Generation = { epoch: number, deleted: boolean }
-type Manifest = { version: number, epoch: number, tableName: string,
-  columns: { string }, primaryKey: string, snapshotIdentity: string,
-  generations: { Generation }? }
+type Generation = manifest.Generation
+type Manifest = manifest.Manifest
 type Paths = { snapshot: string, deletes: string, wal: string }
-
-local Magic = 'JQLM1\n'
-local MaxManifest = 65536
-local MaxEpoch = 99999999
+local MaxEpoch = manifest.MaxEpoch
 local managed = {}
 
 local function assertOK(ok: boolean?, message: string?, action: string)
@@ -86,102 +86,10 @@ local function paths(base: string, epoch: number): Paths
     wal = base .. suffix .. '.wal' }
 end
 
-local function validateSchema(value: Manifest)
-  if (value.version ~= 1 and value.version ~= 2) or type(value.epoch) ~= 'number' or value.epoch % 1 ~= 0
-    or value.epoch < 1 or value.epoch > MaxEpoch or type(value.tableName) ~= 'string'
-    or not string.match(value.tableName, '^[%a_][%w_]*$')
-    or value.tableName ~= string.lower(value.tableName)
-    or value.tableName == '__jessql_hybrid_deleted'
-    or value.tableName == '__jessql_hybrid_identity'
-    or type(value.primaryKey) ~= 'string' or type(value.snapshotIdentity) ~= 'string'
-    or #value.snapshotIdentity > 8192
-    or type(value.columns) ~= 'table' or #value.columns == 0 or #value.columns > 256 then
-    error('jessql managed: invalid manifest schema', 3)
-  end
-  local unique: { [string]: boolean } = {}
-
-  for index, name in value.columns do
-    if type(index) ~= 'number' or type(name) ~= 'string'
-      or not string.match(name, '^[%a_][%w_]*$') or unique[name] then
-      error('jessql managed: invalid manifest columns', 3)
-    end
-    unique[name] = true
-  end
-
-  if not unique[value.primaryKey] then error('jessql managed: missing primary key', 3) end
-
-  if value.version == 1 then
-    if value.generations ~= nil or not string.match(value.snapshotIdentity, '^[%x]+:%d+$') then
-      error('jessql managed: invalid legacy generation identity', 3)
-    end
-  else
-    if type(value.generations) ~= 'table' or #value.generations == 0
-      or #value.generations > 8 or string.sub(value.snapshotIdentity, 1, 6) ~= 'JQLM1|' then
-      error('jessql managed: invalid generations', 3)
-    end
-    local previous = 0
-    for index, generation in value.generations :: { Generation } do
-      if type(index) ~= 'number' or type(generation) ~= 'table'
-        or type(generation.epoch) ~= 'number' or generation.epoch % 1 ~= 0
-        or generation.epoch <= previous or generation.epoch > value.epoch
-        or type(generation.deleted) ~= 'boolean' then
-        error('jessql managed: invalid generation entry', 3)
-      end
-      previous = generation.epoch
-    end
-
-    if previous ~= value.epoch then
-      error('jessql managed: final generation must match publication epoch', 3)
-    end
-  end
-end
-
-local function manifestText(value: Manifest): string
-  validateSchema(value)
-  local body = json.encodeTable(value)
-
-  if #body > MaxManifest - 64 then error('jessql managed: manifest too large', 3) end
-  return Magic .. body .. '\n' .. tostring(bytes.crc32(body)) .. '\n'
-end
-
 local function readManifest(path: string): Manifest
   local raw, failure = fs.readFileString(path)
-
   if not raw then error('jessql managed: read manifest: ' .. tostring(failure), 3) end
-
-  if #raw > MaxManifest or string.sub(raw, 1, #Magic) ~= Magic then
-    error('jessql managed: invalid manifest header', 3)
-  end
-  local body, checksum = string.match(string.sub(raw, #Magic + 1), '^(.*)\n(%d+)\n$')
-
-  if not body or not checksum or tonumber(checksum) ~= bytes.crc32(body) then
-    error('jessql managed: manifest checksum mismatch', 3)
-  end
-  local decoded = json.decode(body) :: Manifest
-
-  if type(decoded) ~= 'table' then error('jessql managed: invalid manifest', 3) end
-  validateSchema(decoded)
-  return decoded
-end
-
-local function sameSchema(left: Manifest, options: Options?)
-  if not options then return end
-
-  if options.tableName ~= nil and options.tableName ~= left.tableName then
-    error('jessql managed: requested table name mismatch', 3)
-  end
-
-  if options.primaryKey ~= nil and options.primaryKey ~= left.primaryKey then
-    error('jessql managed: requested primary key mismatch', 3)
-  end
-
-  if options.columns ~= nil then
-    if #options.columns ~= #left.columns then error('jessql managed: column mismatch', 3) end
-
-    for index, column in options.columns do
-      if column ~= left.columns[index] then error('jessql managed: column mismatch', 3) end
-    end
-  end
+  return manifest.decode(raw)
 end
 
 local function seal(path: string, parent: string)
@@ -225,22 +133,10 @@ local function clearCandidate(candidatePaths: Paths)
   removeIfPresent(candidatePaths.deletes)
 end
 
-local function newManifest(active: Manifest, epoch: number, identity: string,
-  generations: { Generation }?): Manifest
-  return { version = if generations then 2 else 1, epoch = epoch,
-    tableName = active.tableName, columns = active.columns,
-    primaryKey = active.primaryKey, snapshotIdentity = identity, generations = generations }
-end
-
-local function generationList(value: Manifest): { Generation }
-  if value.version == 1 then return { { epoch = value.epoch, deleted = false } } end
-  return value.generations :: { Generation }
-end
-
 local function indexedPaths(base: string, value: Manifest): ({ string }, { [number]: string })
   local sources: { string } = {}
   local deleted: { [number]: string } = {}
-  for index, generation in generationList(value) do
+  for index, generation in manifest.generations(value) do
     local files = paths(base, generation.epoch)
     sources[index] = files.snapshot
     if generation.deleted then deleted[index] = files.deletes end
@@ -316,9 +212,9 @@ end
 -- A WAL is always owned by exactly one epoch; rows can survive many epochs.
 local function retire(base: string, parent: string, prior: Manifest, nextValue: Manifest)
   local retained: { [number]: boolean } = {}
-  for _, generation in generationList(nextValue) do retained[generation.epoch] = true end
+  for _, generation in manifest.generations(nextValue) do retained[generation.epoch] = true end
 
-  for _, generation in generationList(prior) do
+  for _, generation in manifest.generations(prior) do
     if not retained[generation.epoch] then
       clearCandidate(paths(base, generation.epoch))
     end
@@ -336,7 +232,7 @@ local function collectOrphans(base: string, parent: string, value: Manifest)
   local names, listError = fs.list(parent)
   if not names then error('jessql managed: directory list: ' .. tostring(listError), 3) end
   local referenced: { [number]: Generation } = {}
-  for _, generation in generationList(value) do referenced[generation.epoch] = generation end
+  for _, generation in manifest.generations(value) do referenced[generation.epoch] = generation end
   local prefix = (fs.fileName(base) :: string) .. '.g'
   local removed = false
 
@@ -390,7 +286,7 @@ local function durableManifest(base: string, parent: string, value: Manifest,
   hook: ((string) -> ())?, state: { started: boolean })
   local candidate = base .. '.jql-manifest.tmp'
   removeIfPresent(candidate)
-  local text = manifestText(value)
+  local text = manifest.encode(value)
   local count, errorMessage = fs.createDurable(candidate, text)
 
   if count ~= #text then error('jessql managed: durable manifest: ' .. tostring(errorMessage), 3) end
@@ -408,42 +304,65 @@ local function durableManifest(base: string, parent: string, value: Manifest,
   if hook then hook('after-directory-sync') end
 end
 
+-- Lock-protected offline inventory of the published cold generation set.
+-- This opens no writable hybrid handle, replays no WAL, and retires no files.
+-- It validates cold metadata/identity, but DOES NOT validate WAL frames,
+-- WAL binding, or every payload page. Full recovery still requires open().
+function managed.inspect(path: string): Inspection
+  local base = normalize(path)
+  local lock, lockError = fs.lock(base .. '.jql-lock')
+  if not lock then error('jessql managed: inspection locked: ' .. tostring(lockError), 2) end
+
+  -- Metadata opens can throw on corruption; release the advisory lock before reporting.
+  local ok, result = pcall(function(): Inspection
+    local value = readManifest(base .. '.jql-manifest')
+    local identity = verifyCold(base, value, nil)
+    local files: { InspectionGeneration } = {}
+
+    for _, generation in manifest.generations(value) do
+      local location = paths(base, generation.epoch)
+      local rows, rowsError = fs.stat(location.snapshot)
+      if not rows or not rows.isFile then
+        error('generation rows missing: ' .. tostring(rowsError))
+      end
+      local deletionSize: number? = nil
+      if generation.deleted then
+        local deletes, deletesError = fs.stat(location.deletes)
+        if not deletes or not deletes.isFile then
+          error('generation tombstones missing: ' .. tostring(deletesError))
+        end
+        deletionSize = deletes.size
+      end
+
+      files[#files + 1] = { epoch = generation.epoch,
+        deleted = generation.deleted, rowsBytes = rows.size,
+        deletedBytes = deletionSize }
+    end
+
+    local journal, journalError = fs.stat(paths(base, value.epoch).wal)
+    if not journal or not journal.isFile then
+      error('active WAL missing: ' .. tostring(journalError))
+    end
+    local columns: { string } = {}
+    for index, column in value.columns do columns[index] = column end
+
+    return { version = value.version, epoch = value.epoch,
+      tableName = value.tableName, primaryKey = value.primaryKey,
+      columns = columns, generations = files, walBytes = journal.size,
+      coldIdentity = identity, walIdentityChecked = false }
+  end)
+  lock:unlock()
+  if not ok then error('jessql managed: inspection failed: ' .. tostring(result), 2) end
+  return result :: Inspection
+end
+
 -- Managed synchronous generation lifecycle. No background workers or group
 -- commits: each cutover happens while holding this database's exclusive lock.
 function managed.open(path: string, options: Options?): Database
   local base, parent = normalize(path)
-  local maxHotRows = if options and options.maxHotRows ~= nil then options.maxHotRows else nil
-  local maxHotBytes = if options and options.maxHotBytes ~= nil then options.maxHotBytes else nil
-  local maxWalBytes = if options and options.maxWalBytes ~= nil then options.maxWalBytes else nil
-  local maxGenerations = if options and options.maxGenerations ~= nil
-    then options.maxGenerations else 8
-  if maxHotRows ~= nil and (type(maxHotRows) ~= 'number' or maxHotRows % 1 ~= 0
-    or maxHotRows < 1 or maxHotRows > 1000000000) then
-    error('jessql managed: invalid maxHotRows', 2)
-  end
-
-  if maxHotBytes ~= nil and (type(maxHotBytes) ~= 'number' or maxHotBytes % 1 ~= 0
-    or maxHotBytes < 1 or maxHotBytes > 1000000000000) then
-    error('jessql managed: invalid maxHotBytes', 2)
-  end
-
-  -- A WAL has a nonzero bootstrap/header size even with an empty overlay.
-  -- Extremely small thresholds would make every first commit immediately rotate.
-  if maxWalBytes ~= nil and (type(maxWalBytes) ~= 'number' or maxWalBytes % 1 ~= 0
-    or maxWalBytes < 1024 or maxWalBytes > 1000000000000) then
-    error('jessql managed: invalid maxWalBytes', 2)
-  end
-
-  if type(maxGenerations) ~= 'number' or maxGenerations % 1 ~= 0
-    or maxGenerations < 2 or maxGenerations > 8 then
-    error('jessql managed: invalid maxGenerations', 2)
-  end
-  local compactionFanIn = if options and options.compactionFanIn ~= nil
-    then options.compactionFanIn else 3
-  if type(compactionFanIn) ~= 'number' or compactionFanIn % 1 ~= 0
-    or compactionFanIn < 2 or compactionFanIn > 8 then
-    error('jessql managed: invalid compactionFanIn', 2)
-  end
+  local limits = policy.limits(options)
+  local maxHotRows, maxHotBytes, maxWalBytes = limits.maxHotRows, limits.maxHotBytes, limits.maxWalBytes
+  local maxGenerations, compactionFanIn = limits.maxGenerations, limits.compactionFanIn
   local lock, lockError = fs.lock(base .. '.jql-lock')
 
   if not lock then error('jessql managed: database locked: ' .. tostring(lockError), 2) end
@@ -458,7 +377,7 @@ function managed.open(path: string, options: Options?): Database
 
     if exists then
       value = readManifest(manifestPath)
-      sameSchema(value :: Manifest, options)
+      manifest.sameSchema(value :: Manifest, options)
     else
       if not options or not options.tableName or not options.columns or not options.primaryKey then
         error('first open requires tableName, columns and primaryKey')
@@ -478,7 +397,7 @@ function managed.open(path: string, options: Options?): Database
         columns = options.columns, primaryKey = options.primaryKey,
         snapshotIdentity = snapshot.identity }
       snapshot:close()
-      validateSchema(value :: Manifest)
+      manifest.validate(value :: Manifest)
       current = openHybrid(base, value :: Manifest, options, false)
       local started = { started = false }
       durableManifest(base, parent, value :: Manifest, if options then options.testHook else nil, started)
@@ -588,20 +507,22 @@ function managed.open(path: string, options: Options?): Database
   local function autoMaintain()
     if not maxHotRows and not maxHotBytes and not maxWalBytes then return end
 
-    -- Even statistics can throw after the WAL was synchronized. Never turn
-    -- an acknowledged user mutation into an apparent failed transaction.
+    -- Even statistics can throw after WAL synchronization; keep admission
+    -- separate from the transaction's already-successful acknowledgement.
     local ok, failure = pcall(function()
-      local rowPressure, bytePressure = false, false
+      -- A WAL-only watermark must not force a SQL stats query on every commit.
+      local hotRows, tombstones, payloadBytes = 0, 0, nil :: number?
       if maxHotRows or maxHotBytes then
         local state = live:stats()
-        rowPressure = maxHotRows ~= nil and state.hotRows + state.tombstones >= maxHotRows
-        bytePressure = maxHotBytes ~= nil and (state.hotPayloadBytes :: number) >= maxHotBytes
+        hotRows, tombstones, payloadBytes = state.hotRows, state.tombstones, state.hotPayloadBytes
       end
-      local walPressure = maxWalBytes ~= nil and currentWalBytes() >= maxWalBytes
-      if not rowPressure and not bytePressure and not walPressure then return end
-
-      if #generationList(active) >= maxGenerations then db:compact()
-      else db:flush() end
+      local walBytes = if maxWalBytes then currentWalBytes() else nil
+      local generationCount = if active.version == 1 then 1
+        else #(active.generations :: { Generation })
+      local mode = policy.plan(limits, generationCount,
+        hotRows, tombstones, payloadBytes, walBytes)
+      if mode == 'compact' then db:compact()
+      elseif mode == 'flush' then db:flush() end
     end)
     lastMaintenanceError = if ok then nil else tostring(failure)
   end
@@ -612,7 +533,7 @@ function managed.open(path: string, options: Options?): Database
   local function readyToWrite()
     ready()
     if (maxHotRows or maxHotBytes or maxWalBytes) and lastMaintenanceError then
-      error('jessql managed: maintenance failed under byte budget; flush or checkpoint', 3)
+      error('jessql managed: maintenance failed under configured budget; flush or checkpoint', 3)
     end
   end
 
@@ -666,7 +587,7 @@ function managed.open(path: string, options: Options?): Database
   function db.stats(_self: Database)
     ready()
     local result = live:stats()
-    return { epoch = active.epoch, generations = #generationList(active),
+    return { epoch = active.epoch, generations = #manifest.generations(active),
       coldRows = result.coldRows, hotRows = result.hotRows,
       tombstones = result.tombstones, hotPayloadBytes = result.hotPayloadBytes,
       walBytes = if maxWalBytes then currentWalBytes() else nil,
@@ -687,11 +608,11 @@ function managed.open(path: string, options: Options?): Database
     ready()
     if active.epoch >= MaxEpoch then error('jessql managed: generation limit', 2) end
 
-    if mode == 'delta' and #generationList(active) >= maxGenerations then
+    if mode == 'delta' and #manifest.generations(active) >= maxGenerations then
       error('jessql managed: generation budget reached; compact first', 2)
     end
 
-    if mode == 'compact' and #generationList(active) < 2 then
+    if mode == 'compact' and #manifest.generations(active) < 2 then
       error('jessql managed: selective compaction needs two cold generations', 2)
     end
     busy = true
@@ -713,7 +634,7 @@ function managed.open(path: string, options: Options?): Database
         })
         seal(candidatePaths.deletes, parent)
       elseif mode == 'compact' then
-        local generations = generationList(active)
+        local generations = manifest.generations(active)
         mergedCount = math.min(#generations, compactionFanIn)
         local inputRows: { string } = {}
         local inputDeletes: { [number]: string } = {}
@@ -751,7 +672,7 @@ function managed.open(path: string, options: Options?): Database
       if mode ~= 'full' or active.version == 2 then
         local generations: { Generation } = {}
         if mode == 'delta' or mode == 'compact' then
-          local all = generationList(active)
+          local all = manifest.generations(active)
           local limit = if mode == 'compact' then #all - mergedCount else #all
           for index = 1, limit do
             local generation = all[index]
@@ -759,14 +680,14 @@ function managed.open(path: string, options: Options?): Database
           end
         end
         generations[#generations + 1] = { epoch = nextEpoch, deleted = mode ~= 'full' }
-        nextValue = newManifest(active, nextEpoch, '', generations)
+        nextValue = manifest.new(active, nextEpoch, '', generations)
         nextValue.snapshotIdentity = coldIdentity(base, nextValue, options)
       else
         local snapshot = paged.open(candidatePaths.snapshot, { cachePages = 1 })
-        nextValue = newManifest(active, nextEpoch, snapshot.identity, nil)
+        nextValue = manifest.new(active, nextEpoch, snapshot.identity, nil)
         snapshot:close()
       end
-      validateSchema(nextValue)
+      manifest.validate(nextValue)
       if options and options.testHook then options.testHook('candidate-sealed') end
       candidate = openHybrid(base, nextValue, options, false)
       if options and options.testHook then options.testHook('wal-ready') end

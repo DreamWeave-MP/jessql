@@ -1,0 +1,133 @@
+--!strict
+--!native
+-- Internal, pure JQLM1 manifest codec and schema invariants.
+-- No filesystem calls or application-domain imports: callers own locking and publication.
+local bytes = require('@dream/bytes')
+local json = require('@jess/json')
+
+export type Generation = { epoch: number, deleted: boolean }
+export type Manifest = { version: number, epoch: number, tableName: string,
+  columns: { string }, primaryKey: string, snapshotIdentity: string,
+  generations: { Generation }? }
+export type Schema = { tableName: string?, columns: { string }?, primaryKey: string? }
+local Magic = 'JQLM1\n'
+local MaxManifest = 65536
+local MaxEpoch = 99999999
+local manifest = { MaxEpoch = MaxEpoch }
+
+local function validateSchema(value: Manifest)
+  if (value.version ~= 1 and value.version ~= 2) or type(value.epoch) ~= 'number' or value.epoch % 1 ~= 0
+    or value.epoch < 1 or value.epoch > MaxEpoch or type(value.tableName) ~= 'string'
+    or not string.match(value.tableName, '^[%a_][%w_]*$')
+    or value.tableName ~= string.lower(value.tableName)
+    or value.tableName == '__jessql_hybrid_deleted'
+    or value.tableName == '__jessql_hybrid_identity'
+    or type(value.primaryKey) ~= 'string' or type(value.snapshotIdentity) ~= 'string'
+    or #value.snapshotIdentity > 8192
+    or type(value.columns) ~= 'table' or #value.columns == 0 or #value.columns > 256 then
+    error('jessql managed: invalid manifest schema', 3)
+  end
+  local unique: { [string]: boolean } = {}
+
+  for index, name in value.columns do
+    if type(index) ~= 'number' or type(name) ~= 'string'
+      or not string.match(name, '^[%a_][%w_]*$') or unique[name] then
+      error('jessql managed: invalid manifest columns', 3)
+    end
+    unique[name] = true
+  end
+
+  if not unique[value.primaryKey] then error('jessql managed: missing primary key', 3) end
+
+  if value.version == 1 then
+    if value.generations ~= nil or not string.match(value.snapshotIdentity, '^[%x]+:%d+$') then
+      error('jessql managed: invalid legacy generation identity', 3)
+    end
+  else
+    if type(value.generations) ~= 'table' or #value.generations == 0
+      or #value.generations > 8 or string.sub(value.snapshotIdentity, 1, 6) ~= 'JQLM1|' then
+      error('jessql managed: invalid generations', 3)
+    end
+    local previous = 0
+    for index, generation in value.generations :: { Generation } do
+      if type(index) ~= 'number' or type(generation) ~= 'table'
+        or type(generation.epoch) ~= 'number' or generation.epoch % 1 ~= 0
+        or generation.epoch <= previous or generation.epoch > value.epoch
+        or type(generation.deleted) ~= 'boolean' then
+        error('jessql managed: invalid generation entry', 3)
+      end
+      previous = generation.epoch
+    end
+
+    if previous ~= value.epoch then
+      error('jessql managed: final generation must match publication epoch', 3)
+    end
+  end
+end
+
+local function manifestText(value: Manifest): string
+  validateSchema(value)
+  local body = json.encodeTable(value)
+
+  if #body > MaxManifest - 64 then error('jessql managed: manifest too large', 3) end
+  return Magic .. body .. '\n' .. tostring(bytes.crc32(body)) .. '\n'
+end
+
+
+function manifest.validate(value: Manifest)
+  validateSchema(value)
+end
+
+function manifest.encode(value: Manifest): string
+  return manifestText(value)
+end
+
+function manifest.decode(raw: string): Manifest
+  if #raw > MaxManifest or string.sub(raw, 1, #Magic) ~= Magic then
+    error('jessql managed: invalid manifest header', 2)
+  end
+  local body, checksum = string.match(string.sub(raw, #Magic + 1), '^(.*)\n(%d+)\n$')
+  if not body or not checksum or tonumber(checksum) ~= bytes.crc32(body) then
+    error('jessql managed: manifest checksum mismatch', 2)
+  end
+  local decoded = json.decode(body) :: Manifest
+  if type(decoded) ~= 'table' then error('jessql managed: invalid manifest', 2) end
+  validateSchema(decoded)
+  return decoded
+end
+
+function manifest.sameSchema(left: Manifest, options: Schema?)
+  if not options then return end
+
+  if options.tableName ~= nil and options.tableName ~= left.tableName then
+    error('jessql managed: requested table name mismatch', 3)
+  end
+
+  if options.primaryKey ~= nil and options.primaryKey ~= left.primaryKey then
+    error('jessql managed: requested primary key mismatch', 3)
+  end
+
+  if options.columns ~= nil then
+    if #options.columns ~= #left.columns then error('jessql managed: column mismatch', 3) end
+
+    for index, column in options.columns do
+      if column ~= left.columns[index] then error('jessql managed: column mismatch', 3) end
+    end
+  end
+end
+
+
+function manifest.new(active: Manifest, epoch: number, identity: string,
+  generations: { Generation }?): Manifest
+  return { version = if generations then 2 else 1, epoch = epoch,
+    tableName = active.tableName, columns = active.columns,
+    primaryKey = active.primaryKey, snapshotIdentity = identity, generations = generations }
+end
+
+function manifest.generations(value: Manifest): { Generation }
+  if value.version == 1 then return { { epoch = value.epoch, deleted = false } } end
+  return value.generations :: { Generation }
+end
+
+
+return manifest

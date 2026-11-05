@@ -1,0 +1,73 @@
+--!strict
+--!native
+-- Pure, deterministic maintenance policy. Never performs filesystem I/O,
+-- advances an epoch, or acknowledges a transaction. The managed durability
+-- state machine retains exclusive control of these operations.
+export type Options = {
+  maxHotRows: number?, maxHotBytes: number?, maxWalBytes: number?,
+  maxGenerations: number?, compactionFanIn: number?,
+}
+export type Limits = {
+  maxHotRows: number?, maxHotBytes: number?, maxWalBytes: number?,
+  maxGenerations: number, compactionFanIn: number,
+}
+local policy = {}
+
+function policy.limits(options: Options?): Limits
+  local maxHotRows = if options then options.maxHotRows else nil
+  local maxHotBytes = if options then options.maxHotBytes else nil
+  local maxWalBytes = if options then options.maxWalBytes else nil
+  local maxGenerations = if options and options.maxGenerations ~= nil
+    then options.maxGenerations else 8
+  local compactionFanIn = if options and options.compactionFanIn ~= nil
+    then options.compactionFanIn else 3
+
+  if maxHotRows ~= nil and (type(maxHotRows) ~= 'number' or maxHotRows % 1 ~= 0
+    or maxHotRows < 1 or maxHotRows > 1000000000) then
+    error('jessql managed: invalid maxHotRows', 2)
+  end
+
+  if maxHotBytes ~= nil and (type(maxHotBytes) ~= 'number' or maxHotBytes % 1 ~= 0
+    or maxHotBytes < 1 or maxHotBytes > 1000000000000) then
+    error('jessql managed: invalid maxHotBytes', 2)
+  end
+
+  -- A fresh synchronized WAL already has a header. Tiny watermarks would
+  -- rotate the journal on virtually every commit.
+  if maxWalBytes ~= nil and (type(maxWalBytes) ~= 'number' or maxWalBytes % 1 ~= 0
+    or maxWalBytes < 1024 or maxWalBytes > 1000000000000) then
+    error('jessql managed: invalid maxWalBytes', 2)
+  end
+
+  if type(maxGenerations) ~= 'number' or maxGenerations % 1 ~= 0
+    or maxGenerations < 2 or maxGenerations > 8 then
+    error('jessql managed: invalid maxGenerations', 2)
+  end
+
+  if type(compactionFanIn) ~= 'number' or compactionFanIn % 1 ~= 0
+    or compactionFanIn < 2 or compactionFanIn > 8 then
+    error('jessql managed: invalid compactionFanIn', 2)
+  end
+
+  return { maxHotRows = maxHotRows, maxHotBytes = maxHotBytes,
+    maxWalBytes = maxWalBytes, maxGenerations = maxGenerations,
+    compactionFanIn = compactionFanIn }
+end
+
+-- Return only an intent, never perform the transition. A single operation
+-- can cross several watermarks, but it must trigger at most one publication.
+-- An empty hot overlay may still need WAL rotation under maxWalBytes.
+function policy.plan(limits: Limits, generations: number, hotRows: number,
+  tombstones: number, hotPayloadBytes: number?, walBytes: number?): string?
+  local rowPressure = limits.maxHotRows ~= nil
+    and hotRows + tombstones >= limits.maxHotRows
+  local payloadPressure = limits.maxHotBytes ~= nil
+    and hotPayloadBytes ~= nil and hotPayloadBytes >= limits.maxHotBytes
+  local walPressure = limits.maxWalBytes ~= nil
+    and walBytes ~= nil and walBytes >= limits.maxWalBytes
+  if not rowPressure and not payloadPressure and not walPressure then return nil end
+  if generations >= limits.maxGenerations then return 'compact' end
+  return 'flush'
+end
+
+return policy
