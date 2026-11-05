@@ -15,33 +15,34 @@ export type Token = {
 
 local lexer = {}
 
-local function isSpace(byte)
+local function isSpace(byte: number?)
   return byte == 32 or byte == 9 or byte == 10 or byte == 13 or byte == 12
 end
 
-local function isDigit(byte)
-  return byte >= 48 and byte <= 57
+local function isDigit(byte: number?)
+  return byte ~= nil and byte >= 48 and byte <= 57
 end
 
-local function isIdentStart(byte)
-  return (byte >= 65 and byte <= 90) or (byte >= 97 and byte <= 122) or byte == 95 or byte == 64
+local function isIdentStart(byte: number?)
+  return byte ~= nil and ((byte >= 65 and byte <= 90) or (byte >= 97 and byte <= 122) or byte == 95 or byte == 64)
 end
 
-local function isIdent(byte)
+local function isIdent(byte: number?)
   return isIdentStart(byte) or isDigit(byte) or byte == 36
 end
 
-local function fail(sql, at, message)
+local function fail(sql: string, at: number, message: string): never
   error(string.format('jessql lexer at byte %d: %s near %q', at, message, string.sub(sql, at, math.min(#sql, at + 20))), 0)
 end
 
-function lexer.lex(sql): { Token }
-  local out = table.create(math.max(8, math.floor(#sql / 4)))
+function lexer.lex(sql: string): { Token }
+  local out = table.create(math.max(8, math.floor(#sql / 4))) :: { Token }
   local count = 0
   local position = 1
   local len = #sql
 
-  local function push(kind, text, value, at)
+  local function push(kind: 'string' | 'ident' | 'number' | 'word' | 'symbol' | 'eof',
+    text: string, value: (string | number)?, at: number)
     count += 1
     out[count] = { kind = kind, text = text, value = value, at = at }
   end
