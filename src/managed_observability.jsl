@@ -47,14 +47,44 @@ end
 -- Optional app/mod adapter: the HOST explicitly requests delivery, outside
 -- all database transaction or publication call stacks. A failing sink cannot
 -- alter database state. The returned cursor advances only for delivered events.
+local function isCounter(value: unknown): boolean
+  return type(value) == 'number' and value == value and value >= 0 and value % 1 == 0
+end
+
 function observability.relay(batch: Batch, callback: (Event) -> ()): Delivery
-  if batch.version ~= 1 or type(batch.events) ~= 'table' or type(callback) ~= 'function' then
+  if type(batch) ~= 'table' or batch.version ~= 1 or type(batch.events) ~= 'table'
+    or type(callback) ~= 'function' or not isCounter(batch.cursor)
+    or not isCounter(batch.dropped) then
     error('jessql observability: unsupported extension protocol', 2)
+  end
+  -- Validate the complete batch before invoking the first application sink.
+  -- Otherwise malformed event streams could be partially acknowledged.
+  local previous = 0
+  local validated: { Event } = {}
+  for index, event in batch.events do
+    if type(index) ~= 'number' or index % 1 ~= 0 or index < 1 or index > #batch.events
+      or type(event) ~= 'table' or not isCounter(event.sequence)
+      or event.sequence < 1 or event.sequence > batch.cursor
+      or type(event.kind) ~= 'string' or type(event.epoch) ~= 'number'
+      or not isCounter(event.epoch) or event.epoch < 1
+      or (event.detail ~= nil and type(event.detail) ~= 'string')
+      or (previous ~= 0 and event.sequence ~= previous + 1) then
+      error('jessql observability: malformed v1 event batch', 2)
+    end
+    previous = event.sequence
+    -- Snapshot the v1 batch before invoking a sink: a mod callback may mutate
+    -- its original input while a delivery is in progress.
+    validated[index] = { sequence = event.sequence, kind = event.kind,
+      epoch = event.epoch, detail = event.detail }
+  end
+
+  if #batch.events > 0 and previous ~= batch.cursor then
+    error('jessql observability: malformed v1 event cursor', 2)
   end
   local cursor = batch.cursor
   if #batch.events > 0 then cursor = batch.events[1].sequence - 1 end
 
-  for _, event in batch.events do
+  for _, event in validated do
     -- A consumer can fail; do not swallow its error or acknowledge undelivered events.
     local ok, failure = pcall(function() callback({ sequence = event.sequence,
       kind = event.kind, epoch = event.epoch, detail = event.detail }) end)
