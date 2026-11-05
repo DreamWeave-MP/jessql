@@ -30,7 +30,7 @@ reopened:close()
 ```
 
 The managed API provides `get`, `insert`, `upsert`, `update`, `delete`,
-`transaction`, `query`, `prepare`, `stats`, `flush`, `checkpoint`,
+`transaction`, `query`, `prepare`, `stats`, `flush`, `compact`, `checkpoint`,
 `maintenanceStatus`, and `close` with the same one-table semantics as
 `sql.hybrid.open`. `stats()` additionally reports `epoch` and `generations`. On first open `tableName`, ordered `columns`, and `primaryKey` are
 required; on later opens they may be omitted or supplied for validation.
@@ -122,7 +122,7 @@ referenced cold generations remain. No-op `flush()` does not advance the epoch.
 ```luau
 local db = sql.managed.open('data/events', {
   tableName = 'events', columns = { 'id', 'room', 'body' }, primaryKey = 'id',
-  maxHotRows = 10000, maxGenerations = 6,
+  maxHotRows = 10000, maxGenerations = 6, compactionFanIn = 3,
   runRows = 4096, mergeFanIn = 4,
 })
 -- Each committed insert/transaction can trigger a synchronous delta flush.
@@ -130,7 +130,10 @@ db:insert({ id = 42, room = 'lobby', body = 'hello' })
 -- Manual flush is always available, including when auto-flushing is off.
 local epoch = db:flush()
 print(epoch, db:stats().generations)
--- Full logical compaction collapses the generation list to one file.
+-- Merge the newest 2-3 cold generations plus hot updates; older files survive.
+-- Requires at least two existing cold generations.
+if db:stats().generations >= 2 then db:compact() end
+-- Full logical compaction still collapses the generation list to one file.
 db:checkpoint()
 print(db:stats().generations) -- 1
 db:close()
@@ -149,11 +152,27 @@ allow the hot overlay to grow without bound. A successful manual flush clears
 an earlier maintenance error.
 
 `maxGenerations` defaults to 8 (allowed: 2–8). Automatic maintenance uses a
-delta flush while a slot is available and falls back to a **full snapshot
-checkpoint** at the generation limit. This is a conservative full-rewrite
-fallback, not an optimized size-tiered or leveled compaction policy. Explicit
-`flush()` at the limit fails with an error; use `checkpoint()` instead. Any
-successful cutover invalidates plans bound to the previous hybrid reader.
+delta flush while a slot is available, then **selectively compacts the newest
+cold generations plus the committed hot overlay** at the generation limit.
+This avoids routinely rewriting old immutable tiers. `compactionFanIn` chooses
+how many newest cold generations to merge (2–8, default 3). Older
+generations stay untouched, while the new final generation contains both the
+compacted rows and any remaining deletion markers needed to shadow them.
+
+`db:compact()` exposes the same synchronous operation manually (requires at
+least two cold generations). A selective compaction rotates and synchronizes
+a new WAL, publishes a manifest, and retires only merged inputs. The old WAL
+and candidates remain authoritative until publication. During compaction,
+transient sort files named `.gNNNNNNNN.hot-rows` and `.hot-deleted` may appear;
+failed operations remove them best-effort, and recovery removes abandoned
+ones under the database lock. The scratch files are never publication inputs
+solely because they exist.
+
+Explicit `flush()` at the limit still fails; call `compact()` or `checkpoint()`
+instead. `checkpoint()` always rewrites the full logical view and leaves one
+generation, which can reduce read amplification compared with many cold
+generations. Automatic maintenance is synchronous, not a background scheduler.
+Any successful cutover invalidates plans bound to the previous hybrid reader.
 
 `runRows` and `mergeFanIn` configure the bounded external sorter used only for
 delta output (default 8192 rows and fan-in 8); `pageBytes` applies to new
@@ -180,8 +199,9 @@ active generations is bounded but total database size is not.
   Do not expose the managed directory to untrusted local writers.
 
 Tests exercise pre-publication and post-publication fault hooks, retained
-commits, torn-tail recovery, missing/replaced WALs, stale candidates, and
-successful source plus JPK reopening. The `testHook(stage)` option exists to
+commits, torn-tail recovery, missing/replaced WALs, selective compaction
+with tombstones and a bounded generation budget, orphan scratch cleanup,
+repeated multi-generation churn and source plus JPK reopening. The `testHook(stage)` option exists to
 inject deterministic faults at `candidate-sealed`, `wal-ready`,
 `before-replace`, `after-replace`, `after-directory-sync`, and `before-retire`;
 **do not** supply this option in normal applications.
@@ -192,3 +212,7 @@ bench/managed-delta.jsl flush 2000 4 50` and repeat with `checkpoint` to
 compare the same write/update workload. These are CPU timings, not wall-clock
 p99 latencies, and depend on the machine and storage. They are not a
 substitute for real crash or power-failure validation.
+
+For selective maintenance measurements, run `jess run --trusted --package .
+bench/managed-selective.jsl compact 4000 100` and repeat with `checkpoint`
+using the same fixture. See [selective compaction](SELECTIVE-COMPACTION.md).
