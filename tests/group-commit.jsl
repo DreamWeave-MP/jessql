@@ -1,0 +1,302 @@
+--!strict
+local sql = require('@jessql')
+local fs = require('@dream/fs')
+local test = require('@jess/test')
+local expect = test.expect
+local suite = test.new()
+
+local function fixture(label: string): string
+  return fs.join(fs.cwd() :: string, '.jessql-group-' .. label)
+end
+
+local function cleanWal(path: string)
+  fs.remove(path)
+  fs.remove(path .. '.lock')
+end
+
+local function cleanManaged(base: string)
+  for epoch = 1, 8 do
+    local prefix = base .. string.format('.g%08d', epoch)
+    for _, extension in { '.rows', '.deleted', '.wal', '.wal.lock', '.hot-rows', '.hot-deleted' } do
+      fs.remove(prefix .. extension)
+    end
+  end
+
+  for _, extension in { '.jql-lock', '.jql-manifest', '.jql-manifest.tmp' } do
+    fs.remove(base .. extension)
+  end
+end
+
+-- Count independent length-delimited WAL frames; a single giant transaction
+-- would create only one. A batch must leave the existing on-disk format intact.
+local function frames(path: string): number
+  local data = assert((fs.readFileString(path)))
+  assert(string.sub(data, 1, 6) == 'JQLW1\n')
+  local offset, count = 7, 0
+  while offset <= #data do
+    local length = buffer.readu32(buffer.fromstring(string.sub(data, offset, offset + 7)), 0)
+    assert(length > 0 and offset + 7 + length <= #data)
+    offset += 8 + length
+    count += 1
+  end
+  assert(offset == #data + 1)
+  return count
+end
+
+suite.describe('independently framed synchronized transaction batches', function()
+  for _, layout in { 'row', 'packed' } do
+    suite.it('separates callbacks, commits one barrier, and replays each frame: ' .. layout, function()
+      local path = fixture('frames-' .. layout .. '.wal')
+      cleanWal(path)
+      local db = sql.open(path, { durability = 'sync', rowLayout = layout })
+      db:createTable('items', { 'id', 'body' }, 'id')
+      local observed: unknown = nil
+      local results = db:transactionBatch({
+        function(tx) tx:insert('items', { id = 1, body = 'first' }) end,
+        function(tx) tx:insert('items', { id = 1, body = 'duplicate' }) end,
+        function(tx)
+          observed = (assert(tx:get('items', 1))).body
+          tx:update('items', 1, { body = 'updated' })
+        end,
+        function(tx) expect((assert(tx:get('items', 1))).body).toBe('updated') end,
+        function(tx) tx:upsert('items', { id = 2, body = 'second' }) end,
+        function(tx) tx:delete('items', 2) end,
+      })
+      expect(#results).toBe(6)
+      expect(results[1].ok).toBe(true)
+      expect(results[2].ok).toBe(false)
+      expect(string.find(results[2].error :: string, 'duplicate', 1, true) ~= nil).toBe(true)
+      for _, index in { 3, 4, 5, 6 } do expect(results[index].ok).toBe(true) end
+      expect(observed).toBe('first')
+      expect((assert(db:get('items', 1))).body).toBe('updated')
+      expect(db:get('items', 2)).toBe(nil)
+      db:close()
+      expect(frames(path)).toBe(5) -- table creation plus four non-empty successful requests
+      local reopened = sql.open(path, { durability = 'sync', recoverTail = false, rowLayout = layout })
+      expect((assert(reopened:get('items', 1))).body).toBe('updated')
+      expect(reopened:get('items', 2)).toBe(nil)
+      reopened:close()
+      cleanWal(path)
+    end)
+  end
+
+  suite.it('rejects bad admissions before any frames are appended', function()
+    local path = fixture('admission.wal')
+    cleanWal(path)
+    local db = sql.open(path, { durability = 'sync' })
+    db:createTable('items', { 'id' }, 'id')
+    local before = frames(path)
+    -- Empty admissions must fail before touching the WAL.
+    expect((pcall(function() db:transactionBatch({}) end))).toBe(false)
+    local tooMany: { (sql.Transaction) -> () } = {}
+    for _ = 1, 257 do
+      tooMany[#tooMany + 1] = function(_tx) end
+    end
+    -- The bounded API refuses oversized requests without a partial write.
+    expect((pcall(function() db:transactionBatch(tooMany) end))).toBe(false)
+    expect(frames(path)).toBe(before)
+    db:insert('items', { id = 1 })
+    db:close()
+    local buffered = sql.open(path)
+    -- Buffered durability cannot advertise a synchronized batch guarantee.
+    expect((pcall(function()
+      buffered:transactionBatch({ function(tx) tx:insert('items', { id = 3 }) end })
+    end))).toBe(false)
+    buffered:close()
+    cleanWal(path)
+  end)
+
+  suite.it('does not append frames for failed or read-only callbacks', function()
+    local path = fixture('no-write.wal')
+    cleanWal(path)
+    local db = sql.open(path, { durability = 'sync' })
+    db:createTable('t', { 'id' }, 'id')
+    local before = frames(path)
+    local results = db:transactionBatch({
+      function(tx) expect(tx:get('t', 1)).toBe(nil) end,
+      function(_tx) error('reject this request') end,
+      function(tx) expect(tx:get('t', 2)).toBe(nil) end,
+    })
+    expect(results[1].ok).toBe(true)
+    expect(results[2].ok).toBe(false)
+    expect(results[3].ok).toBe(true)
+    expect(frames(path)).toBe(before)
+    db:insert('t', { id = 3 })
+    db:close()
+    expect(frames(path)).toBe(before + 1)
+    cleanWal(path)
+  end)
+
+  suite.it('latches failed SQL DML even if callback catches its exception', function()
+    local path = fixture('abort.wal')
+    cleanWal(path)
+    local db = sql.open(path, { durability = 'sync' })
+    db:createTable('t', { 'id', 'body' }, 'id')
+    local results = db:transactionBatch({
+      function(tx)
+        tx:upsert('t', { id = 1, body = 'staged' })
+        -- Even a caught DML error must latch this transaction as aborted.
+        local ok = pcall(function() tx:exec('DELETE FROM t WHERE nonexisting = ?', { 1 }) end)
+        expect(ok).toBe(false)
+      end,
+      function(tx) tx:insert('t', { id = 2, body = 'survives' }) end,
+    })
+    expect(results[1].ok).toBe(false)
+    expect(results[2].ok).toBe(true)
+    expect(db:get('t', 1)).toBe(nil)
+    expect((assert(db:get('t', 2))).body).toBe('survives')
+    db:close()
+    expect(frames(path)).toBe(2)
+    cleanWal(path)
+  end)
+
+  suite.it('forbids external dirty reads and nested batch admission', function()
+    local path = fixture('guard.wal')
+    cleanWal(path)
+    local db = sql.open(path, { durability = 'sync' })
+    db:createTable('t', { 'id' }, 'id')
+    local results = db:transactionBatch({
+      function(tx) tx:insert('t', { id = 1 }) end,
+      function(tx)
+        expect((assert(tx:get('t', 1))).id).toBe(1)
+        -- Other database handles cannot observe unsynchronized intermediate state.
+        expect((pcall(function() db:get('t', 1) end))).toBe(false)
+        -- Recursive admission must fail; only the current transaction view is valid.
+        expect((pcall(function()
+          db:transactionBatch({ function(other) other:insert('t', { id = 8 }) end })
+        end))).toBe(false)
+      end,
+    })
+    expect(results[1].ok).toBe(true)
+    expect(results[2].ok).toBe(true)
+    db:close()
+    cleanWal(path)
+  end)
+
+  for _, stage in { 'after-append', 'before-sync', 'after-sync' } do
+    suite.it('poisons uncertain outcomes and requires WAL recovery: ' .. stage, function()
+      local path = fixture('uncertain-' .. stage .. '.wal')
+      cleanWal(path)
+      local fired = false
+      local db = sql.open(path, { durability = 'sync',
+        batchTestHook = function(point)
+          if point == stage and not fired then
+            fired = true
+            error('injected ' .. stage)
+          end
+        end })
+      db:createTable('t', { 'id', 'body' }, 'id')
+      -- An injected failure interrupts acknowledgment after at least one frame.
+      local accepted, failure = pcall(function()
+        db:transactionBatch({
+          function(tx) tx:insert('t', { id = 1, body = 'uncertain' }) end,
+          function(tx) tx:insert('t', { id = 2, body = 'later' }) end,
+        })
+      end)
+      expect(accepted).toBe(false)
+      expect(string.find(tostring(failure), 'reopen', 1, true) ~= nil).toBe(true)
+      expect(fired).toBe(true)
+      -- Neither reads nor writes may proceed on a poisoned handle.
+      expect((pcall(function() db:get('t', 1) end))).toBe(false)
+      -- A failed batch cannot be retried against its uncertain in-memory state.
+      expect((pcall(function() db:insert('t', { id = 3 }) end))).toBe(false)
+      db:close()
+      local recovered = sql.open(path, { durability = 'sync', recoverTail = false })
+      expect((assert(recovered:get('t', 1))).body).toBe('uncertain')
+      if stage == 'after-append' then expect(recovered:get('t', 2)).toBe(nil)
+      else expect((assert(recovered:get('t', 2))).body).toBe('later') end
+      recovered:insert('t', { id = 3, body = 'new' })
+      recovered:close()
+      cleanWal(path)
+    end)
+  end
+
+  suite.it('flushes managed generations only after the whole group is acknowledged', function()
+    local base = fixture('managed')
+    cleanManaged(base)
+    local db = sql.managed.open(base, { tableName = 'items', columns = { 'id', 'body' },
+      primaryKey = 'id', maxHotBytes = 60 })
+
+    local results = db:transactionBatch({
+      function(tx) tx:insert({ id = 1, body = string.rep('a', 40) }) end,
+      function(tx) tx:insert({ id = 2, body = string.rep('b', 40) }) end,
+      function(tx) tx:insert({ id = 2, body = 'duplicate' }) end,
+    })
+    expect(results[1].ok).toBe(true)
+    expect(results[2].ok).toBe(true)
+    expect(results[3].ok).toBe(false)
+    expect(db:stats().epoch).toBe(2)
+    expect(db:stats().hotPayloadBytes).toBe(0)
+    db:close()
+    local reopened = sql.managed.open(base, { maxHotBytes = 60 })
+    expect((assert(reopened:get(1))).body).toBe(string.rep('a', 40))
+    expect((assert(reopened:get(2))).body).toBe(string.rep('b', 40))
+    reopened:close()
+    cleanManaged(base)
+  end)
+
+  suite.it('rejects reentrant managed maintenance before WAL synchronization', function()
+    local base = fixture('reentrant-managed')
+    cleanManaged(base)
+    local db = sql.managed.open(base, { tableName = 'items',
+      columns = { 'id', 'body' }, primaryKey = 'id', maxHotBytes = 500 })
+
+    local results = db:transactionBatch({
+      function(tx) tx:insert({ id = 1, body = 'first' }) end,
+      function(tx)
+        expect((assert(tx:get(1))).body).toBe('first')
+        -- Must not publish an immutable generation from an unsynced overlay.
+        expect((pcall(function() db:flush() end))).toBe(false)
+        -- Checkpointing and compaction are just as unsafe as a flush here.
+        expect((pcall(function() db:checkpoint() end))).toBe(false)
+        -- The batch owns the WAL lock; reentrant close cannot retire it.
+        expect((pcall(function() db:close() end))).toBe(false)
+        -- External reads may not observe the not-yet-synchronized result.
+        expect((pcall(function() db:get(1) end))).toBe(false)
+        tx:insert({ id = 2, body = 'second' })
+      end,
+    })
+    expect(results[1].ok).toBe(true)
+    expect(results[2].ok).toBe(true)
+    expect(db:stats().epoch).toBe(1)
+    db:close()
+    local reopened = sql.managed.open(base)
+    expect((assert(reopened:get(1))).body).toBe('first')
+    expect((assert(reopened:get(2))).body).toBe('second')
+    reopened:close()
+    cleanManaged(base)
+  end)
+
+  suite.it('never changes acknowledged batch outcomes when maintenance fails', function()
+    local base = fixture('failed-maintenance')
+    cleanManaged(base)
+    local inject = true
+    local db = sql.managed.open(base, { tableName = 'items', columns = { 'id', 'body' },
+      primaryKey = 'id', maxHotBytes = 20,
+      testHook = function(stage)
+        if inject and stage == 'candidate-sealed' then error('induced maintenance failure') end
+      end })
+
+    local results = db:transactionBatch({
+      function(tx) tx:insert({ id = 1, body = string.rep('k', 30) }) end,
+      function(tx) tx:insert({ id = 2, body = 'second' }) end,
+    })
+    expect(results[1].ok).toBe(true)
+    expect(results[2].ok).toBe(true)
+    expect(db:maintenanceStatus().lastError ~= nil).toBe(true)
+    -- Backpressure remains active even though the synchronized batch succeeded.
+    expect((pcall(function() db:insert({ id = 3, body = 'blocked' }) end))).toBe(false)
+    inject = false
+    db:close()
+    local reopened = sql.managed.open(base, { maxHotBytes = 20 })
+    expect((assert(reopened:get(1))).body).toBe(string.rep('k', 30))
+    expect((assert(reopened:get(2))).body).toBe('second')
+    expect(reopened:maintenanceStatus().lastError ~= nil).toBe(true)
+    reopened:flush()
+    expect(reopened:maintenanceStatus().lastError).toBe(nil)
+    reopened:close()
+    cleanManaged(base)
+  end)
+end)
+
+return suite
