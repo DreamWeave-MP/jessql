@@ -19,3 +19,23 @@ jess = "org.dreamweave.jessql"
 version = "0.1.6"
 date = 2026-10-21
 summary = "First release published as a DreamWeave project."
+
+# Declare the release in the source catalog BEFORE pushing jessql-0.2.0.
+# CI writes the artifact digests to mod.lock when the tag is published.
+[[releases]]
+version = "0.2.0"
+date = 2026-11-05
+summary = "Native JessQL persistence with synchronized WAL commits, immutable generations, recovery verification, and strict-checked JSL."
+added = [
+  "Synchronized WAL transactions, independently framed group commits, immutable generations, delta flush, and selective compaction.",
+  "Managed database create/open-existing lifecycle, offline semantic verification and backup/restore, and versioned observability interfaces.",
+  "MIT OR Apache-2.0 licensing, with both license files inside the JPK.",
+]
+changed = [
+  "All shipped JSL modules, tests, benchmarks, and scripts pass --!strict with zero diagnostics.",
+  "Package can be activated normally by Jess; no experimental deployment switch or external database process is required.",
+]
+known_issues = [
+  "Managed persistence supports one writer; replication, distributed transactions, and online backups are not implemented.",
+  "Physical power-loss guarantees and Windows/macOS durability remain unverified; operational resource thresholds are soft watermarks.",
+]

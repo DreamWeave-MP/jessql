@@ -96,9 +96,13 @@ semantics see the [application guide](APPLICATION-GUIDE.md).
   `managed.openExisting()` is safer on routine application restart.
 - Do not edit manifests, discard WALs, or mix generations by hand.
   Uncertain acknowledgments require reconciliation, **not** blind retries.
-- The website's `content/home/mod.toml` release ledger lists **published**
-  releases; it stays on 0.1.6 until the `jessql-0.2.0` tag is cut and the
-  publishing pipeline records the actual release.
+- The website's `content/home/mod.toml` is the **source release catalog**.
+  The `0.2.0` `[[releases]]` entry must be committed **before** pushing the
+  `jessql-0.2.0` tag. The tag must point to a commit containing matching
+  `jess.toml` and `content/home/mod.toml` versions.
+- `content/home/mod.lock` is a **separate, CI-generated publication ledger**
+  containing artifact names and digests. Do not edit it by hand: the release
+  job updates it after publishing the tag.
 
 ## Operator limitations and minimum deployment checklist
 
