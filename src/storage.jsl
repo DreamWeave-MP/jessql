@@ -12,7 +12,7 @@ local packed = require('@jessql/packed')
 local mutations = require('@jessql/mutations')
 
 export type Row = { [string]: unknown }
-export type Options = { maxFrameBytes: number?, recoverTail: boolean?, queryCacheEntries: number?, rowLayout: string?, durability: string? }
+export type Options = { maxFrameBytes: number?, recoverTail: boolean?, queryCacheEntries: number?, rowLayout: string?, durability: string?, trackPayloadBytes: boolean? }
 export type Store = {
   createTable: (self: Store, name: string, columns: { string }, primaryKey: string) -> (),
   createIndex: (self: Store, name: string, column: string) -> (),
@@ -32,6 +32,7 @@ export type Store = {
   prepare: (self: Store, sql: string) -> queryEngine.Plan,
   tables: (self: Store) -> { queryEngine.TableInfo },
   stats: (self: Store) -> { [string]: TableMetrics },
+  tableFootprint: (self: Store, name: string) -> { rows: number, payloadBytes: number? },
   cacheStats: (self: Store) -> CacheMetrics,
   checkpoint: (self: Store) -> (),
   close: (self: Store) -> (),
@@ -45,7 +46,7 @@ export type CacheMetrics = { entries: number, capacity: number, hits: number, mi
 export type TableMetrics = {
   rows: number, keySlots: number, indexSlots: { [string]: number }, indexKeys: { [string]: number },
   indexNullSlots: { [string]: number }, compositePartitions: { [string]: number },
-  resident: packed.Metrics?,
+  resident: packed.Metrics?, payloadBytes: number?,
 }
 export type Transaction = {
   createTable: (self: Transaction, name: string, columns: { string }, primaryKey: string) -> (),
@@ -85,6 +86,7 @@ type TableState = {
   order: { string },
   seen: { [string]: boolean },
   count: number,
+  payloadBytes: number,
   secondary: { [string]: Index },
   composites: { [string]: Composite },
   available: { [string]: boolean },
@@ -104,6 +106,7 @@ type DatabaseState = {
   busy: boolean,
   poisoned: boolean,
   rowLayout: string,
+  trackPayloadBytes: boolean,
   durability: string,
   walWriter: dream_fs_Writer?,
 }
@@ -174,6 +177,20 @@ local function copyRow(schema: Schema, row: Row): Row
   end
   keyOf(copy[schema.primaryKey])
   return copy
+end
+
+-- Logical live scalar payload only: string UTF-8 bytes, 8 bytes per number,
+-- one byte per boolean. Excludes Lua tables, column/index/allocator overhead,
+-- dead packed arenas and WAL bytes; it is NOT a physical RSS measurement.
+-- Recomputed during WAL replay, so recovery never trusts a persisted counter.
+local function rowPayloadBytes(row: Row): number
+  local total = 0
+  for _, value in row do
+    if type(value) == 'string' then total += #(value :: string)
+    elseif type(value) == 'number' then total += 8
+    elseif type(value) == 'boolean' then total += 1 end
+  end
+  return total
 end
 
 local function frame(payload: string, maximum: number): string
@@ -825,7 +842,7 @@ local function apply(state: DatabaseState, operations: { Operation })
       local columns = if state.rowLayout == 'packed' then packed.new(schema.columns) else nil
       state.tables[name] = {
         schema = schema, rows = if columns then columns.rows else {}, packed = columns,
-        order = {}, seen = {}, count = 0,
+        order = {}, seen = {}, count = 0, payloadBytes = 0,
         secondary = {}, composites = {}, available = { [schema.primaryKey] = true },
       }
 
@@ -868,8 +885,14 @@ local function apply(state: DatabaseState, operations: { Operation })
       local current = state.tables[name] :: TableState
       local row = operation.row :: Row
       local key = keyOf(row[current.schema.primaryKey])
+      local previous = current.rows[key]
       if not hasRow(current, key) then current.count += 1 end
-      updateIndexes(current, key, current.rows[key], row)
+
+      if state.trackPayloadBytes then
+        current.payloadBytes += rowPayloadBytes(row)
+          - (if previous then rowPayloadBytes(previous) else 0)
+      end
+      updateIndexes(current, key, previous, row)
 
       local seen = if current.packed then current.packed:wasSeen(key) else current.seen[key]
       if not seen then
@@ -881,7 +904,9 @@ local function apply(state: DatabaseState, operations: { Operation })
       local current = state.tables[name] :: TableState
       local key = keyOf(operation.key)
       if hasRow(current, key) then
-        updateIndexes(current, key, current.rows[key], nil)
+        local previous = current.rows[key] :: Row
+        if state.trackPayloadBytes then current.payloadBytes -= rowPayloadBytes(previous) end
+        updateIndexes(current, key, previous, nil)
         current.rows[key] = nil
         current.count -= 1
         compactOrder(current)
@@ -1609,6 +1634,9 @@ function storage.open(path: string, options: Options?): Store
     error('jessql storage: rowLayout must be row or packed', 2)
   end
 
+  if options and options.trackPayloadBytes ~= nil and type(options.trackPayloadBytes) ~= 'boolean' then
+    error('jessql storage: trackPayloadBytes must be boolean', 2)
+  end
   local durability = if options and options.durability then options.durability else 'buffered'
   if durability ~= 'buffered' and durability ~= 'sync' then
     error('jessql storage: durability must be buffered or sync', 2)
@@ -1620,7 +1648,8 @@ function storage.open(path: string, options: Options?): Store
   local state: DatabaseState = {
     path = path, lock = lock, engine = queryEngine.new(), tables = {}, sequence = 0, schemaVersion = 0,
     maxFrameBytes = max or DefaultMaxFrame, closed = false, busy = false, poisoned = false,
-    rowLayout = rowLayout or 'row', durability = durability, walWriter = nil,
+    rowLayout = rowLayout or 'row', trackPayloadBytes = options ~= nil and options.trackPayloadBytes == true,
+    durability = durability, walWriter = nil,
   }
 
   -- Opening can fail on invalid frames; release the advisory lock on failure.
@@ -1871,13 +1900,25 @@ function storage.open(path: string, options: Options?): Store
     return state.engine:tables()
   end
 
+  -- Constant-time row count and opt-in scalar payload accounting. Replaying
+  -- a WAL with tracking enabled reconstructs the counter from every mutation.
+  function db.tableFootprint(_self: Store, name: string): { rows: number, payloadBytes: number? }
+    ready()
+    local current = state.tables[requireName(name)]
+    if not current then error('jessql storage: no such table', 2) end
+
+    return { rows = current.count,
+      payloadBytes = if state.trackPayloadBytes then current.payloadBytes else nil }
+  end
+
   -- Snapshot-only counters for verifying memory growth and index maintenance.
   function db.stats(_self: Store): { [string]: TableMetrics }
     ready()
     local output: { [string]: TableMetrics } = {}
     for name, current in state.tables do
       local metrics: TableMetrics = { rows = current.count, keySlots = #current.order,
-        indexSlots = {}, indexKeys = {}, indexNullSlots = {}, compositePartitions = {} }
+        indexSlots = {}, indexKeys = {}, indexNullSlots = {}, compositePartitions = {},
+        payloadBytes = if state.trackPayloadBytes then current.payloadBytes else nil }
 
       for column, index in current.secondary do
         local slots, keys = 0, 0

@@ -16,7 +16,7 @@ export type Row = { [string]: unknown }
 export type Options = {
   tableName: string?, columns: { string }?, primaryKey: string?,
   cachePages: number?, readMode: string?, rowLayout: string?, pageBytes: number?,
-  maxHotRows: number?, maxGenerations: number?, runRows: number?, mergeFanIn: number?,
+  maxHotRows: number?, maxHotBytes: number?, maxGenerations: number?, runRows: number?, mergeFanIn: number?,
   compactionFanIn: number?,
   -- Deterministic fault injection for integration tests. Throws at a named stage.
   testHook: ((string) -> ())?,
@@ -32,7 +32,7 @@ export type Database = {
   query: (self: Database, sql: string, params: { unknown }?) -> engine.Result,
   prepare: (self: Database, sql: string) -> engine.Plan,
   stats: (self: Database) -> { epoch: number, generations: number, coldRows: number, hotRows: number,
-    tombstones: number, cachedPages: number },
+    tombstones: number, hotPayloadBytes: number?, cachedPages: number },
   maintenanceStatus: (self: Database) -> { lastError: string?, poisoned: boolean },
   flush: (self: Database) -> number,
   compact: (self: Database) -> number,
@@ -302,6 +302,7 @@ local function openHybrid(base: string, value: Manifest, options: Options?,
 
   return hybrid.open(active.wal, source, value.tableName, {
     durability = 'sync', requireIdentity = requiredWal,
+    trackPayloadBytes = options ~= nil and options.maxHotBytes ~= nil,
     deletePaths = deletes,
     rowLayout = if options then options.rowLayout else 'packed',
     cachePages = if options then options.cachePages else nil,
@@ -391,11 +392,17 @@ end
 function managed.open(path: string, options: Options?): Database
   local base, parent = normalize(path)
   local maxHotRows = if options and options.maxHotRows ~= nil then options.maxHotRows else nil
+  local maxHotBytes = if options and options.maxHotBytes ~= nil then options.maxHotBytes else nil
   local maxGenerations = if options and options.maxGenerations ~= nil
     then options.maxGenerations else 8
   if maxHotRows ~= nil and (type(maxHotRows) ~= 'number' or maxHotRows % 1 ~= 0
     or maxHotRows < 1 or maxHotRows > 1000000000) then
     error('jessql managed: invalid maxHotRows', 2)
+  end
+
+  if maxHotBytes ~= nil and (type(maxHotBytes) ~= 'number' or maxHotBytes % 1 ~= 0
+    or maxHotBytes < 1 or maxHotBytes > 1000000000000) then
+    error('jessql managed: invalid maxHotBytes', 2)
   end
 
   if type(maxGenerations) ~= 'number' or maxGenerations % 1 ~= 0
@@ -473,6 +480,18 @@ function managed.open(path: string, options: Options?): Database
   local active = value :: Manifest
   local closed, poisoned, busy = false, false, false
   local lastMaintenanceError: string? = nil
+  -- Recovery cannot forget an unresolved byte watermark. A WAL may contain
+  -- an acknowledged oversized transaction after failed auto-maintenance.
+  -- Do not accept another write until its overlay has been retired.
+  if maxHotBytes then
+    local counted, result = pcall(function() return live:stats().hotPayloadBytes end)
+    if not counted then
+      poisoned = true
+      lastMaintenanceError = 'recovered hot-byte accounting failed: ' .. tostring(result)
+    elseif (result :: number) >= maxHotBytes then
+      lastMaintenanceError = 'recovered hot overlay exceeds byte budget; flush or checkpoint'
+    end
+  end
   local db = {} :: Database
 
   local function ready()
@@ -499,14 +518,15 @@ function managed.open(path: string, options: Options?): Database
   -- A successful user commit is already synchronized. Auto-maintenance is
   -- never allowed to turn that acknowledgment into an apparent failed write.
   local function autoMaintain()
-    local threshold = maxHotRows
-    if not threshold then return end
+    if not maxHotRows and not maxHotBytes then return end
 
     -- Even statistics can throw after the WAL was synchronized. Never turn
     -- an acknowledged user mutation into an apparent failed transaction.
     local ok, failure = pcall(function()
       local state = live:stats()
-      if state.hotRows + state.tombstones < threshold then return end
+      local rowPressure = maxHotRows ~= nil and state.hotRows + state.tombstones >= maxHotRows
+      local bytePressure = maxHotBytes ~= nil and (state.hotPayloadBytes :: number) >= maxHotBytes
+      if not rowPressure and not bytePressure then return end
 
       if #generationList(active) >= maxGenerations then db:compact()
       else db:flush() end
@@ -514,33 +534,43 @@ function managed.open(path: string, options: Options?): Database
     lastMaintenanceError = if ok then nil else tostring(failure)
   end
 
-  function db.transaction(_self: Database, callback: (Transaction) -> ())
+  -- An acknowledged commit must remain acknowledged if maintenance fails.
+  -- With a byte watermark configured, reject subsequent writes until manual
+  -- maintenance succeeds, rather than letting an error cause unbounded churn.
+  local function readyToWrite()
     ready()
+    if maxHotBytes and lastMaintenanceError then
+      error('jessql managed: maintenance failed under hot-byte budget; flush or checkpoint', 3)
+    end
+  end
+
+  function db.transaction(_self: Database, callback: (Transaction) -> ())
+    readyToWrite()
     live:transaction(callback)
     autoMaintain()
   end
 
   function db.insert(_self: Database, row: Row)
-    ready()
+    readyToWrite()
     live:insert(row)
     autoMaintain()
   end
 
   function db.upsert(_self: Database, row: Row)
-    ready()
+    readyToWrite()
     live:upsert(row)
     autoMaintain()
   end
 
   function db.update(_self: Database, key: unknown, changes: Row): boolean
-    ready()
+    readyToWrite()
     local changed = live:update(key, changes)
     if changed then autoMaintain() end
     return changed
   end
 
   function db.delete(_self: Database, key: unknown): boolean
-    ready()
+    readyToWrite()
     local changed = live:delete(key)
     if changed then autoMaintain() end
     return changed
@@ -551,7 +581,8 @@ function managed.open(path: string, options: Options?): Database
     local result = live:stats()
     return { epoch = active.epoch, generations = #generationList(active),
       coldRows = result.coldRows, hotRows = result.hotRows,
-      tombstones = result.tombstones, cachedPages = result.cachedPages }
+      tombstones = result.tombstones, hotPayloadBytes = result.hotPayloadBytes,
+      cachedPages = result.cachedPages }
   end
 
   function db.maintenanceStatus(_self: Database): { lastError: string?, poisoned: boolean }

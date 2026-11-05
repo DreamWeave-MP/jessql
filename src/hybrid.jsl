@@ -11,7 +11,7 @@ local delta = require('@jessql/delta')
 local fs = require('@dream/fs')
 
 export type Row = { [string]: unknown }
-export type Options = { cachePages: number?, readMode: string?, durability: string?, rowLayout: string?, secondaryIndexPath: string?, secondaryIndexPaths: { string }?, deletePaths: { [number]: string }?, requireIdentity: boolean? }
+export type Options = { cachePages: number?, readMode: string?, durability: string?, rowLayout: string?, secondaryIndexPath: string?, secondaryIndexPaths: { string }?, deletePaths: { [number]: string }?, requireIdentity: boolean?, trackPayloadBytes: boolean? }
 export type Transaction = {
   get: (self: Transaction, key: unknown) -> Row?,
   insert: (self: Transaction, row: Row) -> (),
@@ -29,7 +29,8 @@ export type Database = {
   transaction: (self: Database, callback: (Transaction) -> ()) -> (),
   query: (self: Database, sql: string, params: { unknown }?) -> engine.Result,
   prepare: (self: Database, sql: string) -> engine.Plan,
-  stats: (self: Database) -> { coldRows: number, hotRows: number, tombstones: number, cachedPages: number },
+  stats: (self: Database) -> { coldRows: number, hotRows: number, tombstones: number,
+    hotPayloadBytes: number?, cachedPages: number },
   exportSnapshot: (self: Database, path: string, options: paged.Options?) -> (),
   exportDelta: (self: Database, rowsPath: string, deletePath: string,
     options: delta.Options?) -> { rows: delta.Metrics, deletions: delta.Metrics },
@@ -395,7 +396,8 @@ function hybrid.open(walPath: string, snapshotPath: string | { string }, tableNa
   -- If the WAL is locked or invalid, close the cold reader before propagating.
   local ok, failure = pcall(function()
     hot = storage.open(walPath, { rowLayout = if options then options.rowLayout else 'packed',
-      durability = if options then options.durability else nil })
+      durability = if options then options.durability else nil,
+      trackPayloadBytes = if options then options.trackPayloadBytes else nil })
   end)
 
   if not ok then
@@ -620,12 +622,28 @@ function hybrid.open(walPath: string, snapshotPath: string | { string }, tableNa
     return deleted
   end
 
-  function db.stats(_self: Database)
-    ready()
-    return { coldRows = cold.count,
-      hotRows = store:query('SELECT COUNT(*) AS n FROM ' .. name).rows[1].n :: number,
-      tombstones = store:query('SELECT COUNT(*) AS n FROM ' .. Tombstones).rows[1].n :: number,
-      cachedPages = cold:stats().cachedPages }
+  -- Select the accounting implementation once per opened table, never on
+  -- the hot stats path. Unmetered databases preserve the existing SQL count
+  -- fast path with no per-call budget checks or payload scanning.
+  if options and options.trackPayloadBytes then
+    function db.stats(_self: Database)
+      ready()
+      local rows = store:tableFootprint(name)
+      local deletions = store:tableFootprint(Tombstones)
+      return { coldRows = cold.count, hotRows = rows.rows,
+        tombstones = deletions.rows,
+        hotPayloadBytes = (rows.payloadBytes :: number) + (deletions.payloadBytes :: number),
+        cachedPages = cold:stats().cachedPages }
+    end
+  else
+    function db.stats(_self: Database)
+      ready()
+      return { coldRows = cold.count,
+        hotRows = store:query('SELECT COUNT(*) AS n FROM ' .. name).rows[1].n :: number,
+        tombstones = store:query('SELECT COUNT(*) AS n FROM ' .. Tombstones).rows[1].n :: number,
+        hotPayloadBytes = nil,
+        cachedPages = cold:stats().cachedPages }
+    end
   end
 
 
