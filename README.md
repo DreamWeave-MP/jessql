@@ -46,7 +46,10 @@ hot-overlay delta and tombstone sidecar without rewriting older generations.
 `db:compact()` merges the newest cold generations with the hot overlay without
 rewriting older tiers, while `db:checkpoint()` still rebuilds the entire view.
 Set `maxHotRows` or opt-in `maxHotBytes` to trigger synchronous automatic
-maintenance after committed operations. The byte watermark measures live scalar
+maintenance after committed operations. Set `maxWalBytes` for an opt-in
+active-WAL-size watermark (useful for repeated updates of unchanged keys).
+All three maintenance budgets block subsequent writes after failed upkeep,
+including after restart, until explicit successful maintenance. The byte watermark measures live scalar
 payload only, **not physical RSS**; `stats().hotPayloadBytes` is `nil` without
 byte tracking. A failed byte-budget maintenance attempt preserves the already
 acknowledged commit but blocks subsequent writes until maintenance succeeds;
@@ -58,7 +61,8 @@ memory limit, an online compaction scheduler, or verified physical power-cut
 durability. The original `sql.open(..., { durability = 'sync' })` still refuses
 its legacy checkpoint. See [managed generations](docs/MANAGED-GENERATIONS.md),
 [selective compaction](docs/SELECTIVE-COMPACTION.md), and
-[hot-byte maintenance](docs/HOT-BYTE-BUDGET.md).
+[hot-byte maintenance](docs/HOT-BYTE-BUDGET.md), and the
+[adversarial architecture review](docs/ADVERSARIAL-ARCHITECTURE-REVIEW.md).
 
 ## Experimental segmented cold indexes and immutable deletions
 

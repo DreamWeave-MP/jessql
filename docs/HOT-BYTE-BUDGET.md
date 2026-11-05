@@ -48,23 +48,28 @@ and inspect `db:tableFootprint(table).payloadBytes`.
 ## When maintenance fires
 
 After an acknowledged synchronized commit, JessQL checks the optional
-`maxHotRows` and `maxHotBytes` thresholds independently. Either threshold
-triggers maintenance. If below `maxGenerations`, it calls the existing durable
+`maxHotRows`, `maxHotBytes`, and `maxWalBytes` thresholds independently.
+Any threshold triggers maintenance. `maxWalBytes` monitors the *physical active
+WAL file size* via a `stat()` call after each acknowledged transaction; it is
+optional (integer 1024 through 1,000,000,000,000) and disabled by default.
+A WAL can grow rapidly under updates or insert/delete churn even when there
+are no surviving hot rows. When WAL pressure is reached, an empty delta
+can rotate the active WAL without rewriting old immutable generations. If below `maxGenerations`, it calls the existing durable
 `flush()`; at the generation budget, it selects the existing newest-tier
 `compact()` operation. These operations remain **foreground, synchronous,
 and mutually exclusive** with writes and generation transitions.
 
 If maintenance fails *before* publication, the just-acknowledged WAL commit is
 still successful. JessQL reports the failure through
-`db:maintenanceStatus().lastError`. With `maxHotBytes` enabled, subsequent
-writes fail before mutation until an explicit successful `db:flush()`,
+`db:maintenanceStatus().lastError`. With any configured maintenance budget,
+subsequent writes fail before mutation until an explicit successful `db:flush()`,
 `db:compact()`, or `db:checkpoint()` clears the condition. Reads remain
 available unless the underlying handle is poisoned by an uncertain
 publication. If a manifest replacement has begun, the handle is poisoned and
 must be closed and reopened, as in the existing managed protocol.
 
-An over-budget WAL reopened after a process crash starts with **write
-backpressure still in force**, even when its earlier in-memory error message
+An over-budget hot overlay or WAL reopened after a process crash starts with
+**write backpressure still in force**, even when its earlier in-memory error message
 has been lost. Use explicit maintenance to clear it; reopening is not a
 backpressure bypass. This is a conservative availability tradeoff meant to
 prevent repeated silent growth after a maintenance failure.
@@ -95,4 +100,6 @@ Performance methodology and measured medians are in `BENCHMARKS.md` and the
 replay archive's `benchmark-final.csv`. Do **not** infer a general performance
 improvement from the small, noisy comparative workload. Further work should
 address explicit admission control before oversized transactions, resident
-heap/arena accounting, and asynchronous maintenance with latency isolation.
+heap/arena accounting, and asynchronous maintenance with latency isolation. See
+[the adversarial architecture review](ADVERSARIAL-ARCHITECTURE-REVIEW.md) for
+outstanding durability and resource-limit concerns.

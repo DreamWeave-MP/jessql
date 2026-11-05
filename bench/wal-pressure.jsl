@@ -1,0 +1,38 @@
+--!strict
+--!native
+-- Compare synchronized overwrite cost with and without file-size pressure.
+-- Usage: jess run --trusted --package . bench/wal-pressure.jsl [off|on] [writes]
+local sql = require('@jessql')
+local fs = require('@dream/fs')
+local mode = arg[1] or 'off'
+local writes = tonumber(arg[2]) or 1000
+if mode ~= 'off' and mode ~= 'on' then error('expected off or on') end
+if writes < 100 or writes > 10000 or writes % 1 ~= 0 then error('invalid write count') end
+local base = fs.join(fs.cwd() :: string, '.jessql-wal-pressure-bench')
+for _, extension in { '.jql-manifest', '.jql-manifest.tmp', '.jql-lock' } do fs.remove(base .. extension) end
+
+for epoch = 1, 6 do
+  local prefix = base .. string.format('.g%08d', epoch)
+  for _, extension in { '.rows', '.deleted', '.wal', '.wal.lock' } do fs.remove(prefix .. extension) end
+end
+
+local db = sql.managed.open(base, {
+  tableName = 'events', columns = { 'id', 'body' }, primaryKey = 'id', rowLayout = 'packed',
+  maxWalBytes = if mode == 'on' then 1000000000 else nil,
+})
+db:insert({ id = 1, body = 'seed' })
+local start = os.clock()
+for index = 1, writes do
+  db:upsert({ id = 1, body = if index % 2 == 0 then 'even' else 'odd' })
+end
+local elapsed = (os.clock() - start) * 1000
+assert((assert(db:get(1))).body == if writes % 2 == 0 then 'even' else 'odd')
+print(string.format('mode=%s writes=%d cpu_ms=%.3f wal_bytes=%s',
+  mode, writes, elapsed, tostring(db:stats().walBytes)))
+db:close()
+for _, extension in { '.jql-manifest', '.jql-manifest.tmp', '.jql-lock' } do fs.remove(base .. extension) end
+
+for epoch = 1, 6 do
+  local prefix = base .. string.format('.g%08d', epoch)
+  for _, extension in { '.rows', '.deleted', '.wal', '.wal.lock' } do fs.remove(prefix .. extension) end
+end

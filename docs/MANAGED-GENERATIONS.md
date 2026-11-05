@@ -71,6 +71,14 @@ separate volumes. Backups must preserve one consistent published manifest,
 its referenced snapshot and WAL, and the ability to replay the WAL; do not
 copy active files individually while commits are ongoing.
 
+
+**Missing-manifest recovery is fail-closed:** if the manifest is absent but
+recognized generations or a manifest replacement candidate remain, the opener
+refuses to initialize over them. It cannot automatically rebuild the lost
+manifest. Restore a verified manifest backup or explicitly clear the old
+namespace only after verifying the old database is expendable. Do not delete
+only the manifest to reset a database.
+
 ## Commit and checkpoint barriers
 
 A managed transaction is written to the retained WAL append writer and
