@@ -8,7 +8,7 @@ local json = require('@jess/json')
 local engine = require('@jessql/engine')
 
 export type Row = { [string]: unknown }
-export type Options = { pageBytes: number?, cachePages: number? }
+export type Options = { pageBytes: number?, cachePages: number?, readMode: string? }
 export type Metrics = { pages: number, rows: number, cachedPages: number, pageReads: number }
 export type Snapshot = {
   columns: { string }, primaryKey: string, count: number, identity: string, keyKind: string,
@@ -242,16 +242,44 @@ function paged.open(path: string, options: Options?): Snapshot
   if cacheLimit < 1 or cacheLimit > 4096 or cacheLimit % 1 ~= 0 then
     error('jessql paged: invalid cachePages', 2)
   end
-  local reader, openError = fs.open(path)
-  if not reader then error('jessql paged: ' .. tostring(openError), 2) end
+  local mode = if options and options.readMode then options.readMode else 'mapped'
+  if mode ~= 'mapped' and mode ~= 'positional' then
+    error('jessql paged: readMode must be mapped or positional', 2)
+  end
+  local reader: dream_fs_Reader? = nil
+  local positional: dream_fs_PositionalReader? = nil
+  local openError: string? = nil
+  if mode == 'positional' then
+    positional, openError = fs.openPositional(path)
+  else
+    reader, openError = fs.open(path)
+  end
+
+  if not reader and not positional then error('jessql paged: ' .. tostring(openError), 2) end
+
+  local function closeReader()
+    if reader then reader:close() end
+    if positional then positional:close() end
+  end
   local closed = false
   local function read(offset: number, length: number): string
     if closed then error('jessql paged: snapshot closed', 3) end
-    local data = reader:readAt(offset, length)
+    local data = if positional then positional:readAt(offset, length)
+      else (reader :: dream_fs_Reader):readAt(offset, length)
     if not data or buffer.len(data) ~= length then error('jessql paged: short read', 3) end
     return buffer.tostring(data)
   end
-  local size = reader:size()
+  local size: number
+  if positional then
+    local measured, sizeError = positional:size()
+    if not measured then
+      closeReader()
+      error('jessql paged: size: ' .. tostring(sizeError), 2)
+    end
+    size = measured
+  else
+    size = (reader :: dream_fs_Reader):size()
+  end
   local directoryChecksum = 0
   -- Close the reader if footer validation or directory parsing raises.
   local ok, parsed = pcall(function(): Directory
@@ -294,7 +322,7 @@ function paged.open(path: string, options: Options?): Snapshot
     return result
   end)
 
-  if not ok then reader:close(); error(parsed, 2) end
+  if not ok then closeReader(); error(parsed, 2) end
   local directory = parsed :: Directory
   local cache: { [number]: Cached } = {}
   local cacheSize, pageReads = 0, 0
@@ -519,7 +547,7 @@ function paged.open(path: string, options: Options?): Snapshot
     if closed then return end
     closed = true
     cache = {}
-    reader:close()
+    closeReader()
   end
   return snapshot
 end

@@ -11,7 +11,7 @@ local delta = require('@jessql/delta')
 local fs = require('@dream/fs')
 
 export type Row = { [string]: unknown }
-export type Options = { cachePages: number?, rowLayout: string?, secondaryIndexPath: string?, secondaryIndexPaths: { string }?, deletePaths: { [number]: string }? }
+export type Options = { cachePages: number?, readMode: string?, durability: string?, rowLayout: string?, secondaryIndexPath: string?, secondaryIndexPaths: { string }?, deletePaths: { [number]: string }? }
 export type Transaction = {
   get: (self: Transaction, key: unknown) -> Row?,
   insert: (self: Transaction, row: Row) -> (),
@@ -353,6 +353,7 @@ end
 function hybrid.open(walPath: string, snapshotPath: string | { string }, tableName: string, options: Options?): Database
   local name = validTable(tableName)
   local indexCache = if options then options.cachePages else nil
+  local readMode = if options then options.readMode else nil
   if options and options.secondaryIndexPath and options.secondaryIndexPaths then
     error('jessql hybrid: choose one secondary index configuration', 2)
   end
@@ -371,18 +372,20 @@ function hybrid.open(walPath: string, snapshotPath: string | { string }, tableNa
 
   local cold = if type(snapshotPath) == 'table'
     then segments.open(snapshotPath :: { string }, { cachePages = if options then options.cachePages else nil,
+      readMode = readMode,
       deletePaths = if options then options.deletePaths else nil })
-    else paged.open(snapshotPath :: string, { cachePages = if options then options.cachePages else nil })
+    else paged.open(snapshotPath :: string, { cachePages = if options then options.cachePages else nil,
+      readMode = readMode })
   local coldIndex: secondary.Index? = nil
   if options and (options.secondaryIndexPath or options.secondaryIndexPaths) then
     -- A mismatched sidecar must not leave an open cold reader behind.
     local indexOk, indexResult = pcall(function()
       if options.secondaryIndexPaths then
         coldIndex = (cold :: segments.Snapshot):openIndexes(options.secondaryIndexPaths,
-          { cachePages = indexCache })
+          { cachePages = indexCache, readMode = readMode })
       else
         coldIndex = secondary.open(options.secondaryIndexPath :: string, cold,
-          { cachePages = indexCache })
+          { cachePages = indexCache, readMode = readMode })
       end
     end)
 
@@ -391,7 +394,8 @@ function hybrid.open(walPath: string, snapshotPath: string | { string }, tableNa
   local hot: storage.Store? = nil
   -- If the WAL is locked or invalid, close the cold reader before propagating.
   local ok, failure = pcall(function()
-    hot = storage.open(walPath, { rowLayout = if options then options.rowLayout else 'packed' })
+    hot = storage.open(walPath, { rowLayout = if options then options.rowLayout else 'packed',
+      durability = if options then options.durability else nil })
   end)
 
   if not ok then

@@ -200,16 +200,45 @@ function compact.open(path: string, options: paged.Options?): paged.Snapshot
   if cacheLimit < 1 or cacheLimit > 4096 or cacheLimit % 1 ~= 0 then
     error('jessql compact: invalid cache size', 2)
   end
-  local reader, openError = fs.open(path)
-  if not reader then error('jessql compact: ' .. tostring(openError), 2) end
+  local mode = if options and options.readMode then options.readMode else 'mapped'
+  if mode ~= 'mapped' and mode ~= 'positional' then
+    error('jessql compact: readMode must be mapped or positional', 2)
+  end
+  local reader: dream_fs_Reader? = nil
+  local positional: dream_fs_PositionalReader? = nil
+  local openError: string? = nil
+  if mode == 'positional' then
+    positional, openError = fs.openPositional(path)
+  else
+    reader, openError = fs.open(path)
+  end
+
+  if not reader and not positional then error('jessql compact: ' .. tostring(openError), 2) end
+
+  local function closeReader()
+    if reader then reader:close() end
+    if positional then positional:close() end
+  end
   local closed = false
   local function read(offset: number, length: number): string
     if closed then error('jessql compact: closed', 3) end
-    local data = reader:readAt(offset, length)
+    local data = if positional then positional:readAt(offset, length)
+      else (reader :: dream_fs_Reader):readAt(offset, length)
     if not data or buffer.len(data) ~= length then error('jessql compact: short read', 3) end
     return buffer.tostring(data)
   end
-  local size = reader:size()
+  local size: number
+  if positional then
+    local measured, sizeError = positional:size()
+    if not measured then
+      closeReader()
+      error('jessql compact: size: ' .. tostring(sizeError), 2)
+    end
+    size = measured
+  else
+    size = (reader :: dream_fs_Reader):size()
+  end
+
   -- A malformed directory can throw; close the reader before propagating the error.
   local ok, parsed = pcall(function(): Directory
     if size < #Magic + 12 or read(0, #Magic) ~= Magic then error('jessql compact: invalid header') end
@@ -249,7 +278,7 @@ function compact.open(path: string, options: paged.Options?): paged.Snapshot
     return directory
   end)
 
-  if not ok then reader:close(); error(parsed, 2) end
+  if not ok then closeReader(); error(parsed, 2) end
   local directory = parsed :: Directory
   local cache: { [number]: Cache } = {}
   local cached, clock, pageReads = 0, 0, 0
@@ -407,7 +436,7 @@ function compact.open(path: string, options: paged.Options?): paged.Snapshot
     if closed then return end
     closed = true
     cache = {}
-    reader:close()
+    closeReader()
   end
   return result
 end

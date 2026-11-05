@@ -8,7 +8,7 @@ local secondary = require('@jessql/secondary')
 local engine = require('@jessql/engine')
 
 export type Row = { [string]: unknown }
-export type Options = { cachePages: number?, pageBytes: number?, deletePaths: { [number]: string }? }
+export type Options = { cachePages: number?, pageBytes: number?, readMode: string?, deletePaths: { [number]: string }? }
 export type Snapshot = paged.Snapshot & {
   openIndexes: (self: Snapshot, paths: { string }, options: paged.Options?) -> secondary.Index,
 }
@@ -78,6 +78,7 @@ function segments.open(paths: { string }, options: Options?): Snapshot
   local deletions: { [number]: paged.Snapshot } = {}
   local seen: { [string]: boolean } = {}
   local cachePages = if options then options.cachePages else nil
+  local readMode = if options then options.readMode else nil
   local deletePaths = if options then options.deletePaths else nil
   if deletePaths then
     for number, deletePath in deletePaths do
@@ -95,7 +96,7 @@ function segments.open(paths: { string }, options: Options?): Snapshot
         error('jessql segments: invalid or duplicate snapshot path')
       end
       seen[path] = true
-      local reader = paged.open(path, { cachePages = cachePages or 1 })
+      local reader = paged.open(path, { cachePages = cachePages or 1, readMode = readMode })
       if #readers > 0 then
         if reader.primaryKey ~= readers[1].primaryKey
           or not identical(reader.columns, readers[1].columns) then
@@ -111,7 +112,7 @@ function segments.open(paths: { string }, options: Options?): Snapshot
       if deletePath then
         if seen[deletePath] then error('jessql segments: duplicate deletion path') end
         seen[deletePath] = true
-        local deleteReader = paged.open(deletePath, { cachePages = cachePages or 1 })
+        local deleteReader = paged.open(deletePath, { cachePages = cachePages or 1, readMode = readMode })
         deletions[#readers] = deleteReader
         if deleteReader.primaryKey ~= 'id' or #deleteReader.columns ~= 2
           or deleteReader.columns[1] ~= 'id' or deleteReader.columns[2] ~= 'token'

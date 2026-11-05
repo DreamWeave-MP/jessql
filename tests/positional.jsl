@@ -1,0 +1,112 @@
+--!strict
+local sql = require('@jessql')
+local fs = require('@dream/fs')
+local test = require('@jess/test')
+local expect = test.expect
+local suite = test.new()
+
+local function paths(name: string): (string, string, string)
+  local base = fs.join(fs.cwd() :: string, '.jessql-positional-' .. name)
+  fs.remove(base .. '.cold')
+  fs.remove(base .. '.idx')
+  fs.remove(base .. '.wal')
+  fs.remove(base .. '.wal.lock')
+  return base .. '.cold', base .. '.idx', base .. '.wal'
+end
+
+local function clean(cold: string, sidecar: string, wal: string)
+  fs.remove(cold)
+  fs.remove(sidecar)
+  fs.remove(wal)
+  fs.remove(wal .. '.lock')
+end
+
+suite.describe('retained positional snapshot I/O', function()
+  suite.it('matches mapped reads, range pagination, and cache bounds', function()
+    local path, sidecar, wal = paths('paged')
+    local nextId = 0
+    sql.paged.create(path, { 'id', 'payload' }, 'id', function()
+      nextId += 1
+      return if nextId > 100 then nil else { id = nextId, payload = tostring(nextId) }
+    end, { pageBytes = 512 })
+    local mapped = sql.paged.open(path, { readMode = 'mapped', cachePages = 2 })
+    local positional = sql.paged.open(path, { readMode = 'positional', cachePages = 2 })
+    for id = 100, 1, -3 do
+      expect((assert(positional:get(id))).payload).toBe((assert(mapped:get(id))).payload)
+    end
+    local fromMap = mapped:iterateRows({ 'id' }, true, 27, 39)
+    local fromDisk = positional:iterateRows({ 'id' }, true, 27, 39)
+    for _ = 1, 13 do
+      local left, right = assert(fromMap()), assert(fromDisk())
+      expect(right.id).toBe(left.id)
+    end
+    expect(positional:stats().cachedPages <= 2).toBe(true)
+    positional:close()
+    mapped:close()
+    clean(path, sidecar, wal)
+  end)
+
+  suite.it('reads compact sidecars in both modes with identical seeks', function()
+    local cold, sidecar, wal = paths('sidecar')
+    local id = 0
+    sql.paged.create(cold, { 'id', 'room', 'stream' }, 'id', function()
+      id += 1
+      return if id > 64 then nil else { id = id, room = 'lobby', stream = id }
+    end, { pageBytes = 512 })
+    sql.secondary.create(sidecar, cold, 'room', 'stream', { format = 'compact', pageBytes = 512 })
+    local snapshot = sql.paged.open(cold, { readMode = 'positional' })
+    local mapped = sql.secondary.open(sidecar, snapshot, { readMode = 'mapped' })
+    local positional = sql.secondary.open(sidecar, snapshot, { readMode = 'positional' })
+    local fromMap = mapped:iterate('lobby', false, 12, 16)
+    local fromDisk = positional:iterate('lobby', false, 12, 16)
+    for idValue = 12, 16 do
+      expect((fromDisk() :: sql.Row).id).toBe((fromMap() :: sql.Row).id)
+    end
+    expect(fromDisk()).toBe(nil)
+    positional:close()
+    mapped:close()
+    snapshot:close()
+    clean(cold, sidecar, wal)
+  end)
+
+  suite.it('passes positional mode through a synchronized hybrid WAL', function()
+    local cold, sidecar, wal = paths('hybrid')
+    local id = 0
+    sql.paged.create(cold, { 'id', 'room', 'stream' }, 'id', function()
+      id += 1
+      return if id > 20 then nil else { id = id, room = 'a', stream = id }
+    end, { pageBytes = 512 })
+
+    local db = sql.hybrid.open(wal, cold, 'events', {
+      readMode = 'positional', durability = 'sync', rowLayout = 'packed',
+    })
+    db:update(2, { room = 'b' })
+    db:delete(3)
+    db:insert({ id = 21, room = 'a', stream = 21 })
+    expect((assert(db:get(2))).room).toBe('b')
+    expect(db:get(3)).toBe(nil)
+    db:close()
+    local reopened = sql.hybrid.open(wal, cold, 'events', {
+      readMode = 'positional', durability = 'sync', rowLayout = 'packed',
+    })
+    expect((assert(reopened:get(21))).stream).toBe(21)
+    expect(reopened:get(3)).toBe(nil)
+    reopened:close()
+    clean(cold, sidecar, wal)
+  end)
+
+  suite.it('rejects unsupported reader modes', function()
+    local cold, sidecar, wal = paths('unsupported')
+    local index = 0
+    sql.paged.create(cold, { 'id' }, 'id', function()
+      index += 1
+      return if index > 1 then nil else { id = 1 }
+    end)
+    -- Invalid I/O policy must fail before opening the snapshot.
+    local accepted = pcall(function() sql.paged.open(cold, { readMode = 'mystery' }) end)
+    expect(accepted).toBe(false)
+    clean(cold, sidecar, wal)
+  end)
+end)
+
+return suite

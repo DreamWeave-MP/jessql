@@ -170,7 +170,13 @@ function secondary.create(path: string, snapshotPath: string, partitionColumn: s
     or fanIn < 2 or fanIn > 32 or fanIn % 1 ~= 0 then
     error('jessql secondary: invalid external-sort limits', 2)
   end
-  local snapshot = paged.open(snapshotPath, options)
+
+  -- The index-builder tuning options are not part of the snapshot I/O API.
+  local pageOptions: paged.Options? = if options then {
+    pageBytes = options.pageBytes, cachePages = options.cachePages,
+  } else nil
+
+  local snapshot = paged.open(snapshotPath, pageOptions)
   local metrics: BuildMetrics = { rows = 0, entries = 0, spilledRuns = 0,
     mergeOperations = 0, maxBufferedEntries = 0, maxOpenReaders = 0 }
   local scratch: { [string]: boolean } = {}
@@ -237,7 +243,7 @@ function secondary.create(path: string, snapshotPath: string, partitionColumn: s
 
       if #tier >= fanIn then
         local merged = newRun()
-        mergeRuns(merged, tier, options, metrics)
+        mergeRuns(merged, tier, pageOptions, metrics)
         for _, old in tier do
           fs.remove(old)
           scratch[old] = nil
@@ -251,7 +257,7 @@ function secondary.create(path: string, snapshotPath: string, partitionColumn: s
       if #keys == 0 then return end
       metrics.maxBufferedEntries = math.max(metrics.maxBufferedEntries, #keys)
       local run = newRun()
-      writeRun(run, keys, options)
+      writeRun(run, keys, pageOptions)
       metrics.spilledRuns += 1
       keys = {}
       addRun(run, 1)
@@ -302,7 +308,7 @@ function secondary.create(path: string, snapshotPath: string, partitionColumn: s
         position += 1
         if position <= #marker then return marker[position] end
         return entries[position - #marker]
-      end, options, compressed)
+      end, pageOptions, compressed)
       metrics.maxBufferedEntries = math.max(metrics.maxBufferedEntries, #entries)
     else
       local remaining: { string } = {}
@@ -318,7 +324,7 @@ function secondary.create(path: string, snapshotPath: string, partitionColumn: s
             batch[#batch + 1] = remaining[index]
           end
           local merged = newRun()
-          mergeRuns(merged, batch, options, metrics)
+          mergeRuns(merged, batch, pageOptions, metrics)
           compacted[#compacted + 1] = merged
           for _, old in batch do
             fs.remove(old)
@@ -327,7 +333,7 @@ function secondary.create(path: string, snapshotPath: string, partitionColumn: s
         end
         remaining = compacted
       end
-      mergeRuns(path, remaining, options, metrics, marker, compressed)
+      mergeRuns(path, remaining, pageOptions, metrics, marker, compressed)
     end
   end)
   snapshot:close()
@@ -339,10 +345,10 @@ end
 
 function secondary.open(path: string, snapshot: paged.Snapshot, options: paged.Options?): Index
   -- The legacy JQLP2 reader remains available for previously built sidecars.
-  local handle, openError = fs.open(path)
-  if not handle then error('jessql secondary: ' .. tostring(openError), 2) end
-  local head = handle:readAt(0, 6)
-  handle:close()
+  -- Dispatch by magic without mapping even six bytes of a potentially
+  -- truncated sidecar; positional mode should never depend on mmap.
+  local head, openError = fs.readAt(path, 0, 6)
+  if not head then error('jessql secondary: ' .. tostring(openError), 2) end
   local pages = if head and buffer.tostring(head) == 'JQLS1\n'
     then compact.open(path, options) else paged.open(path, options)
   -- Close the reader after *any* metadata failure, including a corrupt
