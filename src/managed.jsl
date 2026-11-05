@@ -11,6 +11,7 @@ local tiers = require('@jessql/tiers')
 local engine = require('@jessql/engine')
 local manifest = require('@jessql/managed_manifest')
 local policy = require('@jessql/managed_policy')
+local publicationKernel = require('@jessql/managed_publication')
 
 export type Row = { [string]: unknown }
 export type Options = {
@@ -92,28 +93,10 @@ local function readManifest(path: string): Manifest
   return manifest.decode(raw)
 end
 
-local function seal(path: string, parent: string)
-  local writer, openError = fs.openWrite(path, { create = false, truncate = false })
-
-  if not writer then error('jessql managed: seal open: ' .. tostring(openError), 3) end
-  local synced, syncError = writer:syncAll()
-  local closed, closeError = writer:close()
-  assertOK(synced, syncError, 'seal syncAll')
-  assertOK(closed, closeError, 'seal close')
-  local ok, err = fs.syncDirectory(parent)
-  assertOK(ok, err, 'seal directory')
-end
-
-local function removeIfPresent(path: string)
-  local exists, existenceError = fs.exists(path)
-
-  if exists == nil then error('jessql managed: stat: ' .. tostring(existenceError), 3) end
-
-  if exists then
-    local removed, removeError = fs.remove(path)
-    assertOK(removed, removeError, 'remove ' .. path)
-  end
-end
+-- Publication and durable file sealing are deliberately not pluggable.
+-- The coordinator owns the lock, WAL cutover and poison/failure decisions.
+local seal = publicationKernel.seal
+local removeIfPresent = publicationKernel.removeIfPresent
 
 local function compactScratch(base: string, epoch: number): (string, string)
   local prefix = base .. string.format('.g%08d.hot-', epoch)
@@ -282,28 +265,6 @@ local function requireFreshNamespace(base: string, parent: string)
   end
 end
 
-local function durableManifest(base: string, parent: string, value: Manifest,
-  hook: ((string) -> ())?, state: { started: boolean })
-  local candidate = base .. '.jql-manifest.tmp'
-  removeIfPresent(candidate)
-  local text = manifest.encode(value)
-  local count, errorMessage = fs.createDurable(candidate, text)
-
-  if count ~= #text then error('jessql managed: durable manifest: ' .. tostring(errorMessage), 3) end
-  if hook then hook('before-replace') end
-  -- Once replacement is attempted, failure is an uncertain publication.
-  -- Never remove either candidate generation or the old WAL in this state.
-  state.started = true
-  local ok, failure = fs.replace(candidate, base .. '.jql-manifest')
-  assertOK(ok, failure, 'replace manifest')
-
-  if hook then hook('after-replace') end
-  ok, failure = fs.syncDirectory(parent)
-  assertOK(ok, failure, 'sync manifest directory')
-
-  if hook then hook('after-directory-sync') end
-end
-
 -- Lock-protected offline inventory of the published cold generation set.
 -- This opens no writable hybrid handle, replays no WAL, and retires no files.
 -- It validates cold metadata/identity, but DOES NOT validate WAL frames,
@@ -400,7 +361,8 @@ function managed.open(path: string, options: Options?): Database
       manifest.validate(value :: Manifest)
       current = openHybrid(base, value :: Manifest, options, false)
       local started = { started = false }
-      durableManifest(base, parent, value :: Manifest, if options then options.testHook else nil, started)
+      publicationKernel.publish(base, parent, value :: Manifest,
+        if options then options.testHook else nil, started)
     end
 
     if not current then
@@ -691,7 +653,7 @@ function managed.open(path: string, options: Options?): Database
       if options and options.testHook then options.testHook('candidate-sealed') end
       candidate = openHybrid(base, nextValue, options, false)
       if options and options.testHook then options.testHook('wal-ready') end
-      durableManifest(base, parent, nextValue,
+      publicationKernel.publish(base, parent, nextValue,
         if options then options.testHook else nil, publication)
       local previous, prior = live, active
       live = candidate :: hybrid.Database

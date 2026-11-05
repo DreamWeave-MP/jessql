@@ -23,10 +23,11 @@ tests = ["tests/run.jsl", "tests/semantics.jsl", "tests/style.jsl", "tests/stora
 "@jessql/managed" = "src/managed.jsl"
 "@jessql/managed_manifest" = "src/managed_manifest.jsl"
 "@jessql/managed_policy" = "src/managed_policy.jsl"
+"@jessql/managed_publication" = "src/managed_publication.jsl"
 "@jessql/secondary" = "src/secondary.jsl"
 "@jessql/compactsecondary" = "src/compactsecondary.jsl"
 "@jessql/mutations" = "src/mutations.jsl"
 
 [[layer]]
 id = "jessql.core"
-exports = ["@jessql", "@jessql/lexer", "@jessql/parser", "@jessql/engine", "@jessql/storage", "@jessql/ordered", "@jessql/packed", "@jessql/paged", "@jessql/hybrid", "@jessql/segments", "@jessql/delta", "@jessql/tiers", "@jessql/managed", "@jessql/managed_manifest", "@jessql/managed_policy", "@jessql/secondary", "@jessql/compactsecondary", "@jessql/mutations"]
+exports = ["@jessql", "@jessql/lexer", "@jessql/parser", "@jessql/engine", "@jessql/storage", "@jessql/ordered", "@jessql/packed", "@jessql/paged", "@jessql/hybrid", "@jessql/segments", "@jessql/delta", "@jessql/tiers", "@jessql/managed", "@jessql/managed_manifest", "@jessql/managed_policy", "@jessql/managed_publication", "@jessql/secondary", "@jessql/compactsecondary", "@jessql/mutations"]
