@@ -1,0 +1,304 @@
+--!strict
+local sql = require('@jessql')
+local fs = require('@dream/fs')
+local test = require('@jess/test')
+local suite, expect = test.new(), test.expect
+
+type Row = { [string]: unknown }
+
+local function fixture(name: string): string
+  local cwdResult = fs.cwd()
+  local cwd: string = assert(cwdResult)
+  local base = fs.join(cwd, '.jessql-selective-' .. name)
+  for _, suffix in { '.jql-manifest', '.jql-manifest.tmp', '.jql-lock' } do fs.remove(base .. suffix) end
+
+  for epoch = 1, 32 do
+    local suffix = string.format('.g%08d', epoch)
+    for _, ending in { '.rows', '.deleted', '.wal', '.wal.lock', '.hot-rows', '.hot-deleted' } do
+      fs.remove(base .. suffix .. ending)
+    end
+  end
+  return base
+end
+
+local function removeFixture(base: string)
+  for _, suffix in { '.jql-manifest', '.jql-manifest.tmp', '.jql-lock' } do fs.remove(base .. suffix) end
+
+  for epoch = 1, 32 do
+    local suffix = string.format('.g%08d', epoch)
+    for _, ending in { '.rows', '.deleted', '.wal', '.wal.lock', '.hot-rows', '.hot-deleted' } do
+      fs.remove(base .. suffix .. ending)
+    end
+  end
+end
+
+local function initial(base: string, hook: ((string) -> ())?): sql.ManagedDatabase
+  return sql.managed.open(base, { tableName = 'events', columns = { 'id', 'room', 'body' },
+    primaryKey = 'id', cachePages = 1, rowLayout = 'packed', readMode = 'positional',
+    testHook = hook })
+end
+
+suite.describe('managed selective compaction', function()
+  suite.it('selectively merges recent generations and the hot overlay without rewriting the oldest', function()
+    local base = fixture('selective-preserves-old')
+    local db = sql.managed.open(base, { tableName = 'events',
+      columns = { 'id', 'room', 'body' }, primaryKey = 'id', compactionFanIn = 2 })
+    db:insert({ id = 1, room = 'old', body = 'original' })
+    db:flush() -- generation 2 is an old immutable anchor
+    db:insert({ id = 2, room = 'new', body = 'second' })
+    db:flush()
+    db:insert({ id = 3, room = 'new', body = 'third' })
+    db:flush()
+    local original = assert((fs.readFileString(base .. '.g00000002.rows')))
+    db:transaction(function(tx)
+      tx:upsert({ id = 1, room = 'changed', body = 'hot-shadow' })
+      expect(tx:delete(2)).toBe(true)
+      tx:upsert({ id = 3, room = 'changed', body = 'newest' })
+      tx:insert({ id = 4, room = 'new', body = 'hot-insert' })
+    end)
+    expect(db:compact()).toBe(5)
+    expect(db:stats().generations).toBe(3)
+    expect(db:stats().hotRows).toBe(0)
+    expect(db:stats().tombstones).toBe(0)
+    expect((fs.readFileString(base .. '.g00000002.rows'))).toBe(original)
+    expect((fs.exists(base .. '.g00000003.rows'))).toBe(false)
+    expect((fs.exists(base .. '.g00000004.rows'))).toBe(false)
+    expect((fs.exists(base .. '.g00000005.hot-rows'))).toBe(false)
+    expect((fs.exists(base .. '.g00000005.hot-deleted'))).toBe(false)
+    expect((assert(db:get(1))).body).toBe('hot-shadow')
+    expect(db:get(2)).toBe(nil)
+    expect((assert(db:get(3))).body).toBe('newest')
+    expect((assert(db:get(4))).body).toBe('hot-insert')
+    db:close()
+    local reopened = sql.managed.open(base)
+    expect(reopened:stats().generations).toBe(3)
+    expect((assert(reopened:get(1))).body).toBe('hot-shadow')
+    expect(reopened:get(2)).toBe(nil)
+    expect((assert(reopened:get(4))).body).toBe('hot-insert')
+    reopened:close()
+    removeFixture(base)
+  end)
+
+  suite.it('propagates deletion markers through selective compaction across an untouched older tier', function()
+    local base = fixture('selective-tombstones')
+    local db = sql.managed.open(base, { tableName = 'events',
+      columns = { 'id', 'room', 'body' }, primaryKey = 'id', compactionFanIn = 2 })
+    db:insert({ id = 1, room = 'old', body = 'must-not-return' })
+    db:insert({ id = 2, room = 'old', body = 'kept' })
+    db:flush() -- untouched generation 2 contains both original rows
+    db:insert({ id = 3, room = 'new', body = 'temporary' })
+    db:flush()
+    expect(db:delete(1)).toBe(true)
+    expect(db:delete(3)).toBe(true)
+    db:flush()
+    db:insert({ id = 4, room = 'new', body = 'live' })
+    expect(db:compact()).toBe(5)
+    expect(db:stats().generations).toBe(3)
+    expect(db:get(1)).toBe(nil)
+    expect(db:get(3)).toBe(nil)
+    expect((assert(db:get(2))).body).toBe('kept')
+    db:close()
+    local first = sql.managed.open(base, { compactionFanIn = 2 })
+    expect(first:get(1)).toBe(nil)
+    expect(first:get(3)).toBe(nil)
+    expect((assert(first:get(4))).body).toBe('live')
+    expect(first:compact()).toBe(6) -- recombine newest generations again
+    first:close()
+    local second = sql.managed.open(base)
+    expect(second:get(1)).toBe(nil)
+    expect(second:get(3)).toBe(nil)
+    expect((assert(second:get(2))).body).toBe('kept')
+    second:close()
+    removeFixture(base)
+  end)
+
+  suite.it('automatically compacts recent generations at the budget instead of rewriting the oldest', function()
+    local base = fixture('auto-selective')
+    local db = sql.managed.open(base, { tableName = 'events',
+      columns = { 'id', 'room', 'body' }, primaryKey = 'id', maxGenerations = 4,
+      maxHotRows = 1, compactionFanIn = 2 })
+    local old = ''
+    for index = 1, 12 do
+      db:insert({ id = index, room = 'auto', body = tostring(index) })
+      if index == 2 then
+        old = assert((fs.readFileString(base .. '.g00000002.rows')))
+      end
+      expect(db:stats().generations <= 4).toBe(true)
+      expect(db:stats().hotRows).toBe(0)
+    end
+    expect((fs.readFileString(base .. '.g00000002.rows'))).toBe(old)
+    for index = 1, 12 do expect((assert(db:get(index))).body).toBe(tostring(index)) end
+    db:close()
+    local reopened = sql.managed.open(base)
+    expect(reopened:query('SELECT COUNT(*) AS n FROM events').rows[1].n).toBe(12)
+    reopened:close()
+    removeFixture(base)
+  end)
+
+  suite.it('preserves WAL and reclaims compact scratch after a pre-publication failure', function()
+    for _, stage in { 'candidate-sealed', 'wal-ready', 'before-replace' } do
+      local base = fixture('compact-pre-' .. stage)
+      local inject = false
+      local db = initial(base, function(phase: string)
+        if inject and phase == stage then error('intentional compaction fault') end
+      end)
+      db:insert({ id = 1, room = 'a', body = 'old' })
+      db:flush()
+      db:insert({ id = 2, room = 'b', body = 'second' })
+      db:flush()
+      db:upsert({ id = 1, room = 'c', body = 'committed-hot' })
+      inject = true
+      -- The candidate did not publish; the old WAL must remain authoritative.
+      expect((pcall(function() db:compact() end))).toBe(false)
+      expect(db:stats().epoch).toBe(3)
+      expect((assert(db:get(1))).body).toBe('committed-hot')
+      expect((fs.exists(base .. '.g00000004.hot-rows'))).toBe(false)
+      expect((fs.exists(base .. '.g00000004.hot-deleted'))).toBe(false)
+      inject = false
+      db:close()
+      local recovered = sql.managed.open(base)
+      expect((assert(recovered:get(1))).body).toBe('committed-hot')
+      expect(recovered:compact()).toBe(4)
+      recovered:close()
+      removeFixture(base)
+    end
+  end)
+
+  suite.it('recovers authoritative selective compaction after uncertain publication', function()
+    for _, stage in { 'after-replace', 'after-directory-sync', 'before-retire' } do
+      local base = fixture('compact-post-' .. stage)
+      local inject = false
+      local db = sql.managed.open(base, { tableName = 'events',
+        columns = { 'id', 'room', 'body' }, primaryKey = 'id', compactionFanIn = 2,
+        testHook = function(phase: string)
+          if inject and phase == stage then error('interrupted selective publication') end
+        end })
+      db:insert({ id = 1, room = 'a', body = 'first' })
+      db:flush()
+      db:insert({ id = 2, room = 'b', body = 'second' })
+      db:flush()
+      db:insert({ id = 3, room = 'b', body = 'third' })
+      db:flush()
+      db:delete(1)
+      inject = true
+      -- A possibly visible manifest forbids further activity on this handle.
+      expect((pcall(function() db:compact() end))).toBe(false)
+      expect(db:maintenanceStatus().poisoned).toBe(true)
+      db:close()
+      local recovered = sql.managed.open(base)
+      expect(recovered:stats().epoch).toBe(5)
+      expect(recovered:stats().generations).toBe(3)
+      expect(recovered:get(1)).toBe(nil)
+      expect((assert(recovered:get(2))).body).toBe('second')
+      expect((fs.exists(base .. '.g00000005.hot-rows'))).toBe(false)
+      expect((fs.exists(base .. '.g00000005.hot-deleted'))).toBe(false)
+      expect((fs.exists(base .. '.g00000002.rows'))).toBe(true)
+      expect((fs.exists(base .. '.g00000004.rows'))).toBe(false)
+      recovered:close()
+      removeFixture(base)
+    end
+  end)
+
+  suite.it('collects abandoned compaction scratch on reopen but preserves unrelated files', function()
+    local base = fixture('compact-orphans')
+    local db = initial(base, nil)
+    db:insert({ id = 1, room = 'x', body = 'stable' })
+    db:flush()
+    db:close()
+    assert((fs.writeFile(base .. '.g00000009.hot-rows', 'abandoned')))
+    assert((fs.writeFile(base .. '.g00000009.hot-deleted', 'abandoned')))
+    assert((fs.writeFile(base .. '.g00000009.hot-rows.backup', 'unrelated')))
+    local recovered = sql.managed.open(base)
+    expect((assert(recovered:get(1))).body).toBe('stable')
+    expect((fs.exists(base .. '.g00000009.hot-rows'))).toBe(false)
+    expect((fs.exists(base .. '.g00000009.hot-deleted'))).toBe(false)
+    expect((fs.exists(base .. '.g00000009.hot-rows.backup'))).toBe(true)
+    recovered:close()
+    fs.remove(base .. '.g00000009.hot-rows.backup')
+    removeFixture(base)
+  end)
+
+  suite.it('validates compaction fan-in and rejects a single-generation merge', function()
+    local base = fixture('compact-invalid')
+    -- Invalid tuning should not create a manifest or WAL.
+    expect((pcall(function()
+      sql.managed.open(base, { tableName = 'events', columns = { 'id', 'room', 'body' },
+        primaryKey = 'id', compactionFanIn = 1 })
+    end))).toBe(false)
+    expect((fs.exists(base .. '.jql-manifest'))).toBe(false)
+    local db = initial(base, nil)
+    db:insert({ id = 1, room = 'x', body = 'stable' })
+    -- A single-generation merge is explicitly rejected without touching the WAL.
+    expect((pcall(function() db:compact() end))).toBe(false)
+    expect((assert(db:get(1))).body).toBe('stable')
+    db:close()
+    removeFixture(base)
+  end)
+
+
+  suite.it('agrees with a deterministic row model across repeated flush and compact cycles', function()
+    local base = fixture('churn-model')
+    local db = sql.managed.open(base, { tableName = 'events',
+      columns = { 'id', 'room', 'body' }, primaryKey = 'id', maxHotRows = 4,
+      maxGenerations = 4, compactionFanIn = 2 })
+    local expected: { [number]: string } = {}
+
+    for round = 1, 24 do
+      db:transaction(function(tx)
+        for slot = 1, 5 do
+          local key = ((round * 13 + slot * 7) % 29) + 1
+          if (round + slot) % 6 == 0 then
+            tx:delete(key)
+            expected[key] = nil
+          else
+            local body = 'round-' .. tostring(round) .. '-slot-' .. tostring(slot)
+            tx:upsert({ id = key, room = 'model', body = body })
+            expected[key] = body
+          end
+        end
+      end)
+      expect(db:stats().generations <= 4).toBe(true)
+      expect(db:stats().hotRows).toBe(0)
+      if round % 4 == 0 then
+        db:close()
+        db = sql.managed.open(base, { maxHotRows = 4,
+          maxGenerations = 4, compactionFanIn = 2 })
+        local count = 0
+        for key = 1, 29 do
+          local row = db:get(key)
+          if expected[key] then
+            expect((assert(row)).body).toBe(expected[key])
+            count += 1
+          else
+            expect(row).toBe(nil)
+          end
+        end
+        expect(db:query('SELECT COUNT(*) AS n FROM events').rows[1].n).toBe(count)
+      end
+    end
+    db:close()
+    removeFixture(base)
+  end)
+
+  suite.it('selectively compacts a cold-only deletion delta without hot rows', function()
+    local base = fixture('cold-only')
+    local db = sql.managed.open(base, { tableName = 'events',
+      columns = { 'id', 'room', 'body' }, primaryKey = 'id', compactionFanIn = 2 })
+    db:insert({ id = 1, room = 'x', body = 'older' })
+    db:flush()
+    expect(db:delete(1)).toBe(true)
+    db:flush()
+    expect(db:stats().hotRows).toBe(0)
+    expect(db:stats().tombstones).toBe(0)
+    expect(db:compact()).toBe(4)
+    expect(db:get(1)).toBe(nil)
+    db:close()
+    local recovered = sql.managed.open(base)
+    expect(recovered:get(1)).toBe(nil)
+    expect(recovered:stats().generations).toBe(2)
+    recovered:close()
+    removeFixture(base)
+  end)
+end)
+
+return suite
