@@ -148,6 +148,67 @@ export type Database = {
   tables: (self: Database) -> { TableInfo },
 }
 
+-- Bound sources are internal planner state, not the public provider protocol.
+type BoundSource = {
+  name: string,
+  alias: string,
+  provider: Provider,
+  columns: {string},
+  columnMap: {[string]: string},
+  columnSet: {[string]: boolean},
+  index: number,
+}
+
+-- Evaluators accept a provider row or a join context; their actual scalar output is dynamic.
+-- The engine refines it only where SQL semantics require a particular primitive operation.
+type Evaluator = (unknown, {unknown}?, {unknown}) -> unknown
+
+type AggregateSpec = {
+  name: string,
+  star: boolean,
+  expr: parser.Call,
+  argFn: Evaluator?,
+  slot: number?,
+}
+type AggregateColumns = {
+  names: {string},
+  wantsSum: {[number]: boolean},
+  wantsLeast: {[number]: boolean},
+  wantsGreatest: {[number]: boolean},
+}
+type Group = {
+  [number]: unknown,
+  first: unknown?,
+  groupKey: unknown?,
+  avgCounts: {[number]: number}?,
+}
+type OrderFn = {evaluate: Evaluator, desc: boolean}
+type Unit = {context: unknown, group: Group?, orderKey: unknown?, order: {unknown}?}
+type JoinPlan = {
+  strategy: 'nested-loop' | 'hash' | 'index-left' | 'index-right',
+  leftSourceIndex: number?,
+  leftColumn: string?,
+  rightColumn: string?,
+}
+type BoundConstraint = {sourceIndex: number, column: string, op: string, value: unknown, param: number?}
+type WhereTerm = {predicate: Evaluator, sourceIndex: number?, pushable: boolean}
+type Lookup = (string, unknown, Request) -> (SourceRows | ScanResult)?
+type JoinContext = {SourceRow?}
+type JoinIterator = {next: () -> JoinContext?}
+type ScanFlags = {read handledConstraints: boolean?, read handledWhere: boolean?, read ordered: boolean?}
+
+local function unwrapScan(scanned: SourceRows | ScanResult): (SourceRows, ScanResult?)
+  local envelope = scanned :: ScanResult
+  if envelope._jessqlScan == 'v1' then return envelope.rows, envelope end
+  return scanned :: SourceRows, nil
+end
+
+local function unwrapLookup(scanned: (SourceRows | ScanResult)?): SourceRows?
+  if not scanned then return nil end
+  local rows = unwrapScan(scanned)
+  return rows
+end
+
 local engine = {}
 local AGG = { COUNT = true, SUM = true, AVG = true, MIN = true, MAX = true }
 
@@ -258,7 +319,7 @@ local function compileLiteralLike(pattern: unknown): ((unknown) -> boolean?)?
   return nil
 end
 
-local function bindColumn(expr, sources)
+local function bindColumn(expr: parser.Column, sources: {BoundSource}): (number, string)
   if expr.sourceIndex ~= nil and expr.boundName ~= nil then return expr.sourceIndex, expr.boundName end
   local name = lower(expr.name)
   local sourceIndex: number? = nil
@@ -289,43 +350,43 @@ local function bindColumn(expr, sources)
   end
 
   expr.sourceIndex = sourceIndex
-  expr.boundName = sources[sourceIndex].columnMap[name] or expr.name
-  return sourceIndex, expr.boundName
+  expr.boundName = sources[sourceIndex :: number].columnMap[name] or expr.name
+  return sourceIndex :: number, expr.boundName :: string
 end
 
 --- `column op value` over one table's row as one function, where `value` is a literal that is
 --- not NULL: a WHERE is mostly these, and the general form calls a function for each side
 --- before it compares. Nil for an operator that is not a comparison.
-local function columnAgainstLiteral(op, key, value)
+local function columnAgainstLiteral(op: string, key: string, value: unknown): Evaluator?
   if op == '=' then
     return function(row, _group, _params)
-      local left = row[key]
+      local left = (row :: SourceRow)[key]
       return if left == nil then nil else left == value
     end
   elseif op == '!=' or op == '<>' then
     return function(row, _group, _params)
-      local left = row[key]
+      local left = (row :: SourceRow)[key]
       return if left == nil then nil else left ~= value
     end
   elseif op == '<' then
     return function(row, _group, _params)
-      local left = row[key]
-      return if left == nil then nil else left < value
+      local left = (row :: SourceRow)[key]
+      return if left == nil then nil else (left :: number) < (value :: number)
     end
   elseif op == '<=' then
     return function(row, _group, _params)
-      local left = row[key]
-      return if left == nil then nil else left <= value
+      local left = (row :: SourceRow)[key]
+      return if left == nil then nil else (left :: number) <= (value :: number)
     end
   elseif op == '>' then
     return function(row, _group, _params)
-      local left = row[key]
-      return if left == nil then nil else left > value
+      local left = (row :: SourceRow)[key]
+      return if left == nil then nil else (left :: number) > (value :: number)
     end
   elseif op == '>=' then
     return function(row, _group, _params)
-      local left = row[key]
-      return if left == nil then nil else left >= value
+      local left = (row :: SourceRow)[key]
+      return if left == nil then nil else (left :: number) >= (value :: number)
     end
   end
 
@@ -333,65 +394,65 @@ local function columnAgainstLiteral(op, key, value)
 end
 
 --- `column op ?` over one table's row as one function, the parameter read on every call.
-local function columnAgainstParam(op, key, index)
+local function columnAgainstParam(op: string, key: string, index: number): Evaluator?
   if op == '=' then
     return function(row, _group, params)
-      local left, right = row[key], params[index]
+      local left, right = (row :: SourceRow)[key], params[index]
       return if left == nil or right == nil then nil else left == right
     end
   elseif op == '!=' or op == '<>' then
     return function(row, _group, params)
-      local left, right = row[key], params[index]
+      local left, right = (row :: SourceRow)[key], params[index]
       return if left == nil or right == nil then nil else left ~= right
     end
   elseif op == '<' then
     return function(row, _group, params)
-      local left, right = row[key], params[index]
-      return if left == nil or right == nil then nil else left < right
+      local left, right = (row :: SourceRow)[key], params[index]
+      return if left == nil or right == nil then nil else (left :: number) < (right :: number)
     end
   elseif op == '<=' then
     return function(row, _group, params)
-      local left, right = row[key], params[index]
-      return if left == nil or right == nil then nil else left <= right
+      local left, right = (row :: SourceRow)[key], params[index]
+      return if left == nil or right == nil then nil else (left :: number) <= (right :: number)
     end
   elseif op == '>' then
     return function(row, _group, params)
-      local left, right = row[key], params[index]
-      return if left == nil or right == nil then nil else left > right
+      local left, right = (row :: SourceRow)[key], params[index]
+      return if left == nil or right == nil then nil else (left :: number) > (right :: number)
     end
   elseif op == '>=' then
     return function(row, _group, params)
-      local left, right = row[key], params[index]
-      return if left == nil or right == nil then nil else left >= right
+      local left, right = (row :: SourceRow)[key], params[index]
+      return if left == nil or right == nil then nil else (left :: number) >= (right :: number)
     end
   end
 
   return nil
 end
 
-local function compileExpr(expr, sources, directSingle, aggregateIds)
+local function compileExpr(expr: parser.Expr, sources: {BoundSource}, directSingle: boolean, aggregateIds: {[parser.Expr]: number}?): Evaluator
   local tag = expr.tag
 
-  if tag == 'literal' then
+  if expr.tag == 'literal' then
     local value = expr.value
     return function(_context, _group, _params) return value end
-  elseif tag == 'param' then
+  elseif expr.tag == 'param' then
     local index = expr.index
     return function(_context, _group, params) return params[index] end
-  elseif tag == 'column' then
+  elseif expr.tag == 'column' then
     local sourceIndex, boundName = bindColumn(expr, sources)
     local key = boundName
     local slot = sourceIndex
 
     if directSingle then
-      return function(row, _group, _params) return row[key] end
+      return function(row, _group, _params) return (row :: SourceRow)[key] end
     end
 
     return function(context, _group, _params)
-      local row = context[slot]
+      local row = (context :: {SourceRow?})[slot]
       return if row == nil then nil else row[key]
     end
-  elseif tag == 'unary' then
+  elseif expr.tag == 'unary' then
     local operand = compileExpr(expr.expr, sources, directSingle, aggregateIds)
 
     if expr.op == 'NOT' then
@@ -404,12 +465,12 @@ local function compileExpr(expr, sources, directSingle, aggregateIds)
     if expr.op == '-' then
       return function(context, group, params)
         local value = operand(context, group, params)
-        return if value == nil then nil else -value
+        return if value == nil then nil else -(value :: number)
       end
     end
 
     return function(context, group, params) return operand(context, group, params) end
-  elseif tag == 'isnull' then
+  elseif expr.tag == 'isnull' then
     local operand = compileExpr(expr.expr, sources, directSingle, aggregateIds)
 
     if expr.negated then
@@ -417,7 +478,7 @@ local function compileExpr(expr, sources, directSingle, aggregateIds)
     end
 
     return function(context, group, params) return operand(context, group, params) == nil end
-  elseif tag == 'binary' then
+  elseif expr.tag == 'binary' then
     local leftOperand = compileExpr(expr.left, sources, directSingle, aggregateIds)
     local rightOperand = compileExpr(expr.right, sources, directSingle, aggregateIds)
     local op = expr.op
@@ -427,9 +488,9 @@ local function compileExpr(expr, sources, directSingle, aggregateIds)
       local fused = nil
 
       if right.tag == 'literal' and right.value ~= nil then
-        fused = columnAgainstLiteral(op, expr.left.boundName, right.value)
+        fused = columnAgainstLiteral(op, expr.left.boundName :: string, right.value)
       elseif right.tag == 'param' then
-        fused = columnAgainstParam(op, expr.left.boundName, right.index)
+        fused = columnAgainstParam(op, expr.left.boundName :: string, right.index)
       end
 
       if fused then return fused end
@@ -477,7 +538,7 @@ local function compileExpr(expr, sources, directSingle, aggregateIds)
       return function(context, group, params)
         local left, right = leftOperand(context, group, params), rightOperand(context, group, params)
         if left == nil or right == nil then return nil end
-        return left < right
+        return (left :: number) < (right :: number)
       end
     end
 
@@ -485,7 +546,7 @@ local function compileExpr(expr, sources, directSingle, aggregateIds)
       return function(context, group, params)
         local left, right = leftOperand(context, group, params), rightOperand(context, group, params)
         if left == nil or right == nil then return nil end
-        return left <= right
+        return (left :: number) <= (right :: number)
       end
     end
 
@@ -493,7 +554,7 @@ local function compileExpr(expr, sources, directSingle, aggregateIds)
       return function(context, group, params)
         local left, right = leftOperand(context, group, params), rightOperand(context, group, params)
         if left == nil or right == nil then return nil end
-        return left > right
+        return (left :: number) > (right :: number)
       end
     end
 
@@ -501,7 +562,7 @@ local function compileExpr(expr, sources, directSingle, aggregateIds)
       return function(context, group, params)
         local left, right = leftOperand(context, group, params), rightOperand(context, group, params)
         if left == nil or right == nil then return nil end
-        return left >= right
+        return (left :: number) >= (right :: number)
       end
     end
 
@@ -509,7 +570,7 @@ local function compileExpr(expr, sources, directSingle, aggregateIds)
       return function(context, group, params)
         local left, right = leftOperand(context, group, params), rightOperand(context, group, params)
         if left == nil or right == nil then return nil end
-        return left + right
+        return (left :: number) + (right :: number)
       end
     end
 
@@ -517,7 +578,7 @@ local function compileExpr(expr, sources, directSingle, aggregateIds)
       return function(context, group, params)
         local left, right = leftOperand(context, group, params), rightOperand(context, group, params)
         if left == nil or right == nil then return nil end
-        return left - right
+        return (left :: number) - (right :: number)
       end
     end
 
@@ -525,7 +586,7 @@ local function compileExpr(expr, sources, directSingle, aggregateIds)
       return function(context, group, params)
         local left, right = leftOperand(context, group, params), rightOperand(context, group, params)
         if left == nil or right == nil then return nil end
-        return left * right
+        return (left :: number) * (right :: number)
       end
     end
 
@@ -533,7 +594,7 @@ local function compileExpr(expr, sources, directSingle, aggregateIds)
       return function(context, group, params)
         local left, right = leftOperand(context, group, params), rightOperand(context, group, params)
         if left == nil or right == nil then return nil end
-        return left / right
+        return (left :: number) / (right :: number)
       end
     end
 
@@ -541,7 +602,7 @@ local function compileExpr(expr, sources, directSingle, aggregateIds)
       return function(context, group, params)
         local left, right = leftOperand(context, group, params), rightOperand(context, group, params)
         if left == nil or right == nil then return nil end
-        return left % right
+        return (left :: number) % (right :: number)
       end
     end
 
@@ -568,15 +629,15 @@ local function compileExpr(expr, sources, directSingle, aggregateIds)
     end
 
     error('jessql: unsupported operator ' .. tostring(op), 0)
-  elseif tag == 'call' then
+  elseif expr.tag == 'call' then
     local name = expr.name
 
-    if AGG[name] and aggregateIds ~= nil then
+    if AGG[name] and aggregateIds then
       local id = aggregateIds[expr]
       if id == nil then error('jessql: aggregate expression was not planned', 0) end
-      return function(_context, group, _params) return group[id] end
+      return function(_context, group, _params) return (group :: {unknown})[id] end
     elseif AGG[name] then
-      local arg = nil
+      local arg: Evaluator? = nil
 
       if not expr.star then
         if #expr.args ~= 1 then error('jessql: aggregate ' .. name .. ' needs one argument', 0) end
@@ -585,14 +646,14 @@ local function compileExpr(expr, sources, directSingle, aggregateIds)
 
       if name == 'COUNT' then
         if expr.star then
-          return function(_context, group, _params) return #group end
+          return function(_context, group, _params) return #(group :: {unknown}) end
         end
 
         return function(_context, group, params)
           local count = 0
 
-          for _, member in group do
-            if arg(member, group, params) ~= nil then count += 1 end
+          for _, member in group :: {unknown} do
+            if (arg :: Evaluator)(member, group, params) ~= nil then count += 1 end
           end
 
           return count
@@ -601,9 +662,9 @@ local function compileExpr(expr, sources, directSingle, aggregateIds)
         return function(_context, group, params)
           local total = nil
 
-          for _, member in group do
-            local value = arg(member, group, params)
-            if value ~= nil then total = (total or 0) + value end
+          for _, member in group :: {unknown} do
+            local value = (arg :: Evaluator)(member, group, params)
+            if value ~= nil then total = (total or 0) + (value :: number) end
           end
 
           return total
@@ -612,11 +673,11 @@ local function compileExpr(expr, sources, directSingle, aggregateIds)
         return function(_context, group, params)
           local total, count = 0, 0
 
-          for _, member in group do
-            local value = arg(member, group, params)
+          for _, member in group :: {unknown} do
+            local value = (arg :: Evaluator)(member, group, params)
 
             if value ~= nil then
-              total += value
+              total += (value :: number)
               count += 1
             end
           end
@@ -627,9 +688,9 @@ local function compileExpr(expr, sources, directSingle, aggregateIds)
         return function(_context, group, params)
           local best = nil
 
-          for _, member in group do
-            local value = arg(member, group, params)
-            if value ~= nil and (best == nil or value < best) then best = value end
+          for _, member in group :: {unknown} do
+            local value = (arg :: Evaluator)(member, group, params)
+            if value ~= nil and (best == nil or (value :: number) < (best :: number)) then best = value end
           end
 
           return best
@@ -638,9 +699,9 @@ local function compileExpr(expr, sources, directSingle, aggregateIds)
         return function(_context, group, params)
           local best = nil
 
-          for _, member in group do
-            local value = arg(member, group, params)
-            if value ~= nil and (best == nil or value > best) then best = value end
+          for _, member in group :: {unknown} do
+            local value = (arg :: Evaluator)(member, group, params)
+            if value ~= nil and (best == nil or (value :: number) > (best :: number)) then best = value end
           end
 
           return best
@@ -668,7 +729,7 @@ local function compileExpr(expr, sources, directSingle, aggregateIds)
     elseif name == 'ABS' then
       return function(context, group, params)
         local value = args[1](context, group, params)
-        return if value == nil then nil else math.abs(value)
+        return if value == nil then nil else math.abs(value :: number)
       end
     elseif name == 'COALESCE' then
       return function(context, group, params)
@@ -687,7 +748,7 @@ local function compileExpr(expr, sources, directSingle, aggregateIds)
   error('jessql: cannot compile expression ' .. tostring(tag), 0)
 end
 
-local function schemaFromRows(rows)
+local function schemaFromRows(rows: SourceRows): {string}
   local columns, seen = {}, {}
 
   for index = 1, math.min(#rows, 32) do
@@ -703,7 +764,7 @@ local function schemaFromRows(rows)
   return columns
 end
 
-local function makeSource(db, spec, index)
+local function makeSource(db: Database, spec: parser.Source, index: number): BoundSource
   local provider = db._tables[lower(spec.name)]
   if provider == nil then error('jessql: unknown table ' .. spec.name, 0) end
   local columns = provider.columns
@@ -725,11 +786,11 @@ local function makeSource(db, spec, index)
   }
 end
 
-local function constraintFrom(expr)
+local function constraintFrom(expr: parser.Expr?): ({BoundConstraint}, boolean)
   if expr == nil then return {}, true end
-  local out = {}
+  local out: {BoundConstraint} = {}
 
-  local function walk(node)
+  local function walk(node: parser.Expr): boolean
     if node.tag == 'binary' and node.op == 'AND' then return walk(node.left) and walk(node.right) end
     if node.tag ~= 'binary' then return false end
     local op = node.op
@@ -756,7 +817,11 @@ local function constraintFrom(expr)
       end
     end
 
-    out[#out + 1] = { sourceIndex = col.sourceIndex, column = col.boundName, op = op, value = lit.value, param = lit.index }
+    out[#out + 1] = {
+      sourceIndex = col.sourceIndex, column = col.boundName :: string, op = op,
+      value = if lit.tag == 'literal' then lit.value else nil,
+      param = if lit.tag == 'param' then lit.index else nil,
+    }
     return true
   end
 
@@ -764,10 +829,10 @@ local function constraintFrom(expr)
   return out, complete
 end
 
-local function conjuncts(expr)
-  local out = {}
+local function conjuncts(expr: parser.Expr?): {parser.Expr}
+  local out: {parser.Expr} = {}
 
-  local function walk(node)
+  local function walk(node: parser.Expr?)
     if node ~= nil and node.tag == 'binary' and node.op == 'AND' then
       walk(node.left)
       walk(node.right)
@@ -780,18 +845,18 @@ local function conjuncts(expr)
   return out
 end
 
-local function singleSourceOf(expr)
-  local source = nil
+local function singleSourceOf(expr: parser.Expr?): number?
+  local source: number? = nil
   local mixed = false
 
-  local function walk(node)
+  local function walk(node: parser.Expr?)
     if node == nil or mixed then return end
 
     if node.tag == 'column' then
       local sourceIndex = node.sourceIndex
 
       if sourceIndex ~= nil then
-        if source == nil then
+        if not source then
           source = sourceIndex
         elseif source ~= sourceIndex then
           mixed = true
@@ -811,12 +876,11 @@ local function singleSourceOf(expr)
   return if mixed then nil else source
 end
 
-local function valueKey(value)
+local function valueKey(value: unknown): string
   if value == nil then return 'N;' end
-  local valueType = type(value)
-  if valueType == 'string' then return 'S' .. #value .. ':' .. value end
-  if valueType == 'number' then return 'D' .. tostring(value) .. ';' end
-  if valueType == 'boolean' then return if value then 'B1;' else 'B0;' end
+  if type(value) == 'string' then return 'S' .. #value .. ':' .. value end
+  if type(value) == 'number' then return 'D' .. tostring(value) .. ';' end
+  if type(value) == 'boolean' then return if value then 'B1;' else 'B0;' end
   return 'O' .. tostring(value) .. ';'
 end
 
@@ -832,30 +896,30 @@ end
 --- The rows `accumulate` has put into `group` already are gone on from in turn. Both functions
 --- are nil when a sum, least or greatest of those rows is not a number, which no column of
 --- numbers goes on from.
-local function columnAccumulator(group, aggregateSpecs, columns, retain)
+local function columnAccumulator(group: Group, aggregateSpecs: {AggregateSpec}, columns: AggregateColumns, retain: (unknown) -> unknown): (((SourceRow) -> boolean)?, (() -> ())?)
   local {names, wantsSum, wantsLeast, wantsGreatest} = columns
   local held = table.create(#names, 0)
   local counts = table.create(#names, 0)
   local sums = table.create(#names, 0)
-  local least, greatest = {}, {}
+  local least, greatest = {} :: {[number]: number}, {} :: {[number]: number}
   local rowCount = 0
 
   for index, spec in aggregateSpecs do
-    local slot, gathered = spec.slot, group[index]
+    local slot, gathered = spec.slot :: number, group[index]
 
     if spec.star then
-      rowCount = gathered
+      rowCount = gathered :: number
     elseif spec.name == 'COUNT' then
-      counts[slot] = gathered
+      counts[slot] = gathered :: number
     elseif gathered == nil then
       continue
     elseif type(gathered) ~= 'number' then
       return nil, nil
     elseif spec.name == 'AVG' then
-      sums[slot], counts[slot] = gathered, group.avgCounts[index]
+      sums[slot], counts[slot] = gathered :: number, (group.avgCounts :: {[number]:number})[index]
     elseif spec.name == 'SUM' then
       -- A sum that is there has added a cell; how many is asked only of a COUNT or an AVG.
-      sums[slot], counts[slot] = gathered, math.max(counts[slot], 1)
+      sums[slot], counts[slot] = gathered :: number, math.max(counts[slot], 1)
     elseif spec.name == 'MIN' then
       least[slot] = gathered
     else
@@ -865,7 +929,7 @@ local function columnAccumulator(group, aggregateSpecs, columns, retain)
 
   local chunks = [for _ in names => buffer.create((AggregateChunk + 1) * 8)]
 
-  local function reduce(slot)
+  local function reduce(slot: number)
     local count = held[slot]
     if count == 0 then return end
 
@@ -900,8 +964,8 @@ local function columnAccumulator(group, aggregateSpecs, columns, retain)
     held[slot] = 0
   end
 
-  local function feed(row)
-    if type(row) ~= 'table' or getmetatable(row) ~= nil then return false end
+  local function feed(row: SourceRow): boolean
+    if type(row) ~= 'table' or getmetatable(row :: {}) ~= nil then return false end
 
     for slot, name in names do
       local value = row[name]
@@ -933,7 +997,7 @@ local function columnAccumulator(group, aggregateSpecs, columns, retain)
     end
 
     for index, spec in aggregateSpecs do
-      local slot = spec.slot
+      local slot = spec.slot :: number
 
       if spec.star then
         group[index] = rowCount
@@ -941,7 +1005,8 @@ local function columnAccumulator(group, aggregateSpecs, columns, retain)
         group[index] = counts[slot]
       elseif spec.name == 'AVG' then
         group[index] = sums[slot]
-        group.avgCounts[index] = counts[slot]
+        local avgCounts = group.avgCounts :: {[number]: number}
+        avgCounts[index] = counts[slot]
       elseif spec.name == 'SUM' then
         if counts[slot] > 0 then group[index] = sums[slot] end
       elseif spec.name == 'MIN' then
@@ -958,15 +1023,15 @@ end
 --- Whether the ORDER BY keys `leftKeys` go before `rightKeys`: NULL before every value when a key
 --- runs upwards and after every value when it runs downwards. Raises for values that do not
 --- compare with each other.
-local function keysBefore(orderFns, leftKeys, rightKeys)
+local function keysBefore(orderFns: {OrderFn}, leftKeys: {unknown}, rightKeys: {unknown}): boolean
   for index, order in orderFns do
     local leftKey, rightKey = leftKeys[index], rightKeys[index]
     if leftKey == rightKey then continue end
     if leftKey == nil then return not order.desc end
     if rightKey == nil then return order.desc end
-    if order.desc then return leftKey > rightKey end
+    if order.desc then return (leftKey :: number) > (rightKey :: number) end
 
-    return leftKey < rightKey
+    return (leftKey :: number) < (rightKey :: number)
   end
 
   return false
@@ -1000,7 +1065,7 @@ end
 --- The positions of the first `count` rows of the key `columns` in ORDER BY order: one stable
 --- pass per key, from the last key to the first, so rows whose keys are all equal stay in the
 --- order they are held in.
-local function orderOfColumns(columns: { buffer }, orderFns, count: number): buffer
+local function orderOfColumns(columns: { buffer }, orderFns: {OrderFn}, count: number): buffer
   local keyCount = #columns
   local order = orderOfKeys(columns[keyCount], count, orderFns[keyCount].desc)
   if keyCount == 1 then return order end
@@ -1018,7 +1083,7 @@ local function orderOfColumns(columns: { buffer }, orderFns, count: number): buf
   return order
 end
 
-local function sameContext(context) return context end
+local function sameContext(context: unknown): unknown return context end
 
 --- Whether two rows that stand next to each other in `order` have every key equal, NULL equal
 --- to NULL: the one case in which the order of a sort is the sort's own choice.
@@ -1068,7 +1133,7 @@ end
 --- that is neither a number nor NULL, as key `failedKey` of unit `failedUnit`; read now for the
 --- rest. Nothing is read twice. A `failedUnit` past the last unit takes every key out of the
 --- columns.
-local function restoreOrderKeys(units, orderFns, params, columns: { buffer }, failedUnit: number, failedKey: number, key)
+local function restoreOrderKeys(units: {Unit}, orderFns: {OrderFn}, params: {unknown}, columns: { buffer }, failedUnit: number, failedKey: number, key: unknown)
   local keyCount = #orderFns
 
   if keyCount == 1 then
@@ -1106,29 +1171,29 @@ local function restoreOrderKeys(units, orderFns, params, columns: { buffer }, fa
 end
 
 --- Whether a unit goes before another by their one key, `orderKey`.
-local function oneKeyBefore(desc: boolean)
+local function oneKeyBefore(desc: boolean): (Unit, Unit) -> boolean
   return function(left, right)
     local leftKey, rightKey = left.orderKey, right.orderKey
     if leftKey == rightKey then return false end
     if leftKey == nil then return not desc end
     if rightKey == nil then return desc end
-    if desc then return leftKey > rightKey end
+    if desc then return (leftKey :: number) > (rightKey :: number) end
 
-    return leftKey < rightKey
+    return (leftKey :: number) < (rightKey :: number)
   end
 end
 
 --- Whether a unit goes before another by their keys, `order`.
-local function manyKeysBefore(orderFns)
+local function manyKeysBefore(orderFns: {OrderFn}): (Unit, Unit) -> boolean
   return function(left, right)
     for index, order in orderFns do
-      local leftKey, rightKey = left.order[index], right.order[index]
+      local leftKey, rightKey = (left.order :: {unknown})[index], (right.order :: {unknown})[index]
       if leftKey == rightKey then continue end
       if leftKey == nil then return not order.desc end
       if rightKey == nil then return order.desc end
-      if order.desc then return leftKey > rightKey end
+      if order.desc then return (leftKey :: number) > (rightKey :: number) end
 
-      return leftKey < rightKey
+      return (leftKey :: number) < (rightKey :: number)
     end
 
     return false
@@ -1138,7 +1203,7 @@ end
 --- Gives every unit, as its `orderKey`, the place of its keys among all the units' keys, which
 --- `order` holds sorted: units whose keys are all equal share a place, so a comparator over the
 --- places answers for any two units what one over their keys answers.
-local function placeUnits(units, columns: { buffer }, order: buffer, count: number)
+local function placeUnits(units: {Unit}, columns: { buffer }, order: buffer, count: number)
   local place, before = 0, -1
 
   for position = 0, count - 1 do
@@ -1162,7 +1227,7 @@ local function placeUnits(units, columns: { buffer }, order: buffer, count: numb
 end
 
 --- Whether a unit goes before another by the place of its keys, `orderKey`.
-local function placeBefore(left, right) return left.orderKey < right.orderKey end
+local function placeBefore(left: Unit, right: Unit): boolean return (left.orderKey :: number) < (right.orderKey :: number) end
 
 --- `units` in ORDER BY order, each unit's keys read once and in order. Keys that are all
 --- numbers or NULL go into one f64 column each and are sorted by `orderOfColumns`: that order is
@@ -1171,7 +1236,7 @@ local function placeBefore(left, right) return left.orderKey < right.orderKey en
 --- they always have: under a comparator that reads each unit's place in the sorted columns, and
 --- so answers as the one over the keys does, or under the one over the keys itself. Keys of any
 --- other kind, NaN included, are sorted under the comparator over the keys.
-local function orderUnits(units, orderFns, params)
+local function orderUnits(units: {Unit}, orderFns: {OrderFn}, params: {unknown}): {Unit}
   local count, keyCount = #units, #orderFns
   local columns = [for _ in orderFns => buffer.create(count * 8)]
   local numeric = true
@@ -1219,22 +1284,23 @@ end
 --- kept, and which of two rows with equal keys is kept, and in what order, is what the heap and
 --- `table.sort` make of them. A row's keys are read once and in order, and it becomes a unit,
 --- its context passed through `retain`, only when it enters.
-local function boundedOrdering(orderFns, params, keep: number, retain)
-  local heap = table.create(keep)
+local function boundedOrdering(orderFns: {OrderFn}, params: {unknown}, keep: number, retain: (unknown) -> unknown):
+  ((unknown, Group?) -> (), () -> {Unit})
+  local heap: {Unit} = table.create(keep) :: {Unit}
 
   -- The heap's moves are written out for one key and for several: each calls its comparator by
   -- name, which Luau compiles into the loop, where one picked at run time is called every step.
   if #orderFns == 1 then
     local evaluate, desc = orderFns[1].evaluate, orderFns[1].desc
 
-    local function before(left, right)
+    local function before(left: Unit, right: Unit): boolean
       local leftKey, rightKey = left.orderKey, right.orderKey
       if leftKey == rightKey then return false end
       if leftKey == nil then return not desc end
       if rightKey == nil then return desc end
-      if desc then return leftKey > rightKey end
+      if desc then return (leftKey :: number) > (rightKey :: number) end
 
-      return leftKey < rightKey
+      return (leftKey :: number) < (rightKey :: number)
     end
 
     local function siftUp(index)
@@ -1262,7 +1328,7 @@ local function boundedOrdering(orderFns, params, keep: number, retain)
       end
     end
 
-    local function offer(context, group)
+    local function offer(context: unknown, group: Group?)
       local key = evaluate(context, group, params)
       local size = #heap
 
@@ -1276,14 +1342,14 @@ local function boundedOrdering(orderFns, params, keep: number, retain)
 
       -- Most rows offered to a full heap are numbers that do not go before the last one kept.
       if type(key) == 'number' and type(last) == 'number' then
-        if not (if desc then key > last else key < last) then return end
+        if not (if desc then (key :: number) > (last :: number) else (key :: number) < (last :: number)) then return end
       elseif key == last then
         return
       elseif key == nil then
         if desc then return end
       elseif last == nil then
         if not desc then return end
-      elseif not (if desc then key > last else key < last) then
+      elseif not (if desc then (key :: number) > (last :: number) else (key :: number) < (last :: number)) then
         return
       end
 
@@ -1299,17 +1365,17 @@ local function boundedOrdering(orderFns, params, keep: number, retain)
     return offer, finish
   end
 
-  local pending = table.create(#orderFns)
+  local pending: {unknown} = table.create(#orderFns)
 
-  local function before(left, right)
+  local function before(left: Unit, right: Unit): boolean
     for index, order in orderFns do
-      local leftKey, rightKey = left.order[index], right.order[index]
+      local leftKey, rightKey = (left.order :: {unknown})[index], (right.order :: {unknown})[index]
       if leftKey == rightKey then continue end
       if leftKey == nil then return not order.desc end
       if rightKey == nil then return order.desc end
-      if order.desc then return leftKey > rightKey end
+      if order.desc then return (leftKey :: number) > (rightKey :: number) end
 
-      return leftKey < rightKey
+      return (leftKey :: number) < (rightKey :: number)
     end
 
     return false
@@ -1340,15 +1406,15 @@ local function boundedOrdering(orderFns, params, keep: number, retain)
     end
   end
 
-  local function offer(context, group)
+  local function offer(context: unknown, group: Group?)
     for keyIndex, order in orderFns do
       pending[keyIndex] = order.evaluate(context, group, params)
     end
 
     local size = #heap
-    if size >= keep and not keysBefore(orderFns, pending, heap[1].order) then return end
+    if size >= keep and not keysBefore(orderFns, pending, heap[1].order :: {unknown}) then return end
 
-    local unit = { context = retain(context), group = group, order = table.clone(pending) }
+    local unit: Unit = { context = retain(context), group = group, order = table.clone(pending) }
 
     if size < keep then
       heap[size + 1] = unit
@@ -1375,12 +1441,19 @@ local function prepare(db: Database, sql: string): Plan
 
   if hasAggregate(ast.where) then error('jessql: aggregates are not allowed in WHERE', 0) end
 
-  if any[for node in ast.groupBy => hasAggregate(node)] then error('jessql: aggregates are not allowed in GROUP BY', 0) end
-  if any[for join in ast.joins => hasAggregate(join.on)] then error('jessql: aggregates are not allowed in JOIN ON', 0) end
+  for _, node in ast.groupBy do
+    if hasAggregate(node) then error('jessql: aggregates are not allowed in GROUP BY', 0) end
+  end
 
-  local aggregateIds, aggregateSpecs, aggregateByKey = {}, {}, {}
+  for _, join in ast.joins do
+    if hasAggregate(join.on) then error('jessql: aggregates are not allowed in JOIN ON', 0) end
+  end
 
-  local function exprKey(node)
+  local aggregateIds: {[parser.Expr]: number} = {}
+  local aggregateSpecs: {AggregateSpec} = {}
+  local aggregateByKey: {[string]: number} = {}
+
+  local function exprKey(node: parser.Expr?): string
     if node == nil then return 'nil' end
     if node.tag == 'literal' then return 'lit:' .. type(node.value) .. ':' .. tostring(node.value) end
     if node.tag == 'param' then return 'param:' .. tostring(node.index) end
@@ -1428,7 +1501,7 @@ local function prepare(db: Database, sql: string): Plan
   for _, order in ast.orderBy do registerAggregates(order.expr) end
 
   local whereFn = if ast.where then compileExpr(ast.where, sources, directSingle, nil) else nil
-  local whereTermPlans = {}
+  local whereTermPlans: {WhereTerm} = {}
 
   if ast.where ~= nil then
     for _, term in conjuncts(ast.where) do
@@ -1441,10 +1514,10 @@ local function prepare(db: Database, sql: string): Plan
     end
   end
 
-  local sourceWhereFns = table.create(#sources)
+  local sourceWhereFns: {[number]: (SourceRow, {unknown}) -> boolean} = {}
 
   if #sources > 1 and ast.where ~= nil then
-    local bySource = table.create(#sources)
+    local bySource: {[number]: {Evaluator}} = {}
 
     for _, term in conjuncts(ast.where) do
       local sourceIndex = singleSourceOf(term)
@@ -1470,42 +1543,41 @@ local function prepare(db: Database, sql: string): Plan
     return sum[for term in whereTermPlans if term.sourceIndex == sourceIndex => if term.pushable then 2 else 1]
   end
 
-  local joinFns, joinPlans = {}, {}
+  local joinFns: {Evaluator} = {}
+  local joinPlans: {JoinPlan} = {}
 
   for index, join in ast.joins do
     joinFns[index] = compileExpr(join.on, sources, directSingle, nil)
     local rightIndex = index + 1
     local node = join.on
-    local plan = { strategy = 'nested-loop' }
+    local plan: JoinPlan = { strategy = 'nested-loop' }
 
     if node.tag == 'binary' and node.op == '=' and node.left.tag == 'column' and node.right.tag == 'column' then
       local leftCol, rightCol = node.left, node.right
-      if leftCol.sourceIndex == rightIndex and rightCol.sourceIndex < rightIndex then leftCol, rightCol = rightCol, leftCol end
+      if leftCol.sourceIndex == rightIndex and (rightCol.sourceIndex :: number) < rightIndex then leftCol, rightCol = rightCol, leftCol end
 
-      if leftCol.sourceIndex < rightIndex and rightCol.sourceIndex == rightIndex then
-        plan = {
-          strategy = 'hash',
-          leftSourceIndex = leftCol.sourceIndex,
-          leftColumn = leftCol.boundName,
-          rightColumn = rightCol.boundName,
-        }
+      if (leftCol.sourceIndex :: number) < rightIndex and rightCol.sourceIndex == rightIndex then
+        plan.strategy = 'hash'
+        plan.leftSourceIndex = leftCol.sourceIndex
+        plan.leftColumn = leftCol.boundName
+        plan.rightColumn = rightCol.boundName
 
         if #sources == 2 and #ast.joins == 1 and join.kind == 'inner' then
-          local leftProvider = sources[leftCol.sourceIndex].provider
+          local leftProvider = sources[leftCol.sourceIndex :: number].provider
           local rightProvider = sources[rightIndex].provider
           local leftIndexed = leftCol.sourceIndex == 1 and type(leftProvider.lookup) == 'function'
-            and type(leftProvider.indexes) == 'table' and leftProvider.indexes[leftCol.boundName] == true
+            and type(leftProvider.indexes) == 'table' and leftProvider.indexes[leftCol.boundName :: string] == true
           local rightIndexed = type(rightProvider.lookup) == 'function'
-            and type(rightProvider.indexes) == 'table' and rightProvider.indexes[rightCol.boundName] == true
+            and type(rightProvider.indexes) == 'table' and rightProvider.indexes[rightCol.boundName :: string] == true
 
           if leftIndexed and rightIndexed then
-            local leftScore = sourceFilterScore(leftCol.sourceIndex)
+            local leftScore = sourceFilterScore(leftCol.sourceIndex :: number)
             local rightScore = sourceFilterScore(rightIndex)
-            plan.strategy = if leftScore > rightScore then 'index-right' else 'index-left'
+            plan.strategy = (if leftScore > rightScore then 'index-right' else 'index-left') :: ('index-right' | 'index-left')
           elseif leftIndexed then
-            plan.strategy = 'index-left'
+            plan.strategy = 'index-left' :: 'index-left'
           elseif rightIndexed then
-            plan.strategy = 'index-right'
+            plan.strategy = 'index-right' :: 'index-right'
           end
         end
       end
@@ -1528,23 +1600,23 @@ local function prepare(db: Database, sql: string): Plan
   -- An ungrouped query over one table whose aggregates are each of a column, or COUNT(*), reads
   -- every column once a row and has the data plane reduce it: `aggregateColumns` is the columns,
   -- and which of the sum, the least and the greatest is wanted of each, by its slot.
-  local aggregateColumns = { names = {}, wantsSum = {}, wantsLeast = {}, wantsGreatest = {} }
+  local aggregateColumns: AggregateColumns = { names = {}, wantsSum = {}, wantsLeast = {}, wantsGreatest = {} }
 
   for _, spec in aggregateSpecs do
     local argument = spec.expr.args[1]
-    if spec.star or not directSingle or argument.tag ~= 'column' then continue end
+    if spec.star or not directSingle or argument == nil or argument.tag ~= 'column' then continue end
 
-    local slot = table.find(aggregateColumns.names, argument.boundName)
+    local slot: number? = table.find(aggregateColumns.names, argument.boundName :: string)
 
     if not slot then
-      table.insert(aggregateColumns.names, argument.boundName)
+      table.insert(aggregateColumns.names, argument.boundName :: string)
       slot = #aggregateColumns.names
     end
 
-    spec.slot = slot
-    if spec.name == 'SUM' or spec.name == 'AVG' then aggregateColumns.wantsSum[slot] = true end
-    if spec.name == 'MIN' then aggregateColumns.wantsLeast[slot] = true end
-    if spec.name == 'MAX' then aggregateColumns.wantsGreatest[slot] = true end
+    spec.slot = slot :: number
+    if spec.name == 'SUM' or spec.name == 'AVG' then aggregateColumns.wantsSum[slot :: number] = true end
+    if spec.name == 'MIN' then aggregateColumns.wantsLeast[slot :: number] = true end
+    if spec.name == 'MAX' then aggregateColumns.wantsGreatest[slot :: number] = true end
   end
 
   local columnAggregates = directSingle and #ast.groupBy == 0 and all[for spec in aggregateSpecs => spec.star or spec.slot ~= nil]
@@ -1557,7 +1629,7 @@ local function prepare(db: Database, sql: string): Plan
   -- provider/join context per group is pure overhead. Keep permissive first-row semantics for
   -- every other query shape. ORDER BY may reference SELECT aliases, so inspect their defining
   -- expressions instead of mistaking an aggregate alias for a provider column.
-  local compactGroupColumn = nil
+  local compactGroupColumn: {sourceIndex: number, column: string}? = nil
 
   if #ast.groupBy == 1 then
     local grouped = ast.groupBy[1]
@@ -1566,16 +1638,16 @@ local function prepare(db: Database, sql: string): Plan
 
     if grouped.tag == 'column' and groupedSource ~= nil then
       local groupedName = grouped.boundName or grouped.name
-      local selectAliases = {}
+      local selectAliases: {[string]: parser.Expr} = {}
 
       for _, item in ast.select do
         if item.alias ~= nil then selectAliases[lower(item.alias)] = item.expr end
       end
 
-      local aliasStack = {}
+      local aliasStack: {[parser.Expr]: boolean} = {}
       local safe = true
 
-      local function inspectPostAggregate(expr, insideAggregate)
+      local function inspectPostAggregate(expr: parser.Expr?, insideAggregate: boolean)
         if expr == nil or not safe then return end
 
         if expr.tag == 'column' then
@@ -1613,9 +1685,12 @@ local function prepare(db: Database, sql: string): Plan
     end
   end
 
-  local selectors, resultColumns, selectorByAlias, selectorSource = {}, {}, {}, {}
+  local selectors: {Evaluator} = {}
+  local resultColumns: {string} = {}
+  local selectorByAlias: {[string]: Evaluator} = {}
+  local selectorSource: {[string]: {sourceIndex: number, column: string}} = {}
 
-  local function addSelector(name, selector, sourceInfo)
+  local function addSelector(name: string, selector: Evaluator, sourceInfo: {sourceIndex: number, column: string}?)
     selectors[#selectors + 1] = selector
     resultColumns[#resultColumns + 1] = name
     selectorByAlias[lower(name)] = selector
@@ -1631,13 +1706,13 @@ local function prepare(db: Database, sql: string): Plan
           for _, column in source.columns do
             local key = column
             local slot = sourceIndex
-            local selector
+            local selector: Evaluator
 
             if directSingle then
-              selector = function(row) return row[key] end
+              selector = function(row) return (row :: SourceRow)[key] end
             else
               selector = function(context)
-                local row = context[slot]
+                local row = (context :: {SourceRow?})[slot]
                 return if row then row[key] else nil
               end
             end
@@ -1660,18 +1735,19 @@ local function prepare(db: Database, sql: string): Plan
       end
 
       local selector = compileExpr(node, sources, directSingle, aggregateIds)
-      local sourceInfo = if node.tag == 'column' and node.sourceIndex ~= nil then { sourceIndex = node.sourceIndex, column = node.boundName } else nil
-      addSelector(name, selector, sourceInfo)
+      local sourceInfo = if node.tag == 'column' and node.sourceIndex ~= nil
+        then { sourceIndex = node.sourceIndex, column = node.boundName :: string } else nil
+      addSelector(name :: string, selector, sourceInfo)
     end
   end
 
   -- A result row starts as a copy of this one, which has every result column in it already, so
   -- that filling the row never grows it. Two result columns of one name keep the last value that
   -- is not NULL, and get the row built key by key.
-  local rowTemplate = {}
+  local rowTemplate: Row? = {}
 
   for _, name in resultColumns do
-    if rowTemplate[name] ~= nil then
+    if not rowTemplate or rowTemplate[name] ~= nil then
       rowTemplate = nil
       break
     end
@@ -1679,10 +1755,11 @@ local function prepare(db: Database, sql: string): Plan
     rowTemplate[name] = false
   end
 
-  local orderFns, orderSourceInfo = {}, {}
+  local orderFns: {OrderFn} = {}
+  local orderSourceInfo: {[number]: {sourceIndex: number, column: string}} = {}
 
   for index, order in ast.orderBy do
-    local evaluate = nil
+    local evaluate: Evaluator? = nil
 
     if order.expr.tag == 'column' and order.expr.qualifier == nil then
       local key = lower(order.expr.name)
@@ -1690,24 +1767,24 @@ local function prepare(db: Database, sql: string): Plan
       orderSourceInfo[index] = selectorSource[key]
     end
 
-    if evaluate == nil then
+    if not evaluate then
       evaluate = compileExpr(order.expr, sources, directSingle, aggregateIds)
 
       if order.expr.tag == 'column' and order.expr.sourceIndex ~= nil then
-        orderSourceInfo[index] = { sourceIndex = order.expr.sourceIndex, column = order.expr.boundName }
+        orderSourceInfo[index] = { sourceIndex = order.expr.sourceIndex, column = order.expr.boundName :: string }
       end
     end
 
-    orderFns[index] = { evaluate = evaluate, desc = order.desc }
+    orderFns[index] = { evaluate = evaluate :: Evaluator, desc = order.desc }
   end
 
-  local neededSets = [for _ in sources => {}]
+  local neededSets: {{[string]: boolean}} = [for _ in sources => {}]
 
-  local function markExpr(node)
+  local function markExpr(node: parser.Expr?)
     if node == nil then return end
 
-    if node.tag == 'column' and node.sourceIndex ~= nil then
-      neededSets[node.sourceIndex][node.boundName] = true
+    if node.tag == 'column' then
+      if node.sourceIndex ~= nil then neededSets[node.sourceIndex][node.boundName :: string] = true end
     elseif node.tag == 'star' then
       for sourceIndex, source in sources do
         if node.qualifier == nil or lower(node.qualifier) == lower(source.alias) or lower(node.qualifier) == lower(source.name) then
@@ -1730,7 +1807,7 @@ local function prepare(db: Database, sql: string): Plan
   for _, node in ast.groupBy do markExpr(node) end
   for _, order in ast.orderBy do markExpr(order.expr) end
   for _, join in ast.joins do markExpr(join.on) end
-  local neededColumns = {}
+  local neededColumns: {{string}} = {}
 
   for sourceIndex, source in sources do
     local needed = {}
@@ -1770,10 +1847,10 @@ local function prepare(db: Database, sql: string): Plan
     directFilteredCount = expression.tag == 'call' and expression.name == 'COUNT' and expression.star == true
   end
 
-  local providerOrder = nil
+  local providerOrder: {Order}? = nil
 
   if directSingle and not aggregate and #ast.orderBy > 0 then
-    local pushed = table.create(#ast.orderBy)
+    local pushed: {Order} = table.create(#ast.orderBy) :: {Order}
     local ok = true
 
     for index, order in ast.orderBy do
@@ -1795,23 +1872,24 @@ local function prepare(db: Database, sql: string): Plan
   -- nothing after the scan can need another row: no join, no WHERE for the engine to apply, no
   -- grouping, aggregate or HAVING, and no ORDER BY. `providerLimitHint` also holds under an
   -- ORDER BY asked of the provider whole, for a provider that hands its rows over in that order.
-  local providerLimit, providerLimitHint = nil, nil
+  local providerLimit: number? = nil
+  local providerLimitHint: number? = nil
 
   if directSingle and not aggregate and ast.limit ~= nil and ast.where == nil and ast.having == nil then
     local enough = ast.offset + ast.limit
     if #ast.orderBy == 0 then providerLimit = enough end
-    if #ast.orderBy == 0 or providerOrder ~= nil then providerLimitHint = enough end
+    if #ast.orderBy == 0 or providerOrder then providerLimitHint = enough end
   end
 
-  local indexedDriverSource = nil
-  local indexedDriverOrder = nil
+  local indexedDriverSource: number? = nil
+  local indexedDriverOrder: {Order}? = nil
 
   if #sources == 2 and #joinPlans == 1 then
     if joinPlans[1].strategy == 'index-left' then indexedDriverSource = 2 end
     if joinPlans[1].strategy == 'index-right' then indexedDriverSource = 1 end
 
-    if not aggregate and indexedDriverSource ~= nil and #ast.orderBy > 0 then
-      local pushed = table.create(#ast.orderBy)
+    if not aggregate and indexedDriverSource and #ast.orderBy > 0 then
+      local pushed: {Order} = table.create(#ast.orderBy) :: {Order}
       local ok = true
 
       for index, order in ast.orderBy do
@@ -1829,24 +1907,24 @@ local function prepare(db: Database, sql: string): Plan
     end
   end
 
-  local plan = {}
+  local plan: Plan = {} :: Plan
 
-  function plan.run(params)
-    params = params or {}
-    if #params < ast.params then error(string.format('jessql: query expects %d parameters, got %d', ast.params, #params), 0) end
+  function plan.run(params: {unknown}?): Result
+    local values: {unknown} = params or {}
+    if #values < ast.params then error(string.format('jessql: query expects %d parameters, got %d', ast.params, #values), 0) end
 
     if directProviderCount then
-      local row = {}
-      row[resultColumns[1]] = sources[1].provider.count()
+      local row: Row = {}
+      row[resultColumns[1]] = (sources[1].provider.count :: () -> number)()
       return { columns = resultColumns, rows = { row } }
     end
 
     if directFilteredCount then
-      local sourceConstraints = [
+      local sourceConstraints: {Constraint} = [
         for constraint in constraints => {
           column = constraint.column,
           op = constraint.op,
-          value = if constraint.param then params[constraint.param] else constraint.value,
+          value = if constraint.param then values[constraint.param :: number] else constraint.value,
         }
       ]
 
@@ -1854,21 +1932,21 @@ local function prepare(db: Database, sql: string): Plan
         columns = {}, constraints = sourceConstraints, whereComplete = true,
         allowVolatileRows = false,
       }
-      local counted = sources[1].provider.countFiltered(request)
+      local counted = (sources[1].provider.countFiltered :: (Request) -> number?)(request)
       if counted ~= nil then
         if type(counted) ~= 'number' or counted < 0 or counted % 1 ~= 0 then
           error('jessql: invalid provider filtered count', 0)
         end
-        local row = {}
+        local row: Row = {}
         row[resultColumns[1]] = counted
         return { columns = resultColumns, rows = { row } }
       end
     end
 
-    local rowsBySource = table.create(#sources)
-    local rowIterators = table.create(#sources)
-    local scanMeta = table.create(#sources)
-    local scanRequests = table.create(#sources)
+    local rowsBySource: {[number]: SourceRows} = {}
+    local rowIterators: {[number]: Iterator} = {}
+    local scanMeta: {[number]: ScanFlags} = {}
+    local scanRequests: {[number]: Request} = {}
     local skipScan = {}
     local lazyDriver = {}
 
@@ -1881,22 +1959,22 @@ local function prepare(db: Database, sql: string): Plan
       if joinPlans[1].strategy == 'index-left' then skipScan[1] = true end
       if joinPlans[1].strategy == 'index-right' then skipScan[2] = true end
 
-      if indexedDriverSource ~= nil and type(sources[indexedDriverSource].provider.iterate) == 'function' then
+      if indexedDriverSource and type(sources[indexedDriverSource].provider.iterate) == 'function' then
         skipScan[indexedDriverSource] = true
         lazyDriver[indexedDriverSource] = true
       end
     end
 
     for sourceIndex, source in sources do
-      local sourceConstraints = [
+      local sourceConstraints: {Constraint} = [
         for constraint in constraints if constraint.sourceIndex == sourceIndex => {
           column = constraint.column,
           op = constraint.op,
-          value = if constraint.param then params[constraint.param] else constraint.value,
+          value = if constraint.param then values[constraint.param :: number] else constraint.value,
         }
       ]
 
-      local request = {
+      local request: Request = {
         columns = neededColumns[sourceIndex],
         constraints = sourceConstraints,
         limit = providerLimit,
@@ -1911,7 +1989,7 @@ local function prepare(db: Database, sql: string): Plan
       scanRequests[sourceIndex] = request
 
       if lazyDriver[sourceIndex] then
-        local iter = source.provider.iterate(request)
+        local iter = (source.provider.iterate :: (Request) -> Iterator)(request)
 
         if type(iter) ~= 'table' or iter._jessqlIter ~= 'v1' or type(iter.next) ~= 'function' then
           error('jessql: provider iterate(request) must return a v1 iterator', 0)
@@ -1922,12 +2000,9 @@ local function prepare(db: Database, sql: string): Plan
       elseif not skipScan[sourceIndex] then
         local scanned = source.provider.scan(request)
 
-        if type(scanned) == 'table' and scanned._jessqlScan == 'v1' then
-          rowsBySource[sourceIndex] = scanned.rows
-          scanMeta[sourceIndex] = scanned
-        else
-          rowsBySource[sourceIndex] = scanned
-        end
+        local scanRows, scanResult = unwrapScan(scanned)
+        rowsBySource[sourceIndex] = scanRows
+        if scanResult ~= nil then scanMeta[sourceIndex] = scanResult end
 
         local sourceWhere = sourceWhereFns[sourceIndex]
         local meta = scanMeta[sourceIndex]
@@ -1937,7 +2012,7 @@ local function prepare(db: Database, sql: string): Plan
           local filtered = {}
 
           for _, row in input do
-            if sourceWhere(row, params) then filtered[#filtered + 1] = row end
+            if sourceWhere(row, values) then filtered[#filtered + 1] = row end
           end
 
           rowsBySource[sourceIndex] = filtered
@@ -1945,10 +2020,10 @@ local function prepare(db: Database, sql: string): Plan
       end
     end
 
-    local residualWhere = whereFn
+    local residualWhere: Evaluator? = whereFn
 
     if #whereTermPlans > 0 then
-      local active = {}
+      local active: {Evaluator} = {}
 
       for _, term in whereTermPlans do
         local meta = if term.sourceIndex ~= nil then scanMeta[term.sourceIndex] else nil
@@ -1974,11 +2049,11 @@ local function prepare(db: Database, sql: string): Plan
 
       if meta ~= nil then
         if meta.handledWhere == true then residualWhere = nil end
-        if meta.ordered == true and providerOrder ~= nil then orderHandled = true end
+        if meta.ordered == true and providerOrder then orderHandled = true end
       end
     end
 
-    local indexedJoinIterator = nil
+    local indexedJoinIterator: JoinIterator? = nil
 
     if not directSingle and #ast.joins == 1 then
       local joinPlan = joinPlans[1]
@@ -1986,31 +2061,31 @@ local function prepare(db: Database, sql: string): Plan
       if joinPlan.strategy == 'index-left' or joinPlan.strategy == 'index-right' then
         local lookupSource = if joinPlan.strategy == 'index-left' then 1 else 2
         local driverSource = if lookupSource == 1 then 2 else 1
-        local lookupColumn = if lookupSource == 1 then joinPlan.leftColumn else joinPlan.rightColumn
-        local driverColumn = if driverSource == 1 then joinPlan.leftColumn else joinPlan.rightColumn
+        local lookupColumn = (if lookupSource == 1 then joinPlan.leftColumn else joinPlan.rightColumn) :: string
+        local driverColumn = (if driverSource == 1 then joinPlan.leftColumn else joinPlan.rightColumn) :: string
         local provider = sources[lookupSource].provider
         local request = scanRequests[lookupSource]
         local driverIterator = rowIterators[driverSource]
         local driverRows = rowsBySource[driverSource]
         local driverPosition = 0
-        local currentDriver = nil
-        local currentMatches = nil
+        local currentDriver: SourceRow? = nil
+        local currentMatches: SourceRows? = nil
         local matchPosition = 0
-        local lastKey = nil
-        local lastMatches = nil
+        local lastKey: unknown = nil
+        local lastMatches: SourceRows? = nil
         local yielded = 0
-        local joinedLimit = if not aggregate and residualWhere == nil and #orderFns == 0 and ast.limit ~= nil
+        local joinedLimit = if not aggregate and not residualWhere and #orderFns == 0 and ast.limit
           then ast.offset + ast.limit else nil
 
-        local function nextDriver()
+        local function nextDriver(): SourceRow?
           if driverIterator ~= nil then return driverIterator.next() end
           driverPosition += 1
           if driverRows == nil then return nil end
           return driverRows[driverPosition]
         end
 
-        local function lookupRows(key)
-          if key == lastKey then return lastMatches end
+        local function lookupRows(key: unknown): SourceRows
+          if key == lastKey then return lastMatches :: SourceRows end
           local lookupRequest = request
 
           if joinedLimit ~= nil then
@@ -2018,36 +2093,34 @@ local function prepare(db: Database, sql: string): Plan
             lookupRequest.limitHint = math.max(joinedLimit - yielded, 0)
           end
 
-          local looked = provider.lookup(lookupColumn, key, lookupRequest)
-          local rows = looked
-          if type(looked) == 'table' and looked._jessqlScan == 'v1' then rows = looked.rows end
-          if rows == nil then rows = {} end
+          local looked = (provider.lookup :: Lookup)(lookupColumn, key, lookupRequest)
+          local rows: SourceRows = unwrapLookup(looked) or {}
           lastKey = key
           lastMatches = rows
           return rows
         end
 
         indexedJoinIterator = {
-          next = function()
+          next = function(): JoinContext?
             while true do
-              if joinedLimit ~= nil and yielded >= joinedLimit then return nil end
+              if joinedLimit ~= nil and yielded >= (joinedLimit :: number) then return nil end
 
-              if currentMatches ~= nil then
+              if currentMatches then
                 matchPosition += 1
-                local matched = currentMatches[matchPosition]
+                local matched = (currentMatches :: SourceRows)[matchPosition]
 
                 if matched ~= nil then
                   yielded += 1
-                  if lookupSource == 1 then return { matched, currentDriver } end
-                  return { currentDriver, matched }
+                  if lookupSource == 1 then return { matched, currentDriver :: SourceRow } :: JoinContext end
+                  return { currentDriver :: SourceRow, matched } :: JoinContext
                 end
 
                 currentMatches = nil
               end
 
               currentDriver = nextDriver()
-              if currentDriver == nil then return nil end
-              local key = currentDriver[driverColumn]
+              if not currentDriver then return nil end
+              local key = (currentDriver :: SourceRow)[driverColumn]
 
               if key ~= nil then
                 currentMatches = lookupRows(key)
@@ -2059,15 +2132,15 @@ local function prepare(db: Database, sql: string): Plan
       end
     end
 
-    local contexts = if directSingle then rowsBySource[1] else nil
+    local contexts: {unknown}? = if directSingle then rowsBySource[1] :: {unknown} else nil
 
-    if indexedJoinIterator == nil then
+    if not indexedJoinIterator then
       for joinIndex, join in ast.joins do
         local sourceIndex = joinIndex + 1
-        local rhs = rowsBySource[sourceIndex]
+        local rhs: SourceRows = rowsBySource[sourceIndex]
         local on = joinFns[joinIndex]
         local joinPlan = joinPlans[joinIndex]
-        local nextContexts = {}
+        local nextContexts: {JoinContext} = {}
 
         if joinIndex == 1 and not directSingle and joinPlan.strategy == 'index-left' then
           local provider = sources[1].provider
@@ -2078,33 +2151,33 @@ local function prepare(db: Database, sql: string): Plan
           local stopAfter = if driverOrdered and ast.limit ~= nil and not aggregate then ast.offset + ast.limit else nil
           local done = stopAfter == 0
 
-          local function consumeRight(right)
-            local key = right[joinPlan.rightColumn]
+          local function consumeRight(right: SourceRow)
+            local key = right[joinPlan.rightColumn :: string]
             if key == nil then return end
             local leftRows = cache[key]
 
             if leftRows == nil and not missing[key] then
               local lookupRequest = request
 
-              if stopAfter ~= nil and residualWhere == nil then
+              if stopAfter and not residualWhere then
                 lookupRequest = table.clone(request)
                 lookupRequest.limitHint = stopAfter - #nextContexts
               end
 
-              local looked = provider.lookup(joinPlan.leftColumn, key, lookupRequest)
+              local looked = (provider.lookup :: Lookup)(joinPlan.leftColumn :: string, key, lookupRequest)
 
               if looked ~= nil then
-                leftRows = if type(looked) == 'table' and looked._jessqlScan == 'v1' then looked.rows else looked
+                leftRows = unwrapLookup(looked)
               end
 
-              if leftRows == nil or #leftRows == 0 then missing[key] = true else cache[key] = leftRows end
+              if leftRows == nil or #(leftRows :: SourceRows) == 0 then missing[key] = true else cache[key] = leftRows end
             end
 
             if leftRows ~= nil then
               for _, leftRow in leftRows do
-                local context = { leftRow, right }
+                local context: JoinContext = { leftRow, right }
 
-                if not residualWhere or sqlTruthy(residualWhere(context, nil, params)) then
+                if not residualWhere or sqlTruthy(residualWhere(context, nil, values)) then
                   nextContexts[#nextContexts + 1] = context
 
                   if stopAfter ~= nil and #nextContexts >= stopAfter then
@@ -2125,7 +2198,7 @@ local function prepare(db: Database, sql: string): Plan
               consumeRight(right)
             end
           else
-            for _, right in rowsBySource[2] do
+            for _, right in rowsBySource[2] :: SourceRows do
               if done then break end
               consumeRight(right)
             end
@@ -2142,33 +2215,33 @@ local function prepare(db: Database, sql: string): Plan
           local stopAfter = if driverOrdered and ast.limit ~= nil and not aggregate then ast.offset + ast.limit else nil
           local done = stopAfter == 0
 
-          local function consumeLeft(leftRow)
-            local key = leftRow[joinPlan.leftColumn]
+          local function consumeLeft(leftRow: SourceRow)
+            local key = leftRow[joinPlan.leftColumn :: string]
             if key == nil then return end
             local rightRows = cache[key]
 
             if rightRows == nil and not missing[key] then
               local lookupRequest = request
 
-              if stopAfter ~= nil and residualWhere == nil then
+              if stopAfter and not residualWhere then
                 lookupRequest = table.clone(request)
                 lookupRequest.limitHint = stopAfter - #nextContexts
               end
 
-              local looked = provider.lookup(joinPlan.rightColumn, key, lookupRequest)
+              local looked = (provider.lookup :: Lookup)(joinPlan.rightColumn :: string, key, lookupRequest)
 
               if looked ~= nil then
-                rightRows = if type(looked) == 'table' and looked._jessqlScan == 'v1' then looked.rows else looked
+                rightRows = unwrapLookup(looked)
               end
 
-              if rightRows == nil or #rightRows == 0 then missing[key] = true else cache[key] = rightRows end
+              if rightRows == nil or #(rightRows :: SourceRows) == 0 then missing[key] = true else cache[key] = rightRows end
             end
 
             if rightRows ~= nil then
               for _, right in rightRows do
-                local context = { leftRow, right }
+                local context: JoinContext = { leftRow, right }
 
-                if not residualWhere or sqlTruthy(residualWhere(context, nil, params)) then
+                if not residualWhere or sqlTruthy(residualWhere(context, nil, values)) then
                   nextContexts[#nextContexts + 1] = context
 
                   if stopAfter ~= nil and #nextContexts >= stopAfter then
@@ -2189,7 +2262,7 @@ local function prepare(db: Database, sql: string): Plan
               consumeLeft(leftRow)
             end
           else
-            for _, leftRow in rowsBySource[1] do
+            for _, leftRow in rowsBySource[1] :: SourceRows do
               if done then break end
               consumeLeft(leftRow)
             end
@@ -2198,10 +2271,11 @@ local function prepare(db: Database, sql: string): Plan
           residualWhere = nil
           if #orderFns > 0 and driverOrdered then orderHandled = true end
         elseif joinIndex == 1 and not directSingle and joinPlan.strategy == 'hash' then
-          local buckets, duplicateBuckets = {}, {}
+          local buckets: {[unknown]: SourceRow} = {}
+          local duplicateBuckets: {[unknown]: {SourceRow}} = {}
 
-          for _, right in rhs do
-            local key = right[joinPlan.rightColumn]
+          for _, right in rhs :: SourceRows do
+            local key = right[joinPlan.rightColumn :: string]
 
             if key ~= nil then
               local first = buckets[key]
@@ -2221,8 +2295,8 @@ local function prepare(db: Database, sql: string): Plan
             end
           end
 
-          for _, leftRow in rowsBySource[1] do
-            local key = leftRow[joinPlan.leftColumn]
+          for _, leftRow in rowsBySource[1] :: SourceRows do
+            local key = leftRow[joinPlan.leftColumn :: string]
             local first = if key == nil then nil else buckets[key]
 
             if first ~= nil then
@@ -2238,13 +2312,13 @@ local function prepare(db: Database, sql: string): Plan
             end
           end
         elseif joinIndex == 1 and not directSingle then
-          for _, leftRow in rowsBySource[1] do
+          for _, leftRow in rowsBySource[1] :: SourceRows do
             local matched = false
 
-            for _, right in rhs do
-              local context = { leftRow, right }
+            for _, right in rhs :: SourceRows do
+              local context: JoinContext = { leftRow, right }
 
-              if sqlTruthy(on(context, nil, params)) then
+              if sqlTruthy(on(context, nil, values)) then
                 nextContexts[#nextContexts + 1] = context
                 matched = true
               end
@@ -2253,10 +2327,11 @@ local function prepare(db: Database, sql: string): Plan
             if not matched and join.kind == 'left' then nextContexts[#nextContexts + 1] = { leftRow } end
           end
         elseif joinPlan.strategy == 'hash' then
-          local buckets, duplicateBuckets = {}, {}
+          local buckets: {[unknown]: SourceRow} = {}
+          local duplicateBuckets: {[unknown]: {SourceRow}} = {}
 
-          for _, right in rhs do
-            local key = right[joinPlan.rightColumn]
+          for _, right in rhs :: SourceRows do
+            local key = right[joinPlan.rightColumn :: string]
 
             if key ~= nil then
               local first = buckets[key]
@@ -2276,9 +2351,9 @@ local function prepare(db: Database, sql: string): Plan
             end
           end
 
-          for _, left in contexts do
-            local sourceRow = left[joinPlan.leftSourceIndex]
-            local key = if sourceRow == nil then nil else sourceRow[joinPlan.leftColumn]
+          for _, left in contexts :: {JoinContext} do
+            local sourceRow = (left :: JoinContext)[joinPlan.leftSourceIndex :: number]
+            local key = if sourceRow == nil then nil else sourceRow[joinPlan.leftColumn :: string]
             local first = if key == nil then nil else buckets[key]
 
             if first ~= nil then
@@ -2286,45 +2361,45 @@ local function prepare(db: Database, sql: string): Plan
 
               if bucket ~= nil then
                 for _, right in bucket do
-                  local context = table.clone(left)
+                  local context: JoinContext = table.clone(left :: JoinContext)
                   context[sourceIndex] = right
                   nextContexts[#nextContexts + 1] = context
                 end
               else
                 local right = first
-                local context = table.clone(left)
+                local context: JoinContext = table.clone(left :: JoinContext)
                 context[sourceIndex] = right
                 nextContexts[#nextContexts + 1] = context
               end
             elseif join.kind == 'left' then
-              local context = table.clone(left)
+              local context: JoinContext = table.clone(left :: JoinContext)
               context[sourceIndex] = nil
               nextContexts[#nextContexts + 1] = context
             end
           end
         else
-          for _, left in contexts do
+          for _, left in contexts :: {JoinContext} do
             local matched = false
 
-            for _, right in rhs do
-              local context = table.clone(left)
+            for _, right in rhs :: SourceRows do
+              local context: JoinContext = table.clone(left :: JoinContext)
               context[sourceIndex] = right
 
-              if sqlTruthy(on(context, nil, params)) then
+              if sqlTruthy(on(context, nil, values)) then
                 nextContexts[#nextContexts + 1] = context
                 matched = true
               end
             end
 
             if not matched and join.kind == 'left' then
-              local context = table.clone(left)
+              local context: JoinContext = table.clone(left :: JoinContext)
               context[sourceIndex] = nil
               nextContexts[#nextContexts + 1] = context
             end
           end
         end
 
-        contexts = nextContexts
+        contexts = nextContexts :: {unknown}
       end
     end
 
@@ -2334,13 +2409,13 @@ local function prepare(db: Database, sql: string): Plan
     local directIter = if directSingle then rowIterators[1] else nil
     local volatileContext = directIter ~= nil and directIter.volatileRows == true
 
-    local function retainContext(context)
-      if volatileContext then return table.clone(context) end
+    local function retainContext(context: unknown): unknown
+      if volatileContext then return table.clone(context :: {}) end
       return context
     end
 
-    local function eachContext(visit)
-      if indexedJoinIterator ~= nil then
+    local function eachContext(visit: (unknown) -> boolean?)
+      if indexedJoinIterator then
         while true do
           local context = indexedJoinIterator.next()
           if context == nil then break end
@@ -2353,53 +2428,54 @@ local function prepare(db: Database, sql: string): Plan
           if visit(row) == false then break end
         end
       else
-        for _, context in contexts do
+        for _, context in contexts :: {unknown} do
           if visit(context) == false then break end
         end
       end
     end
 
-    local units = {}
+    local units: {Unit} = {}
     local orderAlreadySorted = false
 
     if aggregate then
       local nilKey = {}
-      local order = {}
+      local order: {Group} = {}
 
-      local function newGroup(first, groupKey)
-        if compactGroupColumn == nil and first ~= nil then first = retainContext(first) end
-        local group = table.create(#aggregateSpecs)
-        group.first = if compactGroupColumn == nil then first else nil
-        if compactGroupColumn ~= nil then group.groupKey = groupKey end
-        if hasAvg then group.avgCounts = table.create(#aggregateSpecs) end
+      local function newGroup(first: unknown, groupKey: unknown?): Group
+        if not compactGroupColumn and first then first = retainContext(first) end
+        local group: Group = table.create(#aggregateSpecs) :: Group
+        group.first = if not compactGroupColumn then first else nil
+        if compactGroupColumn then group.groupKey = groupKey end
+        if hasAvg then group.avgCounts = table.create(#aggregateSpecs) :: {[number]: number} end
 
         for index, spec in aggregateSpecs do
           if spec.name == 'COUNT' or spec.name == 'AVG' then group[index] = 0 end
-          if spec.name == 'AVG' then group.avgCounts[index] = 0 end
+          if spec.name == 'AVG' then (group.avgCounts :: {[number]:number})[index] = 0 end
         end
 
         return group
       end
 
-      local function accumulate(group, context)
-        if compactGroupColumn == nil and group.first == nil then group.first = retainContext(context) end
+      local function accumulate(group: Group, context: unknown)
+        if not compactGroupColumn and not group.first then group.first = retainContext(context) end
 
         for index, spec in aggregateSpecs do
           if spec.name == 'COUNT' then
-            if spec.star or spec.argFn(context, nil, params) ~= nil then group[index] += 1 end
+            if spec.star or (spec.argFn :: Evaluator)(context, nil, values) ~= nil then group[index] = ((group[index] or 0) :: number) + 1 end
           else
-            local value = spec.argFn(context, nil, params)
+            local value = (spec.argFn :: Evaluator)(context, nil, values)
 
             if value ~= nil then
               if spec.name == 'SUM' then
-                group[index] = (group[index] or 0) + value
+                group[index] = ((group[index] or 0) :: number) + (value :: number)
               elseif spec.name == 'AVG' then
-                group[index] += value
-                group.avgCounts[index] += 1
+                group[index] = ((group[index] or 0) :: number) + (value :: number)
+                local avgCounts = group.avgCounts :: {[number]: number}
+                avgCounts[index] += 1
               elseif spec.name == 'MIN' then
-                if group[index] == nil or value < group[index] then group[index] = value end
+                if group[index] == nil or (value :: number) < (group[index] :: number) then group[index] = value end
               elseif spec.name == 'MAX' then
-                if group[index] == nil or value > group[index] then group[index] = value end
+                if group[index] == nil or (value :: number) > (group[index] :: number) then group[index] = value end
               end
             end
           end
@@ -2409,76 +2485,80 @@ local function prepare(db: Database, sql: string): Plan
       if #groupFns == 0 then
         local group = newGroup(nil)
         order[1] = group
-        local columnar = columnAggregates and (directIter ~= nil or (type(contexts) == 'table' and rawlen(contexts) >= AggregateRows))
+        local columnar = columnAggregates and (directIter ~= nil
+          or (type(contexts) == 'table' and rawlen(contexts) >= AggregateRows))
 
         if columnar then
           local feed, finish
           local awaited = AggregateDelay
 
           eachContext(function(context)
-            if residualWhere and not sqlTruthy(residualWhere(context, nil, params)) then return end
+            if residualWhere and not sqlTruthy(residualWhere(context, nil, values)) then return nil end
 
             if awaited == 0 then
               feed, finish = columnAccumulator(group, aggregateSpecs, aggregateColumns, retainContext)
               awaited = math.huge
             end
 
-            if feed and feed(context) then return end
+            if feed and feed(context :: SourceRow) then return nil end
 
             if feed then
-              finish()
+              (finish :: () -> ())()
               feed = nil
             end
 
-            accumulate(group, context)
+            accumulate(group :: Group, context)
             awaited -= 1
+            return nil
           end)
 
-          if feed then finish() end
+          if feed ~= nil and finish ~= nil then finish() end
         else
           eachContext(function(context)
-            if not residualWhere or sqlTruthy(residualWhere(context, nil, params)) then accumulate(group, context) end
+            if not residualWhere or sqlTruthy(residualWhere(context, nil, values)) then accumulate(group :: Group, context) end
+            return nil
           end)
         end
       else
-        local root = {}
+        local root: {[unknown]: unknown} = {}
 
         eachContext(function(context)
-          if not residualWhere or sqlTruthy(residualWhere(context, nil, params)) then
-            local node = root
-            local group = nil
+          if not residualWhere or sqlTruthy(residualWhere(context, nil, values)) then
+            local node: {[unknown]: unknown} = root
+            local group: Group? = nil
 
             for keyIndex, evaluate in groupFns do
-              local key = evaluate(context, nil, params)
+              local key = evaluate(context, nil, values)
               if key == nil then key = nilKey end
 
               if keyIndex == #groupFns then
-                group = node[key]
+                group = node[key] :: Group?
 
-                if group == nil then
+                if not group then
                   group = newGroup(context, if key == nilKey then nil else key)
                   node[key] = group
                   order[#order + 1] = group
                 end
               else
-                local nextNode = node[key]
+                local nextNode = node[key] :: {[unknown]: unknown}?
 
                 if nextNode == nil then
                   nextNode = {}
                   node[key] = nextNode
                 end
 
-                node = nextNode
+                node = nextNode :: {[unknown]: unknown}
               end
             end
 
-            accumulate(group, context)
+            accumulate(group :: Group, context)
           end
+          return nil
         end)
       end
 
-      local function groupContext(group)
-        if compactGroupColumn == nil then
+      local function groupContext(group: Group): unknown
+        if not compactGroupColumn then
           return group.first or (if directSingle then {} else table.create(#sources))
         end
 
@@ -2491,30 +2571,31 @@ local function prepare(db: Database, sql: string): Plan
       end
 
       local keep = if #orderFns > 0 and ast.limit ~= nil then ast.offset + ast.limit else nil
-      local offer, finish
+      local offer: ((unknown, Group?) -> ())? = nil
+      local finish: (() -> {Unit})? = nil
 
-      if keep ~= nil and keep > 0 then offer, finish = boundedOrdering(orderFns, params, keep, sameContext) end
+      if keep ~= nil and keep > 0 then offer, finish = boundedOrdering(orderFns, values, keep, sameContext) end
 
       for _, group in order do
         for index, spec in aggregateSpecs do
           if spec.name == 'AVG' then
-            local count = group.avgCounts[index]
-            group[index] = if count == 0 then nil else group[index] / count
+            local count = (group.avgCounts :: {[number]:number})[index]
+            group[index] = if count == 0 then nil else (group[index] :: number) / count
           end
         end
 
         local context = groupContext(group)
-        if havingFn and not sqlTruthy(havingFn(context, group, params)) then continue end
+        if havingFn ~= nil and not sqlTruthy((havingFn :: Evaluator)(context, group, values)) then continue end
 
-        if offer ~= nil then
-          offer(context, group)
+        if offer then
+          (offer :: (unknown, Group?) -> ())(context, group)
         elseif keep ~= 0 then
           units[#units + 1] = { context = context, group = group }
         end
       end
 
-      if finish ~= nil then
-        units = finish()
+      if finish then
+        units = (finish :: () -> {Unit})()
         orderAlreadySorted = true
       elseif keep == 0 then
         units = {}
@@ -2526,23 +2607,26 @@ local function prepare(db: Database, sql: string): Plan
       if #orderFns == 0 or orderHandled then
         if stopAfter ~= 0 then
           eachContext(function(context)
-            if not residualWhere or sqlTruthy(residualWhere(context, nil, params)) then
+            if not residualWhere or sqlTruthy(residualWhere(context, nil, values)) then
               units[#units + 1] = { context = retainContext(context), group = nil }
               if stopAfter ~= nil and #units >= stopAfter then return false end
             end
+            return nil
           end)
         end
       elseif stopAfter ~= nil then
         if stopAfter > 0 then
-          local offer, finish = boundedOrdering(orderFns, params, stopAfter, retainContext)
+          local offer, finish = boundedOrdering(orderFns, values, stopAfter, retainContext)
 
           -- `offer` takes a context as a visitor is handed one, and answers nothing.
-          if residualWhere then
+          local predicate = residualWhere
+          if predicate ~= nil then
             eachContext(function(context)
-              if sqlTruthy(residualWhere(context, nil, params)) then offer(context, nil) end
+              if sqlTruthy((predicate :: Evaluator)(context, nil, values)) then offer(context, nil) end
+              return nil
             end)
           else
-            eachContext(offer)
+            eachContext(function(context) offer(context, nil) return nil end)
           end
 
           units = finish()
@@ -2551,34 +2635,35 @@ local function prepare(db: Database, sql: string): Plan
         orderAlreadySorted = true
       else
         eachContext(function(context)
-          if not residualWhere or sqlTruthy(residualWhere(context, nil, params)) then
+          if not residualWhere or sqlTruthy(residualWhere(context, nil, values)) then
             units[#units + 1] = { context = retainContext(context), group = nil }
           end
+          return nil
         end)
       end
     end
 
     if #orderFns > 0 and not orderHandled and not orderAlreadySorted then
-      units = orderUnits(units, orderFns, params)
+      units = orderUnits(units, orderFns, values)
     end
 
     local first = ast.offset + 1
     local last = #units
     if ast.limit ~= nil then last = math.min(last, ast.offset + ast.limit) end
-    local resultRows = table.create(math.max(0, last - first + 1))
+    local resultRows: {Row} = table.create(math.max(0, last - first + 1)) :: {Row}
 
     local keyed = if rowTemplate then 0 else math.huge
 
     for unitIndex = first, last do
       local unit = units[unitIndex]
-      local row
+      local row: Row
 
       if keyed == 0 then
         local filled = true
-        row = table.clone(rowTemplate)
+        row = table.clone(rowTemplate :: Row)
 
         for index, selector in selectors do
-          local value = selector(unit.context, unit.group, params)
+          local value = selector(unit.context, unit.group, values)
           if value == nil then filled = false end
 
           row[resultColumns[index]] = value
@@ -2602,7 +2687,7 @@ local function prepare(db: Database, sql: string): Plan
         row = {}
 
         for index, selector in selectors do
-          local value = selector(unit.context, unit.group, params)
+          local value = selector(unit.context, unit.group, values)
           if value ~= nil then row[resultColumns[index]] = value end
         end
       end
@@ -2673,9 +2758,9 @@ function engine.new(): Database
   end
 
   function db.tables(self: Database): { TableInfo }
-    local out = {}
+    local out: {TableInfo} = {}
     for name, provider in self._tables do out[#out + 1] = { name = name, columns = provider.columns } end
-    table.sort(out, function(left, right) return left.name < right.name end)
+    table.sort(out, function(left: TableInfo, right: TableInfo): boolean return left.name < right.name end)
     return out
   end
 
