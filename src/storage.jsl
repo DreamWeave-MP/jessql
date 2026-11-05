@@ -2190,4 +2190,30 @@ function storage.open(path: string, options: Options?): Store
   return db
 end
 
+
+-- An offline caller holding the managed namespace lock may replay a sealed
+-- WAL through the exact write-time validators without opening a writer,
+-- truncating a torn tail, or acknowledging any transaction. The transient
+-- row/index state is discarded after validation; this is intentionally a
+-- memory-intensive audit, not the regular database-open fast path.
+function storage.verifyReplay(path: string): number
+  local exists, statError = fs.exists(path)
+  if exists ~= true then error('jessql storage: read-only replay requires existing WAL: ' .. tostring(statError), 2) end
+  local lock, lockError = fs.lock(path .. '.lock')
+  if not lock then error('jessql storage: read-only replay locked: ' .. tostring(lockError), 2) end
+
+  local state: DatabaseState = {
+    path = path, lock = lock, engine = queryEngine.new(), tables = {},
+    sequence = 0, schemaVersion = 0, maxFrameBytes = DefaultMaxFrame,
+    closed = false, busy = false, poisoned = false, rowLayout = 'row',
+    trackPayloadBytes = false, durability = 'buffered', walWriter = nil,
+  }
+  -- recoverTail=false prohibits the only write-capable branch in load().
+  local ok, failure = pcall(function() load(state, false) end)
+  lock:unlock()
+
+  if not ok then error('jessql storage: semantic replay invalid: ' .. tostring(failure), 2) end
+  return state.sequence
+end
+
 return storage

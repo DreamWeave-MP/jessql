@@ -8,6 +8,7 @@ local json = require('@jess/json')
 local paged = require('@jessql/paged')
 local segments = require('@jessql/segments')
 local manifest = require('@jessql/managed_manifest')
+local storage = require('@jessql/storage')
 
 export type Issue = { code: string, stage: string, message: string, recovery: string }
 type Failure = { code: string, message: string }
@@ -25,6 +26,7 @@ export type Report = {
 local Magic = 'JQLW1\n'
 local HeaderBytes = 8
 local MaxFrameBytes = 16 * 1024 * 1024
+export type Options = { semantic: boolean? }
 local verification = {}
 
 local function generation(base: string, epoch: number, extension: string): string
@@ -179,7 +181,7 @@ local function wal(base: string, value: manifest.Manifest, identity: string,
   if not verified then error(failure, 2) end
 end
 
-function verification.scan(base: string): Report
+function verification.scan(base: string, options: Options?): Report
   local report: Report = { version = 1, ok = true, epoch = nil, manifestVersion = nil,
     disposition = 'structurally-verified', coldRowsScanned = 0, walBytes = 0, walFrames = 0,
     coldPagesChecked = false, walFramesChecked = false,
@@ -215,6 +217,23 @@ function verification.scan(base: string): Report
       code, detail = failure.code, failure.message
     end
     problem(report, 'wal', code, detail)
+  end
+
+  if report.ok and options and options.semantic then
+    -- Exact storage replay validation, after immutable pages and WAL framing
+    -- have already passed. A semantic error is never an excuse to repair data.
+    local replayOK, replayResult = pcall(function()
+      return storage.verifyReplay(generation(base, value.epoch, 'wal'))
+    end)
+
+    if not replayOK then
+      problem(report, 'wal', 'WAL_SEMANTIC_REPLAY_FAILED', tostring(replayResult))
+    elseif replayResult ~= report.walFrames then
+      problem(report, 'wal', 'WAL_REPLAY_SEQUENCE_MISMATCH', 'semantic replay frame count mismatch')
+    else
+      report.walSemanticReplayChecked = true
+      report.disposition = 'semantically-verified'
+    end
   end
   return report
 end

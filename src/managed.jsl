@@ -13,6 +13,7 @@ local manifest = require('@jessql/managed_manifest')
 local policy = require('@jessql/managed_policy')
 local publicationKernel = require('@jessql/managed_publication')
 local verification = require('@jessql/managed_verification')
+local backupKernel = require('@jessql/managed_backup')
 local observability = require('@jessql/managed_observability')
 
 export type Row = { [string]: unknown }
@@ -331,12 +332,12 @@ end
 
 -- Offline integrity scan: no WAL writer, tail truncation, retirement or repair.
 -- The namespace lock guarantees a stable published view for the full scan.
-function managed.verify(path: string): verification.Report
+function managed.verify(path: string, options: verification.Options?): verification.Report
   local base = normalize(path)
   local lock, lockError = fs.lock(base .. '.jql-lock')
   if not lock then error('jessql managed: verification locked: ' .. tostring(lockError), 2) end
   -- Offline scan can report I/O failures; always release the exclusive namespace lock.
-  local ok, result = pcall(function() return verification.scan(base) end)
+  local ok, result = pcall(function() return verification.scan(base, options) end)
   lock:unlock()
   if not ok then error('jessql managed: verification I/O failure: ' .. tostring(result), 2) end
   return result :: verification.Report
@@ -345,6 +346,34 @@ end
 -- Deep verification and structured recovery diagnostics are the same offline scan.
 -- Neither opens a mutable WAL nor attempts tail repair or auto-bootstrap.
 managed.diagnose = managed.verify
+
+-- Offline backup and restore into an EMPTY destination namespace only. This
+-- is an exclusive, fully verified copy, not online snapshotting or repair.
+function managed.backup(sourcePath: string, destinationPath: string): backupKernel.Result
+  local source = normalize(sourcePath)
+  local destination, parent = normalize(destinationPath)
+  if source == destination then error('jessql backup: source and destination must differ', 2) end
+
+  -- Deterministic acquisition order avoids deadlocking two opposite copies.
+  local first, second = source, destination
+  if second < first then first, second = second, first end
+  local firstLock, firstError = fs.lock(first .. '.jql-lock')
+  if not firstLock then error('jessql backup: namespace locked: ' .. tostring(firstError), 2) end
+  local secondLock, secondError = fs.lock(second .. '.jql-lock')
+  if not secondLock then
+    firstLock:unlock()
+    error('jessql backup: namespace locked: ' .. tostring(secondError), 2)
+  end
+  -- Copy/verification can throw; both namespace locks must always be released.
+  local ok, result = pcall(function() return backupKernel.copy(source, destination, parent) end)
+  secondLock:unlock()
+  firstLock:unlock()
+  if not ok then error(result, 2) end
+  return result :: backupKernel.Result
+end
+
+-- Restores are the same copy protocol: never overwrite a nonempty target.
+managed.restore = managed.backup
 
 -- Managed synchronous generation lifecycle. No background workers or group
 -- commits: each cutover happens while holding this database's exclusive lock.
