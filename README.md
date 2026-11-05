@@ -275,3 +275,13 @@ in its existing WAL. `sql.segments.compact('merged.cold', { ... })` produces a
 new candidate snapshot without publishing it or retiring inputs. See
 [docs/SEGMENTS.md](docs/SEGMENTS.md) for the physical-row count caveat,
 recovery boundary, unsupported multi-segment sidecars, and safe cutover rules.
+
+### Synchronized journals and positional snapshots (new Jess runtime)
+
+The newer Jess filesystem API allows `sql.open(path, { durability = 'sync' })`
+to retain a writer and synchronize each committed transaction frame. Buffered
+mode remains the default. Sync-mode checkpoints are deliberately refused until
+safe generation publication and recovery are implemented. Cold snapshots and
+hybrid views can opt into `readMode = 'positional'` to avoid memory mapping.
+See [New Runtime Integration](docs/NEW-RUNTIME-INTEGRATION.md) for the API,
+limitations, and measured tradeoffs.

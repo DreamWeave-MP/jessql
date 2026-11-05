@@ -1,0 +1,78 @@
+--!strict
+-- Compare new synchronized WAL commits and retained positional cold reads.
+local sql = require('@jessql')
+local fs = require('@dream/fs')
+
+local task = arg[1] or 'cold'
+local option = arg[2] or 'mapped'
+local total = tonumber(arg[3]) or 20000
+local repetitions = tonumber(arg[4]) or 2000
+local path = fs.join(fs.cwd() :: string, '.jessql-new-runtime-benchmark')
+local function rss(): number
+  -- /proc is Linux-specific; the benchmark reports -1 elsewhere.
+  local ok, status = pcall(fs.readFileString, '/proc/self/status')
+  if not ok or type(status) ~= 'string' then return -1 end
+  local value = string.match(status, 'VmRSS:%s+(%d+)')
+  return if value then tonumber(value) or -1 else -1
+end
+
+if task == 'prepare' then
+  fs.remove(path .. '.cold')
+  local index = 0
+  sql.paged.create(path .. '.cold', { 'id', 'body' }, 'id', function()
+    index += 1
+    if index > total then return nil end
+    return { id = index, body = string.rep('x', 48) }
+  end)
+  print('prepared', total)
+  return
+end
+
+if task == 'cold' then
+  if option ~= 'mapped' and option ~= 'positional' then error('expected mapped or positional') end
+  local snapshot = sql.paged.open(path .. '.cold', { cachePages = 4, readMode = option })
+  local checksum = 0
+  local start = os.clock()
+  for index = 1, repetitions do
+    local id = ((index * 7919) % total) + 1
+    checksum += (snapshot:get(id) :: sql.Row).id :: number
+  end
+  local elapsed = os.clock() - start
+  print('mode', option, 'rows', total, 'reads', repetitions, 'cpu', elapsed,
+    'pages', snapshot:stats().pageReads, 'rss_kib', rss(), 'checksum', checksum)
+  snapshot:close()
+  return
+end
+
+if task == 'wal' then
+  if option ~= 'sync' and option ~= 'buffered' then error('expected sync or buffered') end
+  local wal = path .. '.wal'
+  fs.remove(wal)
+  fs.remove(wal .. '.lock')
+  local db = sql.open(wal, { durability = option })
+  db:createTable('t', { 'id', 'payload' }, 'id')
+  local batch = repetitions
+  local start = os.clock()
+  local current = 0
+  while current < total do
+    local limit = math.min(current + batch, total)
+    db:transaction(function(tx)
+      for id = current + 1, limit do
+        tx:insert('t', { id = id, payload = 'row-' .. tostring(id) })
+      end
+    end)
+    current = limit
+  end
+  local elapsed = os.clock() - start
+  db:close()
+  local verify = sql.open(wal, { durability = option })
+  assert(verify:query('SELECT COUNT(*) AS n FROM t').rows[1].n == total)
+  verify:close()
+  print('mode', option, 'rows', total, 'batch', batch, 'cpu', elapsed,
+    'rss_kib', rss())
+  fs.remove(wal)
+  fs.remove(wal .. '.lock')
+  return
+end
+
+error('expected prepare, cold or wal')
