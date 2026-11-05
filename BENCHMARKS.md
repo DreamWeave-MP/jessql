@@ -620,3 +620,36 @@ The merger maintains one candidate per indexed generation but must consult
 newer snapshots for shadowed primary keys; heavy overlap can increase page
 reads. There is still no online generation publication, reclaiming of old
 files, or power-loss-durable WAL rotation.
+
+
+## Managed byte-budget accounting (opt-in, November 2026)
+
+The next Jess runtime integration provides a *logical live scalar payload*
+watermark, an error-latched write fence when byte-triggered maintenance fails,
+and reconstruction of byte counters during WAL recovery. These measurements
+compare the incoming selective-compaction tree against this revision, both
+using the supplied Jess 0.3.0 Linux x64 runtime. Each column shows the median
+of five alternating fresh-process executions. Inputs: 3,000 rows, 500 probes;
+64 inserts per synchronized transaction; the optional metered watermark is set
+high enough to avoid generation flushes. See the replay archive's
+`benchmark-final.csv` for individual rows.
+
+```bash
+jess run --trusted --package . bench/hot-budget.jsl stats 3000 500
+jess run --trusted --package . bench/hot-budget.jsl churn 3000 500
+jess run --trusted --package . bench/hot-budget.jsl churn 3000 500 metered
+```
+
+| CPU measurement | Incoming branch | New, unmetered | New, metered |
+|---|---:|---:|---:|
+| 3,000-row ingest during ingest workload | 58.92 ms | 62.78 ms | 63.59 ms |
+| 500 `db:stats()` calls after ingestion | 0.916 ms | 1.082 ms | 0.996 ms |
+| 500 synchronized upserts after ingestion | 150.99 ms | 137.63 ms | 146.71 ms |
+
+The differences are **small and variable**, especially for the sub-millisecond
+stats loop, and do not establish a general speedup or regression. The extra
+byte accounting work is opt-in so it does not impose per-row scalar scans on
+unconfigured databases. These are process CPU measurements from `os.clock`,
+not p99 latency, a physical power-cut test, or a controlled SQLite/RocksDB
+comparison. `maxHotBytes` is explicitly **not** a hard RSS cap. See
+[hot-byte maintenance semantics](docs/HOT-BYTE-BUDGET.md).

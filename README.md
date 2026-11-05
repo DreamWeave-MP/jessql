@@ -36,15 +36,20 @@ checksum-framed, durably replaced manifest. `db:flush()` publishes a small
 hot-overlay delta and tombstone sidecar without rewriting older generations.
 `db:compact()` merges the newest cold generations with the hot overlay without
 rewriting older tiers, while `db:checkpoint()` still rebuilds the entire view.
-Set `maxHotRows` to trigger synchronous automatic maintenance after committed
-operations; `maxGenerations` bounds the immutable generation count (2–8),
-selectively compacting the newest tiers when that limit is reached. Interrupted
-publication is recoverable or fails closed; uncertain outcomes require
-close/reopen. This is **not** a hard total-memory limit, an online compaction
-scheduler, or verified physical power-cut durability. The original
-`sql.open(..., { durability = 'sync' })` still refuses its legacy checkpoint.
-See [managed generations](docs/MANAGED-GENERATIONS.md) and
-[selective compaction](docs/SELECTIVE-COMPACTION.md).
+Set `maxHotRows` or opt-in `maxHotBytes` to trigger synchronous automatic
+maintenance after committed operations. The byte watermark measures live scalar
+payload only, **not physical RSS**; `stats().hotPayloadBytes` is `nil` without
+byte tracking. A failed byte-budget maintenance attempt preserves the already
+acknowledged commit but blocks subsequent writes until maintenance succeeds;
+recovery also restores backpressure for an over-budget WAL. `maxGenerations`
+bounds the immutable generation count (2–8), selectively compacting newer tiers
+when that limit is reached. Interrupted publication is recoverable or fails
+closed; uncertain outcomes require close/reopen. This is **not** a hard
+memory limit, an online compaction scheduler, or verified physical power-cut
+durability. The original `sql.open(..., { durability = 'sync' })` still refuses
+its legacy checkpoint. See [managed generations](docs/MANAGED-GENERATIONS.md),
+[selective compaction](docs/SELECTIVE-COMPACTION.md), and
+[hot-byte maintenance](docs/HOT-BYTE-BUDGET.md).
 
 ## Experimental segmented cold indexes and immutable deletions
 
