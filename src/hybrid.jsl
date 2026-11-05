@@ -12,6 +12,7 @@ local fs = require('@dream/fs')
 
 export type Row = { [string]: unknown }
 export type Options = { cachePages: number?, readMode: string?, durability: string?, rowLayout: string?, secondaryIndexPath: string?, secondaryIndexPaths: { string }?, deletePaths: { [number]: string }?, requireIdentity: boolean?, trackPayloadBytes: boolean? }
+export type BatchResult = storage.BatchResult
 export type Transaction = {
   get: (self: Transaction, key: unknown) -> Row?,
   insert: (self: Transaction, row: Row) -> (),
@@ -27,6 +28,7 @@ export type Database = {
   update: (self: Database, key: unknown, changes: Row) -> boolean,
   delete: (self: Database, key: unknown) -> boolean,
   transaction: (self: Database, callback: (Transaction) -> ()) -> (),
+  transactionBatch: (self: Database, callbacks: { (Transaction) -> () }) -> { BatchResult },
   query: (self: Database, sql: string, params: { unknown }?) -> engine.Result,
   prepare: (self: Database, sql: string) -> engine.Plan,
   stats: (self: Database) -> { coldRows: number, hotRows: number, tombstones: number,
@@ -406,9 +408,10 @@ function hybrid.open(walPath: string, snapshotPath: string | { string }, tableNa
     error(failure, 2)
   end
   local store = hot :: storage.Store
-  local closed = false
+  local closed, batchActive = false, false
 
   local function ready()
+    if batchActive then error('jessql hybrid: batched commit in progress', 3) end
     if closed then error('jessql hybrid: database closed', 3) end
   end
 
@@ -527,13 +530,9 @@ function hybrid.open(walPath: string, snapshotPath: string | { string }, tableNa
     return plan
   end
 
-  function db.transaction(_self: Database, callback: (Transaction) -> ())
-    ready()
-    if activeTransaction then error('jessql hybrid: nested transaction', 2) end
-    activeTransaction = true
-    -- A callback can throw; the underlying store discards staged WAL mutations.
-    local succeeded, failure = pcall(function()
-      apply(function(tx)
+  -- Shared transaction facade for ordinary and independently framed batches.
+  local function wrap(callback: (Transaction) -> ()): (storage.Transaction) -> ()
+    return function(tx: storage.Transaction)
       local transaction = {} :: Transaction
       local txView = newView(function(table, key) return tx:get(table, key) end,
         function(sql, params) return tx:query(sql, params) end)
@@ -596,10 +595,45 @@ function hybrid.open(walPath: string, snapshotPath: string | { string }, tableNa
       end
 
       callback(transaction)
-      end)
-    end)
+    end
+  end
+
+  function db.transaction(_self: Database, callback: (Transaction) -> ())
+    ready()
+    if activeTransaction then error('jessql hybrid: nested transaction', 2) end
+    activeTransaction = true
+    -- A callback or WAL commit can throw; always release our nested-tx guard.
+    local succeeded, failure = pcall(function() store:transaction(wrap(callback)) end)
     activeTransaction = false
     if not succeeded then error(failure, 2) end
+  end
+
+  function db.transactionBatch(_self: Database, callbacks: { (Transaction) -> () }): { BatchResult }
+    ready()
+    if activeTransaction then error('jessql hybrid: nested transaction', 2) end
+
+    -- Storage validates the input before invoking any callbacks; wrapping it
+    -- here must not alter the index/error behavior for malformed arrays.
+    if type(callbacks) ~= 'table' or #callbacks == 0 or #callbacks > 256 then
+      error('jessql hybrid: transactionBatch requires 1..256 callbacks', 2)
+    end
+
+    local wrapped: { (storage.Transaction) -> () } = {}
+    for index, callback in callbacks do
+      if type(index) ~= 'number' or index % 1 ~= 0 or index < 1 or index > #callbacks
+        or type(callback) ~= 'function' then
+        error('jessql hybrid: invalid transactionBatch callback', 2)
+      end
+      wrapped[index] = wrap(callback)
+    end
+    activeTransaction = true
+    batchActive = true
+    -- Storage can throw after an uncertain append; always release our guards.
+    local succeeded, value = pcall(function() return store:transactionBatch(wrapped) end)
+    batchActive = false
+    activeTransaction = false
+    if not succeeded then error(value, 2) end
+    return value :: { BatchResult }
   end
 
   function db.insert(self: Database, row: Row)

@@ -12,8 +12,13 @@ local packed = require('@jessql/packed')
 local mutations = require('@jessql/mutations')
 
 export type Row = { [string]: unknown }
-export type Options = { maxFrameBytes: number?, recoverTail: boolean?, queryCacheEntries: number?, rowLayout: string?, durability: string?, trackPayloadBytes: boolean? }
+export type Options = { maxFrameBytes: number?, recoverTail: boolean?, queryCacheEntries: number?, rowLayout: string?, durability: string?, trackPayloadBytes: boolean?,
+  -- Fault injection for deterministic tests of uncertain batch acknowledgments.
+  batchTestHook: ((string) -> ())? }
+export type BatchResult = { ok: boolean, error: string? }
 export type Store = {
+  -- One CRC-framed WAL transaction per callback, one syncData for all successful entries.
+  transactionBatch: (self: Store, callbacks: { (Transaction) -> () }) -> { BatchResult },
   createTable: (self: Store, name: string, columns: { string }, primaryKey: string) -> (),
   createIndex: (self: Store, name: string, column: string) -> (),
   createOrderedIndex: (self: Store, name: string, column: string) -> (),
@@ -1582,7 +1587,7 @@ local function load(state: DatabaseState, recoverTail: boolean)
   end
 end
 
-local function write(state: DatabaseState, ops: { Operation })
+local function write(state: DatabaseState, ops: { Operation }, deferSync: boolean?)
   if #ops == 0 then return end
   local payload = json.encodeTable({ version = 1, sequence = state.sequence + 1, ops = ops })
   local record = frame(payload, state.maxFrameBytes)
@@ -1598,7 +1603,7 @@ local function write(state: DatabaseState, ops: { Operation })
     error('jessql storage: append failed (reopen required): ' .. tostring(err), 2)
   end
 
-  if state.durability == 'sync' then
+  if state.durability == 'sync' and deferSync ~= true then
     local synced, syncError = (state.walWriter :: dream_fs_Writer):syncData()
     if not synced then
       state.poisoned = true
@@ -1637,6 +1642,11 @@ function storage.open(path: string, options: Options?): Store
   if options and options.trackPayloadBytes ~= nil and type(options.trackPayloadBytes) ~= 'boolean' then
     error('jessql storage: trackPayloadBytes must be boolean', 2)
   end
+
+  if options and options.batchTestHook ~= nil and type(options.batchTestHook) ~= 'function' then
+    error('jessql storage: batchTestHook must be a function', 2)
+  end
+  local batchTestHook = if options then options.batchTestHook else nil
   local durability = if options and options.durability then options.durability else 'buffered'
   if durability ~= 'buffered' and durability ~= 'sync' then
     error('jessql storage: durability must be buffered or sync', 2)
@@ -1683,7 +1693,9 @@ function storage.open(path: string, options: Options?): Store
   local cursorRevision = 0
 
   local db = {} :: Store
+  local batchActive = false
   local function ready()
+    if batchActive then error('jessql storage: batched commit in progress; use transaction view', 3) end
     if state.closed then error('jessql storage: database closed', 3) end
     if state.poisoned then error('jessql storage: database requires reopen', 3) end
   end
@@ -1701,10 +1713,93 @@ function storage.open(path: string, options: Options?): Store
       error(if not succeeded then callbackError else 'jessql storage: transaction aborted after failed DML', 2)
     end
     -- I/O can fail; leave in-memory state untouched and poison uncertain append outcomes.
-    local committed, commitError = pcall(write, state, ops)
+    local committed, commitError = pcall(write, state, ops, false)
     state.busy = false
     if not committed then error(commitError, 2) end
     if #ops > 0 then cursorRevision += 1 end
+  end
+
+  -- Synchronous admission in the owning VM: callbacks execute in order, and each
+  -- successful callback produces its own WAL frame. A failed callback discards
+  -- its staged mutations and does not affect the remaining entries. None of
+  -- the outcomes are exposed until every successful frame has been synced.
+  -- A failed append/sync or post-append apply is an *uncertain outcome*:
+  -- poison the handle and require recovery before any retry.
+  function db.transactionBatch(_self: Store, callbacks: { (Transaction) -> () }): { BatchResult }
+    ready()
+    if state.durability ~= 'sync' then
+      error('jessql storage: transactionBatch requires sync durability', 2)
+    end
+
+    if state.busy then error('jessql storage: nested or concurrent transaction', 2) end
+
+    if type(callbacks) ~= 'table' or #callbacks == 0 or #callbacks > 256 then
+      error('jessql storage: transactionBatch requires 1..256 callbacks', 2)
+    end
+
+    for index, callback in callbacks do
+      if type(index) ~= 'number' or index % 1 ~= 0 or index < 1
+        or index > #callbacks or type(callback) ~= 'function' then
+        error('jessql storage: transactionBatch requires an array of callbacks', 2)
+      end
+    end
+
+    for index = 1, #callbacks do
+      if type(callbacks[index]) ~= 'function' then
+        error('jessql storage: transactionBatch requires a dense callback array', 2)
+      end
+    end
+
+    state.busy = true
+    batchActive = true
+    -- Appends, user callbacks and the final sync can throw. Recover the busy
+    -- guard and poison on any uncertain post-append failure.
+    local committed, resultsOrError = pcall(function(): { BatchResult }
+      local results: { BatchResult } = {}
+      local appended = false
+      for index = 1, #callbacks do
+        local tx, ops, finish = buildTransaction(state)
+        -- Only this entry is rejected if its callback or DML fails.
+        local ok, callbackError = pcall(callbacks[index], tx)
+        local aborted = finish()
+        if not ok or aborted then
+          results[index] = { ok = false,
+            error = tostring(if not ok then callbackError else 'jessql storage: transaction aborted after failed DML') }
+          continue
+        end
+        -- The in-memory state is applied after append, so each subsequent
+        -- callback observes preceding successful transactions and constraints.
+        -- No result escapes this function before the single sync barrier.
+        write(state, ops, true)
+        if #ops > 0 then
+          appended = true
+          cursorRevision += 1
+          if batchTestHook then (batchTestHook :: (string) -> ())('after-append') end
+        end
+        results[index] = { ok = true }
+      end
+
+      if appended then
+        if batchTestHook then batchTestHook('before-sync') end
+        local synced, syncError = (state.walWriter :: dream_fs_Writer):syncData()
+        if not synced then
+          state.poisoned = true
+          error('jessql storage: batch sync failed (reopen required): ' .. tostring(syncError))
+        end
+
+        if batchTestHook then batchTestHook('after-sync') end
+      end
+      return results
+    end)
+    batchActive = false
+    state.busy = false
+    if not committed then
+      -- Any unexpected error after the first append leaves uncertain state;
+      -- even a Lua-side exception must not permit further transactions.
+      state.poisoned = true
+      error('jessql storage: batch uncertain (reopen required): ' .. tostring(resultsOrError), 2)
+    end
+    return resultsOrError :: { BatchResult }
   end
 
   function db.exec(self: Store, sql: string, params: { unknown }?): number

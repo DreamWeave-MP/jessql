@@ -22,6 +22,7 @@ export type Options = {
   testHook: ((string) -> ())?,
 }
 export type Transaction = hybrid.Transaction
+export type BatchResult = hybrid.BatchResult
 export type Database = {
   get: (self: Database, key: unknown) -> Row?,
   insert: (self: Database, row: Row) -> (),
@@ -29,6 +30,7 @@ export type Database = {
   update: (self: Database, key: unknown, changes: Row) -> boolean,
   delete: (self: Database, key: unknown) -> boolean,
   transaction: (self: Database, callback: (Transaction) -> ()) -> (),
+  transactionBatch: (self: Database, callbacks: { (Transaction) -> () }) -> { BatchResult },
   query: (self: Database, sql: string, params: { unknown }?) -> engine.Result,
   prepare: (self: Database, sql: string) -> engine.Plan,
   stats: (self: Database) -> { epoch: number, generations: number, coldRows: number, hotRows: number,
@@ -478,7 +480,7 @@ function managed.open(path: string, options: Options?): Database
 
   local live = current :: hybrid.Database
   local active = value :: Manifest
-  local closed, poisoned, busy = false, false, false
+  local closed, poisoned, busy, batchActive = false, false, false, false
   local lastMaintenanceError: string? = nil
   -- Recovery cannot forget an unresolved byte watermark. A WAL may contain
   -- an acknowledged oversized transaction after failed auto-maintenance.
@@ -495,6 +497,7 @@ function managed.open(path: string, options: Options?): Database
   local db = {} :: Database
 
   local function ready()
+    if batchActive then error('jessql managed: batched commit in progress', 3) end
     if closed then error('jessql managed: closed', 3) end
     if poisoned then error('jessql managed: uncertain publication; close and reopen', 3) end
     if busy then error('jessql managed: generation transition in progress', 3) end
@@ -550,6 +553,21 @@ function managed.open(path: string, options: Options?): Database
     autoMaintain()
   end
 
+  -- A single synchronization barrier for the successful independent WAL
+  -- frames. Auto-maintenance runs only after the entire batch is durable;
+  -- it must never turn an acknowledged commit into a failed batch result.
+  function db.transactionBatch(_self: Database, callbacks: { (Transaction) -> () }): { BatchResult }
+    readyToWrite()
+    batchActive = true
+    -- Caller callbacks and the shared WAL sync may fail; release the reentry
+    -- guard even if the underlying WAL has become poisoned and needs reopen.
+    local ok, result = pcall(function() return live:transactionBatch(callbacks) end)
+    batchActive = false
+    if not ok then error(result, 2) end
+    autoMaintain()
+    return result :: { BatchResult }
+  end
+
   function db.insert(_self: Database, row: Row)
     readyToWrite()
     live:insert(row)
@@ -586,6 +604,7 @@ function managed.open(path: string, options: Options?): Database
   end
 
   function db.maintenanceStatus(_self: Database): { lastError: string?, poisoned: boolean }
+    if batchActive then error('jessql managed: batched commit in progress', 2) end
     if closed then error('jessql managed: closed', 2) end
     return { lastError = lastMaintenanceError, poisoned = poisoned }
   end
@@ -735,6 +754,7 @@ function managed.open(path: string, options: Options?): Database
   end
 
   function db.close(_self: Database)
+    if batchActive then error('jessql managed: cannot close during batched commit', 2) end
     if closed then return end
     if busy then error('jessql managed: cannot close during publication', 2) end
     closed = true

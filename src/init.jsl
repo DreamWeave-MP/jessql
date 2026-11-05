@@ -15,6 +15,7 @@ local managed = require('@jessql/managed')
 
 export type Database = engine.Database
 export type PersistentDatabase = storage.Store
+export type BatchResult = storage.BatchResult
 export type HybridDatabase = hybrid.Database
 export type ManagedDatabase = managed.Database
 export type Transaction = storage.Transaction
