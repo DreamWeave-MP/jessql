@@ -103,9 +103,9 @@ transaction fast path. Five alternating Linux x64 runs of
 
 The runs were noisy (approximately 116–189 ms across the unmetered samples).
 These are only regression observations, **not** a speedup or p99 latency
-claim; raw CSV samples accompany the replay archive. The changed source and
-new tests pass strict checking; the known repository-wide 482 strict type
-errors remain unchanged.
+claim; raw CSV samples accompany the replay archive. The changed source and new tests passed strict checking at the time of this
+historical publication refactor. **Current JessQL releases require zero strict
+errors across the entire package**; see [STRICT-TYPING.md](STRICT-TYPING.md).
 
 ## Still outstanding
 

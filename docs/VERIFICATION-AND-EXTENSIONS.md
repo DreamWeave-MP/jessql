@@ -151,24 +151,26 @@ participate in database scheduling.
 
 ## Strict type-checking policy
 
-The lexer and parser now pass Jess strict checks; the existing type errors
-are all in `src/engine.jsl`. Rather than hiding them with `any` or disabling
-strict mode, the repository has a reproducible non-regression gate:
+**JessQL requires zero native strict diagnostics across the complete package.**
+This covers `src/`, `tests/`, and `bench/`, not just individually modified
+files. Each shipped `.jsl` file explicitly begins with `--!strict`.
 
 ```sh
 jess package test .
 python3 scripts/check-strict.py /path/to/jess
 ```
 
-`scripts/check-strict.py` checks **every** `src/*.jsl` file and selected
-strict-gated test modules, permits at most **427** existing `engine.jsl` errors, and permits
-**zero** errors in every other source file. This is a ceiling to decrease,
-never a license to add new errors. The remaining engine debt is a merge
-blocker for claiming entire-repository strict cleanliness; a later focused
-refactor should address the checker issues by typed AST/value operations,
-not by suppressions. No current GitHub workflow is asserted to execute this
-script automatically; wire it into the appropriate pinned Jess/StroggForge
-CI gate before treating enforcement as continuous.
+The zero-tolerance checker invokes `jess package check . --format json`,
+requires that the checker visit all 78 shipped JSL files, and fails on any
+reported diagnostic, missing strict directive, incomplete run or abnormal exit.
+The former 427-error `engine.jsl` allowance has been **removed**. All files
+now pass; this is a static-type release gate, not proof of runtime correctness,
+durability, or cross-platform safety.
+
+The gate is runnable locally. Hosted enforcement still depends on integrating
+it into the pinned Jess/StroggForge build workflow; do not mistake a local
+script for verified CI enforcement. Details are in
+[the strict type-checking contract](STRICT-TYPING.md).
 
 ## Security, scope and performance
 

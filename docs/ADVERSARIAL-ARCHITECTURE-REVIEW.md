@@ -139,9 +139,10 @@ intentional and technically correct:
    sync latency histograms, compaction backlog, last durable epoch, recovery
    outcome, poison/maintenance status, and bounded error categories. Durable
    commit telemetry must be defined independently of optional Jess events.
-7. **Static-check debt:** the repository-wide strict-check gate has 482
-   existing diagnostics, concentrated in the query parser/engine. Changed
-   files pass; calling the entire repository strict-clean would be false.
+7. **Static-check debt (historical finding):** At the time of this audit,
+   the repository-wide strict checker reported 482 diagnostics. **This finding
+   has since been resolved.** The current zero-tolerance release gate checks
+   source, tests, and benchmarks; see [STRICT-TYPING.md](STRICT-TYPING.md).
 
 ## Benchmarks: interpretation over slogans
 

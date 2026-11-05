@@ -365,8 +365,12 @@ operational state. Jess application hosts may explicitly use
 `sql.managed.extensions.v1.relay(...)` to forward telemetry into their
 interface/event systems without callbacks in the transaction path.
 
-The strict regression gate is `python3 scripts/check-strict.py /path/to/jess`;
-it records remaining `engine.jsl` debt rather than hiding it.
+**Strict typing is a zero-exception release requirement.** Run
+`python3 scripts/check-strict.py /path/to/jess` to check all 78 shipped JSL
+modules, tests, and benchmarks with Jess's native package checker. All files
+explicitly declare `--!strict`. The gate rejects missing directives, a
+partial package check, and **any** diagnostic; there is no legacy debt allowance.
+See [the strict type-checking contract](docs/STRICT-TYPING.md).
 
 Offline verification, semantic WAL replay, backup and restore are documented in
 [Offline Verification and Backup](docs/OFFLINE-VERIFICATION-AND-BACKUP.md).

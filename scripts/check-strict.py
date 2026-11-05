@@ -1,58 +1,92 @@
 #!/usr/bin/env python3
-"""Fail closed on any JessQL strict-check regression.
+"""Zero-tolerance strict release gate for every shipped JessQL JSL file.
 
 Usage: python3 scripts/check-strict.py /path/to/jess
-Each file is checked independently under the same package plan, avoiding
-excessive multi-file checker resource usage. The engine debt can only shrink.
+
+The native package checker resolves the complete JessQL package plan and checks
+all JSL sources, tests, and benchmarks in strict mode. Unlike the former debt
+regression gate, there are no exception lists or allowed diagnostics.
 """
+
 import json
 import pathlib
 import subprocess
 import sys
-from collections import Counter
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-BASELINE = {'src/engine.jsl': 427}
+SOURCE_DIRS = ("src", "tests", "bench")
 
 
-def check(jess, paths, allowed):
-    findings = []
-    for path in paths:
-        cmd = [jess, 'check', path, '--package', '.', '--format', 'json']
-        try:
-            result = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True,
-                                    check=False, timeout=90)
-            report = json.loads(result.stdout)
-            errors = report['errors']
-        except (ValueError, KeyError, TypeError, subprocess.TimeoutExpired) as exc:
-            raise RuntimeError(f'checker failed for {path} ({exc})') from exc
-        if result.returncode not in (0, 1, 2):
-            raise RuntimeError(f'checker exited {result.returncode} for {path}: {result.stderr}')
-        findings.extend(errors)
-    counts = Counter(item['file'] for item in findings)
-    failed = [(path, count, allowed.get(path, 0)) for path, count in sorted(counts.items())
-              if count > allowed.get(path, 0)]
-    for path, count in sorted(counts.items()):
-        print(f'{path}: {count} error(s); permitted <= {allowed.get(path, 0)}')
-    if failed:
-        for path, count, limit in failed:
-            print(f'REGRESSION: {path}: {count} > {limit}', file=sys.stderr)
+def check(jess: str) -> bool:
+    scripts = sorted(
+        file.relative_to(ROOT).as_posix()
+        for folder in SOURCE_DIRS
+        for file in (ROOT / folder).rglob("*.jsl")
+    )
+    if not scripts:
+        raise RuntimeError("no shipped JSL files found")
+
+    missing_directive = [
+        name for name in scripts
+        if not (ROOT / name).read_text(encoding="utf-8").startswith("--!strict\n")
+    ]
+    if missing_directive:
+        for name in missing_directive:
+            print(f"ERROR: missing --!strict directive: {name}", file=sys.stderr)
         return False
-    print(f'PASS: {len(findings)} known strict diagnostics, no new errors')
+
+    command = [jess, "package", "check", ".", "--format", "json"]
+    try:
+        completed = subprocess.run(
+            command, cwd=ROOT, capture_output=True, text=True,
+            timeout=180, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"Jess package checker unavailable: {exc}") from exc
+
+    try:
+        report = json.loads(completed.stdout)
+        diagnostics = report["errors"]
+        checked = report["files"]
+    except (ValueError, TypeError, KeyError) as exc:
+        raise RuntimeError(
+            f"Jess package check produced an invalid report: {completed.stderr.strip()}"
+        ) from exc
+
+    if not isinstance(diagnostics, list) or not isinstance(checked, int):
+        raise RuntimeError("unexpected Jess package check report shape")
+
+    for diagnostic in diagnostics:
+        print(
+            f"{diagnostic.get('file', '?')}:{diagnostic.get('line', '?')}:"
+            f"{diagnostic.get('column', '?')}: {diagnostic.get('message', '?')}",
+            file=sys.stderr,
+        )
+
+    success = completed.returncode == 0 and checked == len(scripts) and not diagnostics
+    if not success:
+        print(
+            f"FAIL: Jess checked {checked}/{len(scripts)} JSL files; "
+            f"{len(diagnostics)} strict errors (exit {completed.returncode})",
+            file=sys.stderr,
+        )
+        return False
+
+    print(f"PASS: {checked} shipped JSL files, zero strict diagnostics")
     return True
 
 
-def main():
+def main() -> int:
     if len(sys.argv) != 2:
         print(__doc__, file=sys.stderr)
         return 2
     jess = str(pathlib.Path(sys.argv[1]).resolve())
-    src = [str(p.relative_to(ROOT)) for p in sorted((ROOT / 'src').glob('*.jsl'))]
-    success = check(jess, src, BASELINE)
-    success = check(jess, ['tests/verification.jsl', 'tests/observability.jsl',
-                           'tests/backup.jsl', 'tests/app-experience.jsl'], {}) and success
-    return 0 if success else 1
+    try:
+        return 0 if check(jess) else 1
+    except RuntimeError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     sys.exit(main())
