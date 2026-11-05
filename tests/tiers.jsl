@@ -1,0 +1,184 @@
+--!strict
+local sql = require('@jessql')
+local fs = require('@dream/fs')
+local test = require('@jess/test')
+local suite, expect = test.new(), test.expect
+
+local function basePath(name: string): string
+  return fs.join(assert(fs.cwd()), '.jessql-tiers-' .. name)
+end
+
+local function cleanup(base: string, count: number)
+  for index = 1, count do
+    fs.remove(base .. '.' .. tostring(index))
+    fs.remove(base .. '.' .. tostring(index) .. '.deleted')
+  end
+
+  for _, ending in { '.out', '.out.deleted', '.old', '.bad', '.new.wal', '.new.wal.lock' } do
+    fs.remove(base .. ending)
+  end
+end
+
+suite.describe('fan-in bounded immutable tier compaction', function()
+  suite.it('compacts 19 overlapping snapshots without exceeding three open generations', function()
+    local base = basePath('overlap')
+    cleanup(base, 19)
+    local sources: { string } = {}
+    local expected: { [number]: number } = {}
+    for generation = 1, 19 do
+      local path = base .. '.' .. tostring(generation)
+      sources[#sources + 1] = path
+      local cursor = 0
+      sql.paged.create(path, { 'id', 'generation' }, 'id', function()
+        cursor += 1
+        if cursor > 60 then return nil end
+        local id = generation * 11 + cursor
+        expected[id] = generation
+        return { id = id, generation = generation }
+      end, { pageBytes = 512 })
+    end
+    local metrics = sql.tiers.compact(base .. '.out', nil, sources,
+      { fanIn = 3, cachePages = 1, pageBytes = 512 })
+    expect(metrics.passes >= 2).toBe(true)
+    expect(metrics.maxOpenGenerations <= 3).toBe(true)
+    local compacted = sql.paged.open(base .. '.out')
+    for id = 12, 269 do
+      local row = compacted:get(id)
+      if expected[id] then expect((assert(row)).generation).toBe(expected[id])
+      else expect(row).toBe(nil) end
+    end
+    compacted:close()
+    -- No original source is retired or replaced by compaction.
+    local original = sql.paged.open(sources[1])
+    expect((assert(original:get(12))).generation).toBe(1)
+    original:close()
+    cleanup(base, 19)
+  end)
+
+  suite.it('preserves deletion markers through multiple merge levels and later reinsertion', function()
+    local base = basePath('deletions')
+    cleanup(base, 13)
+    local sources: { string } = {}
+    local deleted: { [number]: string } = {}
+    local expected: { [number]: number } = {}
+    for generation = 1, 13 do
+      local path = base .. '.' .. tostring(generation)
+      sources[#sources + 1] = path
+      local start = if generation == 1 then 1 else generation * 3
+      local finish = if generation == 1 then 50 else generation * 3 + 5
+      local id = start - 1
+      sql.paged.create(path, { 'id', 'generation' }, 'id', function()
+        id += 1
+        if id > finish then return nil end
+        expected[id] = generation
+        return { id = id, generation = generation }
+      end, { pageBytes = 512 })
+
+      if generation % 3 == 0 then
+        local keys = { 5, 9, 13, 17, 22, 28 }
+        for _, key in keys do expected[key] = nil end
+        table.sort(keys, function(left, right) return tostring(left) < tostring(right) end)
+        local deletionPath = path .. '.deleted'
+        deleted[generation] = deletionPath
+        local position = 0
+        sql.segments.createTombstones(deletionPath, path, function(): string?
+          position += 1
+          return if position <= #keys then 'n' .. tostring(keys[position]) else nil
+        end, { pageBytes = 512 })
+      end
+    end
+    -- Compaction must retain deletes for rows that may exist in older
+    -- generations not included in an intermediate group.
+    local metrics = sql.tiers.compact(base .. '.out', base .. '.out.deleted', sources,
+      { fanIn = 3, cachePages = 1, pageBytes = 512, deletePaths = deleted })
+    expect(metrics.passes >= 2).toBe(true)
+    local view = sql.segments.open({ base .. '.out' },
+      { deletePaths = { [1] = base .. '.out.deleted' }, cachePages = 1 })
+    for id = 1, 60 do
+      local row = view:get(id)
+      if expected[id] then expect((assert(row)).generation).toBe(expected[id])
+      else expect(row).toBe(nil) end
+    end
+    view:close()
+    cleanup(base, 13)
+  end)
+
+  suite.it('tracks repeated deletion and resurrection across independent merge levels', function()
+    local base = basePath('reintroduce')
+    cleanup(base, 9)
+    local paths: { string } = {}
+    local deleted: { [number]: string } = {}
+    for generation = 1, 9 do
+      local path = base .. '.' .. tostring(generation)
+      paths[#paths + 1] = path
+      local keys: { number } = {}
+      if generation == 1 then keys = { 1, 2, 3 }
+      elseif generation == 3 or generation == 5 then keys = { 1, 2 } end
+      local position = 0
+      sql.paged.create(path, { 'id', 'generation' }, 'id', function()
+        position += 1
+        local key = keys[position]
+        return if key then { id = key, generation = generation } else nil
+      end, { pageBytes = 512 })
+
+      if generation == 2 or generation == 4 or generation == 8 then
+        local deletion = path .. '.deleted'
+        deleted[generation] = deletion
+        local deletionKeys: { string } = if generation == 2 then { 'n1', 'n2' } else { 'n1' }
+        local cursor = 0
+        sql.segments.createTombstones(deletion, path, function(): string?
+          cursor += 1
+          return deletionKeys[cursor]
+        end, { pageBytes = 512 })
+      end
+    end
+    sql.tiers.compact(base .. '.out', base .. '.out.deleted', paths,
+      { fanIn = 3, cachePages = 1, deletePaths = deleted, pageBytes = 512 })
+    local merged = sql.segments.open({ base .. '.out' },
+      { deletePaths = { [1] = base .. '.out.deleted' } })
+    expect(merged:get(1)).toBe(nil) -- Latest deletion remains authoritative.
+    expect((assert(merged:get(2))).generation).toBe(5) -- Reintroduced after an old deletion.
+    expect((assert(merged:get(3))).generation).toBe(1)
+    merged:close()
+    cleanup(base, 9)
+  end)
+
+  suite.it('requires deletion outputs and leaves originals untouched after errors', function()
+    local base = basePath('fail')
+    cleanup(base, 2)
+    sql.paged.create(base .. '.1', { 'id' }, 'id', function() return nil end)
+    local position = 0
+    sql.segments.createTombstones(base .. '.1.deleted', base .. '.1', function(): string?
+      position += 1
+      return if position == 1 then 'n1' else nil
+    end)
+
+    -- A tombstone-bearing input without a deletion output must fail closed.
+    local invalid = pcall(function()
+      sql.tiers.compact(base .. '.out', nil, { base .. '.1' },
+        { deletePaths = { [1] = base .. '.1.deleted' } })
+    end)
+    expect(invalid).toBe(false)
+    expect(fs.exists(base .. '.out')).toBe(false)
+    -- A missing input must not partially publish or delete the valid source.
+    -- A missing source in the group throws; the test continues to inspect cleanup.
+    local corrupted = pcall(function()
+      sql.tiers.compact(base .. '.out', base .. '.out.deleted', { base .. '.1', base .. '.bad' },
+        { fanIn = 2, deletePaths = { [1] = base .. '.1.deleted' } })
+    end)
+    expect(corrupted).toBe(false)
+    expect(fs.exists(base .. '.out')).toBe(false)
+    expect(fs.exists(base .. '.1')).toBe(true)
+    expect(fs.exists(base .. '.1.deleted')).toBe(true)
+    assert(fs.writeFile(base .. '.out', 'do not touch', { exclusive = true }))
+    -- Existing output files must remain intact after a rejected compaction.
+    local occupied = pcall(function()
+      sql.tiers.compact(base .. '.out', nil, { base .. '.1' })
+    end)
+    expect(occupied).toBe(false)
+    expect(assert(fs.readFileString(base .. '.out'))).toBe('do not touch')
+    cleanup(base, 2)
+  end)
+end)
+
+return suite

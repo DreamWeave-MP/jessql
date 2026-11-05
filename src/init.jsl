@@ -10,6 +10,7 @@ local hybrid = require('@jessql/hybrid')
 local secondary = require('@jessql/secondary')
 local segments = require('@jessql/segments')
 local delta = require('@jessql/delta')
+local tiers = require('@jessql/tiers')
 
 export type Database = engine.Database
 export type PersistentDatabase = storage.Store
@@ -45,6 +46,7 @@ return {
   secondary = secondary,
   segments = segments,
   delta = delta,
+  tiers = tiers,
   NULL = mutations.NULL,
   parse = parser.parse,
   lex = lexer.lex,

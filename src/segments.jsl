@@ -472,7 +472,7 @@ end
 -- Keys are WAL-encoded ('s...', 'n...', 'b0'/'b1'), strictly byte-sorted,
 -- and supplied by a streaming iterator. The first record binds this sidecar
 -- to its own data snapshot. This operation does not rotate or retire a WAL.
-function segments.createTombstones(path: string, source: string, nextKey: () -> string, options: Options?)
+function segments.createTombstones(path: string, source: string, nextKey: () -> string?, options: Options?)
   local reader = paged.open(source, { cachePages = if options then options.cachePages else 1 })
   local identity = reader.identity
   reader:close()
