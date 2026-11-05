@@ -43,9 +43,10 @@ if not report.ok then error('database requires operator investigation') end
   continuous sequence numbers, size bounds and valid frame checksums.
 - `walIdentityChecked` indicates presence of an identity binding to the exact
   active cold generation set and table name.
-- `walSemanticReplayChecked` is **always false in v1**. An intact, syntactically
-  plausible transaction can still fail when semantically replayed by the
-  storage engine. `verify().ok` is *not* sufficient to declare `open()` safe.
+- `walSemanticReplayChecked` is **false in structural mode**. With
+  `verify(path, { semantic = true })`, the storage engine also replays WAL
+  transactions into transient state; a successful replay marks this flag true.
+  Neither mode certifies power-loss behavior or application invariants.
 - `issues[]` contains stable `stage`, `code`, `message`, `recovery` fields.
   Codes include `MANIFEST_INVALID`, `MANIFEST_UNREADABLE`, `COLD_INVALID`,
   `WAL_TORN_TAIL`, `WAL_CHECKSUM_MISMATCH`, `WAL_SEQUENCE_INVALID`,
@@ -159,8 +160,8 @@ jess package test .
 python3 scripts/check-strict.py /path/to/jess
 ```
 
-`scripts/check-strict.py` checks **every** `src/*.jsl` file and the two new
-test modules, permits at most **453** existing `engine.jsl` errors, and permits
+`scripts/check-strict.py` checks **every** `src/*.jsl` file and selected
+strict-gated test modules, permits at most **427** existing `engine.jsl` errors, and permits
 **zero** errors in every other source file. This is a ceiling to decrease,
 never a license to add new errors. The remaining engine debt is a merge
 blocker for claiming entire-repository strict cleanliness; a later focused

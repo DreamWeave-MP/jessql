@@ -12,7 +12,7 @@ import sys
 from collections import Counter
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-BASELINE = {'src/engine.jsl': 453}
+BASELINE = {'src/engine.jsl': 427}
 
 
 def check(jess, paths, allowed):
@@ -50,7 +50,7 @@ def main():
     src = [str(p.relative_to(ROOT)) for p in sorted((ROOT / 'src').glob('*.jsl'))]
     success = check(jess, src, BASELINE)
     success = check(jess, ['tests/verification.jsl', 'tests/observability.jsl',
-                           'tests/backup.jsl'], {}) and success
+                           'tests/backup.jsl', 'tests/app-experience.jsl'], {}) and success
     return 0 if success else 1
 
 

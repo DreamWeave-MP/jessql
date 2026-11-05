@@ -6,6 +6,17 @@ also adds an **experimental, all-JSL append-only transactional store**, without 
 database dependency. It is not yet safe for power-loss-critical production workloads.
 
 
+## Recommended managed application pattern
+
+Use [`managed.create`](docs/APPLICATION-GUIDE.md) for explicit first-time provisioning and
+`managed.openExisting` for normal startup; this avoids silently initializing an
+empty namespace because of an application path typo. Scoped helpers
+`managed.withNew`, `managed.withExisting`, and `managed.withOpen` reliably close
+the handle after one callback, including when the callback raises. The original
+`managed.open` remains available as a compatible open-or-create API.
+See the [application developer guide](docs/APPLICATION-GUIDE.md) for typed
+examples, transactions, maintenance failures, safe Jess mod integration, and recovery.
+
 ## Operator and maintainer documentation
 
 The managed storage path has deliberately conservative durability boundaries.
