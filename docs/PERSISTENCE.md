@@ -1,7 +1,9 @@
-# Native JessQL persistence — experimental branch
+# Native JessQL persistence — raw WAL API (0.2.0)
 
 This is a JSL storage engine: **no SQLite dependency, no native database driver, and no
-new Rust extension**. It is deliberately *not* yet a production durability guarantee.
+new Rust extension**. This document covers the legacy raw WAL store, not the
+managed synchronized generation API. Use the latter for the stronger documented
+acknowledgment and recovery protocol. Neither API has physical power-loss certification.
 
 ## API
 

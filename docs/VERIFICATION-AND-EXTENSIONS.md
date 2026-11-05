@@ -1,6 +1,6 @@
 # Offline verification, recovery diagnostics and versioned integrations
 
-**Status:** experimental interfaces for `feat/native-persistence`. This guide
+**Status:** JessQL 0.2.0 diagnostic and extension interfaces. This guide
 is an implementation contract, not a physical power-loss certification. All
 examples use the source package `@jessql` on Jess 0.3.0 / Luau 0.745.
 
@@ -68,7 +68,7 @@ if not report.ok then error('database requires operator investigation') end
 5. A structurally clean report does not replace full replay testing, cold
    semantic validation, transaction reconciliation or physical fault testing.
 
-No repair, online backup, replication, snapshot-consistency or salvage API is
+No repair, **online** backup, replication, snapshot-consistency or salvage API is
 introduced here. Never use this verifier as a write authorization protocol.
 It may perform large, multi-hour linear scans on sufficiently big databases;
 run it during an explicit offline maintenance window.

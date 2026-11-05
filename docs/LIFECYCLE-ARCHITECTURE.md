@@ -1,7 +1,7 @@
 # Managed lifecycle architecture and extension boundaries
 
-**Status:** experimental; source for `feat/native-persistence`. This document
-explains implementation boundaries, not a claim of power-loss-qualified storage.
+**Status:** JessQL 0.2.0 internal architecture. This document explains
+implementation boundaries, not a claim of power-loss-qualified storage.
 For practical incident response, see [operator runbook](OPERATIONS.md).
 
 ## Dependency direction

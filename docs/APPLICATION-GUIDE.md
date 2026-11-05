@@ -1,7 +1,8 @@
 # JessQL managed databases: application developer guide
 
-**Status:** experimental managed storage on `feat/native-persistence`, Jess 0.3.0 / Luau 0.745.
-JessQL runs as a Jess package; it is **not** yet certified for power-loss-critical production data.
+**Status:** JessQL 0.2.0 managed synchronous persistence (single writer), tested on
+Jess 0.3.0 / Luau 0.745 on Linux. This is a normal JPK API, not a feature-flagged
+opt-in; physical power-loss and other-platform durability are **not certified**.
 This guide covers the synchronous managed database, not the separate in-memory or raw WAL APIs.
 
 ## Choose an opening intent

@@ -1,6 +1,6 @@
 # Managed JessQL: operations, inventory, and recovery
 
-**Audience:** application owners and operators of experimental, single-writer
+**Audience:** application owners and operators of JessQL 0.2.0 single-writer
 managed databases. This is a fail-closed runbook, not an automated repair tool.
 For invariants and module boundaries see [lifecycle architecture](LIFECYCLE-ARCHITECTURE.md).
 
@@ -104,9 +104,9 @@ manifest and generations can produce an impossible combination. For a backup:
    writers are stopped. Keep names unchanged. Include enough metadata to
    reconstruct the directory layout and the schema. Preserving extra orphan
    files is safer than accidentally omitting a referenced generation.
-4. On a *separate scratch copy*, call `sql.managed.inspect()` and then
-   `sql.managed.open()` to verify that recovery works and expected data can
-   actually be queried. `inspect` alone is insufficient.
+4. On a *separate scratch copy*, run `sql.managed.verify(base, { semantic = true })`
+   and `sql.managed.openExisting(base)` to verify that recovery works and expected
+   data can actually be queried. `inspect` alone is insufficient.
 5. Store the verified complete backup atomically according to your backup
    system's retention controls. Repeat restoration drills periodically.
 
@@ -122,10 +122,10 @@ validated freeze/snapshot protocol; none is supplied here yet.
 2. Make a **complete offline copy** of the namespace before attempting
    corrective actions. Preserve candidate manifests and orphaned generations
    as evidence; do not delete files to make the database open.
-3. With the database closed, run `inspect()` on the copy. It will refuse an
-   invalid/missing manifest or missing/mismatched cold metadata.
-4. Try `sql.managed.open()` **on the copy**, which validates the WAL binding
-   and replays it. Compare independent application-level counts/IDs.
+3. With the database closed, run `inspect()` and then
+   `verify(base, { semantic = true })` on the copy. Preserve diagnostic reports.
+4. Try `sql.managed.openExisting()` **on the copy**, which validates the WAL
+   binding and replays it. Compare independent application-level counts/IDs.
 5. For a missing manifest, restore a **matching manifest from a verified
    backup** or restore the whole verified backup. Never create an empty
    manifest around existing generations or copy a manifest from another epoch.
@@ -142,7 +142,8 @@ must establish explicit evidence-preservation and idempotency guarantees.
 
 - Pin the Jess runtime and JessQL package revision. Reproduce
   `jess package test .` (source and packaged-JPK modes).
-- Strict-check changed modules and retain known repository-wide debt visibility.
+- Run the zero-tolerance package-wide strict gate:
+  `python3 scripts/check-strict.py /path/to/jess` (no permitted diagnostics).
 - Restore a test backup. Exercise missing-manifest, corrupted-WAL, disk-full,
   and interrupted-publication paths in a disposable environment.
 - Verify exact filesystem replacement and directory sync semantics on each
@@ -155,25 +156,30 @@ must establish explicit evidence-preservation and idempotency guarantees.
 
 ## Error-reporting and instrumentation boundaries
 
-The current API does not expose full structured error codes or a persisted
-operator event stream. An application integration can presently poll
-`db:stats()` for the active epoch, generation count and configured metered
-values, and `db:maintenanceStatus()` for the last maintenance error/poisoning.
-Neither is safe to call while an explicit synchronized batch is executing.
-Errors include descriptive messages but are not yet a stable typed taxonomy.
+JessQL 0.2.0 exposes structured **offline verification diagnostics** through
+`sql.managed.verify()` / `diagnose()`; each issue has `stage`, `code`,
+`message`, and `recovery`. These codes are not a universal structured error
+taxonomy for every online transaction failure.
 
-For a future Jess ScriptDomain adapter, prefer an **optional** interface that
-reads this state and emits best-effort notifications after acknowledgment.
-These events must never sit on the durability path and must never become the
-sole record of a committed mutation. Durable changefeeds require WAL-derived
-sequence positions and replayable subscriber offsets.
+An open managed database exposes `db:observe()` and an ephemeral, bounded
+`db:events(cursor)` lifecycle feed. Application hosts may relay these events
+outside the commit path using the versioned `extensions.v1` adapter.
+Applications can also poll `db:stats()` and `db:maintenanceStatus()`. Do not
+call outer-handle operations from an active batch callback.
 
-## Offline integrity verification (experimental)
+Observability events are **not** durable change-data capture, cannot certify
+transaction acknowledgment, and can be lost when a process exits or a ring
+overflows. Reliable changefeeds need WAL sequence positions and persistent
+subscriber offsets. See [verification and extensions](VERIFICATION-AND-EXTENSIONS.md).
+
+## Offline integrity verification
 
 After stopping all managed writers, use `sql.managed.verify(base)` or
 `sql.managed.diagnose(base)` for a lock-protected, non-repairing full scan of
 physical cold pages and the WAL frame stream. An issue contains a stable code
-and recovery guidance. The result does **not** validate full semantic replay
-or determine uncertain transaction acknowledgments. See
+and recovery guidance. Add `{ semantic = true }` to replay WAL operations
+through transaction validators in temporary state; structural mode alone does
+not validate operations. Neither mode determines uncertain acknowledgments
+or certifies a physical power cut. See
 [verification and extension protocol](VERIFICATION-AND-EXTENSIONS.md) for
 examples, report fields, limitations and the incident workflow.

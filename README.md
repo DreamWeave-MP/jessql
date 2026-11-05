@@ -1,10 +1,31 @@
 # jessql
 
-A Luau relational query engine packaged as a Jess JPK. Its existing in-memory and virtual-provider
-query paths remain available without storage dependencies. The native persistence feature branch
-also adds an **experimental, all-JSL append-only transactional store**, without SQLite or another
-database dependency. It is not yet safe for power-loss-critical production workloads.
+A strictly typed Luau relational query engine and **native JSL persistence package** for Jess.
+JessQL 0.2.0 includes in-memory SQL, virtual providers, WAL-backed transactions,
+immutable generations, offline verification, and backup/restore. It requires no
+SQLite/native database driver, database server, or experimental feature toggle.
 
+**Deployment scope:** use the managed synchronous single-writer API for persistence.
+It has been validated on the supplied Linux Jess 0.3.0 / Luau 0.745 runtime,
+but is **not certified for physical power loss or untested operating systems**.
+See the [0.2.0 release and deployment guide](docs/RELEASE-0.2.0.md) and
+[application guide](docs/APPLICATION-GUIDE.md).
+
+
+## Release, installation and license
+
+**Version:** `0.2.0` · **SPDX license:** `MIT OR Apache-2.0` — choose either
+[MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE).
+
+Use JessQL as a normal JPK dependency; no experimental opt-in, special
+activation, or non-Jess database server is required. As with any Jess package,
+the host must activate its layer and grant the filesystem capabilities needed
+by the chosen storage operations. A pure in-memory query needs no database files.
+
+For a new durable database, provision with `sql.managed.create(base, options)`;
+for subsequent startups, use `sql.managed.openExisting(base, options?)`.
+The old `managed.open` open-or-create entry remains available. See the
+[0.2.0 release notes and deployment checklist](docs/RELEASE-0.2.0.md).
 
 ## Recommended managed application pattern
 
@@ -35,10 +56,9 @@ opening a writable database or repairing anything**. It validates cold
 metadata, not full payload pages or WAL replay. It cannot inspect an active
 managed writer; run it offline. See the runbook before relying on it.
 
-## Experimental hybrid hot/cold pages
+## Hybrid hot/cold pages (advanced API)
 
-The native persistence branch now includes a self-contained immutable page
-provider and a single-table hybrid overlay:
+JessQL includes a self-contained immutable page provider and a single-table hybrid overlay:
 
 ```luau
 local sql = require('@jessql')
@@ -66,7 +86,7 @@ failures are isolated, and uncertain I/O outcomes require reopening before retry
 This is an explicit synchronous batching primitive, **not** a worker-based
 concurrent writer service. See [durable batch semantics and benchmarks](docs/GROUP-COMMITS.md).
 
-## Experimental durable managed generations
+## Managed synchronized generations (0.2.0)
 
 `sql.managed.open(base, { tableName, columns, primaryKey })` now owns a
 synchronized WAL and an ordered set of immutable JQLP2 generations under a
@@ -117,7 +137,7 @@ See [delta-flush semantics and benchmarks](docs/DELTA-FLUSH.md).
 
 ## Package
 
-- package: `org.dreamweave.jessql` 0.1.6
+- package: `org.dreamweave.jessql` **0.2.0**
 - layer: `jessql.core`
 - module: `@jessql`
 
@@ -143,7 +163,7 @@ Prepared queries expose `run(params)` and `explain()`. `explain()` reports proje
 join strategies, grouping, aggregate count, and parameter count.
 
 
-## Experimental native persistence (feature branch)
+## Native transactional persistence (0.2.0)
 
 ```luau
 local sql = require('@jessql')
@@ -158,7 +178,7 @@ db:checkpoint()
 db:close()
 ```
 
-For lower resident memory use on large event tables, opt into the experimental
+For lower resident memory use on large event tables, opt into the optional
 packed column representation with `sql.open(path, { rowLayout = 'packed' })`.
 It uses f64/boolean buffers, dictionary-coded repeated strings and chunked byte
 arenas for unique strings, and lazily constructs row dictionaries on reads.
@@ -174,7 +194,8 @@ A standalone `bench/hypervectors.jsl` explores approximate binary hypervector
 similarity but does not participate in SQL correctness or row compression.
 
 No SQLite bindings are involved. The engine uses Jess filesystem, bytes and JSON primitives.
-**Buffered writes are not power-loss durable without a real file/directory sync primitive.**
+**The raw `sql.open` buffered mode is not equivalent to the synchronized managed API;**
+use `managed.create` / `managed.openExisting` for durable-write acknowledgment.
 See [docs/PERSISTENCE.md](docs/PERSISTENCE.md) for the full contract and limitations.
 
 ## Provider protocol
@@ -216,9 +237,10 @@ JessQL can combine an indexed lookup side with a lazy ordered driver and stop as
 `LIKE`, arithmetic/comparison/boolean operators, `IS [NOT] NULL`, and `COUNT`, `SUM`, `AVG`,
 `MIN`, `MAX`. Scalar functions include `LOWER`, `UPPER`, `LENGTH`, `ABS`, and `COALESCE`.
 
-The in-development native store provides a checksummed append log, a transaction API, indexed
-persistent providers, crash-tail recovery, and snapshot compaction. It does **not** yet have a
-page store, SQL DML/DDL grammar, MVCC, subqueries/CTEs, set operators, or window functions.
+The raw WAL store provides checksummed transactions, indexed providers, crash-tail recovery,
+and snapshot compaction; the managed API additionally exposes immutable paged generations.
+The SQL parser supports restricted parameterized DML but not general SQL DDL,
+MVCC, subqueries/CTEs, set operators, or window functions.
 See [Native persistence architecture and safety boundary](docs/PERSISTENCE.md).
 
 ## 0.1.1 execution work
@@ -293,7 +315,7 @@ See [the persistence documentation](docs/PERSISTENCE.md) for supported SQL,
 NULL binding, transaction semantics, range index limitations and the missing
 power-loss durability barrier.
 
-### Scoped ordered indexes (native persistence branch)
+### Scoped ordered indexes
 
 An experimental two-column `db:createCompositeIndex('events', 'room_id', 'stream_id')`
 keeps per-room ordered stream indexes, including bounded ascending/descending
@@ -305,7 +327,7 @@ compiled plans (`queryCacheEntries`, default 64, 0 disables), invalidating on
 schema changes. The cache never retains results. Use `db:cacheStats()` and
 `bench/query-cache.jsl` to assess hot-query benefits.
 
-## Resident index memory optimizations (feature branch)
+## Resident index memory optimizations
 
 The native storage provider represents singleton equality and ordered-index postings
 inline, so unique values no longer allocate a multi-table posting list. Duplicate
