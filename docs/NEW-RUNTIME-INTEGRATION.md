@@ -94,3 +94,11 @@ index building, and independent read workers. Do not convert every ordinary
 paged read to a shared buffer by default: sealing/copying can increase both
 CPU and resident memory when there is no worker boundary to amortize it over.
 The present revision intentionally leaves SQL's single-VM read path unchanged.
+
+## Durable full-generation publication (subsequent experimental integration)
+
+`sql.managed.open()` now exposes a **separate** sync-only managed wrapper
+that publishes full JQLP2 snapshots and independent WALs through an atomic
+manifest. This does **not** change the legacy `sql.open():checkpoint()` refusal
+in synchronized mode. See [the managed recovery protocol](MANAGED-GENERATIONS.md)
+for file ownership, fault boundaries, remaining limits and usage.

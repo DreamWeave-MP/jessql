@@ -28,6 +28,19 @@ See [Hybrid storage details and limitations](docs/HYBRID.md) before using this
 experimental API. Power-loss durability, automatic segment promotion, and
 bounded total RSS are **not yet provided**.
 
+## Experimental durable managed generations
+
+The new `sql.managed.open(base, { tableName, columns, primaryKey })` owns a
+synchronized WAL and an immutable JQLP2 snapshot under a checksum-framed,
+atomically replaced generation manifest. Its explicit `db:checkpoint()` seals
+and publishes a **full** replacement snapshot, creates a new bound WAL, and
+retires the previous generation only after a directory synchronization
+barrier. Interrupted publication is recoverable or fails closed; unknown
+outcomes require close/reopen. This is **not** automatic multi-level LSM
+compaction, a bounded-total-memory engine, or verified physical power-cut
+durability. The original `sql.open(..., { durability = 'sync' })` still refuses
+its legacy checkpoint. See [managed generations](docs/MANAGED-GENERATIONS.md).
+
 ## Experimental segmented cold indexes and immutable deletions
 
 JessQL can now merge `secondaryIndexPaths` across up to eight immutable cold

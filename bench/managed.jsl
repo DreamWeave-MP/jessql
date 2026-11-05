@@ -1,0 +1,66 @@
+--!strict
+-- Synchronous managed publication baseline, including a hot-overlay rewrite.
+-- Usage: jess run --trusted --package . bench/managed.jsl [rows] [batchSize]
+local sql = require('@jessql')
+local fs = require('@dream/fs')
+
+local total = tonumber(arg[1]) or 2000
+local batchSize = tonumber(arg[2]) or 50
+if total < 20 or total > 500000 or total % 1 ~= 0 then error('rows out of range') end
+if batchSize < 1 or batchSize > 100000 or batchSize % 1 ~= 0 then error('batch out of range') end
+local base = fs.join(fs.cwd() :: string, '.jessql-managed-benchmark')
+
+local function clear()
+  for _, suffix in { '.jql-lock', '.jql-manifest', '.jql-manifest.tmp' } do fs.remove(base .. suffix) end
+
+  for epoch = 1, 4 do
+    local prefix = base .. string.format('.g%08d', epoch)
+    for _, ending in { '.rows', '.wal', '.wal.lock' } do fs.remove(prefix .. ending) end
+  end
+end
+
+clear()
+local started = os.clock()
+local db = sql.managed.open(base, { tableName = 'events',
+  columns = { 'id', 'room', 'payload' }, primaryKey = 'id',
+  cachePages = 4, rowLayout = 'packed', readMode = 'positional' })
+local opened = os.clock()
+
+local current = 0
+while current < total do
+  local last = math.min(total, current + batchSize)
+  db:transaction(function(tx)
+    for key = current + 1, last do
+      tx:insert({ id = key, room = 'room-' .. tostring(key % 8), payload = string.rep('x', 32) })
+    end
+  end)
+  current = last
+end
+local ingested = os.clock()
+local epoch = db:checkpoint()
+local checkpointed = os.clock()
+
+-- Build the second generation with both shadows and tombstones.
+db:transaction(function(tx)
+  for key = 1, math.floor(total / 10) do
+    tx:delete(key)
+    tx:insert({ id = total + key, room = 'new', payload = 'replacement' })
+  end
+end)
+local updated = os.clock()
+local secondEpoch = db:checkpoint()
+local secondCheckpoint = os.clock()
+db:close()
+
+local reopened = sql.managed.open(base, { readMode = 'positional' })
+local reopenedAt = os.clock()
+assert(reopened:stats().epoch == secondEpoch)
+assert(reopened:query('SELECT COUNT(*) AS n FROM events').rows[1].n == total)
+reopened:close()
+clear()
+
+print('rows', total, 'batch', batchSize, 'epochs', epoch, secondEpoch,
+  'initial_cpu', opened - started, 'ingest_cpu', ingested - opened,
+  'checkpoint_cpu', checkpointed - ingested, 'overlay_cpu', updated - checkpointed,
+  'second_checkpoint_cpu', secondCheckpoint - updated,
+  'reopen_cpu', reopenedAt - secondCheckpoint)
