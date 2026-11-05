@@ -1,0 +1,103 @@
+--!strict
+-- Pre-tag source-catalog gate. Read-only: never modifies a release or mod.lock.
+-- Usage: jess run --trusted scripts/check_release_metadata.jsl [repository-root]
+local fs = require '@dream/fs'
+
+local function fail(message: string): never
+  error(`JessQL release metadata: {message}`, 0)
+end
+
+local function defaultRoot(): string
+  local source = debug.info(1, 's')
+  local prefix = string.sub(source, 1, 1)
+  local script = if prefix == '@' or prefix == '=' then string.sub(source, 2) else source
+  local absolute = fs.absolute(script) or fail('cannot locate release-check script')
+  local scripts = fs.parent(absolute) or fail('cannot locate scripts directory')
+  return fs.parent(scripts) or fail('cannot locate package root')
+end
+
+local function read(path: string): string
+  return fs.readFileString(path) or fail(`cannot read {path}`)
+end
+
+local function section(text: string, header: string): string
+  local first = string.find(text, header, 1, true) or fail(`missing {header} section`)
+  local beginning = first + #header
+  local nextHeader = string.find(text, '\n[', beginning, true)
+  return string.sub(text, beginning, if nextHeader then nextHeader - 1 else #text)
+end
+
+local function quotedField(contents: string, field: string): string?
+  for line in string.gmatch(contents, '[^\r\n]+') do
+    local name, value = string.match(line, '^%s*([%w_]+)%s*=%s*"([^"]+)"%s*$')
+    if name == field then return value end
+  end
+  return nil
+end
+
+local function bareField(contents: string, field: string): string?
+  for line in string.gmatch(contents, '[^\r\n]+') do
+    local name, value = string.match(line, '^%s*([%w_]+)%s*=%s*([^%s#]+)')
+    if name == field then return value end
+  end
+  return nil
+end
+
+local function check(root: string): ()
+  local packageToml = read(fs.join(root, 'jess.toml'))
+  local modToml = read(fs.join(root, 'content', 'home', 'mod.toml'))
+  local packageFields = section(packageToml, '\n[package]\n')
+  local siteFields = section(modToml, '\n[package]\n')
+  local id = quotedField(packageFields, 'id') or fail('missing jess.toml package id')
+  local version = quotedField(packageFields, 'version') or fail('missing jess.toml package version')
+  local slug = quotedField(modToml, 'slug') or fail('missing mod.toml slug')
+
+  if quotedField(siteFields, 'format') ~= 'jpk' then
+    fail('mod.toml [package].format must be jpk')
+  end
+
+  if quotedField(siteFields, 'jess') ~= id then
+    fail(`mod.toml [package].jess does not match {id}`)
+  end
+
+  local marker = '[[releases]]'
+  local count = 0
+  local at = 1
+  while true do
+    local first = string.find(modToml, marker, at, true)
+    if not first then break end
+    local nextOne = string.find(modToml, marker, first + #marker, true)
+    local entry = string.sub(modToml, first + #marker, if nextOne then nextOne - 1 else #modToml)
+    if quotedField(entry, 'version') == version then
+      count += 1
+      if not string.match(bareField(entry, 'date') or '', '^%d%d%d%d%-%d%d%-%d%d$') then
+        fail(`release {version} requires an ISO date`)
+      end
+
+      if not quotedField(entry, 'summary') then
+        fail(`release {version} requires a summary`)
+      end
+      local explicitTag = quotedField(entry, 'tag')
+      local expectedTag = `{slug}-{version}`
+      if explicitTag and explicitTag ~= expectedTag then
+        fail(`release {version} tag must be {expectedTag}`)
+      end
+    end
+
+    if not nextOne then break end
+    at = nextOne
+  end
+
+  if count ~= 1 then
+    fail(`jess.toml version {version} needs exactly one [[releases]] entry in mod.toml (found {count})`)
+  end
+
+  print(`PASS: {id} {version}, site catalog, and tag {slug}-{version} agree`)
+  print('mod.lock is CI-owned; do not modify it for this pre-tag check')
+end
+
+if select('#', ...) > 1 then
+  fail('usage: jess run --trusted scripts/check_release_metadata.jsl [repository-root]')
+end
+
+check((... :: string?) or defaultRoot())

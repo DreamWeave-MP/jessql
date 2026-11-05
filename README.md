@@ -394,5 +394,12 @@ explicitly declare `--!strict`. The gate rejects missing directives, a
 partial package check, and **any** diagnostic; there is no legacy debt allowance.
 See [the strict type-checking contract](docs/STRICT-TYPING.md).
 
+**Before tagging a release**, also run
+`jess run --trusted scripts/check_release_metadata.jsl`: the version in
+`jess.toml` must already have its `[[releases]]` entry in
+`content/home/mod.toml`. StroggForge then writes the artifact metadata to
+`content/home/mod.lock` after publication. See the
+[0.2.0 release procedure](docs/RELEASE-0.2.0.md#stroggforge--mod-template-release-sequence).
+
 Offline verification, semantic WAL replay, backup and restore are documented in
 [Offline Verification and Backup](docs/OFFLINE-VERIFICATION-AND-BACKUP.md).

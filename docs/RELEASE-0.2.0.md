@@ -134,3 +134,42 @@ not independently establish that the hosted job enforces the local strict
 script. Confirm that separately at PR time. A maintainer should also verify
 code provenance and authority to distribute the current source under both
 licenses before publishing `jessql-0.2.0`.
+
+## StroggForge / Mod Template release sequence
+
+**The site release catalog is an input to publishing, not its output.** Keep the
+three version identities aligned *before* the release tag is pushed:
+
+| Identity | Required 0.2.0 value | Owner |
+| --- | --- | --- |
+| `jess.toml` `[package].version` | `0.2.0` | Source commit |
+| `content/home/mod.toml` `[[releases]].version` | `0.2.0` with date, summary and notes | Source commit |
+| Git tag | `jessql-0.2.0`, pointing at that same source commit | Releaser |
+| `content/home/mod.lock` | Recorded artifact metadata after tag publication | **CI only** |
+
+Execute from the repository root before tagging:
+
+```sh
+jess run --trusted scripts/check_release_metadata.jsl
+jess run --trusted scripts/check_strict.jsl
+jess package test .
+git diff --check
+```
+
+The first check rejects an absent or duplicated matching release entry,
+misaligned JPK identity, malformed release date, and mismatched explicit tag.
+It reads manifests only; it **does not** create releases, update `mod.lock`,
+or prove that GitHub Actions will publish successfully. Review the
+`0.2.0` entry's human-readable notes before tagging.
+
+Once the source and site validation are green on the default branch, create
+and push `jessql-0.2.0` from that exact commit. Let StroggForge record the
+archive and digest in `content/home/mod.lock`. Verify the GitHub release,
+site manifest, and `jess workspace sync` resolution after the tagged run.
+Never move an already published tag without explicitly handling the existing
+release and its consumers.
+
+**Why this gate exists:** the first 0.2.0 PR preparation updated
+`jess.toml` but failed to declare 0.2.0 in `content/home/mod.toml`. The older
+runbook incorrectly said to wait until after publication. This mismatch is a
+release-pipeline bug, not an intentional experimental-deployment restriction.

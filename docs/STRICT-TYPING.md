@@ -23,7 +23,7 @@ all of them, and fails on **any** diagnostic or nonzero checker exit status.
 The last command runs source and packaged-JPK behavioral tests, including the
 repository style suite; static checks are not a substitute for executing code.
 
-At the time of this pass, the package includes **79 JSL files** and the
+At the time of this pass, the package includes **80 JSL files** and the
 behavioral suite includes **274 tests in each of source and packaged mode**.
 These counts are observations, not hard-coded limits: newly added files must be
 covered automatically. The release script is itself included in the packaged JSL inventory
@@ -74,3 +74,14 @@ this new script.
 Successful `!strict` checking does **not** establish query correctness,
 physical power-loss durability, cross-platform behavior, or performance
 non-regression. Those require separate test and measurement gates.
+
+The separate source-to-site release metadata gate is:
+
+```sh
+jess run --trusted scripts/check_release_metadata.jsl
+```
+
+It checks that the release being built has a matching `[[releases]]` entry in
+`content/home/mod.toml`. It does not touch the CI-generated `mod.lock`.
+Run it alongside the strict gate before publishing a JPK release tag; see
+[0.2.0 release instructions](RELEASE-0.2.0.md#stroggforge--mod-template-release-sequence).
