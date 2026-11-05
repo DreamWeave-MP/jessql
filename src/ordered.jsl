@@ -1,0 +1,295 @@
+--!strict
+--!native
+-- AVL ordered indexes with numeric node handles in packed native buffers.
+-- Each node occupies 20 bytes (left, right, height, weight, subtree size);
+-- comparable values and encoded keys are kept in separate dense arrays.
+-- Handles are internal and never written to the WAL.
+export type Node = { value: string | number, encoded: string }
+export type Tree = {
+  data: buffer,
+  capacity: number,
+  nextNode: number,
+  free: { number },
+  values: { [number]: string | number },
+  keys: { [number]: string },
+  root: number,
+}
+
+local ordered = {}
+local NodeWidth = 20
+local InitialCapacity = 16
+local LeftOffset = 0
+local RightOffset = 4
+local HeightOffset = 8
+local WeightOffset = 12
+local SizeOffset = 16
+
+local function rank(value: string | number): number
+  return if type(value) == 'number' then 0 else 1
+end
+
+local function compare(first: string | number, second: string | number): number
+  local ra, rb = rank(first), rank(second)
+  if ra ~= rb then return if ra < rb then -1 else 1 end
+  if first == second then return 0 end
+  if type(first) == 'number' then return if first < (second :: number) then -1 else 1 end
+  return if (first :: string) < (second :: string) then -1 else 1
+end
+ordered.compare = compare
+
+local function read(tree: Tree, node: number, field: number): number
+  return if node == 0 then 0 else buffer.readu32(tree.data, (node - 1) * NodeWidth + field)
+end
+
+local function write(tree: Tree, node: number, field: number, value: number)
+  buffer.writeu32(tree.data, (node - 1) * NodeWidth + field, value)
+end
+
+local function newTree(): Tree
+  return { data = buffer.create(InitialCapacity * NodeWidth), capacity = InitialCapacity,
+    nextNode = 0, free = {}, values = {}, keys = {}, root = 0 }
+end
+
+local function create(tree: Tree, value: string | number, encoded: string): number
+  local free = tree.free
+  local node: number
+  if #free > 0 then
+    node = free[#free]
+    free[#free] = nil
+  else
+    node = tree.nextNode + 1
+    if node > tree.capacity then
+      local nextCapacity = tree.capacity * 2
+      local data = buffer.create(nextCapacity * NodeWidth)
+      buffer.copy(data, 0, tree.data, 0, tree.capacity * NodeWidth)
+      tree.data, tree.capacity = data, nextCapacity
+    end
+    tree.nextNode = node
+  end
+  tree.values[node], tree.keys[node] = value, encoded
+  write(tree, node, LeftOffset, 0)
+  write(tree, node, RightOffset, 0)
+  write(tree, node, HeightOffset, 1)
+  write(tree, node, WeightOffset, 1)
+  write(tree, node, SizeOffset, 1)
+  return node
+end
+
+local function release(tree: Tree, node: number)
+  tree.values[node], tree.keys[node] = nil, nil
+  tree.free[#tree.free + 1] = node
+end
+
+local function height(tree: Tree, node: number): number
+  return read(tree, node, HeightOffset)
+end
+
+local function cardinality(tree: Tree, node: number): number
+  return read(tree, node, SizeOffset)
+end
+
+local function refresh(tree: Tree, node: number)
+  local left = read(tree, node, LeftOffset)
+  local right = read(tree, node, RightOffset)
+  write(tree, node, HeightOffset, math.max(height(tree, left), height(tree, right)) + 1)
+  write(tree, node, SizeOffset, cardinality(tree, left) + cardinality(tree, right)
+    + read(tree, node, WeightOffset))
+end
+
+local function rotateRight(tree: Tree, node: number): number
+  local pivot = read(tree, node, LeftOffset)
+  write(tree, node, LeftOffset, read(tree, pivot, RightOffset))
+  write(tree, pivot, RightOffset, node)
+  refresh(tree, node)
+  refresh(tree, pivot)
+  return pivot
+end
+
+local function rotateLeft(tree: Tree, node: number): number
+  local pivot = read(tree, node, RightOffset)
+  write(tree, node, RightOffset, read(tree, pivot, LeftOffset))
+  write(tree, pivot, LeftOffset, node)
+  refresh(tree, node)
+  refresh(tree, pivot)
+  return pivot
+end
+
+local function balance(tree: Tree, node: number): number
+  -- Refresh height/weight once: the old path read both children twice
+  -- (inside refresh and again to compute the balance factor).
+  local left = read(tree, node, LeftOffset)
+  local right = read(tree, node, RightOffset)
+  local leftHeight = height(tree, left)
+  local rightHeight = height(tree, right)
+  write(tree, node, HeightOffset, math.max(leftHeight, rightHeight) + 1)
+  write(tree, node, SizeOffset, cardinality(tree, left) + cardinality(tree, right)
+    + read(tree, node, WeightOffset))
+  local delta = leftHeight - rightHeight
+  if delta > 1 then
+    local child = left
+    if height(tree, read(tree, child, LeftOffset)) < height(tree, read(tree, child, RightOffset)) then
+      write(tree, node, LeftOffset, rotateLeft(tree, child))
+    end
+    return rotateRight(tree, node)
+  elseif delta < -1 then
+    local child = right
+    if height(tree, read(tree, child, RightOffset)) < height(tree, read(tree, child, LeftOffset)) then
+      write(tree, node, RightOffset, rotateRight(tree, child))
+    end
+    return rotateLeft(tree, node)
+  end
+  return node
+end
+
+local function insert(tree: Tree, node: number, value: string | number, encoded: string): number
+  if node == 0 then return create(tree, value, encoded) end
+  local cmp = compare(value, tree.values[node])
+  if cmp < 0 then
+    write(tree, node, LeftOffset, insert(tree, read(tree, node, LeftOffset), value, encoded))
+  elseif cmp > 0 then
+    write(tree, node, RightOffset, insert(tree, read(tree, node, RightOffset), value, encoded))
+  else
+    return node
+  end
+  return balance(tree, node)
+end
+
+function ordered.insert(root: Tree?, value: string | number, encoded: string): Tree
+  local tree = root or newTree()
+  tree.root = insert(tree, tree.root, value, encoded)
+  return tree
+end
+
+local function adjust(tree: Tree, node: number, value: string | number, delta: number)
+  if node == 0 then error('jessql ordered: missing node during cardinality update', 2) end
+  local cmp = compare(value, tree.values[node])
+  if cmp < 0 then
+    adjust(tree, read(tree, node, LeftOffset), value, delta)
+  elseif cmp > 0 then
+    adjust(tree, read(tree, node, RightOffset), value, delta)
+  else
+    local weight = read(tree, node, WeightOffset) + delta
+    if weight < 1 or weight > 4294967295 then error('jessql ordered: invalid node cardinality', 2) end
+    write(tree, node, WeightOffset, weight)
+  end
+  refresh(tree, node)
+end
+
+function ordered.adjust(root: Tree?, value: string | number, delta: number): Tree?
+  if not root then error('jessql ordered: missing node during cardinality update', 2) end
+  adjust(root, root.root, value, delta)
+  return root
+end
+
+local function prefix(tree: Tree, bound: string | number, inclusive: boolean): number
+  local count, node = 0, tree.root
+  while node ~= 0 do
+    local cmp = compare(tree.values[node], bound)
+    if cmp < 0 or (cmp == 0 and inclusive) then
+      count += cardinality(tree, read(tree, node, LeftOffset)) + read(tree, node, WeightOffset)
+      node = read(tree, node, RightOffset)
+    else
+      node = read(tree, node, LeftOffset)
+    end
+  end
+  return count
+end
+
+function ordered.countRange(root: Tree?, lower: (string | number)?, lowerStrict: boolean,
+    upper: (string | number)?, upperStrict: boolean): number
+  if not root then return 0 end
+  local aboveLower = if lower then prefix(root, lower, lowerStrict) else 0
+  local belowUpper = if upper then prefix(root, upper, not upperStrict)
+    else cardinality(root, root.root)
+  return math.max(0, belowUpper - aboveLower)
+end
+
+local function popMin(tree: Tree, node: number): (number, number)
+  local left = read(tree, node, LeftOffset)
+  if left == 0 then return read(tree, node, RightOffset), node end
+  local child, minimum = popMin(tree, left)
+  write(tree, node, LeftOffset, child)
+  return balance(tree, node), minimum
+end
+
+local function remove(tree: Tree, node: number, value: string | number): number
+  if node == 0 then return 0 end
+  local cmp = compare(value, tree.values[node])
+  if cmp < 0 then
+    write(tree, node, LeftOffset, remove(tree, read(tree, node, LeftOffset), value))
+  elseif cmp > 0 then
+    write(tree, node, RightOffset, remove(tree, read(tree, node, RightOffset), value))
+  else
+    local left = read(tree, node, LeftOffset)
+    local right = read(tree, node, RightOffset)
+    if left == 0 or right == 0 then
+      release(tree, node)
+      return if left ~= 0 then left else right
+    end
+    local nextRight, successor = popMin(tree, right)
+    write(tree, successor, LeftOffset, left)
+    write(tree, successor, RightOffset, nextRight)
+    release(tree, node)
+    return balance(tree, successor)
+  end
+  return balance(tree, node)
+end
+
+function ordered.remove(root: Tree?, value: string | number): Tree?
+  if not root then return nil end
+  root.root = remove(root, root.root, value)
+  return root
+end
+
+function ordered.iteratePairs(root: Tree?, desc: boolean, lower: (string | number)?, lowerStrict: boolean,
+    upper: (string | number)?, upperStrict: boolean): () -> ((string | number)?, string?)
+  if not root then return function(): ((string | number)?, string?) return nil, nil end end
+  local tree = root
+  local stack: { number } = {}
+  local function below(value: string | number): boolean
+    if not lower then return false end
+    local cmp = compare(value, lower)
+    return cmp < 0 or (cmp == 0 and lowerStrict)
+  end
+
+  local function above(value: string | number): boolean
+    if not upper then return false end
+    local cmp = compare(value, upper)
+    return cmp > 0 or (cmp == 0 and upperStrict)
+  end
+
+  local function advance(start: number)
+    local node = start
+    while node ~= 0 do
+      local value = tree.values[node]
+      if below(value) then node = read(tree, node, RightOffset)
+      elseif above(value) then node = read(tree, node, LeftOffset)
+      else
+        stack[#stack + 1] = node
+        node = if desc then read(tree, node, RightOffset) else read(tree, node, LeftOffset)
+      end
+    end
+  end
+
+  advance(tree.root)
+  return function(): ((string | number)?, string?)
+    local top = #stack
+    if top == 0 then return nil, nil end
+    local node = stack[top]
+    stack[top] = nil
+    advance(if desc then read(tree, node, LeftOffset) else read(tree, node, RightOffset))
+    return tree.values[node], tree.keys[node]
+  end
+end
+
+-- Preserve the original public iterator for callers expecting node records.
+function ordered.iterate(root: Tree?, desc: boolean, lower: (string | number)?, lowerStrict: boolean,
+    upper: (string | number)?, upperStrict: boolean): () -> Node?
+  local nextPair = ordered.iteratePairs(root, desc, lower, lowerStrict, upper, upperStrict)
+  return function(): Node?
+    local value, encoded = nextPair()
+    if value == nil then return nil end
+    return { value = value, encoded = encoded :: string }
+  end
+end
+return ordered

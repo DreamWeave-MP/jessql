@@ -1,0 +1,104 @@
+--!strict
+-- Compare per-statement SQL with batched SQL and typed transactions.
+-- Buffered writes only; no sync barrier or durable throughput claims.
+local sql = require('@jessql')
+local fs = require('@dream/fs')
+
+local requested = tonumber((...)) or 4000
+local Batch = 20
+local total = math.max(Batch, math.floor(requested / Batch) * Batch)
+local root = fs.join(assert((fs.cwd())), '.jessql-bulk-bench')
+
+local function path(kind: string): string
+  return root .. '-' .. kind .. '.wal'
+end
+
+local function cleanup(name: string)
+  fs.remove(path(name))
+  fs.remove(path(name) .. '.lock')
+end
+
+local function create(name: string)
+  cleanup(name)
+  local db = sql.open(path(name))
+  db:createTable('events', { 'id', 'bucket', 'attempts' }, 'id')
+  return db
+end
+
+local one = create('single')
+local started = os.clock()
+for id = 1, total do
+  assert(one:exec('INSERT INTO events (id, bucket, attempts) VALUES (?, ?, ?)', {
+    id, id % 16, 0,
+  }) == 1)
+end
+local singleElapsed = os.clock() - started
+assert(one:query('SELECT COUNT(*) AS n FROM events').rows[1].n == total)
+one:close()
+
+local batch = create('sql-batch')
+local groups: { string } = {}
+for _ = 1, Batch do groups[#groups + 1] = '(?, ?, ?)' end
+local statement = batch:prepareExec('INSERT INTO events (id, bucket, attempts) VALUES ' .. table.concat(groups, ','))
+started = os.clock()
+for first = 1, total, Batch do
+  local params: { unknown } = {}
+  for id = first, first + Batch - 1 do
+    params[#params + 1] = id
+    params[#params + 1] = id % 16
+    params[#params + 1] = 0
+  end
+  assert(statement.run(params) == Batch)
+end
+local batchElapsed = os.clock() - started
+assert(batch:query('SELECT COUNT(*) AS n FROM events').rows[1].n == total)
+batch:createIndex('events', 'bucket')
+
+local typed = create('typed')
+started = os.clock()
+for first = 1, total, Batch do
+  typed:transaction(function(tx)
+    for id = first, first + Batch - 1 do
+      tx:insert('events', { id = id, bucket = id % 16, attempts = 0 })
+    end
+  end)
+end
+local typedElapsed = os.clock() - started
+assert(typed:query('SELECT COUNT(*) AS n FROM events').rows[1].n == total)
+typed:createIndex('events', 'bucket')
+
+started = os.clock()
+for group = 0, 15 do
+  assert(batch:exec('UPDATE events SET attempts = attempts + 1 WHERE bucket = ?', { group }) == total / 16)
+end
+local indexedElapsed = os.clock() - started
+assert(batch:query('SELECT SUM(attempts) AS n FROM events').rows[1].n == total)
+
+started = os.clock()
+for group = 0, 15 do
+  typed:transaction(function(tx)
+    for id = 1, total do
+      if id % 16 == group then
+        assert(tx:update('events', id, { attempts = 1 }))
+      end
+    end
+  end)
+end
+local typedUpdateElapsed = os.clock() - started
+assert(typed:query('SELECT SUM(attempts) AS n FROM events').rows[1].n == total)
+
+batch:close()
+typed:close()
+local reopened = sql.open(path('sql-batch'))
+assert(reopened:query('SELECT COUNT(*) AS n FROM events').rows[1].n == total)
+assert(reopened:query('SELECT SUM(attempts) AS n FROM events').rows[1].n == total)
+reopened:close()
+
+print(string.format('rows=%d insert_batch=%d buffered=true', total, Batch))
+print(string.format('insert_individual_sql=%.4fs insert_batched_prepared_sql=%.4fs insert_batched_typed=%.4fs',
+  singleElapsed, batchElapsed, typedElapsed))
+print(string.format('indexed_sql_update=%.4fs typed_known_primary_keys=%.4fs',
+  indexedElapsed, typedUpdateElapsed))
+cleanup('single')
+cleanup('sql-batch')
+cleanup('typed')

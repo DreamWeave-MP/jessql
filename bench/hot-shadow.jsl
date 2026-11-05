@@ -1,0 +1,75 @@
+--!strict
+--!native
+-- Hot-heavy composite cold-index benchmark. Run prepare once; read in separate
+-- processes against identical files and compare checksums before/after code.
+local sql = require('@jessql')
+local fs = require('@dream/fs')
+
+local mode = arg[1] or 'read'
+local coldSize = tonumber(arg[2]) or 12000
+local hotSize = tonumber(arg[3]) or 12000
+local queries = tonumber(arg[4]) or 250
+local base = arg[5] or '.jessql-hot-shadow-bench'
+local snapshot = base .. '.pages'
+local sidecar = base .. '.idx'
+local wal = base .. '.wal'
+local Rooms = 64
+
+if mode == 'cleanup' or mode == 'prepare' then
+  for _, path in { snapshot, sidecar, wal, wal .. '.lock' } do fs.remove(path) end
+  if mode == 'cleanup' then print('cleaned'); return end
+  local id = 0
+  sql.paged.create(snapshot, { 'id', 'room', 'stream', 'body' }, 'id', function()
+    id += 1
+    if id > coldSize then return nil end
+
+    return { id = id, room = 'room-' .. tostring(id % Rooms), stream = id * 4,
+      body = 'cold:' .. tostring(id) }
+  end)
+  sql.secondary.create(sidecar, snapshot, 'room', 'stream', { format = 'compact', runRows = 1024 })
+  local db = sql.hybrid.open(wal, snapshot, 'events', { rowLayout = 'packed' })
+  local added = 0
+  while added < hotSize do
+    db:transaction(function(tx)
+      for _ = 1, math.min(256, hotSize - added) do
+        added += 1
+        local key = coldSize + added
+        tx:insert({ id = key, room = 'room-' .. tostring(key % Rooms),
+          stream = key * 4, body = 'hot:' .. tostring(key) })
+      end
+    end)
+  end
+
+  db:transaction(function(tx)
+    for key = 1, math.min(80, coldSize) do
+      if key % 3 == 0 then tx:delete(key)
+      else tx:upsert({ id = key, room = 'room-' .. tostring((key + 1) % Rooms),
+        stream = key * 4 + 1, body = 'moved' }) end
+    end
+  end)
+  db:close()
+  print('prepared', coldSize, hotSize)
+  return
+end
+
+if mode ~= 'read' then error('expected prepare, read or cleanup') end
+local started = os.clock()
+local db = sql.hybrid.open(wal, snapshot, 'events', {
+  rowLayout = 'packed', cachePages = 2, secondaryIndexPath = sidecar,
+})
+local opened = os.clock() - started
+started = os.clock()
+local checksum, nrows = 0, 0
+for query = 1, queries do
+  local room = 'room-' .. tostring((query * 13) % Rooms)
+  local cursor = math.floor((coldSize + hotSize) * 4 * ((query * 19) % 11) / 11)
+  local rows = db:query('SELECT id, stream FROM events WHERE room = ? AND stream >= ? ORDER BY stream LIMIT 16',
+    { room, cursor }).rows
+  for _, row in rows do
+    checksum += (row.id :: number) + (row.stream :: number)
+    nrows += 1
+  end
+end
+print('read', 'open_cpu_s', opened, 'query_cpu_s', os.clock() - started,
+  'rows', nrows, 'checksum', checksum)
+db:close()

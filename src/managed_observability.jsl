@@ -1,0 +1,99 @@
+--!strict
+-- In-memory, bounded, pull-only observations. Never participates in WAL
+-- acknowledgment or publication, and never invokes external code implicitly.
+export type Event = { sequence: number, kind: string, epoch: number, detail: string? }
+export type Batch = { version: number, cursor: number, dropped: number, events: { Event } }
+export type Delivery = { version: number, ok: boolean, cursor: number, error: string? }
+export type Journal = {
+  record: (self: Journal, kind: string, epoch: number, detail: string?) -> (),
+  read: (self: Journal, after: number?) -> Batch,
+}
+local observability = {}
+
+function observability.new(capacity: number): Journal
+  if capacity % 1 ~= 0 or capacity < 1 or capacity > 4096 then
+    error('jessql observability: invalid capacity', 2)
+  end
+  local events: { Event } = {}
+  local nextSequence = 0
+  local journal = {} :: Journal
+
+  function journal.record(_self: Journal, kind: string, epoch: number, detail: string?)
+    nextSequence += 1
+    -- No arbitrary application callbacks, event bus, or I/O in this path.
+    events[(nextSequence - 1) % capacity + 1] = {
+      sequence = nextSequence, kind = kind, epoch = epoch, detail = detail,
+    }
+  end
+
+  function journal.read(_self: Journal, after: number?): Batch
+    local cursor = after or 0
+    if cursor ~= cursor or cursor % 1 ~= 0 or cursor < 0
+      or cursor > nextSequence then error('jessql observability: invalid cursor', 2) end
+    local first = math.max(1, nextSequence - capacity + 1)
+    local missed = math.max(0, first - cursor - 1)
+    local result: { Event } = {}
+    for sequence = math.max(first, cursor + 1), nextSequence do
+      local item = events[(sequence - 1) % capacity + 1]
+      -- Copy out: no consumer can mutate the internal circular buffer.
+      result[#result + 1] = { sequence = item.sequence, kind = item.kind,
+        epoch = item.epoch, detail = item.detail }
+    end
+    return { version = 1, cursor = nextSequence, dropped = missed, events = result }
+  end
+  return journal
+end
+
+-- Optional app/mod adapter: the HOST explicitly requests delivery, outside
+-- all database transaction or publication call stacks. A failing sink cannot
+-- alter database state. The returned cursor advances only for delivered events.
+local function isCounter(value: unknown): boolean
+  return type(value) == 'number' and value == value and value >= 0 and value % 1 == 0
+end
+
+function observability.relay(batch: Batch, callback: (Event) -> ()): Delivery
+  if type(batch) ~= 'table' or batch.version ~= 1 or type(batch.events) ~= 'table'
+    or type(callback) ~= 'function' or not isCounter(batch.cursor)
+    or not isCounter(batch.dropped) then
+    error('jessql observability: unsupported extension protocol', 2)
+  end
+  -- Validate the complete batch before invoking the first application sink.
+  -- Otherwise malformed event streams could be partially acknowledged.
+  local previous = 0
+  local validated: { Event } = {}
+  for index, event in batch.events do
+    if type(index) ~= 'number' or index % 1 ~= 0 or index < 1 or index > #batch.events
+      or type(event) ~= 'table' or not isCounter(event.sequence)
+      or event.sequence < 1 or event.sequence > batch.cursor
+      or type(event.kind) ~= 'string' or type(event.epoch) ~= 'number'
+      or not isCounter(event.epoch) or event.epoch < 1
+      or (event.detail ~= nil and type(event.detail) ~= 'string')
+      or (previous ~= 0 and event.sequence ~= previous + 1) then
+      error('jessql observability: malformed v1 event batch', 2)
+    end
+    previous = event.sequence
+    -- Snapshot the v1 batch before invoking a sink: a mod callback may mutate
+    -- its original input while a delivery is in progress.
+    validated[index] = { sequence = event.sequence, kind = event.kind,
+      epoch = event.epoch, detail = event.detail }
+  end
+
+  if #batch.events > 0 and previous ~= batch.cursor then
+    error('jessql observability: malformed v1 event cursor', 2)
+  end
+  local cursor = batch.cursor
+  if #batch.events > 0 then cursor = batch.events[1].sequence - 1 end
+
+  for _, event in validated do
+    -- A consumer can fail; do not swallow its error or acknowledge undelivered events.
+    local ok, failure = pcall(function() callback({ sequence = event.sequence,
+      kind = event.kind, epoch = event.epoch, detail = event.detail }) end)
+
+    if not ok then return { version = 1, ok = false, cursor = cursor, error = tostring(failure) } end
+
+    cursor = event.sequence
+  end
+  return { version = 1, ok = true, cursor = batch.cursor, error = nil }
+end
+
+return observability

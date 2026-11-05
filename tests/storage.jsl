@@ -1,0 +1,1779 @@
+--!strict
+local sql = require('@jessql')
+local fs = require('@dream/fs')
+local test = require('@jess/test')
+local expect = test.expect
+local suite = test.new()
+
+local function fixture(name: string): string
+  local path = fs.join(assert((fs.cwd())), '.jessql-' .. name .. '.wal')
+  fs.remove(path)
+  fs.remove(path .. '.lock')
+  return path
+end
+
+local function clean(path: string)
+  fs.remove(path)
+  fs.remove(path .. '.lock')
+end
+
+suite.describe('native persistent store', function()
+  suite.it('round-trips tables and indexed primary-key reads through reopen', function()
+    local path = fixture('roundtrip')
+    local db = sql.open(path)
+    db:createTable('Messages', { 'id', 'room', 'body' }, 'id')
+    db:insert('messages', { id = 'm1', room = 'r', body = 'hello' })
+    db:insert('messages', { id = 'm2', room = 'r', body = 'world' })
+    expect(assert(db:get('messages', 'm2')).body).toBe('world')
+    expect(db:query('SELECT COUNT(*) AS n FROM messages').rows[1].n).toBe(2)
+    db:close()
+
+    local reopened = sql.open(path)
+    expect(assert(reopened:get('messages', 'm1')).body).toBe('hello')
+    local plan = reopened:prepare('SELECT body FROM messages WHERE id = ?')
+    expect(plan.run({ 'm2' }).rows[1].body).toBe('world')
+    expect(plan.explain().scans[1].table).toBe('messages')
+    reopened:close()
+    clean(path)
+  end)
+
+  suite.it('commits a batch once, rolls back failed callbacks and rejects duplicates', function()
+    local path = fixture('rollback')
+    local db = sql.open(path)
+    db:createTable('entries', { 'id', 'value' }, 'id')
+    db:transaction(function(tx)
+      tx:insert('entries', { id = 1, value = 10 })
+      tx:insert('entries', { id = 2, value = 20 })
+      expect(assert(tx:get('entries', 2)).value).toBe(20)
+    end)
+
+    -- A callback failure must not commit an earlier staged upsert.
+    local ok = pcall(function()
+      db:transaction(function(tx)
+        tx:upsert('entries', { id = 1, value = 100 })
+        tx:insert('entries', { id = 2, value = 200 })
+      end)
+    end)
+    expect(ok).toBe(false)
+    expect(assert(db:get('entries', 1)).value).toBe(10)
+    expect(db:query('SELECT SUM(value) AS n FROM entries').rows[1].n).toBe(30)
+    db:close()
+
+    local reopened = sql.open(path)
+    expect(assert(reopened:get('entries', 1)).value).toBe(10)
+    expect(assert(reopened:get('entries', 2)).value).toBe(20)
+    reopened:close()
+    clean(path)
+  end)
+
+  suite.it('updates, deletes and restores keys without duplicating rows', function()
+    local path = fixture('update')
+    local db = sql.open(path)
+    db:createTable('t', { 'key', 'value' }, 'key')
+    db:upsert('t', { key = 1, value = 'a' })
+    db:upsert('t', { key = 1, value = 'b' })
+    expect(db:delete('t', 1)).toBe(true)
+    expect(db:delete('t', 1)).toBe(false)
+    db:insert('t', { key = 1, value = 'c' })
+    expect(db:query('SELECT COUNT(*) AS n FROM t').rows[1].n).toBe(1)
+    expect(db:query('SELECT value FROM t').rows[1].value).toBe('c')
+    db:checkpoint()
+    db:close()
+
+    local reopened = sql.open(path)
+    expect(assert(reopened:get('t', 1)).value).toBe('c')
+    reopened:close()
+    clean(path)
+  end)
+
+  suite.it('recovers incomplete appended frames without accepting them', function()
+    local path = fixture('tail')
+    local db = sql.open(path)
+    db:createTable('t', { 'id' }, 'id')
+    db:insert('t', { id = 'acknowledged' })
+    db:close()
+    assert((fs.writeFile(path, string.char(0x20, 0, 0), { append = true })))
+    -- Strict recovery deliberately raises on a partial final record.
+    local strictOk = pcall(function() sql.open(path, { recoverTail = false }) end)
+    expect(strictOk).toBe(false)
+
+    local recovered = sql.open(path)
+    expect(recovered:query('SELECT COUNT(*) AS n FROM t').rows[1].n).toBe(1)
+    recovered:insert('t', { id = 'new' })
+    recovered:close()
+    local again = sql.open(path)
+    expect(again:query('SELECT COUNT(*) AS n FROM t').rows[1].n).toBe(2)
+    again:close()
+    clean(path)
+  end)
+
+  suite.it('rejects corrupted committed records instead of silently discarding data', function()
+    local path = fixture('corrupt')
+    local db = sql.open(path)
+    db:createTable('t', { 'id' }, 'id')
+    db:insert('t', { id = 1 })
+    db:close()
+    local contents = assert((fs.readFileString(path)))
+    -- The last byte is in a complete CRC-protected record.
+    assert((fs.writeFile(path, string.char(0), { offset = #contents - 1 })))
+    -- A bad checksum must fail to reopen rather than hide corruption.
+    local ok = pcall(function() sql.open(path) end)
+    expect(ok).toBe(false)
+    clean(path)
+  end)
+
+  suite.it('indexes secondary keys across updates, deletions, joins and reopen', function()
+    local path = fixture('indexes')
+    local db = sql.open(path)
+    db:transaction(function(tx)
+      tx:createTable('users', { 'id', 'team', 'name' }, 'id')
+      tx:createTable('teams', { 'code', 'title' }, 'code')
+      tx:insert('users', { id = 1, team = 'a', name = 'one' })
+      tx:insert('users', { id = 2, team = 'b', name = 'two' })
+      tx:insert('users', { id = 3, team = 'a', name = 'three' })
+      tx:insert('teams', { code = 'a', title = 'Alpha' })
+      tx:insert('teams', { code = 'b', title = 'Beta' })
+      tx:createIndex('users', 'team')
+    end)
+
+    local byTeam = db:prepare('SELECT id FROM users WHERE team = ? ORDER BY id')
+    expect(#byTeam.run({ 'a' }).rows).toBe(2)
+    local join = db:query([[SELECT teams.title, users.name FROM teams
+      INNER JOIN users ON users.team = teams.code ORDER BY users.id]])
+    expect(#join.rows).toBe(3)
+    expect(join.rows[1].name).toBe('one')
+    db:upsert('users', { id = 3, team = 'b', name = 'changed' })
+    expect(#byTeam.run({ 'a' }).rows).toBe(1)
+    expect(#byTeam.run({ 'b' }).rows).toBe(2)
+    db:delete('users', 1)
+    expect(#byTeam.run({ 'a' }).rows).toBe(0)
+
+    db:checkpoint()
+    db:close()
+    local reopened = sql.open(path)
+    expect(#reopened:query("SELECT id FROM users WHERE team = 'b'").rows).toBe(2)
+    expect(reopened:query('SELECT COUNT(*) AS n FROM users').rows[1].n).toBe(2)
+    reopened:insert('users', { id = 4, team = 'a', name = 'new' })
+    expect(#reopened:query("SELECT id FROM users WHERE team = 'a'").rows).toBe(1)
+    reopened:close()
+    clean(path)
+  end)
+
+  suite.it('rejects unsupported row values and reuses the database after a failed commit', function()
+    local path = fixture('validation')
+    local db = sql.open(path, { maxFrameBytes = 1024 })
+    db:createTable('data', { 'id', 'value' }, 'id')
+    -- Unsupported nested values are refused before touching the WAL.
+    local nestedOk = pcall(function() db:insert('data', { id = 1, value = { nested = true } }) end)
+    expect(nestedOk).toBe(false)
+    -- Invalid UTF-8 must never be written as malformed JSON.
+    local utf8Ok = pcall(function() db:insert('data', { id = 1, value = string.char(255) }) end)
+    expect(utf8Ok).toBe(false)
+    -- An oversized record is rejected before append, leaving the next sequence valid.
+    local largeOk = pcall(function() db:insert('data', { id = 1, value = string.rep('x', 2000) }) end)
+    expect(largeOk).toBe(false)
+    db:insert('data', { id = 1, value = 'valid' })
+    db:close()
+    local reopened = sql.open(path, { maxFrameBytes = 1024 })
+    expect(assert(reopened:get('data', 1)).value).toBe('valid')
+    reopened:close()
+    clean(path)
+  end)
+
+  suite.it('compacts a many-row table without quadratic checkpoint work', function()
+    local path = fixture('compaction')
+    local db = sql.open(path, { maxFrameBytes = 1024 })
+    db:createTable('items', { 'id', 'bucket' }, 'id')
+    for start = 1, 300, 8 do
+      db:transaction(function(tx)
+        for id = start, math.min(start + 7, 300) do
+          tx:insert('items', { id = id, bucket = id % 7 })
+        end
+      end)
+    end
+    db:createIndex('items', 'bucket')
+    for id = 1, 100 do db:delete('items', id) end
+    db:checkpoint()
+    db:close()
+    local reopened = sql.open(path, { maxFrameBytes = 1024 })
+    expect(reopened:query('SELECT COUNT(*) AS n FROM items').rows[1].n).toBe(200)
+    expect(reopened:query('SELECT COUNT(*) AS n FROM items WHERE bucket = 0').rows[1].n).toBe(28)
+    reopened:close()
+    clean(path)
+  end)
+
+  suite.it('matches a reference model through repeated commits and checkpoints', function()
+    local path = fixture('model')
+    local db = sql.open(path, { maxFrameBytes = 4096 })
+    db:createTable('records', { 'id', 'team', 'label' }, 'id')
+    db:createIndex('records', 'team')
+    local reference: { [number]: { id: number, team: string, label: string } } = {}
+
+    for cycle = 1, 12 do
+      db:transaction(function(tx)
+        for step = 1, 30 do
+          local id = (cycle * 17 + step * 11) % 71
+          if step % 6 == 0 then
+            tx:delete('records', id)
+            reference[id] = nil
+          else
+            local row = { id = id, team = 't' .. tostring(id % 5), label = `v{cycle}-{step}` }
+            tx:upsert('records', row)
+            reference[id] = row
+          end
+        end
+      end)
+
+      if cycle % 3 == 0 then db:checkpoint() end
+      db:close()
+      db = sql.open(path, { maxFrameBytes = 4096 })
+      local count, teams = 0, { 0, 0, 0, 0, 0 }
+      for id, row in reference do
+        count += 1
+        teams[id % 5 + 1] += 1
+        expect(assert(db:get('records', id)).label).toBe(row.label)
+      end
+      expect(db:query('SELECT COUNT(*) AS n FROM records').rows[1].n).toBe(count)
+      for team = 0, 4 do
+        local found = db:query('SELECT COUNT(*) AS n FROM records WHERE team = ?', { 't' .. tostring(team) })
+        expect(found.rows[1].n).toBe(teams[team + 1])
+      end
+    end
+    db:close()
+    clean(path)
+  end)
+
+  suite.it('round-trips NUL-containing keys and fractional numeric cells', function()
+    local path = fixture('scalars')
+    local db = sql.open(path)
+    db:createTable('t', { 'id', 'value' }, 'id')
+    db:insert('t', { id = 'a\0b', value = 1 / 3 })
+    db:close()
+    db = sql.open(path)
+    expect(assert(db:get('t', 'a\0b')).value).toBe(1 / 3)
+    db:close()
+    clean(path)
+  end)
+
+  suite.it('evolves nullable schemas and updates only selected fields across restart', function()
+    local path = fixture('schema-evolution')
+    local db = sql.open(path)
+    db:createTable('users', { 'id', 'name' }, 'id')
+    db:insert('users', { id = 1, name = 'old' })
+    db:transaction(function(tx)
+      tx:addColumn('users', 'team')
+      tx:addColumn('users', 'description')
+      expect(tx:update('users', 1, { team = 'alpha', description = 'intro' })).toBe(true)
+      expect(tx:update('users', 99, { team = 'no' })).toBe(false)
+      expect(assert(tx:get('users', 1)).name).toBe('old')
+      expect(assert(tx:get('users', 1)).team).toBe('alpha')
+      tx:createIndex('users', 'team')
+    end)
+    db:insert('users', { id = 2, name = 'new' })
+    expect(db:update('users', 1, { name = 'updated' }, { 'description' })).toBe(true)
+    expect(assert(db:get('users', 1)).description).toBe(nil)
+    local query = db:query("SELECT name FROM users WHERE team = 'alpha'")
+    expect(#query.rows).toBe(1)
+    expect(query.rows[1].name).toBe('updated')
+    expect(assert(db:get('users', 2)).team).toBe(nil)
+    expect(#db:query('SELECT team FROM users').rows).toBe(2)
+
+    -- Duplicate addColumn must throw and leave the original schema intact.
+    local duplicate = pcall(function() db:addColumn('users', 'team') end)
+    expect(duplicate).toBe(false)
+    -- update cannot change a primary key.
+    local forbidden = pcall(function() db:update('users', 1, { id = 8 }) end)
+    expect(forbidden).toBe(false)
+    -- update cannot unset a primary key.
+    local notPresent = pcall(function() db:update('users', 1, {}, { 'id' }) end)
+    expect(notPresent).toBe(false)
+    expect(assert(db:get('users', 1)).id).toBe(1)
+
+    db:checkpoint()
+    db:close()
+    db = sql.open(path)
+    expect(assert(db:get('users', 1)).team).toBe('alpha')
+    expect(assert(db:get('users', 1)).description).toBe(nil)
+    expect(assert(db:get('users', 2)).team).toBe(nil)
+    db:upsert('users', { id = 2, name = 'two', team = 'alpha' })
+    expect(#db:query("SELECT id FROM users WHERE team = 'alpha'").rows).toBe(2)
+    expect(#db:tables()[1].columns).toBe(4)
+    db:close()
+    clean(path)
+  end)
+
+  suite.it('counts indexed equality filters exactly and falls back safely', function()
+    local path = fixture('filtered-count')
+    local db = sql.open(path)
+    db:createTable('messages', { 'id', 'room', 'body' }, 'id')
+    db:createIndex('messages', 'room')
+    db:transaction(function(tx)
+      for id = 1, 180 do
+        tx:insert('messages', { id = id, room = 'r' .. tostring(id % 6), body = 'b' .. tostring(id % 4) })
+      end
+    end)
+    local byRoom = db:prepare('SELECT COUNT(*) AS n FROM messages WHERE room = ?')
+    expect(byRoom.explain().providerCount).toBe(true)
+    expect(byRoom.run({ 'r1' }).rows[1].n).toBe(30)
+    expect(byRoom.run({ 'missing' }).rows[1].n).toBe(0)
+    expect(db:query('SELECT COUNT(*) AS n FROM messages WHERE id = ?', { 42 }).rows[1].n).toBe(1)
+    expect(db:query('SELECT COUNT(*) AS n FROM messages WHERE id = ?', { '42' }).rows[1].n).toBe(0)
+    expect(db:query('SELECT COUNT(*) AS n FROM messages WHERE id = ?', { 999 }).rows[1].n).toBe(0)
+    expect(db:query('SELECT COUNT(*) AS n FROM messages WHERE room = ? AND body = ?', { 'r1', 'b1' }).rows[1].n).toBe(15)
+    expect(db:query('SELECT COUNT(*) AS n FROM messages WHERE room = ? AND id = ?', { 'r1', 42 }).rows[1].n).toBe(0)
+    expect(db:query('SELECT COUNT(*) AS n FROM messages WHERE room = ? AND id = ?', { 'r0', 42 }).rows[1].n).toBe(1)
+    -- Non-equality and OR predicates cannot use the filtered count fast path.
+    expect(db:prepare('SELECT COUNT(*) FROM messages WHERE id > ?').explain().providerCount).toBe(true)
+    expect(db:query('SELECT COUNT(*) AS n FROM messages WHERE id > ?', { 170 }).rows[1].n).toBe(10)
+    expect(db:prepare("SELECT COUNT(*) FROM messages WHERE room = 'r1' OR room = 'r2'").explain().providerCount).toBe(false)
+    expect(db:query("SELECT COUNT(*) AS n FROM messages WHERE room = 'r1' OR room = 'r2'").rows[1].n).toBe(60)
+    db:upsert('messages', { id = 1, room = 'r2', body = 'edited' })
+    db:delete('messages', 7)
+    expect(byRoom.run({ 'r1' }).rows[1].n).toBe(28)
+    expect(byRoom.run({ 'r2' }).rows[1].n).toBe(31)
+    db:checkpoint()
+    db:close()
+    db = sql.open(path)
+    expect(db:query("SELECT COUNT(*) AS n FROM messages WHERE room = 'r1'").rows[1].n).toBe(28)
+    db:close()
+    clean(path)
+  end)
+
+  suite.it('invalidates prepared plans on schema changes and after close', function()
+    local path = fixture('plans')
+    local db = sql.open(path)
+    db:createTable('t', { 'id', 'value' }, 'id')
+    local first = db:prepare('SELECT * FROM t')
+    db:insert('t', { id = 1, value = 'first' })
+    expect(first.run().rows[1].value).toBe('first')
+    db:addColumn('t', 'extra')
+    -- SELECT * was compiled against the old column set; it must never return a stale projection.
+    local invalid = pcall(function() first.run() end)
+    expect(invalid).toBe(false)
+    local nextPlan = db:prepare('SELECT * FROM t')
+    expect(#nextPlan.columns).toBe(3)
+    db:createIndex('t', 'extra')
+    -- Even an index-only schema change may alter a previously prepared join plan.
+    local stale = pcall(nextPlan.explain)
+    expect(stale).toBe(false)
+    local finalPlan = db:prepare('SELECT id FROM t')
+    db:close()
+    -- Closing the database invalidates all borrowed query plans.
+    local closed = pcall(function() finalPlan.run() end)
+    expect(closed).toBe(false)
+    clean(path)
+  end)
+
+  suite.it('bounds stale hash-index and row-order slots through sustained churn', function()
+    local path = fixture('churn')
+    local db = sql.open(path)
+    db:createTable('state', { 'id', 'group_id', 'value' }, 'id')
+    db:createIndex('state', 'group_id')
+    db:transaction(function(tx)
+      for id = 1, 300 do
+        tx:insert('state', { id = id, group_id = id % 7, value = id })
+      end
+    end)
+
+    for iteration = 1, 3000 do
+      local id = iteration % 300 + 1
+      db:update('state', id, { group_id = iteration % 7, value = iteration })
+    end
+
+    for id = 1, 260 do db:delete('state', id) end
+
+    local before = db:stats().state
+    expect(before.rows).toBe(40)
+    expect(before.keySlots <= 64 + before.rows * 2).toBe(true)
+    expect(before.indexKeys.group_id).toBe(40)
+    expect(before.indexSlots.group_id <= 7 * 64 + 2 * before.rows).toBe(true)
+    expect(db:query('SELECT COUNT(*) AS n FROM state').rows[1].n).toBe(40)
+    for id = 261, 300 do
+      local expected = assert(db:get('state', id))
+      local counted = db:query('SELECT COUNT(*) AS n FROM state WHERE group_id = ? AND id = ?', { expected.group_id, id })
+      expect(counted.rows[1].n).toBe(1)
+    end
+    db:checkpoint()
+    local compacted = db:stats().state
+    expect(compacted.keySlots).toBe(40)
+    expect(compacted.indexSlots.group_id).toBe(40)
+    db:close()
+    db = sql.open(path)
+    expect(db:stats().state.indexSlots.group_id).toBe(40)
+    db:close()
+    clean(path)
+  end)
+
+  suite.it('rolls back schema changes and supports a new table evolved within one transaction', function()
+    local path = fixture('schema-rollback')
+    local db = sql.open(path)
+    -- Deliberate callback failure rolls back schema and row writes.
+    local ok = pcall(function()
+      db:transaction(function(tx)
+        tx:createTable('failed', { 'id' }, 'id')
+        tx:addColumn('failed', 'extra')
+        tx:insert('failed', { id = 1, extra = 'x' })
+        error('rollback')
+      end)
+    end)
+    expect(ok).toBe(false)
+    expect(#db:tables()).toBe(0)
+    db:transaction(function(tx)
+      tx:createTable('good', { 'id' }, 'id')
+      tx:addColumn('good', 'extra')
+      tx:insert('good', { id = 1, extra = 'value' })
+      tx:update('good', 1, { extra = 'changed' })
+    end)
+    expect(assert(db:get('good', 1)).extra).toBe('changed')
+    db:close()
+    db = sql.open(path)
+    expect(#db:tables()[1].columns).toBe(2)
+    expect(assert(db:get('good', 1)).extra).toBe('changed')
+    db:close()
+    clean(path)
+  end)
+
+  suite.it('streams ordered numeric and nullable key ranges across mutation and checkpoint', function()
+    local path = fixture('ordered-ranges')
+    local db = sql.open(path)
+    db:createTable('events', { 'id', 'seq', 'room' }, 'id')
+    db:transaction(function(tx)
+      for id = 1, 400 do
+        tx:insert('events', { id = id, seq = if id % 67 == 0 then nil else 401 - id, room = 'a' })
+      end
+      tx:createOrderedIndex('events', 'seq')
+    end)
+
+    local function reference(query: string, params: { unknown }?)
+      local rows = db:query(query, params).rows
+      return rows
+    end
+
+    local ascending = reference('SELECT seq FROM events WHERE seq >= ? AND seq < ? ORDER BY seq LIMIT 7 OFFSET 3', { 210, 280 })
+    expect([for row in ascending => row.seq]).toEqual { 213, 214, 215, 216, 217, 218, 219 }
+    local descending = reference('SELECT seq FROM events WHERE seq > 0 ORDER BY seq DESC LIMIT 4')
+    expect([for row in descending => row.seq]).toEqual { 400, 399, 398, 397 }
+    local nullRows = reference('SELECT id FROM events WHERE seq IS NULL ORDER BY seq')
+    expect(#nullRows).toBe(5)
+    expect(#reference('SELECT id FROM events WHERE seq = ? ORDER BY seq', { 111 })).toBe(1)
+
+    -- Old primary-key entries and index postings must be removed on deletes.
+    db:delete('events', 200)
+    db:update('events', 201, { seq = 1000 })
+    db:update('events', 202, {}, { 'seq' })
+    expect(#reference('SELECT id FROM events WHERE seq > 999')).toBe(1)
+    expect(#reference('SELECT id FROM events WHERE seq IS NULL')).toBe(5)
+
+    db:checkpoint()
+    db:close()
+    db = sql.open(path)
+    expect([for row in reference('SELECT seq FROM events WHERE seq >= 210 AND seq < 280 ORDER BY seq LIMIT 7 OFFSET 3') => row.seq])
+      .toEqual { 213, 214, 215, 216, 217, 218, 219 }
+    expect(#reference('SELECT id FROM events WHERE seq > 999')).toBe(1)
+    db:close()
+    clean(path)
+  end)
+
+  suite.it('maintains ordered indexes through deterministic update/delete churn', function()
+    local path = fixture('ordered-churn')
+    local db = sql.open(path)
+    db:createTable('items', { 'id', 'value' }, 'id')
+    db:createOrderedIndex('items', 'value')
+    local reference: {[number]: number} = {}
+    for cycle = 1, 15 do
+      db:transaction(function(tx)
+        for step = 1, 45 do
+          local id = (cycle * 37 + step * 19) % 101
+          if step % 7 == 0 then
+            tx:delete('items', id)
+            reference[id] = nil
+          else
+            local value = (cycle * step + id) % 67
+            tx:upsert('items', { id = id, value = value })
+            reference[id] = value
+          end
+        end
+      end)
+
+      if cycle % 5 == 0 then db:checkpoint() end
+      local expected = {}
+      for id, value in reference do
+        if value >= 10 and value <= 40 then expected[#expected + 1] = value end
+      end
+
+      table.sort(expected)
+      local got = [for row in db:query('SELECT value FROM items WHERE value >= 10 AND value <= 40 ORDER BY value').rows => row.value]
+      expect(got).toEqual(expected)
+    end
+    db:close()
+    clean(path)
+  end)
+
+  suite.it('counts ordered numeric ranges exactly through duplicate-value churn', function()
+    local path = fixture('ordered-count')
+    local db = sql.open(path)
+    db:createTable('sample', { 'id', 'value' }, 'id')
+    db:createOrderedIndex('sample', 'value')
+    local reference = {}
+    for id = 1, 180 do
+      db:insert('sample', { id = id, value = if id % 19 == 0 then nil else id % 31 })
+      if id % 19 ~= 0 then reference[id] = id % 31 end
+    end
+
+    local function verify()
+      for low = -2, 31, 7 do
+        for high = low - 1, 35, 9 do
+          local expected = 0
+          for _, value in reference do
+            if value > low and value <= high then expected += 1 end
+          end
+          local count = db:query('SELECT COUNT(*) AS n FROM sample WHERE value > ? AND value <= ?', { low, high })
+          expect(count.rows[1].n).toBe(expected)
+        end
+      end
+    end
+
+    verify()
+    for id = 1, 70 do
+      if id % 5 == 0 then
+        db:delete('sample', id)
+        reference[id] = nil
+      else
+        local value = id % 4
+        db:update('sample', id, { value = value })
+        reference[id] = value
+      end
+    end
+    verify()
+    db:checkpoint()
+    db:close()
+    db = sql.open(path)
+    verify()
+    db:close()
+    clean(path)
+  end)
+
+  suite.it('executes parameterized INSERT UPDATE and DELETE using the same atomic journal', function()
+    local path = fixture('sql-dml')
+    local db = sql.open(path)
+    db:createTable('messages', { 'id', 'room', 'body' }, 'id')
+    db:createIndex('messages', 'room')
+    expect(db:exec("INSERT INTO messages (id, room, body) VALUES (1, 'one', ?)", { 'hi' })).toBe(1)
+    expect(db:exec('INSERT INTO messages (id, room, body) VALUES (?, ?, ?)', { 2, 'two', sql.NULL })).toBe(1)
+    expect(db:exec('UPDATE messages SET body = ?, room = ? WHERE id = ?', { 'updated', 'one', 2 })).toBe(1)
+    expect(assert(db:get('messages', 2)).body).toBe('updated')
+    expect(db:exec('UPDATE messages SET body = NULL WHERE id = 1')).toBe(1)
+    expect(assert(db:get('messages', 1)).body).toBeNil()
+    expect(db:exec('UPDATE messages SET body = 9 WHERE id = 999')).toBe(0)
+    expect(db:exec('DELETE FROM messages WHERE id = ?', { sql.NULL })).toBe(0)
+    expect(db:query("SELECT COUNT(*) AS n FROM messages WHERE room = 'one'").rows[1].n).toBe(2)
+    expect(db:exec('DELETE FROM messages WHERE id = ?', { 1 })).toBe(1)
+    expect(db:exec('DELETE FROM messages WHERE id = ?', { 1 })).toBe(0)
+    db:close()
+
+    local reopened = sql.open(path)
+    expect(reopened:get('messages', 1)).toBeNil()
+    expect(assert(reopened:get('messages', 2)).body).toBe('updated')
+    reopened:close()
+    clean(path)
+  end)
+
+  suite.it('reuses prepared mutation plans in batches and invalidates on schema evolution', function()
+    local path = fixture('prepared-dml')
+    local db = sql.open(path)
+    db:createTable('records', { 'id', 'value' }, 'id')
+    local insert = db:prepareExec('INSERT INTO records (id, value) VALUES (?, ?)')
+    local update = db:prepareExec('UPDATE records SET value = ? WHERE id = ?')
+    expect(insert.parameterCount).toBe(2)
+    db:transaction(function(tx)
+      for id = 1, 100 do insert.inTransaction(tx, { id, id * 2 }) end
+      for id = 1, 10 do update.inTransaction(tx, { id * 5, id }) end
+      expect(assert(tx:get('records', 9)).value).toBe(45)
+    end)
+    expect(db:query('SELECT COUNT(*) AS n FROM records').rows[1].n).toBe(100)
+    expect(update.run({ 111, 3 })).toBe(1)
+    db:addColumn('records', 'extra')
+    -- The prepared INSERT is invalidated because addColumn changed its schema.
+    expect((pcall(function() insert.run({ 101, 101 }) end))).toBe(false)
+    -- The prepared UPDATE likewise refuses to execute against an old schema.
+    expect((pcall(function() update.run({ 1, 1 }) end))).toBe(false)
+    db:exec('INSERT INTO records (id, value, extra) VALUES (?, ?, ?)', { 101, 5, 'a' })
+    expect(assert(db:get('records', 101)).extra).toBe('a')
+    db:close()
+    clean(path)
+  end)
+
+  suite.it('rejects injected SQL, unsafe DML predicates, duplicates and incomplete binds', function()
+    local path = fixture('dml-security')
+    local db = sql.open(path)
+    db:createTable('a', { 'id', 'value' }, 'id')
+    db:exec('INSERT INTO a (id, value) VALUES (?, ?)', { 1, 'initial' })
+    local unsupported = {
+      'DELETE FROM a',
+      'DELETE FROM a WHERE value = ?',
+      'UPDATE a SET value = 99 WHERE value = 1',
+      'UPDATE a SET value = 1 WHERE id > 0',
+      'UPDATE a SET id = 5 WHERE id = 1',
+      'UPDATE a SET missing = 3 WHERE id = 999',
+      'UPDATE a SET id = 5 WHERE id = 999',
+      'INSERT INTO a (id, id) VALUES (2, 3)',
+      'INSERT INTO a (id, value) VALUES (2, 3); DELETE FROM a WHERE id = 1',
+      'INSERT INTO a (id, value) VALUES (2, 3 + 4)',
+    }
+
+    for _, statement in unsupported do
+      -- Each unsupported or unsafe SQL mutation must reject before writing.
+      expect((pcall(function() db:exec(statement, { 2 }) end))).toBe(false)
+    end
+    -- Missing parameters must not silently bind as SQL NULL.
+    expect((pcall(function() db:exec('INSERT INTO a (id, value) VALUES (?, ?)', { 2 }) end))).toBe(false)
+    -- Duplicate primary-key inserts must fail without replacing the stored row.
+    expect((pcall(function() db:exec('INSERT INTO a (id, value) VALUES (?, ?)', { 1, 'dup' }) end))).toBe(false)
+    local valid = db:exec('INSERT INTO a (id, value) VALUES (?, ?)', { 2, 'safe; DROP TABLE a' })
+    expect(valid).toBe(1)
+    expect(assert(db:get('a', 1)).value).toBe('initial')
+    expect(assert(db:get('a', 2)).value).toBe('safe; DROP TABLE a')
+    db:close()
+    clean(path)
+  end)
+
+  suite.it('seeks a composite room stream and preserves ordering through checkpoint/reopen', function()
+    local path = fixture('composite-stream')
+    local db = sql.open(path)
+    db:createTable('events', { 'id', 'room_id', 'stream_id', 'body' }, 'id')
+    db:transaction(function(tx)
+      for id = 1, 120 do
+        tx:insert('events', { id = id, room_id = if id % 3 == 0 then 'a' else 'b',
+          stream_id = 121 - id, body = 'body' })
+      end
+    end)
+    db:createOrderedIndex('events', 'stream_id')
+    local statement = 'SELECT stream_id FROM events WHERE room_id = ? AND stream_id >= ? AND stream_id < ? ORDER BY stream_id LIMIT 5'
+    local before = db:query(statement, { 'a', 25, 70 })
+    local expected: { number } = {}
+    for id = 1, 120 do
+      local seq = 121 - id
+      if id % 3 == 0 and seq >= 25 and seq < 70 then expected[#expected + 1] = seq end
+    end
+    table.sort(expected)
+    expect(#before.rows).toBe(5)
+    for index = 1, 5 do expect(before.rows[index].stream_id).toBe(expected[index]) end
+
+    db:createCompositeIndex('events', 'room_id', 'stream_id')
+    local query = db:prepare(statement)
+    local after = query.run({ 'a', 25, 70 })
+    expect(#after.rows).toBe(5)
+    for index = 1, 5 do expect(after.rows[index].stream_id).toBe(expected[index]) end
+    local desc = db:query('SELECT stream_id FROM events WHERE room_id = ? ORDER BY stream_id DESC LIMIT 3', { 'a' })
+    expect(desc.rows[1].stream_id).toBe(118)
+    expect(desc.rows[2].stream_id).toBe(115)
+    expect(desc.rows[3].stream_id).toBe(112)
+    expect(db:stats().events.compositePartitions['room_id:stream_id']).toBe(2)
+
+    db:checkpoint()
+    db:close()
+    db = sql.open(path)
+    expect(#db:query(statement, { 'a', 25, 70 }).rows).toBe(5)
+    expect(db:stats().events.compositePartitions['room_id:stream_id']).toBe(2)
+    -- Mutations move postings between partitions and remove empty partitions.
+    db:update('events', 3, { room_id = 'c', stream_id = 1 })
+    expect(db:query('SELECT COUNT(*) AS n FROM events WHERE room_id = ? AND stream_id >= ?', { 'c', 0 }).rows[1].n).toBe(1)
+    db:delete('events', 3)
+    expect(db:stats().events.compositePartitions['room_id:stream_id']).toBe(2)
+    db:close()
+    clean(path)
+  end)
+
+  suite.it('composite exact range counts match a model under repeated update/delete churn', function()
+    local path = fixture('composite-count')
+    local db = sql.open(path)
+    db:createTable('events', { 'id', 'room', 'sequence' }, 'id')
+    db:createCompositeIndex('events', 'room', 'sequence')
+    local model: { [number]: { room: string, sequence: number } } = {}
+    for id = 1, 80 do
+      local room = if id % 2 == 0 then 'a' else 'b'
+      local seq = id % 11
+      model[id] = { room = room, sequence = seq }
+      db:insert('events', { id = id, room = room, sequence = seq })
+    end
+
+    local function verify()
+      for _, room in { 'a', 'b', 'missing' } do
+        for low = -2, 12, 3 do
+          local high = low + 6
+          local expected = 0
+          for _, data in model do
+            if data.room == room and data.sequence > low and data.sequence <= high then expected += 1 end
+          end
+          local actual = db:query('SELECT COUNT(*) AS n FROM events WHERE room = ? AND sequence > ? AND sequence <= ?', { room, low, high })
+          expect(actual.rows[1].n).toBe(expected)
+        end
+      end
+    end
+    verify()
+    for id = 1, 80 do
+      if id % 9 == 0 then
+        db:delete('events', id)
+        model[id] = nil
+      else
+        local room = if id % 5 == 0 then 'c' else if id % 2 == 0 then 'a' else 'b'
+        local seq = (id * 7) % 13
+        db:update('events', id, { room = room, sequence = seq })
+        model[id] = { room = room, sequence = seq }
+      end
+    end
+    verify()
+    db:checkpoint()
+    db:close()
+    db = sql.open(path)
+    verify()
+    db:close()
+    clean(path)
+  end)
+
+  suite.it('rejects invalid and duplicate composite indexes without corrupting schema', function()
+    local path = fixture('composite-errors')
+    local db = sql.open(path)
+    db:createTable('events', { 'id', 'room', 'sequence' }, 'id')
+    -- An index must contain two distinct schema columns.
+    expect((pcall(function() db:createCompositeIndex('events', 'room', 'room') end))).toBe(false)
+    -- An unknown prefix is never silently admitted.
+    expect((pcall(function() db:createCompositeIndex('events', 'missing', 'sequence') end))).toBe(false)
+    -- An unknown suffix is never silently admitted.
+    expect((pcall(function() db:createCompositeIndex('events', 'room', 'missing') end))).toBe(false)
+    -- Rollback must discard the pending schema operation.
+    local worked = pcall(function()
+      db:transaction(function(tx)
+        tx:createCompositeIndex('events', 'room', 'sequence')
+        error('discard proposed schema change')
+      end)
+    end)
+    expect(worked).toBe(false)
+    db:createCompositeIndex('events', 'room', 'sequence')
+    -- Duplicate index definitions fail without altering the existing index.
+    expect((pcall(function() db:createCompositeIndex('events', 'room', 'sequence') end))).toBe(false)
+    local old = db:prepare('SELECT id FROM events')
+    db:createCompositeIndex('events', 'sequence', 'room')
+    -- Schema changes invalidate prepared queries.
+    expect((pcall(function() old.run() end))).toBe(false)
+    db:close()
+    db = sql.open(path)
+    -- Journal replay must restore the duplicate-index guard.
+    expect((pcall(function() db:createCompositeIndex('events', 'room', 'sequence') end))).toBe(false)
+    db:close()
+    clean(path)
+  end)
+
+  suite.it('uses exact composite equality keys without leaking neighboring partitions', function()
+    local path = fixture('composite-equality')
+    local db = sql.open(path)
+    db:createTable('data', { 'id', 'room', 'sequence', 'tag' }, 'id')
+    db:createIndex('data', 'room')
+    db:transaction(function(tx)
+      for id = 1, 80 do
+        local room = if id % 2 == 0 then 'a' else 'a:extra'
+        tx:insert('data', { id = id, room = room, sequence = id % 10,
+          tag = if id % 3 == 0 then 'match' else 'other' })
+      end
+      tx:insert('data', { id = 81, room = 'a' }) -- SQL NULL suffix
+    end)
+
+    local exact = 'SELECT COUNT(*) AS n FROM data WHERE room = ? AND sequence = ?'
+    local residual = 'SELECT COUNT(*) AS n FROM data WHERE room = ? AND sequence = ? AND tag = ?'
+    local original = db:query(exact, { 'a', 4 }).rows[1].n :: number
+    db:createCompositeIndex('data', 'room', 'sequence')
+    expect(db:query(exact, { 'a', 4 }).rows[1].n).toBe(original)
+    expect(db:query(exact, { 'a:extra', 4 }).rows[1].n).toBe(0)
+    expect(db:query(exact, { 'missing', 4 }).rows[1].n).toBe(0)
+    expect(db:query(exact, { 'a', sql.NULL }).rows[1].n).toBe(0)
+    expect(db:query(residual, { 'a', 4, 'match' }).rows[1].n).toBe(2)
+    expect(db:query(residual, { 'a', 4, 'other' }).rows[1].n).toBe(6)
+
+    db:delete('data', 4)
+    expect(db:query(exact, { 'a', 4 }).rows[1].n).toBe(original - 1)
+    db:update('data', 14, { room = 'a:extra' })
+    expect(db:query(exact, { 'a', 4 }).rows[1].n).toBe(original - 2)
+    expect(db:query(exact, { 'a:extra', 4 }).rows[1].n).toBe(1)
+    db:checkpoint()
+    db:close()
+    db = sql.open(path)
+    expect(db:query(exact, { 'a', 4 }).rows[1].n).toBe(original - 2)
+    expect(db:query(exact, { 'a:extra', 4 }).rows[1].n).toBe(1)
+    db:close()
+    clean(path)
+  end)
+
+  suite.it('caches hot SELECT plans across binds and invalidates them on schema changes', function()
+    local path = fixture('query-cache')
+    local db = sql.open(path, { queryCacheEntries = 2 })
+    db:createTable('records', { 'id', 'value' }, 'id')
+    db:insert('records', { id = 1, value = 'a' })
+    db:insert('records', { id = 2, value = 'b' })
+    local statement = 'SELECT value FROM records WHERE id = ?'
+    expect(db:query(statement, { 1 }).rows[1].value).toBe('a')
+    expect(db:query(statement, { 2 }).rows[1].value).toBe('b')
+    local stats = db:cacheStats()
+    expect(stats.entries).toBe(1)
+    expect(stats.hits).toBe(1)
+    expect(stats.misses).toBe(1)
+
+    db:update('records', 1, { value = 'changed' })
+    expect(db:query(statement, { 1 }).rows[1].value).toBe('changed')
+    expect(db:cacheStats().hits).toBe(2)
+
+    db:query('SELECT id FROM records')
+    db:query('SELECT COUNT(*) AS n FROM records')
+    expect(db:cacheStats().entries).toBe(2)
+    expect(db:cacheStats().evictions).toBe(1)
+    db:query(statement, { 2 }) -- evicted statement must compile again
+    expect(db:cacheStats().misses).toBe(4)
+
+    db:addColumn('records', 'extra')
+    expect(db:cacheStats().entries).toBe(0)
+    local projection = db:query('SELECT * FROM records')
+    expect(#projection.columns).toBe(3)
+    db:update('records', 2, { extra = 'new' })
+    expect(db:query('SELECT * FROM records WHERE id = ?', { 2 }).rows[1].extra).toBe('new')
+    db:close()
+    clean(path)
+  end)
+
+  suite.it('supports disabling the plan cache and rejects invalid capacities', function()
+    local path = fixture('query-cache-off')
+    -- Negative capacity must fail without opening or writing a journal.
+    expect((pcall(function() sql.open(path, { queryCacheEntries = -1 }) end))).toBe(false)
+    -- Nonintegral capacities must fail before a filesystem lock is acquired.
+    expect((pcall(function() sql.open(path, { queryCacheEntries = 2.5 }) end))).toBe(false)
+    local db = sql.open(path, { queryCacheEntries = 0 })
+    db:createTable('data', { 'id' }, 'id')
+    db:insert('data', { id = 1 })
+    for _ = 1, 20 do
+      expect(db:query('SELECT COUNT(*) AS n FROM data').rows[1].n).toBe(1)
+    end
+    expect(db:cacheStats().capacity).toBe(0)
+    expect(db:cacheStats().entries).toBe(0)
+    db:close()
+    clean(path)
+  end)
+
+  suite.it('aborts a transaction even when a failed SQL mutation is caught', function()
+    local path = fixture('dml-abort')
+    local db = sql.open(path)
+    db:createTable('items', { 'id', 'name' }, 'id')
+    -- Catch the outer transaction error to verify its staged changes vanished.
+    local committed = pcall(function()
+      db:transaction(function(tx)
+        tx:insert('items', { id = 1, name = 'first' })
+        -- Intercept the DML exception to test the transaction abort latch.
+        local ok = pcall(function()
+          tx:exec('INSERT INTO items (id, name) VALUES (?, ?)', { 1, 'duplicate' })
+        end)
+        expect(ok).toBe(false)
+      end)
+    end)
+    expect(committed).toBe(false)
+    expect(db:query('SELECT COUNT(*) AS n FROM items').rows[1].n).toBe(0)
+
+    local plan = db:prepareExec('INSERT INTO items (id, name) VALUES (?, ?)')
+    -- Prepared statement failures must obey the same abort contract.
+    local caught = pcall(function()
+      db:transaction(function(tx)
+        plan.inTransaction(tx, { 2, 'staged' })
+        -- The duplicate prepared INSERT is expected to fail within this callback.
+        expect((pcall(function() plan.inTransaction(tx, { 2, 'duplicate' }) end))).toBe(false)
+      end)
+    end)
+    expect(caught).toBe(false)
+    expect(db:query('SELECT COUNT(*) AS n FROM items').rows[1].n).toBe(0)
+    db:insert('items', { id = 3, name = 'valid' })
+    db:close()
+    db = sql.open(path)
+    expect(db:query('SELECT COUNT(*) AS n FROM items').rows[1].n).toBe(1)
+    db:close()
+    clean(path)
+  end)
+
+  suite.it('inserts multiple parameterized rows and handles primary-key conflicts atomically', function()
+    local path = fixture('multi-insert')
+    local db = sql.open(path)
+    db:createTable('items', { 'id', 'label', 'optional' }, 'id')
+    local statement = 'INSERT INTO items (id, label, optional) VALUES (?, ?, ?), (?, ?, ?)'
+    local plan = db:prepareExec(statement)
+    expect(plan.parameterCount).toBe(6)
+    expect(plan.run({ 1, 'one', sql.NULL, 2, 'two', 'set' })).toBe(2)
+    expect(assert(db:get('items', 1)).optional).toBe(nil)
+    expect(assert(db:get('items', 2)).optional).toBe('set')
+    local skip = db:prepareExec([[INSERT INTO items (id, label)
+      VALUES (?, ?), (?, ?), (?, ?) ON CONFLICT (id) DO NOTHING]])
+    expect(skip.run({ 1, 'ignored', 3, 'three', 3, 'also ignored' })).toBe(1)
+    expect(assert(db:get('items', 1)).label).toBe('one')
+    expect(assert(db:get('items', 3)).label).toBe('three')
+    expect(db:query('SELECT COUNT(*) AS n FROM items').rows[1].n).toBe(3)
+
+    -- This second row duplicates an existing key; even an intercepted failure
+    -- must not persist the first staged INSERT in the same statement.
+    expect((pcall(function()
+      db:exec('INSERT INTO items (id, label) VALUES (?, ?), (?, ?)', { 4, 'new', 2, 'bad' })
+    end))).toBe(false)
+    expect(db:get('items', 4)).toBe(nil)
+    -- Conflict targets other than the actual primary key are not supported.
+    expect((pcall(function()
+      db:exec('INSERT INTO items (id, label) VALUES (?, ?) ON CONFLICT (label) DO NOTHING', { 4, 'bad' })
+    end))).toBe(false)
+    db:checkpoint()
+    db:close()
+    db = sql.open(path)
+    expect(assert(db:get('items', 3)).label).toBe('three')
+    expect(db:query('SELECT COUNT(*) AS n FROM items').rows[1].n).toBe(3)
+    db:close()
+    clean(path)
+  end)
+
+  suite.it('updates and deletes indexed equality matches with staged read-your-writes semantics', function()
+    local path = fixture('bulk-indexed')
+    local db = sql.open(path)
+    db:createTable('jobs', { 'id', 'status', 'attempts' }, 'id')
+    db:transaction(function(tx)
+      for id = 1, 60 do
+        tx:insert('jobs', { id = id, status = if id % 3 == 0 then 'pending' else 'active', attempts = 0 })
+      end
+    end)
+    db:createIndex('jobs', 'status')
+    expect(db:exec('UPDATE jobs SET attempts = ? WHERE status = ?', { 5, 'pending' })).toBe(20)
+    expect(db:query('SELECT COUNT(*) AS n FROM jobs WHERE attempts = 5').rows[1].n).toBe(20)
+    local update = db:prepareExec('UPDATE jobs SET status = ? WHERE status = ?')
+    expect(update.run({ 'ready', 'pending' })).toBe(20)
+    expect(update.run({ 'ready', 'pending' })).toBe(0)
+
+    db:transaction(function(tx)
+      tx:update('jobs', 1, { status = 'ready' }) -- staged new match
+      tx:update('jobs', 3, { status = 'other' }) -- staged removal
+      expect(tx:exec('DELETE FROM jobs WHERE status = ?', { 'ready' })).toBe(20)
+      expect(tx:get('jobs', 1)).toBe(nil)
+      expect(assert(tx:get('jobs', 3)).status).toBe('other')
+    end)
+    expect(db:query('SELECT COUNT(*) AS n FROM jobs').rows[1].n).toBe(40)
+    expect(db:query('SELECT COUNT(*) AS n FROM jobs WHERE status = ?', { 'ready' }).rows[1].n).toBe(0)
+    expect(db:exec('DELETE FROM jobs WHERE status = ?', { sql.NULL })).toBe(0)
+
+    db:checkpoint()
+    db:close()
+    db = sql.open(path)
+    expect(db:query('SELECT COUNT(*) AS n FROM jobs').rows[1].n).toBe(40)
+    expect(assert(db:get('jobs', 3)).status).toBe('other')
+    db:close()
+    clean(path)
+  end)
+
+  suite.it('rejects unindexed bulk writes and keeps the transaction usable after rejection', function()
+    local path = fixture('bulk-unindexed')
+    local db = sql.open(path)
+    db:createTable('jobs', { 'id', 'status' }, 'id')
+    db:exec([[INSERT INTO jobs (id, status) VALUES (1, 'active'), (2, 'active')]] )
+    -- The unknown WHERE plan must not silently devolve into a table scan.
+    expect((pcall(function()
+      db:exec('DELETE FROM jobs WHERE status = ?', { 'active' })
+    end))).toBe(false)
+    expect(db:query('SELECT COUNT(*) AS n FROM jobs').rows[1].n).toBe(2)
+    expect(db:exec('DELETE FROM jobs WHERE id = ?', { 1 })).toBe(1)
+    db:close()
+    clean(path)
+  end)
+
+  suite.it('applies numeric SQL expressions from stable pre-update row values', function()
+    local path = fixture('dml-counters')
+    local db = sql.open(path)
+    db:createTable('queue', { 'id', 'destination', 'attempts', 'mirror' }, 'id')
+    db:transaction(function(tx)
+      tx:insert('queue', { id = 1, destination = 'a', attempts = 3, mirror = 4 })
+      tx:insert('queue', { id = 2, destination = 'a', attempts = 5, mirror = 1 })
+      tx:insert('queue', { id = 3, destination = 'b', mirror = 10 })
+    end)
+    db:createIndex('queue', 'destination')
+    expect(db:exec([[UPDATE queue
+      SET attempts = attempts + ?, mirror = attempts - 1
+      WHERE destination = ?]], { 2, 'a' })).toBe(2)
+    expect(assert(db:get('queue', 1)).attempts).toBe(5)
+    expect(assert(db:get('queue', 1)).mirror).toBe(2) -- old attempts, not new
+    expect(assert(db:get('queue', 2)).attempts).toBe(7)
+    expect(assert(db:get('queue', 2)).mirror).toBe(4)
+    expect(db:exec('UPDATE queue SET attempts = attempts + 1 WHERE id = ?', { 3 })).toBe(1)
+    expect(assert(db:get('queue', 3)).attempts).toBe(nil) -- NULL arithmetic stays NULL
+
+    -- Unknown columns must fail even when the predicate matches zero rows.
+    expect((pcall(function()
+      db:exec('UPDATE queue SET absent = 1 WHERE id = ?', { 9999 })
+    end))).toBe(false)
+
+    -- Strictly numeric arithmetic; no implicit coercion of strings to numbers.
+    expect((pcall(function()
+      db:exec('UPDATE queue SET attempts = attempts + ? WHERE id = ?', { '2', 1 })
+    end))).toBe(false)
+    expect(assert(db:get('queue', 1)).attempts).toBe(5)
+    db:close()
+    db = sql.open(path)
+    expect(assert(db:get('queue', 2)).mirror).toBe(4)
+    db:close()
+    clean(path)
+  end)
+
+  suite.it('queries staged inserts, updates and deletes before commit', function()
+    local path = fixture('transaction-select')
+    local db = sql.open(path)
+    db:createTable('events', { 'id', 'room', 'body', 'score' }, 'id')
+    db:createIndex('events', 'room')
+    db:transaction(function(tx)
+      tx:insert('events', { id = 1, room = 'a', body = 'old', score = 10 })
+      tx:insert('events', { id = 2, room = 'b', body = 'second', score = 20 })
+    end)
+    local expired: sql.Transaction?
+    db:transaction(function(tx)
+      expired = tx
+      tx:update('events', 1, { room = 'b', body = 'replacement', score = 11 })
+      tx:delete('events', 2)
+      tx:insert('events', { id = 3, room = 'b', body = 'new', score = 30 })
+      expect(tx:query('SELECT COUNT(*) AS n FROM events').rows[1].n).toBe(2)
+      expect(tx:query('SELECT SUM(score) AS n FROM events').rows[1].n).toBe(41)
+      expect(tx:query([[SELECT id FROM events WHERE room = 'a']]).rows).toEqual({})
+      expect(tx:query('SELECT id, body FROM events WHERE room = ? ORDER BY id', { 'b' }).rows)
+        .toEqual({ { id = 1, body = 'replacement' }, { id = 3, body = 'new' } })
+      expect(db:query('SELECT COUNT(*) AS n FROM events').rows[1].n).toBe(2)
+      expect(assert(db:get('events', 1)).body).toBe('old')
+    end)
+    -- A transaction handle cannot be queried after its callback completes.
+    expect((pcall(function() (assert(expired)):query('SELECT * FROM events') end))).toBe(false)
+    expect(db:query('SELECT SUM(score) AS n FROM events').rows[1].n).toBe(41)
+    db:close()
+    clean(path)
+  end)
+
+  suite.it('queries new tables and nullable schema migrations inside a transaction', function()
+    local path = fixture('transaction-schema')
+    local db = sql.open(path)
+    db:createTable('members', { 'id', 'room' }, 'id')
+    db:insert('members', { id = 'u1', room = 'alpha' })
+    local committed = db:query('SELECT COUNT(*) AS n FROM members').rows[1].n
+    -- The deliberate callback error must roll back the staged schema and rows.
+    local ok = pcall(function()
+      db:transaction(function(tx)
+        tx:addColumn('members', 'role')
+        tx:createTable('rooms', { 'room', 'title' }, 'room')
+        tx:insert('rooms', { room = 'alpha', title = 'First' })
+        tx:update('members', 'u1', { role = 'admin' })
+        tx:insert('members', { id = 'u2', room = 'alpha', role = 'reader' })
+        expect(tx:query('SELECT m.id, m.role, r.title FROM members m JOIN rooms r ON m.room = r.room ORDER BY m.id').rows)
+          .toEqual({ { id = 'u1', role = 'admin', title = 'First' }, { id = 'u2', role = 'reader', title = 'First' } })
+        expect(tx:query('SELECT COUNT(*) AS n FROM rooms').rows[1].n).toBe(1)
+        error('rollback')
+      end)
+    end)
+    expect(ok).toBe(false)
+    expect(db:query('SELECT COUNT(*) AS n FROM members').rows[1].n).toBe(committed)
+    -- Uncommitted columns and tables must not leak into the live SQL schema.
+    expect((pcall(function() db:query('SELECT role FROM members') end))).toBe(false)
+    -- The new table must be absent after rollback.
+    expect((pcall(function() db:query('SELECT * FROM rooms') end))).toBe(false)
+    db:close()
+    clean(path)
+  end)
+
+  suite.it('transaction SELECT respects indexed join lookups and staged key moves', function()
+    local path = fixture('transaction-join')
+    local db = sql.open(path)
+    db:createTable('users', { 'id', 'team' }, 'id')
+    db:createTable('teams', { 'code', 'title' }, 'code')
+    db:createIndex('users', 'team')
+    db:transaction(function(tx)
+      tx:insert('users', { id = 1, team = 'a' })
+      tx:insert('users', { id = 2, team = 'a' })
+      tx:insert('teams', { code = 'a', title = 'Alpha' })
+    end)
+
+    db:transaction(function(tx)
+      tx:update('users', 2, { team = 'b' })
+      tx:insert('users', { id = 3, team = 'a' })
+      tx:insert('teams', { code = 'b', title = 'Beta' })
+      expect(tx:query('SELECT u.id, t.title FROM teams t JOIN users u ON t.code = u.team ORDER BY u.id').rows)
+        .toEqual({ { id = 1, title = 'Alpha' }, { id = 2, title = 'Beta' }, { id = 3, title = 'Alpha' } })
+    end)
+    db:close()
+    clean(path)
+  end)
+
+  suite.it('executes bounded ordered-range UPDATE and DELETE in SQL', function()
+    local path = fixture('range-dml')
+    local db = sql.open(path)
+    db:createTable('jobs', { 'id', 'deadline', 'attempts' }, 'id')
+    db:createOrderedIndex('jobs', 'deadline')
+    db:transaction(function(tx)
+      for id = 1, 12 do
+        tx:insert('jobs', { id = id, deadline = id, attempts = 0 })
+      end
+    end)
+    local update = db:prepareExec('UPDATE jobs SET attempts = attempts + 1 WHERE deadline <= ?')
+    expect(update.run({ 6 })).toBe(6)
+    expect(db:query('SELECT SUM(attempts) AS n FROM jobs').rows[1].n).toBe(6)
+    expect(db:exec('DELETE FROM jobs WHERE deadline > ?', { 9 })).toBe(3)
+    expect(db:exec('DELETE FROM jobs WHERE deadline < ?', { 3 })).toBe(2)
+    expect(db:exec('DELETE FROM jobs WHERE deadline >= ?', { 9 })).toBe(1)
+    expect(db:query('SELECT id FROM jobs ORDER BY id').rows)
+      .toEqual({ { id = 3 }, { id = 4 }, { id = 5 }, { id = 6 }, { id = 7 }, { id = 8 } })
+    db:checkpoint()
+    db:close()
+    db = sql.open(path)
+    expect(db:query('SELECT COUNT(*) AS n FROM jobs').rows[1].n).toBe(6)
+    db:close()
+    clean(path)
+  end)
+
+  suite.it('range mutations reconcile staged rows and respect NULL exclusion', function()
+    local path = fixture('range-staged')
+    local db = sql.open(path)
+    db:createTable('queue', { 'id', 'due', 'count' }, 'id')
+    db:createOrderedIndex('queue', 'due')
+    db:transaction(function(tx)
+      tx:insert('queue', { id = 1, due = 10, count = 0 })
+      tx:insert('queue', { id = 2, due = 20, count = 0 })
+      tx:insert('queue', { id = 3, due = 30, count = 0 })
+    end)
+
+    db:transaction(function(tx)
+      tx:update('queue', 1, { due = 40 }) -- moves out of range
+      tx:update('queue', 3, { due = 5 }) -- moves into range
+      tx:insert('queue', { id = 4, due = 15, count = 0 })
+      tx:insert('queue', { id = 5, count = 0 }) -- NULL is excluded
+      expect(tx:exec('UPDATE queue SET count = count + 1 WHERE due < ?', { 25 })).toBe(3)
+      expect(tx:query('SELECT id FROM queue WHERE count = 1 ORDER BY id').rows)
+        .toEqual({ { id = 2 }, { id = 3 }, { id = 4 } })
+    end)
+    expect(assert(db:get('queue', 1)).count).toBe(0)
+    expect(assert(db:get('queue', 3)).count).toBe(1)
+    expect(assert(db:get('queue', 4)).count).toBe(1)
+    expect(assert(db:get('queue', 5)).count).toBe(0)
+    db:close()
+    clean(path)
+  end)
+
+  suite.it('refuses unindexed ranges and caught range execution failures', function()
+    local path = fixture('range-reject')
+    local db = sql.open(path)
+    db:createTable('events', { 'id', 'due', 'attempts' }, 'id')
+    db:insert('events', { id = 1, due = 10, attempts = 2 })
+    -- A primary-key lookup does not grant a range scan over an unindexed column.
+    expect((pcall(function()
+      db:exec('DELETE FROM events WHERE due < ?', { 20 })
+    end))).toBe(false)
+    expect(db:query('SELECT COUNT(*) AS n FROM events').rows[1].n).toBe(1)
+    db:createOrderedIndex('events', 'due')
+    -- SQL NULL cannot match a numeric range.
+    expect(db:exec('DELETE FROM events WHERE due > ?', { sql.NULL })).toBe(0)
+    -- An invalid range value must abort the entire surrounding transaction.
+    local committed = pcall(function()
+      db:transaction(function(tx)
+        tx:insert('events', { id = 2, due = 15, attempts = 0 })
+        -- Even a caught failed DML must poison the transaction, not commit id 2.
+        expect((pcall(function()
+          tx:exec('UPDATE events SET attempts = 3 WHERE due >= ?', { false })
+        end))).toBe(false)
+      end)
+    end)
+    expect(committed).toBe(false)
+    expect(db:get('events', 2)).toBeNil()
+    db:close()
+    clean(path)
+  end)
+
+  suite.it('reuses transaction SELECT plans without caching row results', function()
+    local path = fixture('tx-plan-cache')
+    local db = sql.open(path)
+    db:createTable('values', { 'id', 'bucket', 'amount' }, 'id')
+    db:insert('values', { id = 1, bucket = 'a', amount = 1 })
+    db:createIndex('values', 'bucket')
+    db:transaction(function(tx)
+      local query = 'SELECT SUM(amount) AS n FROM values WHERE bucket = ?'
+      expect(tx:query(query, { 'a' }).rows[1].n).toBe(1)
+      tx:update('values', 1, { amount = 4 })
+      expect(tx:query(query, { 'a' }).rows[1].n).toBe(4)
+      tx:insert('values', { id = 2, bucket = 'a', amount = 5 })
+      expect(tx:query(query, { 'a' }).rows[1].n).toBe(9)
+      tx:update('values', 2, { bucket = 'b' })
+      expect(tx:query(query, { 'a' }).rows[1].n).toBe(4)
+      expect(tx:query(query, { 'b' }).rows[1].n).toBe(5)
+      tx:delete('values', 1)
+      expect(#tx:query('SELECT id FROM values WHERE bucket = ?', { 'a' }).rows).toBe(0)
+      expect(tx:query('SELECT COUNT(*) AS n FROM values').rows[1].n).toBe(1)
+      tx:addColumn('values', 'label')
+      tx:update('values', 2, { label = 'new' })
+      expect(tx:query('SELECT label FROM values WHERE id = ?', { 2 }).rows[1].label).toBe('new')
+      tx:createIndex('values', 'label')
+      expect(tx:query('SELECT id FROM values WHERE label = ?', { 'new' }).rows[1].id).toBe(2)
+    end)
+    expect(db:query('SELECT label FROM values WHERE id = 2').rows[1].label).toBe('new')
+    db:close()
+    clean(path)
+  end)
+
+  suite.it('matches committed SQL results for deterministic staged mutation sequences', function()
+    local path = fixture('tx-query-model')
+    local db = sql.open(path)
+    db:createTable('events', { 'id', 'room', 'priority' }, 'id')
+    db:createIndex('events', 'room')
+    db:createOrderedIndex('events', 'priority')
+    for id = 1, 80 do
+      db:insert('events', { id = id, room = 'r' .. tostring(id % 5), priority = id % 11 })
+    end
+
+    local statements = {
+      'SELECT COUNT(*) AS n FROM events',
+      'SELECT id FROM events WHERE room = ? ORDER BY id LIMIT 15',
+      'SELECT id FROM events WHERE priority >= ? ORDER BY id LIMIT 30',
+      'SELECT room, COUNT(*) AS n FROM events GROUP BY room ORDER BY room',
+      'SELECT id, room, priority FROM events ORDER BY id LIMIT 25',
+    }
+
+    for cycle = 1, 12 do
+      local expected: {{sql.Row}} = {}
+      db:transaction(function(tx)
+        for step = 1, 22 do
+          local id = (cycle * 17 + step * 13) % 89 + 1
+          if step % 5 == 0 then
+            tx:delete('events', id)
+          else
+            tx:upsert('events', { id = id, room = 'r' .. tostring((cycle + step) % 5),
+              priority = (cycle * 5 + step) % 11 })
+          end
+        end
+
+        for index, statement in statements do
+          local args: {unknown}? = if index == 2 then { 'r2' } elseif index == 3 then { 5 } else nil
+          expected[index] = tx:query(statement, args).rows
+        end
+      end)
+
+      for index, statement in statements do
+        local args: {unknown}? = if index == 2 then { 'r2' } elseif index == 3 then { 5 } else nil
+        expect(db:query(statement, args).rows).toEqual(expected[index])
+      end
+
+      if cycle % 4 == 0 then
+        db:checkpoint()
+        db:close()
+        db = sql.open(path)
+      end
+    end
+    db:close()
+    clean(path)
+  end)
+
+  suite.it('promotes and demotes single-key index postings across deletion and checkpoint', function()
+    local path = fixture('postings-inline')
+    local db = sql.open(path)
+    db:createTable('events', { 'id', 'room', 'stream', 'unique_code', 'status' }, 'id')
+    db:transaction(function(tx)
+      for id = 1, 240 do
+        tx:insert('events', { id = id, room = 'r' .. (id % 4), stream = id,
+          unique_code = 'u' .. id, status = if id % 11 == 0 then nil else id % 3 })
+      end
+    end)
+    db:createIndex('events', 'unique_code')
+    db:createIndex('events', 'status')
+    db:createOrderedIndex('events', 'stream')
+    db:createCompositeIndex('events', 'room', 'stream')
+
+    local metrics = db:stats().events
+    expect(metrics.indexKeys.unique_code).toBe(240)
+    expect(metrics.indexSlots.unique_code).toBe(240)
+    local uniquePlan = db:prepare('SELECT id FROM events WHERE unique_code = ?')
+    local point = db:prepare('SELECT id FROM events WHERE room = ? AND stream = ?')
+    local range = db:prepare('SELECT COUNT(*) AS n FROM events WHERE stream >= ? AND stream <= ?')
+
+    -- A unique bucket expands to duplicates and contracts back to an inline
+    -- posting after two removals. Old tombstone slots must never be returned.
+    db:update('events', 2, { unique_code = 'u1', status = nil })
+    db:update('events', 3, { unique_code = 'u1', status = nil })
+    expect(#uniquePlan.run({ 'u1' }).rows).toBe(3)
+    db:delete('events', 2)
+    expect(#uniquePlan.run({ 'u1' }).rows).toBe(2)
+    db:delete('events', 3)
+    expect(#uniquePlan.run({ 'u1' }).rows).toBe(1)
+    db:insert('events', { id = 3, room = 'r3', stream = 3, unique_code = 'u1', status = 1 })
+    expect(#uniquePlan.run({ 'u1' }).rows).toBe(2)
+    db:update('events', 3, { unique_code = 'u3' })
+    expect(#uniquePlan.run({ 'u1' }).rows).toBe(1)
+    expect(#uniquePlan.run({ 'u3' }).rows).toBe(1)
+    expect(#point.run({ 'r3', 3 }).rows).toBe(1)
+    expect(range.run({ 1, 240 }).rows[1].n).toBe(239)
+
+    db:checkpoint()
+    db:close()
+    db = sql.open(path)
+    expect(#db:query('SELECT id FROM events WHERE unique_code = ?', { 'u1' }).rows).toBe(1)
+    expect(db:query('SELECT COUNT(*) AS n FROM events').rows[1].n).toBe(239)
+    expect(db:stats().events.indexSlots.unique_code).toBe(239)
+    db:close()
+    clean(path)
+  end)
+
+  suite.it('recycles duplicate posting slots under repeated indexed churn', function()
+    local path = fixture('postings-churn')
+    local db = sql.open(path)
+    db:createTable('events', { 'id', 'bucket' }, 'id')
+    db:createIndex('events', 'bucket')
+    db:transaction(function(tx)
+      for id = 1, 160 do tx:insert('events', { id = id, bucket = id % 5 }) end
+    end)
+
+    for iteration = 1, 2200 do
+      local id = iteration % 160 + 1
+      db:update('events', id, { bucket = iteration % 5 })
+    end
+
+    for id = 1, 110 do db:delete('events', id) end
+
+    for value = 0, 4 do
+      local expected = 0
+      for id = 111, 160 do
+        if assert(db:get('events', id)).bucket == value then expected += 1 end
+      end
+      expect(db:query('SELECT COUNT(*) AS n FROM events WHERE bucket = ?', { value }).rows[1].n).toBe(expected)
+    end
+    local metrics = db:stats().events
+    expect(metrics.indexKeys.bucket).toBe(50)
+    expect(metrics.indexSlots.bucket <= 5 * 64 + 100).toBe(true)
+    db:checkpoint()
+    db:close()
+    db = sql.open(path)
+    expect(db:stats().events.indexKeys.bucket).toBe(50)
+    db:close()
+    clean(path)
+  end)
+
+  suite.it('bounds nullable ordered-posting tombstones during churn', function()
+    local path = fixture('postings-null-churn')
+    local db = sql.open(path)
+    db:createTable('events', { 'id', 'score' }, 'id')
+    db:createOrderedIndex('events', 'score')
+    db:transaction(function(tx)
+      for id = 1, 160 do tx:insert('events', { id = id }) end
+    end)
+
+    for iteration = 1, 1800 do
+      local id = iteration % 160 + 1
+      if iteration % 3 == 0 then
+        db:update('events', id, { score = iteration % 7 })
+      else
+        db:update('events', id, {}, { 'score' })
+      end
+    end
+
+    local actualNull = 0
+    for id = 1, 160 do
+      if assert(db:get('events', id)).score == nil then actualNull += 1 end
+    end
+    local nullSlots = db:stats().events.indexNullSlots.score
+    expect(nullSlots <= 64 + 2 * actualNull).toBe(true)
+    expect(#db:query('SELECT id FROM events ORDER BY score LIMIT 10').rows).toBe(10)
+    db:checkpoint()
+    db:close()
+    db = sql.open(path)
+    expect(db:stats().events.indexNullSlots.score).toBe(actualNull)
+    db:close()
+    clean(path)
+  end)
+
+  suite.it('refuses a second writer while the first lock is held', function()
+    local path = fixture('lock')
+    local db = sql.open(path)
+    -- A bad checksum must fail to reopen rather than hide corruption.
+    -- An exclusive advisory lock must reject the competing opener.
+    local ok = pcall(function() sql.open(path) end)
+    expect(ok).toBe(false)
+    db:close()
+    local reopened = sql.open(path)
+    reopened:close()
+    clean(path)
+  end)
+end)
+
+suite.describe('packed resident layout', function()
+  suite.it('round trips buffered numeric nullable columns, strings and booleans', function()
+    local path = fixture('packed-roundtrip')
+    local db = sql.open(path, { rowLayout = 'packed' })
+    db:createTable('data', { 'id', 'room', 'value', 'enabled', 'label' }, 'id')
+    db:transaction(function(tx)
+      for id = 1, 1200 do
+        tx:insert('data', { id = id, room = 'r' .. tostring(id % 8),
+          value = if id % 3 == 0 then nil else id + 0.5,
+          enabled = if id % 4 == 0 then nil else id % 2 == 0,
+          label = if id % 5 == 0 then nil else 'l' .. tostring(id) })
+      end
+    end)
+    db:createIndex('data', 'room')
+    db:createOrderedIndex('data', 'value')
+    local metrics = assert(db:stats().data.resident)
+    expect(metrics ~= nil).toBe(true)
+    expect(metrics.kinds.id).toBe('number')
+    expect(metrics.kinds.room).toBe('dictionary')
+    expect(metrics.kinds.value).toBe('number')
+    expect(metrics.kinds.enabled).toBe('boolean')
+    expect(metrics.kinds.label).toBe('bytes')
+    expect(assert(db:get('data', 3)).value).toBe(nil)
+    expect(assert(db:get('data', 4)).value).toBe(4.5)
+    expect(assert(db:get('data', 4)).enabled).toBe(nil)
+    expect(assert(db:get('data', 5)).enabled).toBe(false)
+    expect(assert(db:get('data', 1199)).label).toBe('l1199')
+    expect(db:query('SELECT COUNT(*) AS n FROM data WHERE room = ?', { 'r1' }).rows[1].n).toBe(150)
+    db:checkpoint()
+    db:close()
+    local reopened = sql.open(path, { rowLayout = 'packed' })
+    expect(assert(reopened:get('data', 3)).value).toBe(nil)
+    expect(assert(reopened:get('data', 4)).value).toBe(4.5)
+    expect(assert(reopened:get('data', 1199)).label).toBe('l1199')
+    expect(reopened:query('SELECT COUNT(*) AS n FROM data').rows[1].n).toBe(1200)
+    reopened:close()
+    clean(path)
+  end)
+
+  suite.it('supports schema migration, type switches, reinsertions and staged reads', function()
+    local path = fixture('packed-mixed')
+    local db = sql.open(path, { rowLayout = 'packed' })
+    db:createTable('items', { 'id', 'value', 'tag' }, 'id')
+    db:insert('items', { id = 1, value = 0, tag = 'same' })
+    db:insert('items', { id = 2, value = 2, tag = 'same' })
+    db:addColumn('items', 'extra')
+    db:transaction(function(tx)
+      tx:update('items', 1, { value = 'string', extra = true })
+      expect(assert(tx:get('items', 1)).value).toBe('string')
+      tx:delete('items', 2)
+      tx:insert('items', { id = 3, value = -0.5, extra = false })
+      expect(#tx:query('SELECT id FROM items WHERE id = ?', { 3 }).rows).toBe(1)
+    end)
+    expect(assert(db:get('items', 1)).value).toBe('string')
+    expect(db:get('items', 2)).toBe(nil)
+    expect(assert(db:get('items', 3)).extra).toBe(false)
+    db:insert('items', { id = 2, value = 22, tag = 'again' })
+    expect(db:query('SELECT SUM(id) AS total FROM items').rows[1].total).toBe(6)
+    db:checkpoint()
+    db:close()
+    local reopened = sql.open(path, { rowLayout = 'row' })
+    expect(assert(reopened:get('items', 1)).value).toBe('string')
+    expect(assert(reopened:get('items', 2)).tag).toBe('again')
+    reopened:close()
+    clean(path)
+  end)
+
+  suite.it('reclaims dictionary entries across repeated delete and insert', function()
+    local path = fixture('packed-churn')
+    local db = sql.open(path, { rowLayout = 'packed' })
+    db:createTable('items', { 'id', 'tag', 'value' }, 'id')
+    for iteration = 1, 300 do
+      db:upsert('items', { id = 1, tag = 'value-' .. tostring(iteration), value = iteration })
+      db:upsert('items', { id = 2, tag = 'fixed', value = -iteration })
+      if iteration % 4 == 0 then
+        db:delete('items', 2)
+        db:insert('items', { id = 2, tag = 'fixed', value = -iteration })
+      end
+    end
+    expect(assert(db:get('items', 1)).tag).toBe('value-300')
+    expect(assert(db:get('items', 2)).tag).toBe('fixed')
+    db:close()
+    clean(path)
+  end)
+
+  suite.it('reclaims obsolete byte-arena storage after repeated updates', function()
+    local path = fixture('packed-arena-churn')
+    local db = sql.open(path, { rowLayout = 'packed' })
+    db:createTable('items', { 'id', 'payload' }, 'id')
+    db:transaction(function(tx)
+      for id = 1, 500 do
+        tx:insert('items', { id = id, payload = 'initial-' .. tostring(id) })
+      end
+    end)
+    expect((assert(db:stats().items.resident)).kinds.payload).toBe('bytes')
+    for iteration = 1, 2600 do
+      local id = iteration % 500 + 1
+      db:update('items', id, { payload = string.rep('x', 700) .. tostring(iteration) })
+    end
+    local resident = assert(db:stats().items.resident)
+    expect(resident.kinds.payload).toBe('bytes')
+    expect(resident.allocatedStringBytes.payload < 3 * resident.liveStringBytes.payload + 1024 * 1024).toBe(true)
+    expect(assert(db:get('items', 500)).payload ~= nil).toBe(true)
+    db:checkpoint()
+    db:close()
+    local reopened = sql.open(path, { rowLayout = 'packed' })
+    expect(reopened:query('SELECT COUNT(*) AS n FROM items').rows[1].n).toBe(500)
+    reopened:close()
+    clean(path)
+  end)
+
+
+  suite.it('matches resident row SQL across joins, grouped aggregates and nullable scans', function()
+    local path = fixture('packed-query-parity')
+    local row = sql.open(path, { rowLayout = 'row' })
+    row:createTable('events', { 'id', 'room', 'priority', 'tag', 'body' }, 'id')
+    row:createTable('rooms', { 'room', 'label' }, 'room')
+    row:transaction(function(tx)
+      for room = 0, 6 do
+        tx:insert('rooms', { room = 'r' .. tostring(room), label = 'Room' .. tostring(room) })
+      end
+
+      for id = 1, 1100 do
+        tx:insert('events', { id = id, room = 'r' .. tostring(id % 7),
+          priority = if id % 9 == 0 then nil else id % 17,
+          tag = if id % 4 == 0 then 'shared' else 'event-' .. tostring(id),
+          body = if id % 13 == 0 then '' else 'body ' .. tostring(id) .. ' Ω' })
+      end
+    end)
+    row:createIndex('events', 'room')
+    row:createIndex('events', 'tag')
+    row:createOrderedIndex('events', 'priority')
+    row:createCompositeIndex('events', 'room', 'priority')
+
+    local questions = {
+      'SELECT COUNT(*) AS n FROM events',
+      "SELECT COUNT(*) AS n FROM events WHERE room = 'r2'",
+      'SELECT id, body FROM events ORDER BY id LIMIT 30',
+      'SELECT id, tag FROM events WHERE priority > 8 ORDER BY priority LIMIT 25',
+      'SELECT room, COUNT(*) AS n, SUM(priority) AS total FROM events GROUP BY room ORDER BY room',
+      'SELECT COUNT(*) AS n FROM events WHERE priority >= 4 AND priority < 11',
+      "SELECT events.id, rooms.label FROM events INNER JOIN rooms ON events.room = rooms.room WHERE events.room = 'r3' ORDER BY events.id LIMIT 25",
+    }
+    local expected = {}
+    for index, question in questions do expected[index] = row:query(question) end
+    row:close()
+
+    local db = sql.open(path, { rowLayout = 'packed' })
+    for index, question in questions do
+      local actual = db:query(question)
+      local baseline = expected[index]
+      expect(#actual.rows).toBe(#baseline.rows)
+      for position, item in actual.rows do
+        for key, value in baseline.rows[position] do
+          expect(item[key]).toBe(value)
+        end
+      end
+    end
+
+    db:transaction(function(tx)
+      tx:update('events', 41, { tag = 'modified', priority = nil }, { 'priority' })
+      tx:delete('events', 43)
+      tx:insert('events', { id = 1101, room = 'r1', priority = 4, tag = 'fresh', body = 'new' })
+      expect(tx:query('SELECT COUNT(*) AS n FROM events').rows[1].n).toBe(1100)
+    end)
+    expect(assert(db:get('events', 41)).priority).toBe(nil)
+    expect(assert(db:get('events', 41)).tag).toBe('modified')
+    expect(db:get('events', 43)).toBe(nil)
+    db:checkpoint()
+    db:close()
+    local legacy = sql.open(path, { rowLayout = 'row' })
+    expect(assert(legacy:get('events', 41)).tag).toBe('modified')
+    expect(assert(legacy:get('events', 1101)).body).toBe('new')
+    legacy:close()
+    clean(path)
+  end)
+
+end)
+
+suite.describe('compact ordered index nodes', function()
+  suite.it('recycles AVL nodes and preserves weighted counts and ordering', function()
+    local ordered = require('@jessql/ordered')
+    local tree = nil
+    for value = 1, 800 do
+      tree = ordered.insert(tree, value, 'n' .. tostring(value))
+      if value % 5 == 0 then tree = ordered.adjust(tree, value, 2) end
+    end
+    expect(ordered.countRange(tree, nil, false, nil, false)).toBe(1120)
+    local forward = ordered.iterate(tree, false, 375, true, 405, false)
+    local last = 375
+    while true do
+      local node = forward()
+      if not node then break end
+      expect((node.value :: number) > last).toBe(true)
+      last = node.value
+    end
+    expect(last).toBe(405)
+    local descending = ordered.iterate(tree, true, 375, false, 405, true)
+    last = 405
+    while true do
+      local node = descending()
+      if not node then break end
+      expect((node.value :: number) < last).toBe(true)
+      last = node.value
+    end
+    expect(last).toBe(375)
+
+    local highestSlot = (assert(tree)).nextNode
+    for value = 1, 800 do tree = ordered.remove(tree, value) end
+    expect(ordered.countRange(tree, nil, false, nil, false)).toBe(0)
+    for value = 801, 1600 do tree = ordered.insert(tree, value, 'n' .. tostring(value)) end
+    -- Deleted nodes must be reused, not leaked as monotonically allocated slots.
+    expect((assert(tree)).nextNode).toBe(highestSlot)
+    expect(ordered.countRange(tree, 1000, true, 1200, false)).toBe(200)
+    local probe = ordered.iterate(tree, false, nil, false, nil, false)
+    for value = 801, 1600 do
+      local node = probe()
+      expect((assert(node)).value).toBe(value)
+    end
+    expect(probe()).toBe(nil)
+  end)
+
+  suite.it('preserves range cardinality through mixed index mutations and checkpoints', function()
+    for _, layout in { 'row', 'packed' } do
+      local path = fixture('compact-avl-' .. layout)
+      local db = sql.open(path, { rowLayout = layout })
+      db:createTable('events', { 'id', 'room', 'stream' }, 'id')
+      local values: { [number]: number } = {}
+      local rooms: { [number]: string } = {}
+      db:transaction(function(tx)
+        for id = 1, 240 do
+          local value = id % 41
+          local room = 'r' .. tostring(id % 7)
+          tx:insert('events', { id = id, room = room, stream = value })
+          values[id], rooms[id] = value, room
+        end
+      end)
+      db:createOrderedIndex('events', 'stream')
+      db:createCompositeIndex('events', 'room', 'stream')
+
+      for batch = 1, 12 do
+        db:transaction(function(tx)
+          for step = 1, 35 do
+            local id = (batch * 79 + step * 17) % 240 + 1
+            local value = (batch * 41 + step * 13) % 79
+            local room = 'r' .. tostring((batch + step) % 7)
+            if step % 5 == 0 then
+              tx:delete('events', id)
+              tx:insert('events', { id = id, room = room, stream = value })
+            else
+              tx:update('events', id, { room = room, stream = value })
+            end
+            values[id], rooms[id] = value, room
+          end
+        end)
+        local bound = batch * 5
+        local want, scoped = 0, 0
+        for id = 1, 240 do
+          if values[id] >= bound then
+            want += 1
+            if rooms[id] == 'r2' then scoped += 1 end
+          end
+        end
+        expect(db:query('SELECT COUNT(*) AS n FROM events WHERE stream >= ?', { bound }).rows[1].n).toBe(want)
+        expect(db:query('SELECT COUNT(*) AS n FROM events WHERE room = ? AND stream >= ?',
+          { 'r2', bound }).rows[1].n).toBe(scoped)
+        local sorted = db:query('SELECT stream FROM events WHERE room = ? AND stream >= ? ORDER BY stream DESC LIMIT 30',
+          { 'r2', bound }).rows
+        local previous = math.huge
+        for _, row in sorted do
+          expect((row.stream :: number) <= previous).toBe(true)
+          expect((row.stream :: number) >= bound).toBe(true)
+          previous = row.stream :: number
+        end
+      end
+      db:checkpoint()
+      db:close()
+      local reopened = sql.open(path, { rowLayout = layout })
+      local expected = 0
+      for id = 1, 240 do if values[id] >= 20 then expected += 1 end end
+      expect(reopened:query('SELECT COUNT(*) AS n FROM events WHERE stream >= 20').rows[1].n).toBe(expected)
+      reopened:close()
+      clean(path)
+    end
+  end)
+end)
+
+
+suite.describe('low-allocation ordered and packed storage', function()
+  suite.it('streams ordered value/key pairs with exact legacy bounds and ordering', function()
+    local ordered = require('@jessql/ordered')
+    local empty = ordered.iteratePairs(nil, false, nil, false, nil, false)
+    local value, encoded = empty()
+    expect(value).toBe(nil)
+    expect(encoded).toBe(nil)
+
+    local tree = nil
+    for _, value in { -11, 0, 1, 4, 12, '0', 'a', 'z' } do
+      tree = ordered.insert(tree, value, 'k' .. tostring(value))
+    end
+
+    for _, options in {
+      { false, nil, false, nil, false },
+      { true, nil, false, nil, false },
+      { false, 0, true, 'z', true },
+      { true, -11, false, 12, false },
+      { false, '0', false, 'z', false },
+    } do
+      local descending = options[1] :: boolean
+      local lower = options[2] :: (number | string)?
+      local lowerStrict = options[3] :: boolean
+      local upper = options[4] :: (number | string)?
+      local upperStrict = options[5] :: boolean
+      local pairs = ordered.iteratePairs(tree, descending, lower, lowerStrict, upper, upperStrict)
+      local legacy = ordered.iterate(tree, descending, lower, lowerStrict, upper, upperStrict)
+      while true do
+        local actualValue, actualKey = pairs()
+        local old = legacy()
+        if not old then
+          expect(actualValue).toBe(nil)
+          expect(actualKey).toBe(nil)
+          break
+        end
+        expect(actualValue).toBe(old.value)
+        expect(actualKey).toBe(old.encoded)
+      end
+    end
+  end)
+
+  suite.it('reuses packed slot history without duplicating key order after churn', function()
+    local path = fixture('packed-slot-history')
+    local db = sql.open(path, { rowLayout = 'packed' })
+    db:createTable('entries', { 'id', 'group_id', 'name' }, 'id')
+    db:transaction(function(tx)
+      for id = 1, 180 do
+        tx:insert('entries', { id = id, group_id = id % 5, name = `value-{id}` })
+      end
+    end)
+    db:createOrderedIndex('entries', 'group_id')
+
+    -- Rows deleted and then reinserted before compaction must retain one
+    -- insertion-order slot, while their physical data slots can be recycled.
+    for cycle = 1, 7 do
+      db:transaction(function(tx)
+        for id = 1, 180 do
+          if id % 3 == cycle % 3 then
+            tx:delete('entries', id)
+            tx:insert('entries', { id = id, group_id = (id + cycle) % 5, name = `cycle-{cycle}` })
+          end
+        end
+      end)
+      expect(db:query('SELECT COUNT(*) AS n FROM entries').rows[1].n).toBe(180)
+      expect(db:stats().entries.keySlots).toBe(180)
+    end
+
+    -- Removal of most rows forces order and deleted-key history compaction.
+    db:transaction(function(tx)
+      for id = 1, 145 do tx:delete('entries', id) end
+    end)
+    expect(db:query('SELECT COUNT(*) AS n FROM entries').rows[1].n).toBe(35)
+    expect(db:stats().entries.keySlots <= 145).toBe(true)
+    db:transaction(function(tx)
+      for id = 1, 145 do
+        tx:insert('entries', { id = id, group_id = id % 5, name = `again-{id}` })
+      end
+    end)
+    expect(db:stats().entries.keySlots).toBe(180)
+    expect(db:query('SELECT COUNT(*) AS n FROM entries').rows[1].n).toBe(180)
+    expect(db:query('SELECT COUNT(*) AS n FROM entries WHERE group_id = 4').rows[1].n).toBe(36)
+
+    db:checkpoint()
+    db:close()
+    local reopened = sql.open(path, { rowLayout = 'packed' })
+    expect(reopened:stats().entries.keySlots).toBe(180)
+    expect(reopened:query('SELECT COUNT(*) AS n FROM entries').rows[1].n).toBe(180)
+    expect(assert(reopened:get('entries', 17)).name).toBe('again-17')
+    reopened:close()
+    clean(path)
+  end)
+end)
+
+return suite

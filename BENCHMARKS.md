@@ -172,3 +172,495 @@ filter, and join. Marking only those the rows' profiles named saved 0.010 s a lo
 queries 1.05x to 1.91x slower than all marked: a nested-loop join of 400 to 400 went from 23 ms
 to 43 ms. Whole, every row is within 5% of all marked, at what all marked costs to require; a
 database is the queries it runs, so that is the state kept.
+
+
+## Native persistence prototype (unmerged feature branch)
+
+Tested on the supplied `jess 0.3.0` Linux x64 runtime with `bench/storage.jsl`, a single
+process, local filesystem, buffered writes, primary-key hash storage, and secondary equality
+index. Numbers vary with hardware, filesystem and cache state; no `fsync` is performed.
+
+| Workload | Measured time |
+| --- | ---: |
+| 50,000 inserts in 64-row transactions | 0.562 s (~88,972 rows/s) |
+| 1,000 indexed equality COUNT queries (50k-row table) | 0.160 s |
+| Streaming compact checkpoint, 50k live rows | 0.792 s |
+| Reopen and replay compact checkpoint, 50k rows | 0.399 s |
+
+These numbers are **not a claim of durable commits per second**. `@dream/fs` currently lacks a
+documented stable-storage barrier, and the 50k rows are entirely resident in memory. The
+benchmark is for comparing native JSL engine revisions, not production deployment estimates.
+
+### Native JSL ordered-index ranges (new prototype)
+
+Jess 0.3.0 Linux x64, 30,000 stored records, 500 prepared probes, identical SQL
+and data within each comparison. Run with:
+
+```
+jess run --trusted --package . bench/ordered.jsl 30000 500
+```
+
+One observed run:
+
+```
+rows=30000 queries=500 result_rows=10000
+hash_baseline_s=2.9937 ordered_s=0.0166 build_s=0.1231 speedup=179.91x
+count_hash_s=2.5635 count_ordered_s=0.0018 count_speedup=1433.96x
+```
+
+The baseline has only the primary-key hash index and must scan/filter/sort for
+range queries; the experimental version adds an in-memory AVL ordered index.
+These are *workload-specific algorithmic* improvements, not comparisons with
+other DBMSs, full-database throughput figures, or fsync/power-loss measurements.
+Build cost is measured separately. More representative write-heavy and mixed
+room workloads, disk-backed indexes, and multi-run statistical benchmarks are
+still needed before performance claims in production.
+
+Prepared primary-key UPDATE microbenchmark, 5,000 updates per mode in one
+transaction, same table and statement (run `jess run --trusted --package .
+bench/mutations.jsl 5000`):
+
+```
+updates_per_mode=5000 parse_each_s=0.0630 prepared_s=0.0442 speedup=1.43x
+```
+
+These are single-run observations, including row copy/index maintenance and
+journal commit, not parser-only timings. A larger representative DML suite is
+required to assess concurrency and long-term regressions.
+
+## Native two-column scoped ordered indexes (Jess 0.3.0, buffered)
+
+`jess run --trusted --package . bench/composite.jsl 25000 150` compares
+standalone `stream_id` AVL + `room_id` hash indexes against the two-column
+`room_id, stream_id` composite index on the **same 25,000 persisted rows in 64
+rooms**. It uses identical prepared SQL on both sides and checks returned row
+counts and count totals for equality.
+
+| Workload (150 repetitions) | Separate ordered/hash indexes | Composite ordered index | Speedup |
+|---|---:|---:|---:|
+| `room_id = ? AND stream_id > ? ORDER BY stream_id LIMIT 20` | 0.08039 s | 0.00636 s | 12.65× |
+| `room_id = ? AND stream_id >= ? AND stream_id < ?` exact count | 0.09327 s | 0.00065 s | 143.34× |
+| `room_id = ? AND stream_id = ?` point SELECT | 0.00163 s | 0.00098 s | 1.67× |
+| `room_id = ? AND stream_id = ?` exact count | 0.00065 s | 0.00025 s | 2.55× |
+
+Building the composite index took 0.08586 seconds. These are one-run CPU-time
+microbenchmarks, not reliable p99 measurements. Rows, indexes, and range
+queries execute in memory after buffered log appends; they are **not**
+fsync-protected and do not imply disk-B-tree performance.
+
+## Reused ad-hoc SELECT plan cache (Jess 0.3.0, buffered)
+
+`jess run --trusted --package . bench/query-cache.jsl 3000` performs 3,000
+identical parameterized primary-key SELECT texts with varied bind parameters
+against a 1,000-row persistent table, reopening between runs to compare
+`queryCacheEntries = 0` versus 64. Checksums are compared for correctness.
+
+| Cache configuration | 3,000 `db:query` calls |
+|---|---:|
+| Disabled (`0`) | 0.03745 s |
+| LRU (`64`) | 0.00810 s |
+
+This measured run shows **4.63× lower total CPU time** for the specific hot-
+query microbenchmark. No disk-sync or network I/O is involved. SQL texts are
+identical except for bound parameters; random diverse SQL may show little
+benefit and may evict cached plans.
+
+## Resident index RSS and query throughput (native persistence branch)
+
+Benchmark: `jess run --trusted --package . bench/rss.jsl 80000`, Jess 0.3.0
+Linux x64, fresh database per process, 256 inserts per transaction, equality
+index on a unique code, duplicate-heavy room index, unique numeric ordered
+index, room+numeric composite index, 5,000 equality probes and 800 bounded
+room-stream range queries. The script asserts query counts/checksums. Exact
+baseline tree: `5ada94d229f5e18fabcf0a2f3f0558d97d13108e`; the optimized
+source changes only resident index metadata, not WAL contents. Runs alternated
+baseline/optimized on the same runtime (3 each for 40k rows, 2 each for 80k).
+
+| Rows | Metric | Baseline median | Compact postings median |
+|---:|---|---:|---:|
+| 40,000 | OS peak RSS | 161,344 KiB | 110,856 KiB (−31.3%) |
+| 40,000 | RSS after building indexes | 143,656 KiB | 94,336 KiB (−34.3%) |
+| 40,000 | End-to-end CPU time | 1.495 s | 0.998 s |
+| 80,000 | OS peak RSS | 277,480 KiB | 181,178 KiB (−34.7%) |
+| 80,000 | RSS after building indexes | 259,888 KiB | 163,204 KiB (−37.2%) |
+| 80,000 | End-to-end CPU time | 3.135 s | 2.166 s |
+| 80,000 | 5,000 indexed equality reads | 0.0974 s | 0.0832 s |
+| 80,000 | 800 bounded composite reads | 0.0958 s | 0.0554 s |
+
+The 40k and 80k runs have identical query checksums before/after. Timings and
+RSS are single-host development measurements, not statistically controlled
+production benchmarks. RSS includes the Jess binary, allocator arenas, and
+heap objects awaiting collection. CPU timings vary materially between runs;
+no universal query speedup is claimed. No fsync durability or disk paging is
+measured. The independent replay archive includes machine-readable raw runs.
+
+## Experimental packed resident columns + hypervectors (Jess 0.3.0)
+
+Compared the ordinary `row` layout with `rowLayout = 'packed'`, on the exact
+same SQL/data/query workload in `bench/packed-rss.jsl`: 80,000 rows, 256 inserts
+per transaction, a unique-code equality index, room hash index, numeric AVL
+index and room/stream composite index, 5,000 point probes and 800 range
+queries. Same query checksum `49295`, same range result count `16000`.
+Both modes use **identical buffered WAL semantics** and entirely resident
+indexes. Six fresh child processes ran in alternating order, three per mode.
+The medians are:
+
+| Measurement | Ordinary rows | Packed columns | Difference |
+|---|---:|---:|---:|
+| RSS after inserts | 120,900 KiB | 72,660 KiB | **−39.9%** |
+| RSS after index builds | 170,876 KiB | 140,000 KiB | **−18.1%** |
+| Peak RSS after queries | 184,824 KiB | 149,288 KiB | **−19.2%** |
+| Populate + index CPU | 2.328 s | 2.067 s | −11.2% |
+| 5,000 point probes CPU | 0.0886 s | 0.0297 s | −66.4% |
+| 800 range reads CPU | 0.0621 s | 0.0634 s | +2.0% |
+| Total benchmark CPU | 2.399 s | 2.165 s | −9.8% |
+
+Memory ranges were ordinary peak 184,784–189,564 KiB and packed peak
+148,764–150,684 KiB. CPU times varied significantly across runs (especially
+short queries), so they are **not** throughput guarantees; the exact raw runs
+are in the replay archive. RSS includes Jess and the allocator; it does not
+measure live Luau heap alone. These are microbenchmarks from one Linux x64 host,
+not cross-platform memory results. See `docs/PERSISTENCE.md` for representation
+and correctness limits. No fsync, disk-page I/O, compression ratio, or
+power-loss behavior is measured.
+
+### Hypervector sandbox
+
+`jess run --trusted --package . bench/hypervectors.jsl` constructs 2,000
+256-dimensional randomized binary token signatures (32 raw payload bytes per
+signature, excluding Luau `buffer` object overhead). On one development run:
+
+```
+dimensions=256 vectors=2000 payload_bytes_per_vector=32 build_s=0.07159
+pairs=200 compare_s=0.01243 near_wins=200 near_mean=48.2 unrelated_mean=129.6
+```
+
+Near matches share four of five synthetic tags. This demonstrates a similarity
+signal for *this generated dataset only*, not recall guarantees, a fast ANN
+index, or a lossless encoding of source text. A hypervector would **add**
+resident memory if stored alongside exact SQL fields; it is not part of the
+RSS optimization. To scale similarity search, we would need an explicit
+candidate-retrieval index and evaluate false matches, cost and recall under
+realistic distributions.
+
+## Compact native-buffer AVL nodes (Jess 0.3.0)
+
+Compared the unchanged packed-column/reusable-posting baseline
+`1674f8c400b5ddb85c858d162ddcf044032a51ce` with AVL nodes stored as
+20-byte buffer records. Each of three `packed` runs used a fresh Jess process
+in alternating before/after order; two `row` runs per configuration supplement
+the comparison. Same 80,000 rows, four indexes, 5,000 equality queries and 800
+room-scoped bounded range queries. Both sides returned **checksum 49295** and
+**16000 range results** on every run.
+
+| 80K-row metric (median) | Baseline | Compact AVL | Change |
+|---|---:|---:|---:|
+| Packed peak process RSS | 153,824 KiB | 116,812 KiB | **−24.1%** |
+| Packed RSS after indexes | 133,352 KiB | 114,292 KiB | −14.3% |
+| Packed total benchmark CPU | 2.259 s | 2.264 s | +0.2% |
+| Packed 5K equality queries | 0.0335 s | 0.0394 s | +17.7% |
+| Packed 800 composite range queries | 0.0392 s | 0.0326 s | −17.0% |
+| Ordinary-row peak RSS (2 runs) | 185,028 KiB | 154,994 KiB | **−16.2%** |
+| Ordinary-row total CPU (2 runs) | 2.535 s | 2.563 s | +1.1% |
+
+An isolated 80,000-node AVL benchmark additionally tests 4,000 weighted
+range counts, removes half the nodes, inserts replacements and iterates the
+entire tree. Its three-run medians were:
+
+| Isolated tree measurement | Previous | Compact | Change |
+|---|---:|---:|---:|
+| Peak process RSS | 60,596 KiB | 49,292 KiB | −18.7% |
+| 4,000 range-count probes | 0.01265 s | 0.00625 s | −50.6% |
+| Delete/reinsert plus iteration | 0.15795 s | 0.20244 s | **+28.2%** |
+
+**This is a memory/performance tradeoff.** The isolated mutation-heavy index
+microbenchmark got slower. The mixed SQL workload stayed approximately level
+in total CPU, but its short-query timings vary widely between runs. Do not
+infer production speedups from them. RSS includes Jess VM and allocator
+residency; the measured reduction depends on index cardinality and workload.
+These are Linux x64 measurements with buffered writes and no fsync, cold-disk
+paging, multi-worker contention or power-loss testing. Raw alternating-run
+logs are included in the replay archive.
+
+For repeatability:
+
+```bash
+jess run --trusted --package . bench/packed-rss.jsl packed 80000
+jess run --trusted --package . bench/packed-rss.jsl row 80000
+jess run --trusted --package . bench/ordered-slabs.jsl 80000
+```
+
+## Ordered scan and packed key-map follow-up (Jess 0.3.0)
+
+The compact-AVL baseline (`58d1e3aaf3be45c8e4d60d5612b0badbe652eaa1`)
+was compared against this revision with an unchanged Jess 0.3.0 executable
+and identical data, using fresh processes in alternating baseline/revision order.
+The internal ordered iterator now yields `(value, encodedKey)` pairs instead of
+allocating a `{value, encoded}` table per visited distinct key. The old iterator
+remains supported as a wrapper for external callers. AVL rebalancing computes
+child heights once per node rather than reading them twice. The packed row
+slot map also records deleted-key history using an internal negative sentinel,
+removing the separate `seen` hash table without losing insertion-order identity.
+Deleted-key history is purged with order compaction and checkpoint cleanup.
+
+| 80,000 packed rows, three alternating runs each (median) | Baseline | Revised |
+|---|---:|---:|
+| RSS after inserts | 72,420 KiB | 64,204 KiB |
+| RSS after building four indexes | 112,968 KiB | 108,140 KiB |
+| Peak RSS after queries | 116,976 KiB | 120,128 KiB |
+| Total CPU, including inserts/index builds and queries | 2.583 s | 2.046 s |
+| 5,000 indexed equality SQL queries | 0.0322 s | 0.0842 s |
+| 800 bounded composite range SQL queries | 0.0403 s | 0.0313 s |
+
+**Interpretation:** resident storage after inserts fell 11.3%, and RSS after
+index construction fell 4.3%. Peak process RSS **did not consistently improve**;
+query-phase allocator and GC behavior produced overlapping ranges. Small CPU
+numbers are volatile on this shared host, and the point-query result in this
+batch is a regression; earlier alternating trials did not reproduce it. Do not
+infer an overall SQL throughput win without a quieter, controlled workload.
+All six runs returned checksum 49,295 and 16,000 range rows.
+
+A separate 80,000-key AVL benchmark, with five alternating runs per revision,
+reported these medians:
+
+| Isolated benchmark | Before | After |
+|---|---:|---:|
+| AVL construction | 0.2170 s | 0.1755 s |
+| 4,000 range counts | 0.0069 s | 0.0063 s |
+| Delete half, reinsert and iterate 80,000 keys | 0.2152 s | 0.1635 s |
+| Peak RSS | 47,768 KiB | 48,912 KiB |
+
+The original compact-node deletion slowdown is reduced here, without reverting
+to per-node Lua tables. Memory readings for this isolated benchmark are too
+close to separate from allocator noise.
+
+To isolate cursor allocation, `bench/ordered-pairs.jsl` walks 40,000 keys eight
+times using the allocating compatibility cursor and the new pair cursor.
+Five same-process runs reported a median of **0.0861 s vs 0.0442 s**,
+respectively, with checksum 6,400,160,000 for both. This measures the iterator
+itself, not end-to-end SQL performance.
+
+The new regression tests cover mixed number/string AVL bounds and ascending/
+descending parity, packed deleted-key history, reinsertion without duplicate
+order slots, index counts, compaction, checkpoint and reopen. Neither the WAL
+format nor the buffered-write durability contract changed.
+
+## Experimental hybrid cold pages and hot WAL (Jess 0.3.0, Linux x64)
+
+Reproduce with `jess run --package . --trusted bench/hybrid-compare.jsl prepare 100000`,
+then separate processes for `resident 100000` and `hybrid 100000`. Six alternating
+measurements (three per configuration), from the same logical data and query
+checksum. The resident baseline has an ordered primary-key AVL index.
+
+| 100K-row metric | Resident packed median | Hybrid median |
+| --- | ---: | ---: |
+| Reopen elapsed CPU | 1.331 s | 0.0124 s |
+| RSS just after open | 76,312 KiB | 30,976 KiB |
+| RSS after query workload | 76,312 KiB | 42,908 KiB |
+| 300 random primary-key reads | 0.00121 s | 0.2517 s |
+| Three ordered ranges, LIMIT 20 | 0.000196 s | 0.00981 s |
+| Logical COUNT | 100,000 | 100,000 |
+| Query checksum | 20,999,420 | 20,999,420 |
+
+Medians from alternating runs; CPU and RSS vary with the host and GC. **Hybrid
+is significantly slower for hot queries**, and only its decoded-page cache is
+bounded. The massive reopen improvement comes from not reconstructing the full
+resident table and index. Buffered I/O, not fsync-backed durability.
+
+## Cold-page key lookup optimization (Jess 0.3.0)
+
+The immutable `JQLP2` provider now coalesces page reads and decodes simple
+numeric / unescaped string keys without allocating JSON objects per indexed
+row. The file format and CRC checks are unchanged. For 3,000 deterministic
+random misses against 30K rows and a four-page cache, median CPU from five
+alternating runs improved **2.84x** with numeric keys and **1.75x** with
+Matrix-style string keys. All query checksums and page-read counts matched.
+See [full benchmark methodology and limitations](docs/COLD-PAGE-LOOKUPS.md).
+
+## Cold composite sidecar vs unindexed hybrid scan (Jess 0.3.0)
+
+24,000 cold events across 48 rooms, 40 queries of the form `WHERE room = ? AND
+stream >= ? ORDER BY stream LIMIT 12`, with identical result checksums:
+
+| Measurement | Baseline (3 runs) | Sidecar (3 runs) |
+| --- | ---: | ---: |
+| Median query CPU | 4.889 s | 0.0508 s |
+| Query CPU range | 4.690–4.992 s | 0.0478–0.0534 s |
+| Post-query RSS range | 32,884–34,420 KiB | 37,264–37,648 KiB |
+| Checksum | 4,548,468 | 4,548,468 |
+
+Sidecar build ~0.437 s, cold file ~1.9 MiB, sidecar ~3.3 MiB. This is a
+scan-avoidance result, not a universal performance claim. See
+`docs/SECONDARY-INDEXES.md` and `bench/secondary.jsl`.
+
+## Bounded-memory external sidecar builder
+
+A snapshot-bound composite sidecar can now be built with external sorted
+runs, tiered merges, at most `mergeFanIn` concurrent source readers, and
+`runRows` maximum unsorted keys in memory. The small-index case uses the
+original in-memory fast path. Repro: `bench/secondary-build.jsl`.
+
+| 100K rows | Previous resident builder | External, 16K keys | External, 4K keys |
+| --- | ---: | ---: | ---: |
+| CPU build (s), one run | 2.24 | 3.08 | 4.64 |
+| Process peak RSS (KiB), one run | 95,644 | 64,480 | 57,684 |
+| Sidecar bytes | 14,394,086 | 14,394,086 | 14,394,086 |
+| Query checksum | 34,358,907 | 34,358,907 | 34,358,907 |
+
+These measurements include the Jess process and runtime residency, not
+just live sorter objects. Runs were performed on the same host with the
+same prepared snapshot but are not an exhaustive benchmark. The external
+builder trades increased build time and temporary disk I/O for lower peak
+RSS. No change to the JQLP2 format or WAL; durability is still buffered.
+
+## Compact cold sidecars (JQLS1, experimental)
+
+With the Jess 0.3.0 Linux x64 release, 100,000 events in 48 partitions,
+16,384-entry external-sort runs, merge fan-in 8, and identical source cold
+snapshot, we compared four runs of the original `JQLP2` sidecar builder and
+four runs of the opt-in `JQLS1` compact builder, alternating process order.
+
+| Metric (median) | JQLP2 | JQLS1 |
+|---|---:|---:|
+| Sidecar bytes | 14,394,086 | **3,581,252** |
+| Builder CPU seconds | 2.882 | **2.279** |
+| Peak process RSS (KiB) | 64,898 | 64,748 |
+| 120 bounded indexed range reads (CPU seconds) | 0.276 | 0.230 |
+| Query checksum | 28,443,996 | 28,443,996 |
+
+The index sidecar is **75.1% smaller** in this workload. Builder CPU is about
+21% lower in the sampled medians; the bounded query measurements overlap
+between runs, so do not extrapolate the median improvement to all workloads.
+The shared external sorter still dominates peak RSS. Read latency varies
+with partition cardinality, page cache size, storage, and key lengths.
+
+The benchmark is `bench/secondary-build.jsl`; its fifth positional argument
+selects `paged` (the backwards-compatible default) or `compact`. This
+experiment changes *index representation only*. It does not change the WAL,
+snapshot row format, query semantics, or cross-platform durability guarantees.
+
+## Experimental multi-segment cold storage — Jess 0.3.0
+
+`bench/segments.jsl` prepares four JQLP2 generations of 20,000 rows each,
+whose primary-key ranges overlap by 5,000 rows: **80,000 physical records,
+65,000 logical records**. It then measures 500 random lookups, 80 bounded
+keyset-pagination queries returning 30 rows each, and one full logical count.
+`compact` separately merges all generations to a new immutable snapshot.
+Run each phase in a separate process, with process RSS recorded by GNU time:
+
+```bash
+jess run --package . --trusted bench/segments.jsl prepare 20000 /tmp/jessql-segs
+/usr/bin/time -f 'RSS_KiB=%M' jess run --package . --trusted bench/segments.jsl read 20000 /tmp/jessql-segs
+/usr/bin/time -f 'RSS_KiB=%M' jess run --package . --trusted bench/segments.jsl compact 20000 /tmp/jessql-segs
+jess run --package . --trusted bench/segments.jsl cleanup 20000 /tmp/jessql-segs
+```
+
+Three independent read-phase processes, Linux x64, identical result checksum
+`35455850` and 694 page loads each:
+
+| Read-phase measurement | Median | Range |
+|---|---:|---:|
+| Total CPU, including 65K-row count | 0.570 s | 0.509–0.622 s |
+| 80 bounded ranges only | 0.0278 s | 0.0273–0.0393 s |
+| Peak process RSS | 37,492 KiB | 37,352–38,076 KiB |
+
+Three compaction processes, same inputs, same 65,000 logical output rows:
+
+| Compaction measurement | Median | Range |
+|---|---:|---:|
+| CPU | 0.606 s | 0.523–0.699 s |
+| Peak process RSS | 38,032 KiB | 37,816–38,292 KiB |
+
+The prototype's *initial*, non-index-aware ordered provider took ~26 seconds
+for the read phase because it scanned each generation for every short ordered
+page. Respecting the primary-key ordering and range constraints reduced that
+same workload to under 0.7 seconds wall time. This is an optimization against
+an internal prototype, **not** a comparison with an external database.
+
+Only one decoded row per generation is held by the merge iterator; the sparse
+page directories still grow with file size. The compaction output remains
+unpublished and does not establish power-loss durability or bounded disk
+reclamation. These results do not benchmark segment-aware composite indexes,
+which are not yet supported.
+
+## Segmented cold secondary-index merge
+
+`bench/segment-index.jsl` creates four overlapping 6,000-row JQLP2 snapshots
+and one compact composite `(room, stream)` sidecar per snapshot. It then
+compares 24 bounded, room-scoped ordered queries with and without sidecar
+merging. The fixture uses **unique ordered values** so LIMIT ties cannot
+produce different but equally valid SQL results. The 12 hot updates and 6
+deletions in the shared WAL exercise masking during both paths.
+
+```bash
+jess run --trusted --package . bench/segment-index.jsl prepare 6000 24 /tmp/jessql-si
+/usr/bin/time -f 'RSS_KiB=%M' jess run --trusted --package . bench/segment-index.jsl plain 6000 24 /tmp/jessql-si
+/usr/bin/time -f 'RSS_KiB=%M' jess run --trusted --package . bench/segment-index.jsl indexed 6000 24 /tmp/jessql-si
+jess run --trusted --package . bench/segment-index.jsl cleanup 6000 24 /tmp/jessql-si
+```
+
+Jess 0.3.0, Linux x64, six alternating fresh-process executions (three per
+configuration), with identical checksum **53,581,730**:
+
+| Measurement | Unindexed generation merge | Indexed generation merge |
+|---|---:|---:|
+| Median query CPU | 3.565 s | **0.0685 s** |
+| Query CPU range | 3.343–3.572 s | 0.0648–0.0777 s |
+| Median peak RSS | 35,460 KiB | 37,568 KiB |
+| Query count | 24 | 24 |
+
+**~52× less CPU** in this scoped workload, at roughly **2 MiB more RSS**.
+This compares an indexed generation merge against the previous full cold
+scan; it does not establish superiority over another indexed database. Builds
+of the four sidecars are done in the separate `prepare` phase and are not
+included in query CPU or RSS. Immutable deletion sidecars are checked by the
+regression suite but are not used in this specific performance fixture.
+
+The merger maintains one candidate per indexed generation but must consult
+newer snapshots for shadowed primary keys; heavy overlap can increase page
+reads. There is still no online generation publication, reclaiming of old
+files, or power-loss-durable WAL rotation.
+
+
+## Managed byte-budget accounting (opt-in, November 2026)
+
+The next Jess runtime integration provides a *logical live scalar payload*
+watermark, an error-latched write fence when byte-triggered maintenance fails,
+and reconstruction of byte counters during WAL recovery. These measurements
+compare the incoming selective-compaction tree against this revision, both
+using the supplied Jess 0.3.0 Linux x64 runtime. Each column shows the median
+of five alternating fresh-process executions. Inputs: 3,000 rows, 500 probes;
+64 inserts per synchronized transaction; the optional metered watermark is set
+high enough to avoid generation flushes. See the replay archive's
+`benchmark-final.csv` for individual rows.
+
+```bash
+jess run --trusted --package . bench/hot-budget.jsl stats 3000 500
+jess run --trusted --package . bench/hot-budget.jsl churn 3000 500
+jess run --trusted --package . bench/hot-budget.jsl churn 3000 500 metered
+```
+
+| CPU measurement | Incoming branch | New, unmetered | New, metered |
+|---|---:|---:|---:|
+| 3,000-row ingest during ingest workload | 58.92 ms | 62.78 ms | 63.59 ms |
+| 500 `db:stats()` calls after ingestion | 0.916 ms | 1.082 ms | 0.996 ms |
+| 500 synchronized upserts after ingestion | 150.99 ms | 137.63 ms | 146.71 ms |
+
+The differences are **small and variable**, especially for the sub-millisecond
+stats loop, and do not establish a general speedup or regression. The extra
+byte accounting work is opt-in so it does not impose per-row scalar scans on
+unconfigured databases. These are process CPU measurements from `os.clock`,
+not p99 latency, a physical power-cut test, or a controlled SQLite/RocksDB
+comparison. `maxHotBytes` is explicitly **not** a hard RSS cap. See
+[hot-byte maintenance semantics](docs/HOT-BYTE-BUDGET.md).
+
+## Grouped synchronized WAL transactions (experimental)
+
+The 960-transaction test compares identical CRC-framed WAL records while
+amortizing `syncData()` over 32 callbacks, not combining transactions. Seven
+alternating fresh-process Linux x64 runs produced median `os.clock()` of
+**262.527 ms** (solo) versus **28.304 ms** (batch), and process wall times of
+**0.42 s** versus **0.18 s**; both wrote **186,158 bytes** of WAL. This is an
+isolated sequential-submission benchmark, not concurrent multi-client throughput.
+See [docs/GROUP-COMMITS.md](docs/GROUP-COMMITS.md) for exact commands, failure
+contract, and limitations. Raw results are in the replay archive.

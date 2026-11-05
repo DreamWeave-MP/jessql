@@ -1,0 +1,2219 @@
+--!strict
+--!native
+-- JessQL's native append-only store. No external database or FFI dependency.
+-- Records are length-delimited and CRC-protected; one record contains one transaction.
+-- A torn trailing record is discarded. A corrupt complete record fails closed.
+local fs = require('@dream/fs')
+local bytes = require('@dream/bytes')
+local json = require('@jess/json')
+local queryEngine = require('@jessql/engine')
+local ordered = require('@jessql/ordered')
+local packed = require('@jessql/packed')
+local mutations = require('@jessql/mutations')
+
+export type Row = { [string]: unknown }
+export type Options = { maxFrameBytes: number?, recoverTail: boolean?, queryCacheEntries: number?, rowLayout: string?, durability: string?, trackPayloadBytes: boolean?,
+  -- Fault injection for deterministic tests of uncertain batch acknowledgments.
+  batchTestHook: ((string) -> ())? }
+export type BatchResult = { ok: boolean, error: string? }
+export type Store = {
+  -- One CRC-framed WAL transaction per callback, one syncData for all successful entries.
+  transactionBatch: (self: Store, callbacks: { (Transaction) -> () }) -> { BatchResult },
+  createTable: (self: Store, name: string, columns: { string }, primaryKey: string) -> (),
+  createIndex: (self: Store, name: string, column: string) -> (),
+  createOrderedIndex: (self: Store, name: string, column: string) -> (),
+  createCompositeIndex: (self: Store, name: string, prefix: string, suffix: string) -> (),
+  exec: (self: Store, sql: string, params: { unknown }?) -> number,
+  prepareExec: (self: Store, sql: string) -> MutationPlan,
+  addColumn: (self: Store, name: string, column: string) -> (),
+  update: (self: Store, name: string, key: unknown, changes: Row, unset: { string }?) -> boolean,
+  insert: (self: Store, name: string, row: Row) -> (),
+  upsert: (self: Store, name: string, row: Row) -> (),
+  delete: (self: Store, name: string, key: unknown) -> boolean,
+  get: (self: Store, name: string, key: unknown) -> Row?,
+  iterateRows: (self: Store, name: string) -> () -> Row?,
+  transaction: (self: Store, callback: (Transaction) -> ()) -> (),
+  query: (self: Store, sql: string, params: { unknown }?) -> queryEngine.Result,
+  prepare: (self: Store, sql: string) -> queryEngine.Plan,
+  tables: (self: Store) -> { queryEngine.TableInfo },
+  stats: (self: Store) -> { [string]: TableMetrics },
+  tableFootprint: (self: Store, name: string) -> { rows: number, payloadBytes: number? },
+  cacheStats: (self: Store) -> CacheMetrics,
+  checkpoint: (self: Store) -> (),
+  close: (self: Store) -> (),
+}
+export type MutationPlan = {
+  parameterCount: number,
+  run: (params: { unknown }?) -> number,
+  inTransaction: (tx: Transaction, params: { unknown }?) -> number,
+}
+export type CacheMetrics = { entries: number, capacity: number, hits: number, misses: number, evictions: number }
+export type TableMetrics = {
+  rows: number, keySlots: number, indexSlots: { [string]: number }, indexKeys: { [string]: number },
+  indexNullSlots: { [string]: number }, compositePartitions: { [string]: number },
+  resident: packed.Metrics?, payloadBytes: number?,
+}
+export type Transaction = {
+  createTable: (self: Transaction, name: string, columns: { string }, primaryKey: string) -> (),
+  createIndex: (self: Transaction, name: string, column: string) -> (),
+  createOrderedIndex: (self: Transaction, name: string, column: string) -> (),
+  createCompositeIndex: (self: Transaction, name: string, prefix: string, suffix: string) -> (),
+  primaryKey: (self: Transaction, name: string) -> string,
+  hasColumn: (self: Transaction, name: string, column: string) -> boolean,
+  keysWhere: (self: Transaction, name: string, column: string, value: unknown) -> { unknown },
+  keysRange: (self: Transaction, name: string, column: string, op: string, value: unknown) -> { unknown },
+  exec: (self: Transaction, sql: string, params: { unknown }?) -> number,
+  executeMutation: (self: Transaction, statement: mutations.Statement, params: { unknown }?) -> number,
+  addColumn: (self: Transaction, name: string, column: string) -> (),
+  update: (self: Transaction, name: string, key: unknown, changes: Row, unset: { string }?) -> boolean,
+  insert: (self: Transaction, name: string, row: Row) -> (),
+  upsert: (self: Transaction, name: string, row: Row) -> (),
+  delete: (self: Transaction, name: string, key: unknown) -> boolean,
+  get: (self: Transaction, name: string, key: unknown) -> Row?,
+  query: (self: Transaction, sql: string, params: { unknown }?) -> queryEngine.Result,
+}
+
+type Schema = { columns: { string }, primaryKey: string, allowed: { [string]: boolean } }
+-- Dense ordered posting slots plus one primary-key -> slot map; deleted slots
+-- use the impossible encoded key '' so no second hash set is retained.
+type Bucket = { keys: { string }, positions: { [string]: number }, count: number }
+type Posting = string | Bucket
+type Index = {
+  -- The common single-row posting is the encoded primary key itself. A bucket
+  -- is allocated only when at least two rows share an indexed value.
+  buckets: { [string]: Posting }, ordered: boolean?, tree: ordered.Tree?,
+  types: { [string]: number }?, nulls: Posting?,
+}
+type Composite = { prefix: string, suffix: string, partitions: { [string]: Index } }
+type TableState = {
+  schema: Schema,
+  rows: { [string]: Row },
+  order: { string },
+  seen: { [string]: boolean },
+  count: number,
+  payloadBytes: number,
+  secondary: { [string]: Index },
+  composites: { [string]: Composite },
+  available: { [string]: boolean },
+  packed: packed.Store?,
+}
+type Operation = { kind: string, table: string, columns: { string }?, primaryKey: string?, column: string?, suffix: string?, ordered: boolean?, row: Row?, key: unknown }
+type Pending = { [string]: { [string]: Row | boolean } }
+type DatabaseState = {
+  path: string,
+  lock: dream_fs_Lock,
+  engine: queryEngine.Database,
+  tables: { [string]: TableState },
+  sequence: number,
+  schemaVersion: number,
+  maxFrameBytes: number,
+  closed: boolean,
+  busy: boolean,
+  poisoned: boolean,
+  rowLayout: string,
+  trackPayloadBytes: boolean,
+  durability: string,
+  walWriter: dream_fs_Writer?,
+}
+
+local Magic = 'JQLW1\n'
+local HeaderBytes = 8
+local DefaultMaxFrame = 16 * 1024 * 1024
+local Deleted = false
+
+local function compositeName(prefix: string, suffix: string): string
+  return prefix .. ':' .. suffix
+end
+
+local function requireName(name: string): string
+  if type(name) ~= 'string' or not string.match(name, '^[%a_][%w_]*$') then
+    error('jessql storage: invalid identifier', 3)
+  end
+  return string.lower(name)
+end
+
+-- Explicit scalar-only contract: no arbitrary Lua objects, cycles, NaN or infinities.
+-- Integers must fit exactly in IEEE754; full i64 support requires a separate value type.
+local function scalar(value: unknown): boolean
+  if value == nil then return true end
+  local kind = type(value)
+  if kind == 'string' then return utf8.len(value :: string) ~= nil end
+  if kind == 'boolean' then return true end
+  return kind == 'number' and (value :: number) == (value :: number)
+    and math.abs(value :: number) < math.huge
+end
+
+local function keyOf(value: unknown): string
+  if not scalar(value) or value == nil then error('jessql storage: invalid primary key', 3) end
+  local kind = type(value)
+  if kind == 'string' then return 's' .. (value :: string) end
+  if kind == 'boolean' then return if value == true then 'b1' else 'b0' end
+  local number = value :: number
+  if number == 0 then number = 0 end
+  return 'n' .. string.format('%.17g', number)
+end
+
+local function makeSchema(columns: { string }, primaryKey: string): Schema
+  if type(columns) ~= 'table' or #columns == 0 or #columns > 256 then
+    error('jessql storage: columns must be a non-empty array (up to 256)', 3)
+  end
+  local allowed, copy = {}, {}
+  for _, column in columns do
+    local normalized = requireName(column)
+    if allowed[normalized] then error('jessql storage: duplicate column', 3) end
+    allowed[normalized] = true
+    copy[#copy + 1] = normalized
+  end
+  local pk = requireName(primaryKey)
+  if not allowed[pk] then error('jessql storage: primary key is not a column', 3) end
+  return { columns = copy, primaryKey = pk, allowed = allowed }
+end
+
+local function copyRow(schema: Schema, row: Row): Row
+  if type(row) ~= 'table' then error('jessql storage: row must be a table', 3) end
+  local copy: Row = {}
+  for key, value in row do
+    if type(key) ~= 'string' or not schema.allowed[string.lower(key)] then
+      error('jessql storage: unknown column', 3)
+    end
+
+    if not scalar(value) then error('jessql storage: unsupported value', 3) end
+    copy[string.lower(key)] = value
+  end
+  keyOf(copy[schema.primaryKey])
+  return copy
+end
+
+-- Logical live scalar payload only: string UTF-8 bytes, 8 bytes per number,
+-- one byte per boolean. Excludes Lua tables, column/index/allocator overhead,
+-- dead packed arenas and WAL bytes; it is NOT a physical RSS measurement.
+-- Recomputed during WAL replay, so recovery never trusts a persisted counter.
+local function rowPayloadBytes(row: Row): number
+  local total = 0
+  for _, value in row do
+    if type(value) == 'string' then total += #(value :: string)
+    elseif type(value) == 'number' then total += 8
+    elseif type(value) == 'boolean' then total += 1 end
+  end
+  return total
+end
+
+local function frame(payload: string, maximum: number): string
+  if #payload > maximum then error('jessql storage: transaction exceeds frame limit', 3) end
+  local header = buffer.create(HeaderBytes)
+  buffer.writeu32(header, 0, #payload)
+  buffer.writeu32(header, 4, bytes.crc32(payload))
+  return buffer.tostring(header) .. payload
+end
+
+-- Maintain bounded tombstone overhead under long-running update/delete churn.
+-- Rebuilding only after the dead slots exceed the live slots amortizes the cost.
+local function postingCount(posting: Posting?): number
+  if not posting then return 0 end
+  return if type(posting) == 'string' then 1 else posting.count
+end
+
+local function postingKeys(posting: Posting?): ({ string }, { [string]: boolean }?)
+  if not posting then return {}, nil end
+  if type(posting) == 'string' then return { posting }, nil end
+  return posting.keys, nil -- Deleted entries are empty-string tombstones.
+end
+
+local function compactBucket(bucket: Bucket)
+  if #bucket.keys <= 64 + 2 * bucket.count then return end
+  local liveKeys, positions = {} :: { string }, {} :: { [string]: number }
+  for _, key in bucket.keys do
+    if key ~= '' then
+      liveKeys[#liveKeys + 1] = key
+      positions[key] = #liveKeys
+    end
+  end
+  bucket.keys = liveKeys
+  bucket.positions = positions
+end
+
+-- Yield live encoded primary keys without allocating a result table.
+local function eachPosting(posting: Posting?, visit: (string) -> ())
+  if not posting then return end
+
+  if type(posting) == 'string' then
+    visit(posting)
+  else
+    for _, key in posting.keys do
+      if key ~= '' then visit(key) end
+    end
+  end
+end
+
+local function compactOrder(current: TableState)
+  if #current.order <= 64 + 2 * current.count then return end
+  local liveOrder, liveSeen = {} :: { string }, {} :: { [string]: boolean }
+  for _, key in current.order do
+    if (current.packed and current.packed:has(key)) or current.rows[key] then
+      liveOrder[#liveOrder + 1] = key
+      if not current.packed then liveSeen[key] = true end
+    end
+  end
+  current.order = liveOrder
+  if current.packed then
+    current.packed:clearDeadKeys()
+  else
+    current.seen = liveSeen
+  end
+end
+
+-- Read only the columns requested by the query. Packed tables otherwise
+-- materialize full row dictionaries just to return one projected scalar.
+local function readRow(current: TableState, key: string, columns: { string }?): Row?
+  local resident = current.packed
+  return if resident then resident:read(key, columns) else current.rows[key]
+end
+
+local function hasRow(current: TableState, key: string): boolean
+  local resident = current.packed
+  return if resident then resident:has(key) else current.rows[key] ~= nil
+end
+
+local function columnValue(current: TableState, key: string, column: string): unknown
+  local resident = current.packed
+  if resident then return resident:value(key, column) end
+  local row = current.rows[key]
+  return if row then row[column] else nil
+end
+
+local function indexSet(index: Index, value: unknown, key: string, present: boolean)
+  if value == nil and not index.ordered then return end
+  local encoded = if value ~= nil then keyOf(value) else ''
+  local posting = if value == nil then index.nulls else index.buckets[encoded]
+  local function set(nextPosting: Posting?)
+    if value == nil then index.nulls = nextPosting else index.buckets[encoded] = nextPosting end
+  end
+  local kind = type(value)
+
+  if present then
+    if not posting then
+      set(key) -- Avoid three small Lua tables for unique indexed values.
+      if index.ordered and value ~= nil then
+        local kinds = index.types :: { [string]: number }
+        kinds[kind] = (kinds[kind] or 0) + 1
+        if kind == 'number' or kind == 'string' then
+          index.tree = ordered.insert(index.tree, value :: string | number, encoded)
+        end
+      end
+      return
+    end
+
+    if type(posting) == 'string' then
+      if posting == key then return end
+      -- Promote to a real posting list only on the second distinct row.
+      local other = posting
+      set({ keys = { other, key }, positions = { [other] = 1, [key] = 2 }, count = 2 })
+    else
+      if posting.positions[key] then return end
+
+      posting.keys[#posting.keys + 1] = key
+      posting.positions[key] = #posting.keys
+      posting.count += 1
+    end
+
+    if index.ordered and value ~= nil and (kind == 'number' or kind == 'string') then
+      index.tree = ordered.adjust(index.tree, value :: string | number, 1)
+    end
+
+    return
+  end
+
+  if not posting then return end
+
+  if type(posting) == 'string' then
+    if posting ~= key then return end
+    set(nil)
+    if index.ordered and value ~= nil then
+      local kinds = index.types :: { [string]: number }
+      kinds[kind] -= 1
+      if kind == 'number' or kind == 'string' then
+        index.tree = ordered.remove(index.tree, value :: string | number)
+      end
+    end
+    return
+  end
+
+  local position = posting.positions[key]
+  if not position then return end
+
+  posting.positions[key] = nil
+  posting.keys[position] = ''
+  posting.count -= 1
+  if index.ordered and value ~= nil and (kind == 'number' or kind == 'string') then
+    index.tree = ordered.adjust(index.tree, value :: string | number, -1)
+  end
+
+  -- Shrink back to an inline posting when only one row remains. SQL does not
+  -- guarantee tie order; no indexed iterator survives a synchronous write.
+  if posting.count == 1 then
+    for _, survivor in posting.keys do
+      if survivor ~= '' then set(survivor); break end
+    end
+  elseif posting.count == 0 then
+    set(nil)
+    if index.ordered and value ~= nil then
+      local kinds = index.types :: { [string]: number }
+      kinds[kind] -= 1
+      if kind == 'number' or kind == 'string' then
+        index.tree = ordered.remove(index.tree, value :: string | number)
+      end
+    end
+  else
+    -- NULL postings need the same compaction bound as ordinary values.
+    compactBucket(posting)
+  end
+end
+
+-- Only let the ordered provider claim SQL sorting if *all* non-NULL entries
+-- have one comparable type. Otherwise the SQL engine retains its own semantics.
+local function orderType(index: Index): string?
+  local kinds = index.types
+  if not kinds then return nil end
+  if (kinds.boolean or 0) > 0 then return nil end
+
+  if (kinds.number or 0) > 0 then
+    return if (kinds.string or 0) == 0 then 'number' else nil
+  end
+
+  if (kinds.string or 0) > 0 then return 'string' end
+  return 'empty'
+end
+
+-- Return the value of an exact equality on a given column, if present.
+local function equalityValue(request: queryEngine.Request, column: string): unknown
+  for _, constraint in request.constraints do
+    if constraint.column == column and constraint.op == '=' and constraint.value ~= nil
+      and scalar(constraint.value) then
+      return constraint.value
+    end
+  end
+  return nil
+end
+
+-- An ordered index can supply a direct range cursor for simple predicates.
+-- Never claim that a partial WHERE has been evaluated: JessQL handles it.
+local function orderedCursor(current: TableState, request: queryEngine.Request): queryEngine.Iterator?
+  local order = request.orderBy
+  local column: string? = nil
+  local descending = false
+  if order and #order == 1 then
+    column, descending = order[1].column, order[1].desc
+  elseif not order then
+    for _, constraint in request.constraints do
+      if constraint.op ~= '<' and constraint.op ~= '<=' and constraint.op ~= '>' and constraint.op ~= '>=' then
+        continue
+      end
+
+      local index = current.secondary[constraint.column]
+      if index and index.ordered then column = constraint.column; break end
+
+      for _, composite in current.composites do
+        if composite.suffix ~= constraint.column then continue end
+        if equalityValue(request, composite.prefix) == nil then continue end
+        column = constraint.column
+        break
+      end
+
+      if column then break end
+    end
+  end
+
+  if not column then return nil end
+  local index = current.secondary[column]
+  for _, composite in current.composites do
+    if composite.suffix ~= column then continue end
+    local prefix = equalityValue(request, composite.prefix)
+    if prefix == nil then continue end
+    index = composite.partitions[keyOf(prefix)]
+    -- An absent prefix has no rows. This is still a correctly ordered scan.
+    if not index then
+      return { _jessqlIter = 'v1', ordered = order ~= nil, next = function() return nil end }
+    end
+    break
+  end
+
+  if not index or not index.ordered then return nil end
+
+  local kind = orderType(index)
+  if not kind then return nil end
+  local lower: (string | number)? = nil
+  local upper: (string | number)? = nil
+  local lowerStrict, upperStrict = false, false
+  local hasRange = false
+  for _, constraint in request.constraints do
+    if constraint.column ~= column then continue end
+    local op, value = constraint.op, constraint.value
+    if op ~= '<' and op ~= '<=' and op ~= '>' and op ~= '>=' then continue end
+
+    if value == nil or (kind ~= 'empty' and type(value) ~= kind)
+      or (type(value) ~= 'string' and type(value) ~= 'number') then
+      return nil -- retain errors/null semantics in the SQL executor
+    end
+    local bound = value :: string | number
+    if op == '>' or op == '>=' then
+      if not lower or ordered.compare(bound, lower) > 0 or (bound == lower and op == '>') then
+        lower, lowerStrict = bound, op == '>'
+      end
+    else
+      if not upper or ordered.compare(bound, upper) < 0 or (bound == upper and op == '<') then
+        upper, upperStrict = bound, op == '<'
+      end
+    end
+
+    hasRange = true
+  end
+
+  if not order and not hasRange then return nil end
+
+  local advance = ordered.iteratePairs(index.tree, descending, lower, lowerStrict, upper, upperStrict)
+  local nullBucket = index.nulls
+  local nullPosition = 0
+  local posting: Posting? = nil
+  local postingPosition = 0
+  local finished = false
+  local resident = current.packed
+  local reusable: Row? = if resident and request.allowVolatileRows then {} else nil
+  local function nextRow(key: string): Row?
+    if resident and reusable then return resident:readInto(key, request.columns, reusable) end
+    return readRow(current, key, request.columns)
+  end
+
+  local function nextNull(): queryEngine.SourceRow?
+    if not nullBucket then return nil end
+
+    if type(nullBucket) == 'string' then
+      if nullPosition > 0 then return nil end
+      nullPosition = 1
+      return nextRow(nullBucket)
+    end
+
+    while nullPosition < #nullBucket.keys do
+      nullPosition += 1
+      local key = nullBucket.keys[nullPosition]
+      if key ~= '' then
+        local row = nextRow(key)
+        if row then return row end
+      end
+    end
+
+    return nil
+  end
+
+  return {
+    _jessqlIter = 'v1', ordered = order ~= nil, volatileRows = reusable ~= nil,
+    next = function(): queryEngine.SourceRow?
+      if order and not hasRange and not descending and not finished then
+        local row = nextNull()
+        if row then return row end
+
+        finished = true
+      end
+
+      while true do
+        if posting then
+          if type(posting) == 'string' then
+            local key = posting :: string
+            posting = nil
+            local row = nextRow(key)
+            if row then return row end
+          else
+            local bucket = posting :: Bucket
+            while postingPosition < #bucket.keys do
+              postingPosition += 1
+              local key = bucket.keys[postingPosition]
+              if key ~= '' then
+                local row = nextRow(key)
+                if row then return row end
+              end
+            end
+          end
+        end
+
+        local _value, encoded = advance()
+        if not encoded then break end
+
+        posting = index.buckets[encoded]
+        postingPosition = 0
+      end
+
+      if order and not hasRange and descending then return nextNull() end
+      return nil
+    end,
+  }
+end
+
+-- Each prefix value has its own suffix AVL tree. There is no combined-string
+-- encoding: suffix comparison preserves numeric ordering and avoids collisions.
+local function compositeSet(composite: Composite, row: Row, key: string, present: boolean)
+  local prefix = row[composite.prefix]
+  if prefix == nil then return end
+  local encoded = keyOf(prefix)
+  local index = composite.partitions[encoded]
+  if not index then
+    if not present then return end
+    index = { buckets = {}, ordered = true, types = {} } :: Index
+    composite.partitions[encoded] = index
+  end
+  indexSet(index, row[composite.suffix], key, present)
+  if not present and next(index.buckets) == nil and index.nulls == nil then
+    composite.partitions[encoded] = nil
+  end
+end
+
+local function updateIndexes(current: TableState, key: string, before: Row?, after: Row?)
+  for _, composite in current.composites do
+    if before and after and before[composite.prefix] == after[composite.prefix]
+      and before[composite.suffix] == after[composite.suffix] then continue end
+
+    if before then compositeSet(composite, before, key, false) end
+    if after then compositeSet(composite, after, key, true) end
+  end
+
+  for column, index in current.secondary do
+    local oldValue = if before then before[column] else nil
+    local newValue = if after then after[column] else nil
+    if oldValue ~= newValue or (index.ordered and (not before or not after)) then
+      if before then indexSet(index, oldValue, key, false) end
+      if after then indexSet(index, newValue, key, true) end
+    end
+  end
+end
+
+local function indexedKeys(current: TableState, request: queryEngine.Request): ({ string }, { [string]: boolean }?)
+  local bestKeys = current.order
+  local bestSet = nil
+  local bestCount = current.count + 1
+  -- A pair of equalities can use the narrowest composite posting list,
+  -- even when neither field has a standalone hash index.
+  for _, composite in current.composites do
+    local prefix = equalityValue(request, composite.prefix)
+    local suffix = equalityValue(request, composite.suffix)
+    if prefix == nil or suffix == nil then continue end
+    local index = composite.partitions[keyOf(prefix)]
+    local bucket = if index then index.buckets[keyOf(suffix)] else nil
+    local count = postingCount(bucket)
+    if count < bestCount then
+      bestCount = count
+      bestKeys, bestSet = postingKeys(bucket)
+    end
+  end
+
+  for _, constraint in request.constraints do
+    if constraint.op ~= '=' or constraint.value == nil or not scalar(constraint.value) then continue end
+    local column = constraint.column
+    local value = constraint.value
+    if column == current.schema.primaryKey then
+      local key = keyOf(value)
+      return { key }, nil
+    end
+    local index = current.secondary[column]
+    if index then
+      local bucket = index.buckets[keyOf(value)]
+      local count = postingCount(bucket)
+      if count < bestCount then
+        bestCount = count
+        bestKeys, bestSet = postingKeys(bucket)
+      end
+    end
+  end
+  return bestKeys, bestSet
+end
+
+local function tableProvider(state: DatabaseState, name: string): queryEngine.Provider
+  local current = state.tables[name] :: TableState
+  return {
+    columns = current.schema.columns,
+    indexes = current.available,
+    count = function() return (state.tables[name] :: TableState).count end,
+    countFiltered = function(request)
+      if not request.whereComplete or #request.constraints == 0 then return nil end
+      local tableState = state.tables[name] :: TableState
+      -- Composite (prefix = value, suffix range) counts can be answered by one
+      -- partition's subtree weights without reading any matching rows.
+      for _, composite in tableState.composites do
+        local prefixValue: unknown = nil
+        local hasPrefix, hasRange, compatible = false, false, true
+        local lower: (string | number)? = nil
+        local upper: (string | number)? = nil
+        local lowerStrict, upperStrict = false, false
+        for _, constraint in request.constraints do
+          if constraint.column == composite.prefix and constraint.op == '=' then
+            if hasPrefix then compatible = false; break end
+            hasPrefix, prefixValue = true, constraint.value
+          elseif constraint.column == composite.suffix and
+            (constraint.op == '<' or constraint.op == '<=' or constraint.op == '>' or constraint.op == '>=') then
+            if constraint.value == nil then return 0 end
+            local value = constraint.value
+            if type(value) ~= 'number' and type(value) ~= 'string' then compatible = false; break end
+            local bound = value :: string | number
+            if constraint.op == '>' or constraint.op == '>=' then
+              if not lower or ordered.compare(bound, lower) > 0
+                or (bound == lower and constraint.op == '>') then
+                lower, lowerStrict = bound, constraint.op == '>'
+              end
+            else
+              if not upper or ordered.compare(bound, upper) < 0
+                or (bound == upper and constraint.op == '<') then
+                upper, upperStrict = bound, constraint.op == '<'
+              end
+            end
+            hasRange = true
+          else
+            compatible = false
+            break
+          end
+        end
+
+        if compatible and hasPrefix and hasRange then
+          if prefixValue == nil then return 0 end
+          if not scalar(prefixValue) then break end
+          local index = composite.partitions[keyOf(prefixValue)]
+          if not index then return 0 end
+          local kind = orderType(index)
+          if kind and (kind == 'empty' or ((not lower or type(lower) == kind)
+            and (not upper or type(upper) == kind))) then
+            return ordered.countRange(index.tree, lower, lowerStrict, upper, upperStrict)
+          end
+        end
+      end
+      -- A fully covered range over one ordered column can be counted by AVL
+      -- subtree cardinalities without reading or materializing any rows.
+      local rangeColumn: string? = nil
+      local rangeCompatible = true
+      local lower: (string | number)? = nil
+      local upper: (string | number)? = nil
+      local lowerStrict, upperStrict = false, false
+      for _, constraint in request.constraints do
+        if constraint.op ~= '<' and constraint.op ~= '<=' and constraint.op ~= '>' and constraint.op ~= '>=' then
+          rangeCompatible = false
+          break
+        end
+
+        if rangeColumn and rangeColumn ~= constraint.column then rangeCompatible = false; break end
+
+        rangeColumn = constraint.column
+        if constraint.value == nil then return 0 end
+        if not scalar(constraint.value) then rangeCompatible = false; break end
+        local value = constraint.value
+        if type(value) ~= 'string' and type(value) ~= 'number' then rangeCompatible = false; break end
+
+        local bound = value :: string | number
+        if constraint.op == '>' or constraint.op == '>=' then
+          if not lower or ordered.compare(bound, lower) > 0
+            or (bound == lower and constraint.op == '>') then
+            lower, lowerStrict = bound, constraint.op == '>'
+          end
+        else
+          if not upper or ordered.compare(bound, upper) < 0
+            or (bound == upper and constraint.op == '<') then
+            upper, upperStrict = bound, constraint.op == '<'
+          end
+        end
+      end
+
+      if rangeCompatible and rangeColumn then
+        local index = tableState.secondary[rangeColumn]
+        if index and index.ordered then
+          local kind = orderType(index)
+          if kind and (kind == 'empty' or ((not lower or type(lower) == kind)
+            and (not upper or type(upper) == kind))) then
+            return ordered.countRange(index.tree, lower, lowerStrict, upper, upperStrict)
+          end
+        end
+      end
+
+      -- Composite equality lookups support exact counts without scanning rows.
+      -- With additional equalities, indexedKeys narrows candidates then the
+      -- existing residual verifier checks the complete conjunction.
+      local compositeIndexed = false
+      for _, composite in tableState.composites do
+        local prefix = equalityValue(request, composite.prefix)
+        local suffix = equalityValue(request, composite.suffix)
+        if prefix == nil or suffix == nil then continue end
+        compositeIndexed = true
+        if #request.constraints == 2 then
+          local index = composite.partitions[keyOf(prefix)]
+          local bucket = if index then index.buckets[keyOf(suffix)] else nil
+          return postingCount(bucket)
+        end
+      end
+
+      local indexed = compositeIndexed
+      for _, constraint in request.constraints do
+        if constraint.op ~= '=' then return nil end
+        if constraint.value == nil then return 0 end
+        if not scalar(constraint.value) then return nil end
+        if tableState.available[constraint.column] then indexed = true end
+      end
+
+      if not indexed then return nil end
+
+      local keys, live = indexedKeys(tableState, request)
+      if #request.constraints == 1 then
+        local only = request.constraints[1]
+        if only.column == tableState.schema.primaryKey then
+          return if hasRow(tableState, keys[1]) then 1 else 0
+        end
+        local bucket = tableState.secondary[only.column].buckets[keyOf(only.value)]
+        return postingCount(bucket)
+      end
+
+      -- More than one predicate: use the smallest available posting list, then
+      -- verify every equality against the original row (including non-indexed columns).
+      local count = 0
+      for _, key in keys do
+        if live and not (live :: { [string]: boolean })[key] then continue end
+        local row = readRow(tableState, key, request.columns)
+        if not row then continue end
+        local matches = true
+        for _, constraint in request.constraints do
+          if row[constraint.column] == nil or row[constraint.column] ~= constraint.value then
+            matches = false
+            break
+          end
+        end
+
+        if matches then count += 1 end
+      end
+      return count
+    end,
+    scan = function(request)
+      local tableState = state.tables[name] :: TableState
+      local keys, live = indexedKeys(tableState, request)
+      local rows: { queryEngine.Row } = {}
+      for _, key in keys do
+        if live and not (live :: { [string]: boolean })[key] then continue end
+        local row = readRow(tableState, key, request.columns)
+        if row then rows[#rows + 1] = row end
+      end
+      return rows
+    end,
+    iterate = function(request)
+      local tableState = state.tables[name] :: TableState
+      local sorted = orderedCursor(tableState, request)
+      if sorted then return sorted end
+      local keys, live = indexedKeys(tableState, request)
+      local cursor = 0
+      local resident = tableState.packed
+      local reusable: Row? = if resident and request.allowVolatileRows then {} else nil
+      local iterator: queryEngine.Iterator = {
+        _jessqlIter = 'v1', volatileRows = reusable ~= nil,
+        next = function(): queryEngine.SourceRow?
+          while cursor < #keys do
+            cursor += 1
+            local key = keys[cursor]
+            if live and not (live :: { [string]: boolean })[key] then continue end
+            local row = if resident and reusable then (resident :: packed.Store):readInto(key, request.columns, reusable :: Row)
+              else readRow(tableState, key, request.columns)
+            if row then return row end
+          end
+          return nil
+        end,
+      }
+      return iterator
+    end,
+    lookup = function(column, value, _request)
+      local tableState = state.tables[name] :: TableState
+      if value == nil or not scalar(value) then return nil end
+
+      if column == tableState.schema.primaryKey then
+        local row = readRow(tableState, keyOf(value), _request.columns)
+        return if row then { row } else {}
+      end
+      local index = tableState.secondary[column]
+      if not index then return nil end
+      local bucket = index.buckets[keyOf(value)]
+      local rows: { queryEngine.Row } = {}
+      eachPosting(bucket, function(key)
+        local row = readRow(tableState, key, _request.columns)
+        if row then rows[#rows + 1] = row end
+      end)
+      return rows
+    end,
+  }
+end
+
+local function apply(state: DatabaseState, operations: { Operation })
+  -- Transaction has already been validated; applying it must not perform I/O.
+  for _, operation in operations do
+    local name = operation.table
+    if operation.kind == 'create' then
+      local schema = makeSchema(operation.columns :: { string }, operation.primaryKey :: string)
+      local columns = if state.rowLayout == 'packed' then packed.new(schema.columns) else nil
+      state.tables[name] = {
+        schema = schema, rows = if columns then columns.rows else {}, packed = columns,
+        order = {}, seen = {}, count = 0, payloadBytes = 0,
+        secondary = {}, composites = {}, available = { [schema.primaryKey] = true },
+      }
+
+      state.engine:register(name, tableProvider(state, name))
+    elseif operation.kind == 'addcol' then
+      local current = state.tables[name] :: TableState
+      local column = operation.column :: string
+      current.schema.columns[#current.schema.columns + 1] = column
+      current.schema.allowed[column] = true
+      if current.packed then current.packed:addColumn(column) end
+    elseif operation.kind == 'index' then
+      local current = state.tables[name] :: TableState
+      local column = operation.column :: string
+      local index: Index = { buckets = {}, ordered = operation.ordered == true,
+        types = if operation.ordered == true then {} else nil }
+
+      for _, key in current.order do
+        if hasRow(current, key) then
+          indexSet(index, columnValue(current, key, column), key, true)
+        end
+      end
+      current.secondary[column] = index
+      current.available[column] = true
+    elseif operation.kind == 'composite' then
+      local current = state.tables[name] :: TableState
+      local prefix = operation.column :: string
+      local suffix = operation.suffix :: string
+      local composite: Composite = { prefix = prefix, suffix = suffix, partitions = {} }
+      for _, key in current.order do
+        if hasRow(current, key) then
+          local prefixValue = columnValue(current, key, prefix)
+          if prefixValue ~= nil then
+            compositeSet(composite, { [prefix] = prefixValue,
+              [suffix] = columnValue(current, key, suffix) }, key, true)
+          end
+        end
+      end
+      current.composites[compositeName(prefix, suffix)] = composite
+    elseif operation.kind == 'put' then
+      local current = state.tables[name] :: TableState
+      local row = operation.row :: Row
+      local key = keyOf(row[current.schema.primaryKey])
+      local previous = current.rows[key]
+      if not hasRow(current, key) then current.count += 1 end
+
+      if state.trackPayloadBytes then
+        current.payloadBytes += rowPayloadBytes(row)
+          - (if previous then rowPayloadBytes(previous) else 0)
+      end
+      updateIndexes(current, key, previous, row)
+
+      local seen = if current.packed then current.packed:wasSeen(key) else current.seen[key]
+      if not seen then
+        if not current.packed then current.seen[key] = true end
+        current.order[#current.order + 1] = key
+      end
+      current.rows[key] = row
+    elseif operation.kind == 'del' then
+      local current = state.tables[name] :: TableState
+      local key = keyOf(operation.key)
+      if hasRow(current, key) then
+        local previous = current.rows[key] :: Row
+        if state.trackPayloadBytes then current.payloadBytes -= rowPayloadBytes(previous) end
+        updateIndexes(current, key, previous, nil)
+        current.rows[key] = nil
+        current.count -= 1
+        compactOrder(current)
+      end
+    else
+      error('jessql storage: unknown log operation', 2)
+    end
+
+    if operation.kind == 'create' or operation.kind == 'addcol' or operation.kind == 'index' or operation.kind == 'composite' then
+      state.schemaVersion += 1
+    end
+  end
+end
+
+local function buildTransaction(state: DatabaseState)
+  local operations: { Operation } = {}
+  local staged: Pending = {}
+  local created, altered = {} :: { [string]: Schema }, {} :: { [string]: Schema }
+  local indexed, composites = {} :: { [string]: { [string]: boolean } }, {} :: { [string]: { [string]: boolean } }
+  local active, aborted = true, false
+  -- A transaction owns its short-lived SQL plan cache; pending row changes
+  -- never invalidate plans, but schema and index changes always do.
+  local schemaRevision, viewRevision = 0, -1
+  local queryView: queryEngine.Database? = nil
+  local queryPlans: { [string]: queryEngine.Plan } = {}
+  local queryPlanAges: { [string]: number } = {}
+  local queryCount, queryAge = 0, 0
+  local transaction = {} :: Transaction
+
+  local function writable()
+    if not active then error('jessql storage: transaction is no longer active', 3) end
+    if aborted then error('jessql storage: transaction aborted after failed DML', 3) end
+  end
+
+  local function findSchema(name: string): Schema
+    local schema = created[name] or altered[name]
+    if schema then return schema end
+    local current = state.tables[name]
+    if not current then error('jessql storage: no such table: ' .. name, 3) end
+    return current.schema
+  end
+
+  function transaction.primaryKey(_self: Transaction, name: string): string
+    writable()
+    return findSchema(requireName(name)).primaryKey
+  end
+
+  function transaction.hasColumn(_self: Transaction, name: string, column: string): boolean
+    writable()
+    return findSchema(requireName(name)).allowed[requireName(column)] == true
+  end
+
+  function transaction.executeMutation(_self: Transaction, statement: mutations.Statement, params: { unknown }?): number
+    writable()
+    -- DML execution can throw after staging rows; latch the failure so a
+    -- caller's pcall cannot accidentally commit a partially applied statement.
+    local ok, affected = pcall(mutations.execute, statement, transaction :: mutations.Writer, params)
+    if not ok then
+      -- A SQL statement may have staged some rows before encountering an error.
+      -- Even if the caller catches the exception, never commit a partial statement.
+      aborted = true
+      error(affected, 2)
+    end
+    return affected :: number
+  end
+
+  function transaction.exec(_self: Transaction, sql: string, params: { unknown }?): number
+    writable()
+    -- Parsing can throw; an intercepted syntax error must also abort the
+    -- transaction rather than allow previous staged operations to commit.
+    local ok, parsed = pcall(mutations.parse, sql)
+    if not ok then
+      aborted = true
+      error(parsed, 2)
+    end
+    return transaction:executeMutation(parsed :: mutations.Statement, params)
+  end
+
+  function transaction.createTable(_self: Transaction, name: string, columns: { string }, pk: string)
+    writable()
+    name = requireName(name)
+    if created[name] or state.tables[name] then error('jessql storage: table already exists', 2) end
+    local schema = makeSchema(columns, pk)
+    created[name] = schema
+    schemaRevision += 1
+    operations[#operations + 1] = { kind = 'create', table = name, columns = schema.columns, primaryKey = schema.primaryKey, key = nil }
+  end
+
+  -- A nullable column is a metadata-only migration. Rows predating it read as NULL.
+  function transaction.addColumn(_self: Transaction, name: string, column: string)
+    writable()
+    name = requireName(name)
+    column = requireName(column)
+    local schema = findSchema(name)
+    if schema.allowed[column] then error('jessql storage: column already exists', 2) end
+    if #schema.columns >= 256 then error('jessql storage: column limit exceeded', 2) end
+
+    schemaRevision += 1
+    if created[name] then
+      -- CREATE and subsequent inserts share this schema; amend its logged column array.
+      schema.allowed[column] = true
+      schema.columns[#schema.columns + 1] = column
+    else
+      local nextSchema = altered[name]
+      if not nextSchema then
+        nextSchema = makeSchema(schema.columns, schema.primaryKey)
+        altered[name] = nextSchema
+      end
+      nextSchema.allowed[column] = true
+      nextSchema.columns[#nextSchema.columns + 1] = column
+      operations[#operations + 1] = { kind = 'addcol', table = name, column = column, key = nil }
+    end
+  end
+
+  local function index(name: string, column: string, makeOrdered: boolean)
+    writable()
+    name = requireName(name)
+    column = requireName(column)
+    local schema = findSchema(name)
+    if not schema.allowed[column] then error('jessql storage: no such column', 2) end
+    local current = state.tables[name]
+    -- Equality on the primary key is already indexed, but a separate AVL
+    -- index is useful for ordered keyset pagination. Do not duplicate it.
+    local existing = if column == schema.primaryKey then
+      not makeOrdered or (current ~= nil and current.secondary[column] ~= nil)
+      else current ~= nil and current.available[column] == true
+    if existing or (indexed[name] and indexed[name][column]) then
+      error('jessql storage: index already exists', 2)
+    end
+
+    if not indexed[name] then indexed[name] = {} end
+    indexed[name][column] = true
+    schemaRevision += 1
+    operations[#operations + 1] = { kind = 'index', table = name, column = column, ordered = makeOrdered, key = nil }
+  end
+
+  function transaction.createIndex(_self: Transaction, name: string, column: string)
+    index(name, column, false)
+  end
+
+  function transaction.createOrderedIndex(_self: Transaction, name: string, column: string)
+    index(name, column, true)
+  end
+
+  function transaction.createCompositeIndex(_self: Transaction, name: string, prefix: string, suffix: string)
+    writable()
+    name = requireName(name)
+    prefix = requireName(prefix)
+    suffix = requireName(suffix)
+    local schema = findSchema(name)
+    if prefix == suffix then error('jessql storage: composite columns must differ', 2) end
+
+    if not schema.allowed[prefix] or not schema.allowed[suffix] then
+      error('jessql storage: no such composite index column', 2)
+    end
+    local id = compositeName(prefix, suffix)
+    local current = state.tables[name]
+    if (current and current.composites[id]) or (composites[name] and composites[name][id]) then
+      error('jessql storage: composite index already exists', 2)
+    end
+
+    if not composites[name] then composites[name] = {} end
+    composites[name][id] = true
+    schemaRevision += 1
+    operations[#operations + 1] = { kind = 'composite', table = name, column = prefix, suffix = suffix, key = nil }
+  end
+
+  function transaction.get(_self: Transaction, name: string, key: unknown): Row?
+    writable()
+    name = requireName(name)
+    findSchema(name)
+    local encoded = keyOf(key)
+    local pending = staged[name]
+    local change = if pending then pending[encoded] else nil
+    if change == Deleted then return nil end
+    if type(change) == 'table' then return table.clone(change :: Row) end
+    local current = state.tables[name]
+    local row = if current then current.rows[encoded] else nil
+    return if row then table.clone(row) else nil
+  end
+
+  -- Query a transaction's logical state, including its inserts, replacements,
+  -- deletes, freshly created tables and nullable schema additions. Providers
+  -- merge the existing indexes with staged keys, without cloning every row.
+  -- They do not claim ordered scans: pending changes may invalidate ordering.
+  function transaction.query(_self: Transaction, sql: string, params: { unknown }?): queryEngine.Result
+    writable()
+    if not queryView or schemaRevision ~= viewRevision then
+      local view = queryEngine.new()
+      local names: { [string]: boolean } = {}
+    for name in state.tables do names[name] = true end
+    for name in created do names[name] = true end
+
+    for name in names do
+      local schema = findSchema(name)
+      local current = state.tables[name]
+      local indexes: { [string]: boolean } = { [schema.primaryKey] = true }
+      if current then
+        for column in current.available do indexes[column] = true end
+      end
+
+      -- Staged index declarations are not populated until commit. Advertising
+      -- them as physical lookup indexes would cause expensive fake indexed joins.
+
+      -- The iterator first walks committed candidates (possibly indexed),
+      -- then appends staged inserts/moves missing from that candidate set.
+      -- It checks pending values at consumption time, not construction time.
+      local function rows(request: queryEngine.Request): queryEngine.Iterator
+        local pending = staged[name]
+        local candidates: { string } = {}
+        local live: { [string]: boolean }? = nil
+        if current then candidates, live = indexedKeys(current, request) end
+        local cursor = 0
+        local visited: { [string]: boolean } = {}
+        local pendingKeys: { string } = {}
+        -- A primary-key equality needs at most one pending key, even with a
+        -- transaction staging thousands of unrelated inserts.
+        local primary: string? = nil
+        for _, constraint in request.constraints do
+          if constraint.column == schema.primaryKey and constraint.op == '='
+            and constraint.value ~= nil and scalar(constraint.value) then
+            primary = keyOf(constraint.value)
+            break
+          end
+        end
+
+        if pending then
+          if primary then
+            if pending[primary] ~= nil then pendingKeys[1] = primary end
+          else
+            for key in pending do pendingKeys[#pendingKeys + 1] = key end
+          end
+        end
+        local pendingCursor = 0
+
+        return {
+          _jessqlIter = 'v1',
+          next = function(): queryEngine.SourceRow?
+            while cursor < #candidates do
+              cursor += 1
+              local key = candidates[cursor]
+              if visited[key] then continue end
+              -- An index tombstone may have been resurrected in this tx.
+
+              if live and not (live :: { [string]: boolean })[key] and not (pending and type(pending[key]) == 'table') then
+                continue
+              end
+              visited[key] = true
+              local change = if pending then pending[key] else nil
+              local row: Row? = if change == Deleted then nil
+                elseif type(change) == 'table' then change :: Row
+                else (current :: TableState).rows[key]
+              if row then return row end
+            end
+
+            while pendingCursor < #pendingKeys do
+              pendingCursor += 1
+              local key = pendingKeys[pendingCursor]
+              if visited[key] then continue end
+              visited[key] = true
+              local row = (pending :: { [string]: Row | boolean })[key]
+              if type(row) == 'table' then return row :: Row end
+            end
+            return nil
+          end,
+        }
+      end
+
+      local provider: queryEngine.Provider = {
+        columns = schema.columns,
+        indexes = indexes,
+        count = function(): number
+          local pending = staged[name]
+          local total = if current then current.count else 0
+          if pending then
+            for key, changed in pending do
+              local wasPresent = current ~= nil and current.rows[key] ~= nil
+              if changed == Deleted then
+                if wasPresent then total -= 1 end
+              elseif type(changed) == 'table' and not wasPresent then
+                total += 1
+              end
+            end
+          end
+          return total
+        end,
+        scan = function(request: queryEngine.Request): queryEngine.SourceRows
+          local iterator = rows(request)
+          local result: { queryEngine.SourceRow } = {}
+          while true do
+            local row = iterator.next()
+            if not row then break end
+            result[#result + 1] = row
+          end
+          return result
+        end,
+        iterate = rows,
+        lookup = function(column: string, value: unknown, _request: queryEngine.Request): queryEngine.SourceRows
+          if value == nil or not scalar(value) then return {} end
+
+          local request: queryEngine.Request = {
+            columns = {}, constraints = { { column = column, op = '=', value = value } },
+            whereComplete = false, allowVolatileRows = false,
+          }
+          local iterator = rows(request)
+          local result: { queryEngine.SourceRow } = {}
+          while true do
+            local row = iterator.next()
+            if not row then break end
+            if row[column] == value then result[#result + 1] = row end
+          end
+          return result
+        end,
+      }
+        view:register(name, provider)
+      end
+      queryView = view
+      viewRevision = schemaRevision
+      queryPlans = {}
+      queryPlanAges = {}
+      queryCount, queryAge = 0, 0
+    end
+
+    -- Bounded by the transaction lifetime and a fixed number of statements.
+    -- Changed row values are read by the provider on every plan invocation.
+    if #sql > 8192 then return (queryView :: queryEngine.Database):query(sql, params) end
+    queryAge += 1
+    local plan = queryPlans[sql]
+    if not plan then
+      plan = (queryView :: queryEngine.Database):prepare(sql)
+      if queryCount >= 32 then
+        local oldest: string? = nil
+        local age = math.huge
+        for text, last in queryPlanAges do
+          if last < age then oldest, age = text, last end
+        end
+
+        if oldest then
+          queryPlans[oldest] = nil
+          queryPlanAges[oldest] = nil
+          queryCount -= 1
+        end
+      end
+      queryPlans[sql] = plan
+      queryCount += 1
+    end
+    queryPlanAges[sql] = queryAge
+    return plan.run(params)
+  end
+
+  -- Return a statement-stable set of keys for an indexed equality predicate.
+  -- Merge the committed index with staged rows: an UPDATE of the predicate
+  -- column must not accidentally visit a row twice or miss a newly matching row.
+  function transaction.keysWhere(_self: Transaction, name: string, column: string, value: unknown): { unknown }
+    writable()
+    name = requireName(name)
+    column = requireName(column)
+    local schema = findSchema(name)
+    if not schema.allowed[column] then error('jessql storage: no such column', 2) end
+    if value == nil then return {} end -- SQL = NULL never matches
+    if not scalar(value) then error('jessql storage: unsupported predicate value', 2) end
+    local current = state.tables[name]
+    local result: { unknown } = {}
+    if column == schema.primaryKey then
+      local row = transaction:get(name, value)
+      if row then result[1] = row[schema.primaryKey] end
+      return result
+    end
+
+    local index = if current then current.secondary[column] else nil
+    -- New tables can be queried from their staged rows. Persistent tables
+    -- require a real index so an UPDATE cannot silently scan all rows.
+    if current and not index then
+      error('jessql storage: bulk mutation requires an index on WHERE column', 2)
+    end
+    local seen: { [string]: boolean } = {}
+    local matched: { string } = {}
+    local stagedTable = staged[name]
+    local function consider(key: string)
+      if seen[key] then return end
+      seen[key] = true
+      local change = if stagedTable then stagedTable[key] else nil
+      local row: Row? = if change == Deleted then nil
+        elseif type(change) == 'table' then change :: Row
+        else if current then current.rows[key] else nil
+      if row and row[column] == value then
+        matched[#matched + 1] = key
+        if #matched > 10000 then error('jessql storage: bulk mutation exceeds 10000 rows', 2) end
+      end
+    end
+
+    if index then
+      local bucket = index.buckets[keyOf(value)]
+      eachPosting(bucket, consider)
+    end
+
+    if stagedTable then
+      for key in stagedTable do consider(key) end
+    end
+    table.sort(matched) -- Stable log ordering across hash iteration orders.
+    for _, key in matched do
+      local change = if stagedTable then stagedTable[key] else nil
+      local row: Row = if type(change) == 'table' then change :: Row
+        else (current :: TableState).rows[key]
+      result[#result + 1] = row[schema.primaryKey]
+    end
+    return result
+  end
+
+  -- Bounded range mutations require a committed ordered index. Seeking the
+  -- AVL tree avoids scanning unrelated records, while staging is reconciled
+  -- before any mutation so index changes cannot disturb the key set.
+  function transaction.keysRange(_self: Transaction, name: string, column: string,
+      op: string, value: unknown): { unknown }
+    writable()
+    name = requireName(name)
+    column = requireName(column)
+    local schema = findSchema(name)
+    if not schema.allowed[column] then error('jessql storage: no such column', 2) end
+
+    if op ~= '<' and op ~= '<=' and op ~= '>' and op ~= '>=' then
+      error('jessql storage: unsupported range operator', 2)
+    end
+
+    if value == nil then return {} end -- SQL comparisons with NULL never match
+
+    if type(value) ~= 'number' and type(value) ~= 'string' then
+      error('jessql storage: range requires a number or string', 2)
+    end
+
+    if not scalar(value) then error('jessql storage: invalid range value', 2) end
+
+    local current = state.tables[name]
+    local index = if current then current.secondary[column] else nil
+    if current and (not index or not index.ordered) then
+      error('jessql storage: range mutation requires an ordered index on WHERE column', 2)
+    end
+
+    if index then
+      local kind = orderType(index)
+      if kind == nil or (kind ~= 'empty' and kind ~= type(value)) then
+        error('jessql storage: indexed range has incompatible value types', 2)
+      end
+    end
+
+    local result: { unknown } = {}
+    local matched: { string } = {}
+    local visited: { [string]: boolean } = {}
+    local pending = staged[name]
+    local limit = 10000
+    local target = value :: string | number
+    local function consider(key: string)
+      if visited[key] then return end
+      visited[key] = true
+      local change = if pending then pending[key] else nil
+      local row: Row? = if change == Deleted then nil
+        elseif type(change) == 'table' then change :: Row
+        else if current then current.rows[key] else nil
+      if not row then return end
+      local cell = row[column]
+      if cell == nil then return end
+
+      if type(cell) ~= type(target) then
+        error('jessql storage: indexed range has incompatible value types', 2)
+      end
+
+      local comparison = ordered.compare(cell :: string | number, target)
+      local matches = if op == '<' then comparison < 0 elseif op == '<=' then comparison <= 0
+        elseif op == '>' then comparison > 0 else comparison >= 0
+      if not matches then return end
+      matched[#matched + 1] = key
+      if #matched > limit then error('jessql storage: bulk mutation exceeds 10000 rows', 2) end
+    end
+
+    if index then
+      local lower = if op == '>' or op == '>=' then target else nil
+      local upper = if op == '<' or op == '<=' then target else nil
+      local scan = ordered.iteratePairs(index.tree, false, lower, op == '>', upper, op == '<')
+      while true do
+        local _value, encoded = scan()
+        if not encoded then break end
+        local bucket = index.buckets[encoded]
+        if not bucket then error('jessql storage: index bucket missing', 2) end
+
+        eachPosting(bucket, consider)
+      end
+    end
+
+    if pending then
+      for key in pending do consider(key) end
+    end
+    table.sort(matched)
+    for _, key in matched do
+      local change = if pending then pending[key] else nil
+      local row: Row = if type(change) == 'table' then change :: Row
+        else (current :: TableState).rows[key]
+      result[#result + 1] = row[schema.primaryKey]
+    end
+    return result
+  end
+
+  local function put(name: string, row: Row, insertOnly: boolean)
+    writable()
+    name = requireName(name)
+    local schema = findSchema(name)
+    local saved = copyRow(schema, row)
+    if insertOnly and transaction:get(name, saved[schema.primaryKey]) ~= nil then
+      error('jessql storage: duplicate primary key', 3)
+    end
+
+    if not staged[name] then staged[name] = {} end
+    staged[name][keyOf(saved[schema.primaryKey])] = saved
+    operations[#operations + 1] = { kind = 'put', table = name, row = saved, key = nil }
+  end
+
+  function transaction.insert(_self: Transaction, name: string, row: Row) put(name, row, true) end
+  function transaction.upsert(_self: Transaction, name: string, row: Row) put(name, row, false) end
+
+  -- Update selected fields without clearing unspecified columns. Use `unset` to write NULL.
+  -- The primary key is immutable and updates to absent records return false.
+  -- Validate the statement against schema even when no row matches. SQL DML
+  -- must not silently accept an unknown column on an absent primary key.
+  function transaction.update(_self: Transaction, name: string, key: unknown, changes: Row, unset: { string }?): boolean
+    writable()
+    name = requireName(name)
+    local schema = findSchema(name)
+    if type(changes) ~= 'table' then error('jessql storage: changes must be a table', 2) end
+    local normalized: Row = {}
+    local seen: { [string]: boolean } = {}
+    for column, value in changes do
+      if type(column) ~= 'string' then error('jessql storage: invalid column', 2) end
+
+      local canonical = requireName(column)
+      if not schema.allowed[canonical] or canonical == schema.primaryKey then
+        error('jessql storage: cannot update column', 2)
+      end
+
+      if seen[canonical] then error('jessql storage: duplicate update column', 2) end
+      if not scalar(value) then error('jessql storage: unsupported value', 2) end
+      seen[canonical] = true
+      normalized[canonical] = value
+    end
+
+    local unsetColumns: { string } = {}
+    if unset then
+      if type(unset) ~= 'table' then error('jessql storage: invalid unset columns', 2) end
+
+      for _, column in unset do
+        local canonical = requireName(column)
+        if not schema.allowed[canonical] or canonical == schema.primaryKey then
+          error('jessql storage: cannot unset column', 2)
+        end
+
+        if seen[canonical] then error('jessql storage: conflicting update column', 2) end
+        seen[canonical] = true
+        unsetColumns[#unsetColumns + 1] = canonical
+      end
+    end
+
+    local existing = transaction:get(name, key)
+    if not existing then return false end
+    for column, value in normalized do existing[column] = value end
+    for _, column in unsetColumns do existing[column] = nil end
+    put(name, existing, false)
+    return true
+  end
+
+  function transaction.delete(_self: Transaction, name: string, key: unknown): boolean
+    writable()
+    name = requireName(name)
+    findSchema(name)
+    local exists = transaction:get(name, key) ~= nil
+    if exists then
+      if not staged[name] then staged[name] = {} end
+      staged[name][keyOf(key)] = Deleted
+      operations[#operations + 1] = { kind = 'del', table = name, key = key }
+    end
+    return exists
+  end
+
+  return transaction, operations, function(): boolean
+    active = false
+    return aborted
+  end
+end
+
+local function replay(state: DatabaseState, operations: { Operation })
+  -- Reuse write-time schema, uniqueness and value validation before mutating live state.
+  local tx, _, finish = buildTransaction(state)
+  for _, operation in operations do
+    if operation.kind == 'create' then
+      tx:createTable(operation.table, operation.columns :: { string }, operation.primaryKey :: string)
+    elseif operation.kind == 'index' then
+      if operation.ordered == true then
+        tx:createOrderedIndex(operation.table, operation.column :: string)
+      else
+        tx:createIndex(operation.table, operation.column :: string)
+      end
+    elseif operation.kind == 'composite' then
+      tx:createCompositeIndex(operation.table, operation.column :: string, operation.suffix :: string)
+    elseif operation.kind == 'addcol' then
+      tx:addColumn(operation.table, operation.column :: string)
+    elseif operation.kind == 'put' then
+      tx:upsert(operation.table, operation.row :: Row)
+    elseif operation.kind == 'del' then
+      tx:delete(operation.table, operation.key)
+    else
+      error('jessql storage: invalid log record', 2)
+    end
+  end
+  finish()
+  apply(state, operations)
+end
+
+local function load(state: DatabaseState, recoverTail: boolean)
+  local reader, err = fs.open(state.path)
+  if not reader then error('jessql storage: ' .. tostring(err), 2) end
+  local size = reader:size()
+  local magic = reader:readAt(0, #Magic)
+  if not magic or buffer.tostring(magic) ~= Magic then
+    reader:close()
+    error('jessql storage: invalid file header', 2)
+  end
+  local offset = #Magic
+  local limit = state.maxFrameBytes
+  while offset < size do
+    if size - offset < HeaderBytes then break end
+    local header = reader:readAt(offset, HeaderBytes)
+    if not header or buffer.len(header) ~= HeaderBytes then
+      reader:close()
+      error('jessql storage: read failed', 2)
+    end
+    local length = buffer.readu32(header, 0)
+    local checksum = buffer.readu32(header, 4)
+    if length == 0 or length > limit then
+      reader:close()
+      error('jessql storage: invalid frame length', 2)
+    end
+
+    if size - offset - HeaderBytes < length then break end
+    local body = reader:readAt(offset + HeaderBytes, length)
+    if not body or buffer.len(body) ~= length then
+      reader:close()
+      error('jessql storage: read failed', 2)
+    end
+    local payload = buffer.tostring(body)
+    if bytes.crc32(payload) ~= checksum then
+      reader:close()
+      error('jessql storage: checksum mismatch', 2)
+    end
+    local parsed = json.decode(payload) :: { [string]: unknown }
+    if type(parsed) ~= 'table' or parsed.version ~= 1 or parsed.sequence ~= state.sequence + 1
+      or type(parsed.ops) ~= 'table' then
+      reader:close()
+      error('jessql storage: invalid transaction metadata', 2)
+    end
+    replay(state, parsed.ops :: { Operation })
+    state.sequence += 1
+    offset += HeaderBytes + length
+  end
+  reader:close()
+  if offset ~= size then
+    if not recoverTail then error('jessql storage: incomplete trailing transaction', 2) end
+    local writer, err = fs.openWrite(state.path, { create = false, truncate = false })
+    if not writer then error('jessql storage: ' .. tostring(err), 2) end
+    local ok, truncateError = writer:truncate(offset)
+    local synced, syncError = true, nil
+    if ok and state.durability == 'sync' then synced, syncError = writer:syncAll() end
+    local closed, closeError = writer:close()
+    if not ok or not synced or not closed then
+      error('jessql storage: tail recovery failed: ' .. tostring(truncateError or syncError or closeError), 2)
+    end
+  end
+end
+
+local function write(state: DatabaseState, ops: { Operation }, deferSync: boolean?)
+  if #ops == 0 then return end
+  local payload = json.encodeTable({ version = 1, sequence = state.sequence + 1, ops = ops })
+  local record = frame(payload, state.maxFrameBytes)
+  local count: number?, err: string?
+  if state.durability == 'sync' then
+    count, err = (state.walWriter :: dream_fs_Writer):write(record)
+  else
+    count, err = fs.writeFile(state.path, record, { append = true, create = false })
+  end
+
+  if count ~= #record then
+    state.poisoned = true
+    error('jessql storage: append failed (reopen required): ' .. tostring(err), 2)
+  end
+
+  if state.durability == 'sync' and deferSync ~= true then
+    local synced, syncError = (state.walWriter :: dream_fs_Writer):syncData()
+    if not synced then
+      state.poisoned = true
+      error('jessql storage: sync failed (reopen required): ' .. tostring(syncError), 2)
+    end
+  end
+  -- The append has crossed the requested visibility/durability boundary. A subsequent apply failure is uncertain
+  -- state, never an ordinary rollback: close/reopen before any further work.
+  local ok, applyError = pcall(apply, state, ops)
+  if not ok then
+    state.poisoned = true
+    error('jessql storage: post-append apply failed (reopen required): ' .. tostring(applyError), 2)
+  end
+  state.sequence += 1
+end
+
+local storage = {}
+
+function storage.open(path: string, options: Options?): Store
+  if type(path) ~= 'string' or path == '' then error('jessql storage: path is required', 2) end
+  local max = if options then options.maxFrameBytes else nil
+  if max ~= nil and (max < 1024 or max > 256 * 1024 * 1024 or max % 1 ~= 0) then
+    error('jessql storage: invalid frame limit', 2)
+  end
+  local cacheSize = if options then options.queryCacheEntries else nil
+  if cacheSize ~= nil and (type(cacheSize) ~= 'number' or cacheSize < 0
+    or cacheSize > 1024 or cacheSize % 1 ~= 0) then
+    error('jessql storage: invalid query cache size', 2)
+  end
+
+  local rowLayout = if options then options.rowLayout else nil
+  if rowLayout ~= nil and rowLayout ~= 'row' and rowLayout ~= 'packed' then
+    error('jessql storage: rowLayout must be row or packed', 2)
+  end
+
+  if options and options.trackPayloadBytes ~= nil and type(options.trackPayloadBytes) ~= 'boolean' then
+    error('jessql storage: trackPayloadBytes must be boolean', 2)
+  end
+
+  if options and options.batchTestHook ~= nil and type(options.batchTestHook) ~= 'function' then
+    error('jessql storage: batchTestHook must be a function', 2)
+  end
+  local batchTestHook = if options then options.batchTestHook else nil
+  local durability = if options and options.durability then options.durability else 'buffered'
+  if durability ~= 'buffered' and durability ~= 'sync' then
+    error('jessql storage: durability must be buffered or sync', 2)
+  end
+
+  local lock, err = fs.lock(path .. '.lock', { createParents = true })
+  if not lock then error('jessql storage: database locked: ' .. tostring(err), 2) end
+
+  local state: DatabaseState = {
+    path = path, lock = lock, engine = queryEngine.new(), tables = {}, sequence = 0, schemaVersion = 0,
+    maxFrameBytes = max or DefaultMaxFrame, closed = false, busy = false, poisoned = false,
+    rowLayout = rowLayout or 'row', trackPayloadBytes = options ~= nil and options.trackPayloadBytes == true,
+    durability = durability, walWriter = nil,
+  }
+
+  -- Opening can fail on invalid frames; release the advisory lock on failure.
+  local ok, failure = pcall(function()
+    if not fs.exists(path) then
+      local count, writeError: string?
+      if durability == 'sync' then
+        count, writeError = fs.createDurable(path, Magic)
+      else
+        count, writeError = fs.writeFile(path, Magic, { exclusive = true, createParents = true })
+      end
+
+      if count ~= #Magic then error('jessql storage: ' .. tostring(writeError)) end
+    end
+    load(state, options == nil or options.recoverTail ~= false)
+    if durability == 'sync' then
+      local writer, openError = fs.openWrite(path, { append = true, create = false })
+      if not writer then error('jessql storage: sync writer: ' .. tostring(openError)) end
+      state.walWriter = writer
+    end
+  end)
+
+  if not ok then lock:unlock(); error(failure, 2) end
+
+  -- Bound prepared-query memory to a configurable number of plans. This is
+  -- an LRU *plan* cache, not a row/result cache: every run sees current data.
+  local capacity = if cacheSize == nil then 64 else cacheSize
+  local cached: { [string]: { plan: queryEngine.Plan, age: number } } = {}
+  local count, hits, misses, evictions, age = 0, 0, 0, 0, 0
+  local generation = state.schemaVersion
+  local cursorRevision = 0
+
+  local db = {} :: Store
+  local batchActive = false
+  local function ready()
+    if batchActive then error('jessql storage: batched commit in progress; use transaction view', 3) end
+    if state.closed then error('jessql storage: database closed', 3) end
+    if state.poisoned then error('jessql storage: database requires reopen', 3) end
+  end
+
+  function db.transaction(_self: Store, callback: (Transaction) -> ())
+    ready()
+    if state.busy then error('jessql storage: nested or concurrent transaction', 2) end
+    state.busy = true
+    local tx, ops, finish = buildTransaction(state)
+    -- A user callback may throw; discard its staged writes on failure.
+    local succeeded, callbackError = pcall(callback, tx)
+    local aborted = finish()
+    if not succeeded or aborted then
+      state.busy = false
+      error(if not succeeded then callbackError else 'jessql storage: transaction aborted after failed DML', 2)
+    end
+    -- I/O can fail; leave in-memory state untouched and poison uncertain append outcomes.
+    local committed, commitError = pcall(write, state, ops, false)
+    state.busy = false
+    if not committed then error(commitError, 2) end
+    if #ops > 0 then cursorRevision += 1 end
+  end
+
+  -- Synchronous admission in the owning VM: callbacks execute in order, and each
+  -- successful callback produces its own WAL frame. A failed callback discards
+  -- its staged mutations and does not affect the remaining entries. None of
+  -- the outcomes are exposed until every successful frame has been synced.
+  -- A failed append/sync or post-append apply is an *uncertain outcome*:
+  -- poison the handle and require recovery before any retry.
+  function db.transactionBatch(_self: Store, callbacks: { (Transaction) -> () }): { BatchResult }
+    ready()
+    if state.durability ~= 'sync' then
+      error('jessql storage: transactionBatch requires sync durability', 2)
+    end
+
+    if state.busy then error('jessql storage: nested or concurrent transaction', 2) end
+
+    if type(callbacks) ~= 'table' or #callbacks == 0 or #callbacks > 256 then
+      error('jessql storage: transactionBatch requires 1..256 callbacks', 2)
+    end
+
+    for index, callback in callbacks do
+      if type(index) ~= 'number' or index % 1 ~= 0 or index < 1
+        or index > #callbacks or type(callback) ~= 'function' then
+        error('jessql storage: transactionBatch requires an array of callbacks', 2)
+      end
+    end
+
+    for index = 1, #callbacks do
+      if type(callbacks[index]) ~= 'function' then
+        error('jessql storage: transactionBatch requires a dense callback array', 2)
+      end
+    end
+
+    state.busy = true
+    batchActive = true
+    -- Appends, user callbacks and the final sync can throw. Recover the busy
+    -- guard and poison on any uncertain post-append failure.
+    local committed, resultsOrError = pcall(function(): { BatchResult }
+      local results: { BatchResult } = {}
+      local appended = false
+      for index = 1, #callbacks do
+        local tx, ops, finish = buildTransaction(state)
+        -- Only this entry is rejected if its callback or DML fails.
+        local ok, callbackError = pcall(callbacks[index], tx)
+        local aborted = finish()
+        if not ok or aborted then
+          results[index] = { ok = false,
+            error = tostring(if not ok then callbackError else 'jessql storage: transaction aborted after failed DML') }
+          continue
+        end
+        -- The in-memory state is applied after append, so each subsequent
+        -- callback observes preceding successful transactions and constraints.
+        -- No result escapes this function before the single sync barrier.
+        write(state, ops, true)
+        if #ops > 0 then
+          appended = true
+          cursorRevision += 1
+          if batchTestHook then (batchTestHook :: (string) -> ())('after-append') end
+        end
+        results[index] = { ok = true }
+      end
+
+      if appended then
+        if batchTestHook then batchTestHook('before-sync') end
+        local synced, syncError = (state.walWriter :: dream_fs_Writer):syncData()
+        if not synced then
+          state.poisoned = true
+          error('jessql storage: batch sync failed (reopen required): ' .. tostring(syncError))
+        end
+
+        if batchTestHook then batchTestHook('after-sync') end
+      end
+      return results
+    end)
+    batchActive = false
+    state.busy = false
+    if not committed then
+      -- Any unexpected error after the first append leaves uncertain state;
+      -- even a Lua-side exception must not permit further transactions.
+      state.poisoned = true
+      error('jessql storage: batch uncertain (reopen required): ' .. tostring(resultsOrError), 2)
+    end
+    return resultsOrError :: { BatchResult }
+  end
+
+  function db.exec(self: Store, sql: string, params: { unknown }?): number
+    ready()
+    local statement = mutations.parse(sql)
+    local affected = 0
+    self:transaction(function(tx)
+      affected = mutations.execute(statement, tx :: mutations.Writer, params)
+    end)
+    return affected
+  end
+
+  function db.prepareExec(self: Store, sql: string): MutationPlan
+    ready()
+    local statement = mutations.parse(sql)
+    local generation = state.schemaVersion
+    local function valid()
+      ready()
+      if state.schemaVersion ~= generation then
+        error('jessql storage: prepared mutation invalidated by schema change; prepare again', 3)
+      end
+    end
+
+    return {
+      parameterCount = statement.parameterCount,
+      run = function(params: { unknown }?): number
+        valid()
+        local affected = 0
+        self:transaction(function(tx)
+          affected = mutations.execute(statement, tx :: mutations.Writer, params)
+        end)
+        return affected
+      end,
+      inTransaction = function(tx: Transaction, params: { unknown }?): number
+        valid()
+        return tx:executeMutation(statement, params)
+      end,
+    }
+  end
+
+  function db.createTable(self: Store, name: string, columns: { string }, primaryKey: string)
+    self:transaction(function(tx) tx:createTable(name, columns, primaryKey) end)
+  end
+
+  function db.createIndex(self: Store, name: string, column: string)
+    self:transaction(function(tx) tx:createIndex(name, column) end)
+  end
+
+  function db.createOrderedIndex(self: Store, name: string, column: string)
+    self:transaction(function(tx) tx:createOrderedIndex(name, column) end)
+  end
+
+  function db.createCompositeIndex(self: Store, name: string, prefix: string, suffix: string)
+    self:transaction(function(tx) tx:createCompositeIndex(name, prefix, suffix) end)
+  end
+
+  function db.addColumn(self: Store, name: string, column: string)
+    self:transaction(function(tx) tx:addColumn(name, column) end)
+  end
+
+  function db.update(self: Store, name: string, key: unknown, changes: Row, unset: { string }?): boolean
+    local updated = false
+    self:transaction(function(tx) updated = tx:update(name, key, changes, unset) end)
+    return updated
+  end
+
+  function db.insert(self: Store, name: string, row: Row)
+    self:transaction(function(tx) tx:insert(name, row) end)
+  end
+
+  function db.upsert(self: Store, name: string, row: Row)
+    self:transaction(function(tx) tx:upsert(name, row) end)
+  end
+
+  function db.delete(self: Store, name: string, key: unknown): boolean
+    local deleted = false
+    self:transaction(function(tx) deleted = tx:delete(name, key) end)
+    return deleted
+  end
+
+  function db.get(_self: Store, name: string, key: unknown): Row?
+    ready()
+    local current = state.tables[requireName(name)]
+    if not current then error('jessql storage: no such table', 2) end
+    local row = current.rows[keyOf(key)]
+    return if row then table.clone(row) else nil
+  end
+
+  function db.query(_self: Store, sql: string, params: { unknown }?): queryEngine.Result
+    ready()
+    if capacity == 0 or #sql > 8192 then return state.engine:query(sql, params) end
+
+    if generation ~= state.schemaVersion then
+      cached = {}
+      count = 0
+      generation = state.schemaVersion
+    end
+
+    age += 1
+    local entry = cached[sql]
+    if entry then
+      hits += 1
+      entry.age = age
+      return entry.plan.run(params)
+    end
+
+    misses += 1
+    local plan = state.engine:prepare(sql)
+    if count >= capacity then
+      local oldestName: string? = nil
+      local oldestAge = math.huge
+      for name, candidate in cached do
+        if candidate.age < oldestAge then
+          oldestName, oldestAge = name, candidate.age
+        end
+      end
+
+      if oldestName then
+        cached[oldestName] = nil
+        count -= 1
+        evictions += 1
+      end
+    end
+
+    cached[sql] = { plan = plan, age = age }
+    count += 1
+    return plan.run(params)
+  end
+
+  function db.cacheStats(_self: Store): CacheMetrics
+    ready()
+    if generation ~= state.schemaVersion then
+      cached = {}
+      count = 0
+      generation = state.schemaVersion
+    end
+    return { entries = count, capacity = capacity, hits = hits, misses = misses, evictions = evictions }
+  end
+
+  function db.prepare(_self: Store, sql: string): queryEngine.Plan
+    ready()
+    local plan = state.engine:prepare(sql)
+    local generation = state.schemaVersion
+    local run, explain = plan.run, plan.explain
+
+    local function valid()
+      ready()
+      if state.schemaVersion ~= generation then
+        error('jessql storage: prepared plan invalidated by schema change; prepare again', 3)
+      end
+    end
+
+    function plan.run(params)
+      valid()
+      return run(params)
+    end
+
+    function plan.explain()
+      valid()
+      return explain()
+    end
+
+    return plan
+  end
+
+  -- Stream committed rows without SQL result materialization. The cursor
+  -- invalidates on every WAL commit or checkpoint; a caller must not mix
+  -- versions while constructing an immutable generation.
+  function db.iterateRows(_self: Store, name: string): () -> Row?
+    ready()
+    if state.busy then error('jessql storage: cannot iterate inside transaction', 2) end
+    local current = state.tables[requireName(name)]
+    if not current then error('jessql storage: unknown table', 2) end
+    local version = cursorRevision
+    local position = 0
+    return function(): Row?
+      ready()
+      if state.busy or cursorRevision ~= version then
+        error('jessql storage: row cursor invalidated by mutation', 2)
+      end
+
+      while position < #current.order do
+        position += 1
+        local row = readRow(current, current.order[position], nil)
+        if row then return if current.packed then row else table.clone(row) end
+      end
+      return nil
+    end
+  end
+
+  function db.tables(_self: Store): { queryEngine.TableInfo }
+    ready()
+    return state.engine:tables()
+  end
+
+  -- Constant-time row count and opt-in scalar payload accounting. Replaying
+  -- a WAL with tracking enabled reconstructs the counter from every mutation.
+  function db.tableFootprint(_self: Store, name: string): { rows: number, payloadBytes: number? }
+    ready()
+    local current = state.tables[requireName(name)]
+    if not current then error('jessql storage: no such table', 2) end
+
+    return { rows = current.count,
+      payloadBytes = if state.trackPayloadBytes then current.payloadBytes else nil }
+  end
+
+  -- Snapshot-only counters for verifying memory growth and index maintenance.
+  function db.stats(_self: Store): { [string]: TableMetrics }
+    ready()
+    local output: { [string]: TableMetrics } = {}
+    for name, current in state.tables do
+      local metrics: TableMetrics = { rows = current.count, keySlots = #current.order,
+        indexSlots = {}, indexKeys = {}, indexNullSlots = {}, compositePartitions = {},
+        payloadBytes = if state.trackPayloadBytes then current.payloadBytes else nil }
+
+      for column, index in current.secondary do
+        local slots, keys = 0, 0
+        for _, bucket in index.buckets do
+          slots += if type(bucket) == 'string' then 1 else #bucket.keys
+          keys += postingCount(bucket)
+        end
+        metrics.indexSlots[column] = slots
+        metrics.indexKeys[column] = keys
+        local nullPosting = index.nulls
+        metrics.indexNullSlots[column] = if type(nullPosting) == 'string' then 1
+          elseif nullPosting then #nullPosting.keys else 0
+      end
+
+      for id, composite in current.composites do
+        local partitions = 0
+        for _ in composite.partitions do partitions += 1 end
+        metrics.compositePartitions[id] = partitions
+      end
+
+      if current.packed then metrics.resident = current.packed:stats() end
+      output[name] = metrics
+    end
+    return output
+  end
+
+  function db.checkpoint(_self: Store)
+    ready()
+    -- The legacy checkpoint replaces the active WAL without a generation
+    -- manifest. Refuse to claim a durable commit contract for that operation.
+    if state.durability == 'sync' then
+      error('jessql storage: synced checkpoint requires durable generation publication', 2)
+    end
+
+    if state.busy then error('jessql storage: checkpoint inside transaction', 2) end
+    -- Write a new compact log beside the live log; rename only after a complete close.
+    -- The old log stays usable if snapshot construction fails.
+    local temp = state.path .. '.checkpoint.tmp'
+    local writer, openError = fs.openWrite(temp, { truncate = true, create = true })
+    if not writer then error('jessql storage: ' .. tostring(openError), 2) end
+    local sequence = 0
+    local batch: { Operation } = {}
+    local estimate = 0
+    local maximum = state.maxFrameBytes
+
+    local function writeBytes(contents: string)
+      local count, err = writer:write(contents)
+      if count ~= #contents then error('jessql storage: checkpoint write: ' .. tostring(err), 2) end
+    end
+
+    local function flushBatch()
+      if #batch == 0 then return end
+      sequence += 1
+      local payload = json.encodeTable({ version = 1, sequence = sequence, ops = batch })
+      writeBytes(frame(payload, maximum))
+      batch = {}
+      estimate = 0
+    end
+
+    local function add(operation: Operation)
+      -- Exact single-op length, then a conservative bound for the frame metadata.
+      -- Avoid O(n^2) repeated serialization of the ever-growing batch.
+      local size = #json.encodeTable(operation) + 1
+      if estimate + size > maximum - 128 then flushBatch() end
+      batch[#batch + 1] = operation
+      estimate += size
+    end
+
+    -- A checkpoint may throw (invalid oversized row or I/O failure). Close and
+    -- discard the temporary file without changing the readable original.
+    local ok, failure = pcall(function()
+      writeBytes(Magic)
+      local names: { string } = {}
+      for name in state.tables do names[#names + 1] = name end
+      table.sort(names)
+      for _, name in names do
+        local current = state.tables[name]
+        add({ kind = 'create', table = name, columns = current.schema.columns,
+          primaryKey = current.schema.primaryKey, key = nil })
+        local indexColumns: { string } = {}
+        for column in current.secondary do indexColumns[#indexColumns + 1] = column end
+        table.sort(indexColumns)
+        for _, column in indexColumns do
+          add({ kind = 'index', table = name, column = column,
+            ordered = current.secondary[column].ordered == true, key = nil })
+        end
+
+        local compoundNames: { string } = {}
+        for id in current.composites do compoundNames[#compoundNames + 1] = id end
+        table.sort(compoundNames)
+        for _, id in compoundNames do
+          local compound = current.composites[id]
+          add({ kind = 'composite', table = name, column = compound.prefix, suffix = compound.suffix, key = nil })
+        end
+
+        for _, key in current.order do
+          local row = current.rows[key]
+          if row then add({ kind = 'put', table = name, row = row, key = nil }) end
+        end
+      end
+      flushBatch()
+    end)
+    local closed, closeError = writer:close()
+    if not ok or not closed then
+      fs.remove(temp)
+      error('jessql storage: checkpoint failed: ' .. tostring(failure or closeError), 2)
+    end
+
+    local renamed, renameError = fs.rename(temp, state.path)
+    if not renamed then
+      state.poisoned = true
+      error('jessql storage: checkpoint rename uncertain: ' .. tostring(renameError), 2)
+    end
+    state.sequence = sequence
+
+    -- Discard dead key slots and stale secondary postings after compaction.
+    for _, current in state.tables do
+      local liveOrder: { string } = {}
+      local liveSeen: { [string]: boolean } = {}
+      for _, key in current.order do
+        if hasRow(current, key) then
+          liveOrder[#liveOrder + 1] = key
+          if not current.packed then liveSeen[key] = true end
+        end
+      end
+      current.order = liveOrder
+      if current.packed then
+        current.packed:clearDeadKeys()
+      else
+        current.seen = liveSeen
+      end
+
+      for _, composite in current.composites do
+        composite.partitions = {}
+        for _, key in liveOrder do
+          if current.packed then
+            local prefix = columnValue(current, key, composite.prefix)
+            if prefix ~= nil then
+              compositeSet(composite, { [composite.prefix] = prefix,
+                [composite.suffix] = columnValue(current, key, composite.suffix) }, key, true)
+            end
+          else
+            compositeSet(composite, current.rows[key], key, true)
+          end
+        end
+      end
+
+      for column in current.secondary do
+        local wasOrdered = current.secondary[column].ordered == true
+        local index: Index = { buckets = {}, ordered = wasOrdered,
+          types = if wasOrdered then {} else nil }
+
+        for _, key in liveOrder do
+          indexSet(index, columnValue(current, key, column), key, true)
+        end
+        current.secondary[column] = index
+      end
+    end
+    cursorRevision += 1
+  end
+
+  function db.close(_self: Store)
+    if state.closed then return end
+    if state.busy then error('jessql storage: close inside transaction', 2) end
+    state.closed = true
+    local closed, closeError = true, nil
+    if state.walWriter then
+      closed, closeError = state.walWriter:close()
+      state.walWriter = nil
+    end
+    state.lock:unlock()
+    if not closed then error('jessql storage: close: ' .. tostring(closeError), 2) end
+  end
+  return db
+end
+
+
+-- An offline caller holding the managed namespace lock may replay a sealed
+-- WAL through the exact write-time validators without opening a writer,
+-- truncating a torn tail, or acknowledging any transaction. The transient
+-- row/index state is discarded after validation; this is intentionally a
+-- memory-intensive audit, not the regular database-open fast path.
+function storage.verifyReplay(path: string): number
+  local exists, statError = fs.exists(path)
+  if exists ~= true then error('jessql storage: read-only replay requires existing WAL: ' .. tostring(statError), 2) end
+  local lock, lockError = fs.lock(path .. '.lock')
+  if not lock then error('jessql storage: read-only replay locked: ' .. tostring(lockError), 2) end
+
+  local state: DatabaseState = {
+    path = path, lock = lock, engine = queryEngine.new(), tables = {},
+    sequence = 0, schemaVersion = 0, maxFrameBytes = DefaultMaxFrame,
+    closed = false, busy = false, poisoned = false, rowLayout = 'row',
+    trackPayloadBytes = false, durability = 'buffered', walWriter = nil,
+  }
+  -- recoverTail=false prohibits the only write-capable branch in load().
+  local ok, failure = pcall(function() load(state, false) end)
+  lock:unlock()
+
+  if not ok then error('jessql storage: semantic replay invalid: ' .. tostring(failure), 2) end
+  return state.sequence
+end
+
+return storage

@@ -1,7 +1,8 @@
+--!strict
 local sql = require('@jessql')
 
 local rowCount = tonumber((...)) or 100000
-local rows = table.create(rowCount)
+local rows: {sql.Row} = table.create(rowCount) :: {sql.Row}
 
 for index = 1, rowCount do
   rows[index] = {
@@ -27,5 +28,5 @@ print(string.format('rows_in=%d rows_out=%d params=%d', rowCount, #result.rows, 
 
 for index = 1, math.min(3, #result.rows) do
   local row = result.rows[index]
-  print(string.format('%s bucket=%d n=%d total=%d mean=%.2f', row.kind, row.bucket, row.n, row.total, row.mean))
+  print(string.format('%s bucket=%d n=%d total=%d mean=%.2f', (row.kind :: string), (row.bucket :: number), (row.n :: number), (row.total :: number), (row.mean :: number)))
 end

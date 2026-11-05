@@ -1,0 +1,178 @@
+--!strict
+local sql = require('@jessql')
+local fs = require('@dream/fs')
+local test = require('@jess/test')
+local suite, expect = test.new(), test.expect
+
+local Options: sql.ManagedOptions = { tableName = 'events', columns = { 'id', 'value' }, primaryKey = 'id' }
+
+local function fixture(name: string): string
+  return fs.join(fs.cwd() :: string, '.jessql-app-experience-' .. name)
+end
+
+local function cleanup(base: string)
+  for epoch = 1, 8 do
+    local prefix = base .. string.format('.g%08d', epoch)
+    for _, extension in { '.rows', '.deleted', '.wal', '.wal.lock', '.hot-rows', '.hot-deleted' } do
+      fs.remove(prefix .. extension)
+    end
+  end
+
+  for _, extension in { '.jql-lock', '.jql-manifest', '.jql-manifest.tmp' } do
+    fs.remove(base .. extension)
+  end
+end
+
+local function fails(callback: () -> ()): boolean
+  -- Expected API-contract failures are asserted without failing the test process.
+  local ok = pcall(callback)
+  return not ok
+end
+
+suite.describe('managed application lifecycle safety', function()
+  suite.it('distinguishes first-time creation from reopening an existing database', function()
+    local base = fixture('intent')
+    cleanup(base)
+    expect(fails(function() sql.managed.openExisting(base) end)).toBe(true)
+    expect((fs.exists(base .. '.jql-manifest'))).toBe(false)
+    local db = sql.managed.create(base, Options)
+    db:insert({ id = 'one', value = 'persisted' })
+    expect(fails(function() sql.managed.create(base, Options) end)).toBe(true)
+    db:close()
+    expect(fails(function() sql.managed.create(base, Options) end)).toBe(true)
+    local reopened = sql.managed.openExisting(base)
+    expect((assert(reopened:get('one'))).value).toBe('persisted')
+    reopened:close()
+    -- Legacy open-or-create behavior remains intact for existing consumers.
+    local legacy = sql.managed.open(base)
+    expect((assert(legacy:get('one'))).value).toBe('persisted')
+    legacy:close()
+    cleanup(base)
+  end)
+
+  suite.it('never treats a missing manifest with old files as a fresh database', function()
+    local base = fixture('missing')
+    cleanup(base)
+    local db = sql.managed.create(base, Options)
+    db:insert({ id = 1, value = 'safe' })
+    db:close()
+    local before = assert((fs.readFileString(base .. '.g00000001.wal')))
+    assert((fs.remove(base .. '.jql-manifest')))
+    expect(fails(function() sql.managed.create(base, Options) end)).toBe(true)
+    expect(fails(function() sql.managed.openExisting(base) end)).toBe(true)
+    expect((fs.readFileString(base .. '.g00000001.wal'))).toBe(before)
+    cleanup(base)
+  end)
+
+  suite.it('returns callback values and releases lock after successful scoped use', function()
+    local base = fixture('return')
+    cleanup(base)
+    local retained: sql.ManagedDatabase? = nil
+    local answer = sql.managed.withNew(base, Options, function(db)
+      retained = db
+      db:insert({ id = 7, value = 'created' })
+      return (assert(db:get(7))).value
+    end)
+    expect(answer).toBe('created')
+    expect(fails(function() (retained :: sql.ManagedDatabase):get(7) end)).toBe(true)
+    local value = sql.managed.withExisting(base, nil, function(db)
+      return (assert(db:get(7))).value
+    end)
+    expect(value).toBe('created')
+    cleanup(base)
+  end)
+
+  suite.it('releases lock even when an application callback raises', function()
+    local base = fixture('throw')
+    cleanup(base)
+    expect(fails(function()
+      sql.managed.withNew(base, Options, function(db)
+        db:insert({ id = 11, value = 'acknowledged' })
+        error('application failed after a commit')
+        return true
+      end)
+    end)).toBe(true)
+    local recovered = sql.managed.openExisting(base)
+    expect((assert(recovered:get(11))).value).toBe('acknowledged')
+    recovered:close()
+    cleanup(base)
+  end)
+
+  suite.it('does not create a namespace without a valid scoped callback', function()
+    local base = fixture('callback')
+    cleanup(base)
+    expect(fails(function()
+      sql.managed.withNew(base, Options, (nil :: unknown) :: (sql.ManagedDatabase) -> boolean)
+    end)).toBe(true)
+    expect((fs.exists(base .. '.jql-manifest'))).toBe(false)
+    cleanup(base)
+  end)
+end)
+
+suite.describe('extension protocol hardening', function()
+  suite.it('rejects malformed delivery batches before invoking a mod sink', function()
+    local relay = sql.managed.extensions.v1.relay
+    local calls = 0
+    local function deliver(_event)
+      calls += 1
+    end
+
+    local malformed = {
+      { version = 1, cursor = 5, dropped = 0, events = {
+        { sequence = 3, kind = 'opened', epoch = 1 },
+        { sequence = 5, kind = 'generation-published', epoch = 2 },
+      } },
+      { version = 1, cursor = 1, dropped = 0, events = {
+        { sequence = 1, kind = 'opened', epoch = 1, detail = 123 },
+      } },
+      { version = 1, cursor = 1, dropped = -1, events = {
+        { sequence = 1, kind = 'opened', epoch = 1 },
+      } },
+      { version = 1, cursor = 0, dropped = 0, events = {
+        { sequence = 1, kind = 'opened', epoch = 1 },
+      } },
+    }
+
+    for _, batch in malformed do
+      expect(fails(function()
+        relay((batch :: unknown) :: sql.ManagedEventBatch, deliver)
+      end)).toBe(true)
+    end
+
+    expect(calls).toBe(0)
+  end)
+
+  suite.it('defends the delivery stream from a mod mutating its original event batch', function()
+    local batch: sql.ManagedEventBatch = { version = 1, cursor = 2, dropped = 0, events = {
+      { sequence = 1, kind = 'opened', epoch = 1 },
+      { sequence = 2, kind = 'generation-published', epoch = 2 },
+    } }
+    local seen: { string } = {}
+    local result = sql.managed.extensions.v1.relay(batch, function(event)
+      seen[#seen + 1] = event.kind
+      -- An extension sink is untrusted application code. Delivery must use
+      -- the validated snapshot, not this mutable array.
+      batch.events[2].kind = 'forged-after-validation'
+    end)
+    expect(result.ok).toBe(true)
+    expect(seen[2]).toBe('generation-published')
+  end)
+
+  suite.it('delivers a valid dropped-prefix batch without inventing missed events', function()
+    local batch: sql.ManagedEventBatch = { version = 1, cursor = 7, dropped = 4, events = {
+      { sequence = 5, kind = 'opened', epoch = 5 },
+      { sequence = 6, kind = 'opened', epoch = 6 },
+      { sequence = 7, kind = 'opened', epoch = 7 },
+    } }
+    local received: { number } = {}
+    local result = sql.managed.extensions.v1.relay(batch, function(event)
+      received[#received + 1] = event.sequence
+    end)
+    expect(result.ok).toBe(true)
+    expect(result.cursor).toBe(7)
+    expect(#received).toBe(3)
+    expect(received[1]).toBe(5)
+  end)
+end)
+
+return suite

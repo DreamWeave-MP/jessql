@@ -3,8 +3,27 @@
 local engine = require('@jessql/engine')
 local parser = require('@jessql/parser')
 local lexer = require('@jessql/lexer')
+local storage = require('@jessql/storage')
+local mutations = require('@jessql/mutations')
+local paged = require('@jessql/paged')
+local hybrid = require('@jessql/hybrid')
+local secondary = require('@jessql/secondary')
+local segments = require('@jessql/segments')
+local delta = require('@jessql/delta')
+local tiers = require('@jessql/tiers')
+local managed = require('@jessql/managed')
 
 export type Database = engine.Database
+export type PersistentDatabase = storage.Store
+export type BatchResult = storage.BatchResult
+export type HybridDatabase = hybrid.Database
+export type ManagedDatabase = managed.Database
+export type ManagedOptions = managed.Options
+export type ManagedEvent = managed.Event
+export type ManagedEventBatch = managed.EventBatch
+export type ManagedObservation = managed.Observation
+export type Transaction = storage.Transaction
+export type MutationPlan = storage.MutationPlan
 export type Plan = engine.Plan
 export type Result = engine.Result
 export type Row = engine.Row
@@ -28,6 +47,15 @@ export type Token = lexer.Token
 
 return {
   new = engine.new,
+  open = storage.open,
+  paged = paged,
+  hybrid = hybrid,
+  secondary = secondary,
+  segments = segments,
+  delta = delta,
+  tiers = tiers,
+  managed = managed,
+  NULL = mutations.NULL,
   parse = parser.parse,
   lex = lexer.lex,
 }

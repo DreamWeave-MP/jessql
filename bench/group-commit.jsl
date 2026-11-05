@@ -1,0 +1,54 @@
+--!strict
+-- Compare independently framed sync WAL commits with the same callbacks
+-- admitted in groups. No SQL transaction coalescing and no worker concurrency.
+-- Usage: jess run --trusted --package . bench/group-commit.jsl solo|batch [rows] [groupSize]
+local sql = require('@jessql')
+local fs = require('@dream/fs')
+local mode = arg[1] or 'solo'
+local rows = tonumber(arg[2]) or 960
+local groupSize = tonumber(arg[3]) or 32
+if mode ~= 'solo' and mode ~= 'batch' then error('mode must be solo or batch') end
+if rows < 1 or rows > 100000 or rows % 1 ~= 0 then error('invalid rows') end
+if groupSize < 1 or groupSize > 256 or groupSize % 1 ~= 0 then error('invalid groupSize') end
+
+local path = fs.join(fs.cwd() :: string, '.jessql-group-commit-bench.wal')
+fs.remove(path)
+fs.remove(path .. '.lock')
+local db = sql.open(path, { durability = 'sync', rowLayout = 'packed' })
+db:createTable('events', { 'id', 'room', 'body' }, 'id')
+local payload = string.rep('x', 80)
+local started = os.clock()
+local submitted = 0
+while submitted < rows do
+  local last = math.min(submitted + groupSize, rows)
+  if mode == 'batch' then
+    local callbacks: { (sql.Transaction) -> () } = {}
+    for key = submitted + 1, last do
+      local id = key
+      callbacks[#callbacks + 1] = function(tx)
+        tx:insert('events', { id = id, room = 'r', body = payload })
+      end
+    end
+    local results = db:transactionBatch(callbacks)
+    for _, result in results do assert(result.ok, result.error) end
+  else
+    for key = submitted + 1, last do
+      local id = key
+      db:transaction(function(tx)
+        tx:insert('events', { id = id, room = 'r', body = payload })
+      end)
+    end
+  end
+  submitted = last
+end
+local elapsed = os.clock() - started
+assert(db:query('SELECT COUNT(*) AS n FROM events').rows[1].n == rows)
+db:close()
+local walBytes = #(assert((fs.readFileString(path))))
+local verified = sql.open(path, { durability = 'sync', recoverTail = false, rowLayout = 'packed' })
+assert(verified:query('SELECT COUNT(*) AS n FROM events').rows[1].n == rows)
+verified:close()
+fs.remove(path)
+fs.remove(path .. '.lock')
+print(string.format('mode=%s rows=%d group=%d cpu_ms=%.3f wal_bytes=%d',
+  mode, rows, groupSize, elapsed * 1000, walBytes))

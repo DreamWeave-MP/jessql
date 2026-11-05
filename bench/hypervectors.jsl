@@ -1,0 +1,105 @@
+--!strict
+--!native
+-- An opt-in hyperdimensional-computing experiment, NOT an exact SQL index.
+-- Majority-bundled randomized token hypervectors are bitpacked in Luau buffers.
+-- The database must verify any candidates against actual stored values.
+local Dimensions = 256
+local Words = Dimensions / 32
+
+local function tokenSeed(token: string): number
+  -- Deterministic hash used only to seed an approximate randomized projection.
+  local value = 2166136261
+  for position = 1, #token do
+    value = bit32.band(bit32.bxor(value, string.byte(token, position)) * 16777619, 0xffffffff)
+  end
+  return value
+end
+
+local function randomWord(seed: number, index: number): number
+  local value = bit32.band(seed + index * 2654435761, 0xffffffff)
+  value = bit32.bxor(value, bit32.lshift(value, 13))
+  value = bit32.bxor(value, bit32.rshift(value, 17))
+  return bit32.bxor(value, bit32.lshift(value, 5))
+end
+
+local function encode(tokens: { string }): buffer
+  local votes = table.create(Dimensions, 0)
+  for _, token in tokens do
+    local seed = tokenSeed(token)
+    for word = 0, Words - 1 do
+      local bits = randomWord(seed, word + 1)
+      local offset = word * 32
+      for bit = 0, 31 do
+        local position = offset + bit + 1
+        votes[position] += if bit32.band(bits, bit32.lshift(1, bit)) ~= 0 then 1 else -1
+      end
+    end
+  end
+
+  local signature = buffer.create(Dimensions / 8)
+  for word = 0, Words - 1 do
+    local bits = 0
+    for bit = 0, 31 do
+      if votes[word * 32 + bit + 1] > 0 then bits = bit32.bor(bits, bit32.lshift(1, bit)) end
+    end
+    buffer.writeu32(signature, word * 4, bits)
+  end
+  return signature
+end
+
+local function popcount(word: number): number
+  local value = word - bit32.band(bit32.rshift(word, 1), 0x55555555)
+  value = bit32.band(value, 0x33333333) + bit32.band(bit32.rshift(value, 2), 0x33333333)
+  value = bit32.band(value + bit32.rshift(value, 4), 0x0f0f0f0f)
+  value = value + bit32.rshift(value, 8)
+  value = value + bit32.rshift(value, 16)
+  return bit32.band(value, 0x3f)
+end
+
+local function distance(left: buffer, right: buffer): number
+  local different = 0
+  for word = 0, Words - 1 do
+    different += popcount(bit32.bxor(buffer.readu32(left, word * 4), buffer.readu32(right, word * 4)))
+  end
+  return different
+end
+
+-- Sanity-check exact binary distances before benchmarking fuzzy behavior.
+local empty = buffer.create(Dimensions / 8)
+local ones = buffer.create(Dimensions / 8)
+for word = 0, Words - 1 do buffer.writeu32(ones, word * 4, 0xffffffff) end
+assert(distance(empty, empty) == 0)
+assert(distance(empty, ones) == Dimensions)
+
+local start = os.clock()
+local corpus: { buffer } = {}
+local tags: { { string } } = {}
+for index = 1, 2000 do
+  local item = { 'room:' .. tostring(index % 47), 'sender:' .. tostring(index % 149),
+    'kind:' .. tostring(index % 13), 'category:' .. tostring(index % 23),
+    'topic:' .. tostring(index % 31) }
+  tags[index] = item
+  corpus[index] = encode(item)
+end
+local encoded = os.clock() - start
+
+start = os.clock()
+local pairsChecked, nearBeatsFar, nearTotal, unrelatedTotal = 0, 0, 0, 0
+for index = 1, 200 do
+  local base = tags[index]
+  -- Four shared tokens; one new tag. Similarity is approximate, not exact.
+  local similar = { base[1], base[2], base[3], base[4], 'topic:completely-new' }
+  local unrelated = { 'room:unrelated' .. tostring(index), 'sender:unrelated',
+    'kind:unrelated', 'category:unrelated', 'topic:unrelated' }
+  local near = distance(corpus[index], encode(similar))
+  local far = distance(corpus[index], encode(unrelated))
+  if near < far then nearBeatsFar += 1 end
+  nearTotal += near
+  unrelatedTotal += far
+  pairsChecked += 1
+end
+local seconds = os.clock() - start
+print(string.format('dimensions=%d vectors=%d payload_bytes_per_vector=%d build_s=%.5f pairs=%d compare_s=%.5f near_wins=%d near_mean=%.1f unrelated_mean=%.1f',
+  Dimensions, #corpus, Dimensions / 8, encoded, pairsChecked, seconds, nearBeatsFar,
+  nearTotal / pairsChecked, unrelatedTotal / pairsChecked))
+assert(nearBeatsFar > 160, 'near matches should generally outrank unrelated tokens')

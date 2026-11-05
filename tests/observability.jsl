@@ -1,0 +1,116 @@
+--!strict
+local sql = require('@jessql')
+local observability = require('@jessql/managed_observability')
+local fs = require('@dream/fs')
+local test = require('@jess/test')
+local suite, expect = test.new(), test.expect
+
+local function fixture(name: string): string
+  return fs.join(fs.cwd() :: string, '.jessql-observe-' .. name)
+end
+
+local function cleanup(base: string)
+  for epoch = 1, 10 do
+    local prefix = base .. string.format('.g%08d', epoch)
+    for _, extension in { '.rows', '.deleted', '.wal', '.wal.lock', '.hot-rows', '.hot-deleted' } do
+      fs.remove(prefix .. extension)
+    end
+  end
+
+  for _, extension in { '.jql-lock', '.jql-manifest', '.jql-manifest.tmp' } do
+    fs.remove(base .. extension)
+  end
+end
+
+suite.describe('versioned pull observability and explicit extensions', function()
+  suite.it('emits generation lifecycle events without per-transaction notifications', function()
+    local base = fixture('stages')
+    cleanup(base)
+    local db = sql.managed.open(base, { tableName = 'events', columns = { 'id' }, primaryKey = 'id' })
+    local start = db:events()
+    expect(start.version).toBe(1)
+    expect(#start.events).toBe(1)
+    expect(start.events[1].kind).toBe('opened')
+    db:insert({ id = 2 })
+    expect(#db:events(start.cursor).events).toBe(0)
+    db:flush()
+    local update = db:events(start.cursor)
+    expect(#update.events).toBe(1)
+    expect(update.events[1].kind).toBe('generation-published')
+    expect(update.events[1].epoch).toBe(2)
+    local view = db:observe()
+    expect(view.version).toBe(1)
+    expect(view.epoch).toBe(2)
+    expect(view.generations).toBe(2)
+    expect(view.poisoned).toBe(false)
+    -- A returned event can be mutated without altering the internal buffer.
+    update.events[1].kind = 'tampered'
+    expect(db:events(start.cursor).events[1].kind).toBe('generation-published')
+    db:close()
+    cleanup(base)
+  end)
+
+  suite.it('separates uncertain publication telemetry from durable commit outcomes', function()
+    local base = fixture('uncertain')
+    cleanup(base)
+    local fail = false
+    local db = sql.managed.open(base, { tableName = 'events', columns = { 'id' }, primaryKey = 'id',
+      testHook = function(stage)
+        if fail and stage == 'after-replace' then error('publish fault') end
+      end })
+    db:insert({ id = 1 })
+    fail = true
+    -- Fault injection deliberately reproduces an uncertain cutover.
+    local ok = pcall(function() db:flush() end)
+    expect(ok).toBe(false)
+    local status = db:observe()
+    expect(status.poisoned).toBe(true)
+    local events = db:events()
+    expect(events.events[#events.events].kind).toBe('publication-uncertain')
+    db:close()
+    local reopened = sql.managed.open(base)
+    expect((assert(reopened:get(1))).id).toBe(1)
+    reopened:close()
+    cleanup(base)
+  end)
+
+  suite.it('isolates extension failures and preserves cursor for redelivery', function()
+    local base = fixture('relay')
+    cleanup(base)
+    local db = sql.managed.open(base, { tableName = 'events', columns = { 'id' }, primaryKey = 'id' })
+    db:insert({ id = 1 })
+    db:flush()
+    local events = db:events()
+    local invoked = 0
+    local failure = sql.managed.extensions.v1.relay(events, function(_event)
+      invoked += 1
+      if invoked == 2 then error('consumer failure') end
+    end)
+    expect(failure.ok).toBe(false)
+    expect(failure.cursor).toBe(events.events[1].sequence)
+    local second = db:events(failure.cursor)
+    expect(#second.events).toBe(1)
+    local delivered = sql.managed.extensions.v1.relay(second, function(_event) end)
+    expect(delivered.ok).toBe(true)
+    expect(delivered.cursor).toBe(events.cursor)
+    expect((assert(db:get(1))).id).toBe(1)
+    db:close()
+    cleanup(base)
+  end)
+
+  suite.it('reports bounded-journal overflow and rejects invalid cursors', function()
+    local journal = observability.new(3)
+    for index = 1, 7 do journal:record('test', index) end
+    local batch = journal:read(0)
+    expect(batch.dropped).toBe(4)
+    expect(#batch.events).toBe(3)
+    expect(batch.events[1].epoch).toBe(5)
+    expect(batch.cursor).toBe(7)
+    expect(#journal:read(7).events).toBe(0)
+    -- Invalid read cursors are programmer errors; do not silently rewind.
+    local ok = pcall(function() journal:read(8) end)
+    expect(ok).toBe(false)
+  end)
+end)
+
+return suite

@@ -1,0 +1,444 @@
+--!strict
+--!native
+-- Experimental immutable JQLS1 sidecar: sorted, prefix-compressed index keys.
+-- Metadata lives in the checksummed directory. Index primary keys are decoded
+-- from their reversible key component, not stored a second time.
+local fs = require('@dream/fs')
+local bytes = require('@dream/bytes')
+local json = require('@jess/json')
+local engine = require('@jessql/engine')
+local paged = require('@jessql/paged')
+
+export type Row = { [string]: unknown }
+export type Page = { first: string, last: string, offset: number, length: number, rows: number, checksum: number }
+export type Directory = { version: number, pages: { Page }, metadata: { [string]: unknown }, entries: number }
+export type Cache = { keys: { string }, age: number }
+local Magic, Tail = 'JQLS1\n', 'JQSF'
+local DefaultPageBytes, DefaultCachePages = 32768, 4
+local MaxFileBytes, MaxKeyBytes = 4294967295, 4 * 1024 * 1024
+local MarkerCount = 7
+local compact = {}
+
+local function word(value: number): string
+  local item = buffer.create(4)
+  buffer.writeu32(item, 0, value)
+  return buffer.tostring(item)
+end
+
+local function recordHeader(prefix: number, suffix: number): string
+  local item = buffer.create(6)
+  buffer.writeu16(item, 0, prefix)
+  buffer.writeu32(item, 2, suffix)
+  return buffer.tostring(item)
+end
+
+local function numberAt(value: string, offset: number): number
+  if offset < 1 or offset + 3 > #value then error('jessql compact: truncated integer', 3) end
+  local firstByte, secondByte, thirdByte, fourthByte = string.byte(value, offset, offset + 3)
+  return firstByte + secondByte * 256 + thirdByte * 65536 + fourthByte * 16777216
+end
+
+local function commonPrefix(left: string, right: string): number
+  local limit = math.min(#left, #right, 65535)
+  for index = 1, limit do
+    if string.byte(left, index) ~= string.byte(right, index) then return index - 1 end
+  end
+  return limit
+end
+
+local function decodeKey(key: string): unknown
+  local encoded = string.match(key, '|([^|]+)$')
+  if not encoded then error('jessql compact: invalid composite key', 3) end
+  if encoded == 'b0' then return false end
+  if encoded == 'b1' then return true end
+
+  if string.sub(encoded, 1, 1) == 'n' and #encoded == 17 then
+    local hi = tonumber(string.sub(encoded, 2, 9), 16)
+    local lo = tonumber(string.sub(encoded, 10, 17), 16)
+    if hi == nil or lo == nil then error('jessql compact: invalid numeric key', 3) end
+
+    if bit32.band(hi, 0x80000000) == 0 then
+      hi, lo = bit32.bnot(hi), bit32.bnot(lo)
+    else
+      hi = bit32.bxor(hi, 0x80000000)
+    end
+    local data = buffer.create(8)
+    buffer.writeu32(data, 0, lo :: number)
+    buffer.writeu32(data, 4, hi :: number)
+    local number = buffer.readf64(data, 0)
+    if number ~= number or math.abs(number) == math.huge then
+      error('jessql compact: invalid numeric key', 3)
+    end
+    return if number == 0 then 0 else number
+  end
+
+  if string.sub(encoded, 1, 1) == 's' and string.sub(encoded, -1) == '!' then
+    local hex = string.sub(encoded, 2, #encoded - 1)
+    if #hex % 2 ~= 0 or string.find(hex, '[^0-9a-f]') then
+      error('jessql compact: invalid string key', 3)
+    end
+    local parts: { string } = {}
+    for offset = 1, #hex, 2 do
+      local number = tonumber(string.sub(hex, offset, offset + 1), 16)
+      if not number then error('jessql compact: invalid string key', 3) end
+      parts[#parts + 1] = string.char(number)
+    end
+    local decoded = table.concat(parts)
+    if utf8.len(decoded) == nil then error('jessql compact: invalid UTF-8 key', 3) end
+    return decoded
+  end
+  error('jessql compact: unsupported key encoding', 3)
+end
+
+local function assertMarkers(metadata: { [string]: unknown })
+  if type(metadata['!identity']) ~= 'string' or type(metadata['!partition']) ~= 'string'
+    or type(metadata['!order']) ~= 'string' or type(metadata['!kind']) ~= 'string'
+    or type(metadata['!complete']) ~= 'boolean' or type(metadata['!count']) ~= 'number'
+    or type(metadata['!entries']) ~= 'number' then
+    error('jessql compact: invalid metadata', 3)
+  end
+end
+
+-- Streaming writer. The final sidecar retains none of its sorted keys in RAM.
+function compact.create(path: string, nextRow: () -> Row?, options: paged.Options?)
+  local pageBytes = if options and options.pageBytes then options.pageBytes else DefaultPageBytes
+  if pageBytes < 512 or pageBytes > 1024 * 1024 or pageBytes % 1 ~= 0 then
+    error('jessql compact: invalid page size', 2)
+  end
+  local created, createError = fs.writeFile(path, Magic, { exclusive = true, createParents = true })
+  if created ~= #Magic then error('jessql compact: ' .. tostring(createError), 2) end
+  local writer, openError = fs.openWrite(path, { create = false, append = true })
+  if not writer then
+    fs.remove(path)
+    error('jessql compact: ' .. tostring(openError), 2)
+  end
+  local directory: Directory = { version = 1, pages = {}, metadata = {}, entries = 0 }
+  local offset = #Magic
+  local parts: { string } = {}
+  local used, rows = 0, 0
+  local first, last, previous = '', '', ''
+  local previousGlobal: string? = nil
+  local markerCount = 0
+  local function write(value: string)
+    if offset + #value > MaxFileBytes then error('jessql compact: sidecar exceeds 4 GiB') end
+    local written, failure = writer:write(value)
+    if written ~= #value then error('jessql compact: write failed: ' .. tostring(failure)) end
+    offset += #value
+  end
+
+  local function flush()
+    if rows == 0 then return end
+    local body = table.concat(parts)
+    local checksum = bytes.crc32(body)
+    local start = offset
+    write(word(#body) .. word(checksum) .. body)
+    directory.pages[#directory.pages + 1] = {
+      first = first, last = last, offset = start, length = #body, rows = rows, checksum = checksum,
+    }
+    parts, used, rows = {}, 0, 0
+    first, last, previous = '', '', ''
+  end
+
+  -- A failed write/source callback must close and remove the incomplete sidecar.
+  local ok, failure = pcall(function()
+    while true do
+      local row = nextRow()
+      if not row then break end
+      local id = row.id
+      if type(id) ~= 'string' or #id > MaxKeyBytes then
+        error('jessql compact: invalid index key')
+      end
+      local key = id :: string
+      if previousGlobal and key <= (previousGlobal :: string) then error('jessql compact: keys not sorted') end
+      previousGlobal = key
+      if string.sub(key, 1, 1) == '!' then
+        if directory.entries ~= 0 or directory.metadata[key] ~= nil then
+          error('jessql compact: misplaced or repeated metadata')
+        end
+        directory.metadata[key] = row.pk
+        markerCount += 1
+      else
+        if string.sub(key, 1, 1) ~= 'z' then error('jessql compact: bad index key') end
+        local common = commonPrefix(previous, key)
+        local suffix = string.sub(key, common + 1)
+        local record = recordHeader(common, #suffix) .. suffix
+        if rows > 0 and used + #record > pageBytes then
+          flush()
+          common = 0
+          suffix = key
+          record = recordHeader(common, #suffix) .. suffix
+        end
+
+        if rows == 0 then first = key end
+        last, previous = key, key
+        rows += 1
+        used += #record
+        parts[#parts + 1] = record
+        directory.entries += 1
+      end
+    end
+
+    if markerCount ~= MarkerCount then error('jessql compact: missing metadata') end
+    assertMarkers(directory.metadata)
+    if directory.metadata['!entries'] ~= directory.entries then
+      error('jessql compact: entry count mismatch')
+    end
+    flush()
+    local metadata = json.encodeTable(directory)
+    if #metadata > 16 * 1024 * 1024 then error('jessql compact: directory too large') end
+    write(metadata .. word(#metadata) .. word(bytes.crc32(metadata)) .. Tail)
+  end)
+  local closed, closeError = writer:close()
+  if not ok or not closed then
+    fs.remove(path)
+    error('jessql compact: create failed: ' .. tostring(failure or closeError), 2)
+  end
+end
+
+function compact.open(path: string, options: paged.Options?): paged.Snapshot
+  local cacheLimit = if options and options.cachePages then options.cachePages else DefaultCachePages
+  if cacheLimit < 1 or cacheLimit > 4096 or cacheLimit % 1 ~= 0 then
+    error('jessql compact: invalid cache size', 2)
+  end
+  local mode = if options and options.readMode then options.readMode else 'mapped'
+  if mode ~= 'mapped' and mode ~= 'positional' then
+    error('jessql compact: readMode must be mapped or positional', 2)
+  end
+  local reader: dream_fs_Reader? = nil
+  local positional: dream_fs_PositionalReader? = nil
+  local openError: string? = nil
+  if mode == 'positional' then
+    positional, openError = fs.openPositional(path)
+  else
+    reader, openError = fs.open(path)
+  end
+
+  if not reader and not positional then error('jessql compact: ' .. tostring(openError), 2) end
+
+  local function closeReader()
+    if reader then reader:close() end
+    if positional then positional:close() end
+  end
+  local closed = false
+  local function read(offset: number, length: number): string
+    if closed then error('jessql compact: closed', 3) end
+    local data = if positional then positional:readAt(offset, length)
+      else (reader :: dream_fs_Reader):readAt(offset, length)
+    if not data or buffer.len(data) ~= length then error('jessql compact: short read', 3) end
+    return buffer.tostring(data)
+  end
+  local size: number
+  if positional then
+    local measured, sizeError = positional:size()
+    if not measured then
+      closeReader()
+      error('jessql compact: size: ' .. tostring(sizeError), 2)
+    end
+    size = measured
+  else
+    size = (reader :: dream_fs_Reader):size()
+  end
+
+  -- A malformed directory can throw; close the reader before propagating the error.
+  local ok, parsed = pcall(function(): Directory
+    if size < #Magic + 12 or read(0, #Magic) ~= Magic then error('jessql compact: invalid header') end
+    local trailer = read(size - 12, 12)
+    if string.sub(trailer, 9, 12) ~= Tail then error('jessql compact: invalid footer') end
+    local length, checksum = numberAt(trailer, 1), numberAt(trailer, 5)
+    if length > 16 * 1024 * 1024 or length > size - #Magic - 12 then
+      error('jessql compact: invalid directory size')
+    end
+    local metadata = read(size - 12 - length, length)
+    if bytes.crc32(metadata) ~= checksum then error('jessql compact: directory checksum') end
+    local directory = json.decode(metadata) :: Directory
+    if type(directory) ~= 'table' or directory.version ~= 1
+      or type(directory.pages) ~= 'table' or type(directory.metadata) ~= 'table'
+      or type(directory.entries) ~= 'number' then error('jessql compact: invalid directory') end
+    assertMarkers(directory.metadata)
+    if directory.entries ~= directory.metadata['!entries'] then
+      error('jessql compact: invalid entry count')
+    end
+    local offset, total, previousKey = #Magic, 0, ''
+    for _, page in directory.pages do
+      if type(page) ~= 'table' or type(page.first) ~= 'string' or type(page.last) ~= 'string'
+        or type(page.offset) ~= 'number' or type(page.length) ~= 'number'
+        or type(page.rows) ~= 'number' or type(page.checksum) ~= 'number'
+        or page.offset ~= offset or page.length <= 0 or page.rows < 1
+        or page.first <= previousKey or page.first > page.last then
+        error('jessql compact: invalid page directory')
+      end
+      previousKey = page.last
+      offset += page.length + 8
+      total += page.rows
+    end
+
+    if offset ~= size - 12 - length or total ~= directory.entries then
+      error('jessql compact: directory mismatch')
+    end
+    return directory
+  end)
+
+  if not ok then closeReader(); error(parsed, 2) end
+  local directory = parsed :: Directory
+  local cache: { [number]: Cache } = {}
+  local cached, clock, pageReads = 0, 0, 0
+  local result = {} :: paged.Snapshot
+  result.columns, result.primaryKey = { 'id', 'pk' }, 'id'
+  result.keyKind, result.count = 'string', directory.entries + MarkerCount
+  result.identity = 'JQLS1:' .. tostring(size)
+
+  local function loadPage(number: number): Cache
+    clock += 1
+    local existing = cache[number]
+    if existing then existing.age = clock; return existing end
+    local page = directory.pages[number]
+    local frame = read(page.offset, page.length + 8)
+    if numberAt(frame, 1) ~= page.length or numberAt(frame, 5) ~= page.checksum then
+      error('jessql compact: page header mismatch', 2)
+    end
+    local body = string.sub(frame, 9)
+    if bytes.crc32(body) ~= page.checksum then error('jessql compact: page checksum mismatch', 2) end
+    local keys: { string } = {}
+    local offset, previous = 1, ''
+    while offset <= #body do
+      if offset + 5 > #body then error('jessql compact: truncated index entry', 2) end
+      local b0, b1 = string.byte(body, offset, offset + 1)
+      local common = b0 + b1 * 256
+      local length = numberAt(body, offset + 2)
+      if common > #previous or length == 0 or length > MaxKeyBytes
+        or offset + 5 + length > #body then error('jessql compact: invalid prefix entry', 2) end
+      local key = string.sub(previous, 1, common) .. string.sub(body, offset + 6, offset + 5 + length)
+      if #key > MaxKeyBytes or (previous ~= '' and key <= previous) then
+        error('jessql compact: invalid key ordering', 2)
+      end
+      keys[#keys + 1] = key
+      previous = key
+      offset += 6 + length
+    end
+
+    if #keys ~= page.rows or keys[1] ~= page.first or keys[#keys] ~= page.last then
+      error('jessql compact: page directory mismatch', 2)
+    end
+
+    if cached >= cacheLimit then
+      local oldest, oldestAge = 0, math.huge
+      for slot, candidate in cache do
+        if candidate.age < oldestAge then oldest, oldestAge = slot, candidate.age end
+      end
+      cache[oldest] = nil
+      cached -= 1
+    end
+    local item = { keys = keys, age = clock }
+    cache[number] = item
+    cached += 1
+    pageReads += 1
+    return item
+  end
+
+  local function entry(key: string): Row
+    return { id = key, pk = decodeKey(key) }
+  end
+
+  function result.get(_self: paged.Snapshot, key: unknown): Row?
+    if closed then error('jessql compact: closed', 2) end
+    if type(key) ~= 'string' then return nil end
+    local encoded = key :: string
+    local value = directory.metadata[encoded]
+    if value ~= nil then return { id = encoded, pk = value } end
+    if string.sub(encoded, 1, 1) ~= 'z' then return nil end
+    local low, high = 1, #directory.pages
+    while low <= high do
+      local mid = math.floor((low + high) / 2)
+      local page = directory.pages[mid]
+      if encoded < page.first then high = mid - 1
+      elseif encoded > page.last then low = mid + 1
+      else
+        local keys = loadPage(mid).keys
+        local left, right = 1, #keys
+        while left <= right do
+          local middle = math.floor((left + right) / 2)
+          if keys[middle] == encoded then return entry(encoded) end
+          if encoded < keys[middle] then right = middle - 1 else left = middle + 1 end
+        end
+        return nil
+      end
+    end
+    return nil
+  end
+
+  function result.iterateRows(_self: paged.Snapshot, _columns: { string }?, descending: boolean?,
+    lower: unknown?, upper: unknown?, lowerStrict: boolean?, upperStrict: boolean?): () -> Row?
+    if closed then error('jessql compact: closed', 2) end
+    local backwards = descending == true
+    local pages = directory.pages
+    local number, step = if backwards then #pages else 1, if backwards then -1 else 1
+    local index = if backwards then math.huge else 0
+    if backwards and type(upper) == 'string' then
+      local bound = upper :: string
+      local low, high = 1, #pages
+      number = 0
+      while low <= high do
+        local mid = math.floor((low + high) / 2)
+        if pages[mid].first <= bound then number = mid; low = mid + 1 else high = mid - 1 end
+      end
+    elseif not backwards and type(lower) == 'string' then
+      local bound = lower :: string
+      local low, high = 1, #pages
+      number = #pages + 1
+      while low <= high do
+        local mid = math.floor((low + high) / 2)
+        if pages[mid].last >= bound then number = mid; high = mid - 1 else low = mid + 1 end
+      end
+    end
+
+    return function(): Row?
+      if closed then error('jessql compact: closed', 2) end
+
+      while number >= 1 and number <= #pages do
+        local loaded = loadPage(number)
+        if backwards and index == math.huge then index = #loaded.keys + 1 end
+        index += step
+        if index < 1 or index > #loaded.keys then
+          number += step
+          index = if backwards then math.huge else 0
+          continue
+        end
+        local key = loaded.keys[index]
+        if type(lower) == 'string' then
+          if key < (lower :: string) or (key == lower and lowerStrict == true) then
+            if backwards then return nil end
+            continue
+          end
+        end
+
+        if type(upper) == 'string' then
+          if key > (upper :: string) or (key == upper and upperStrict == true) then
+            if not backwards then return nil end
+            continue
+          end
+        end
+        return entry(key)
+      end
+      return nil
+    end
+  end
+
+  function result.stats(_self: paged.Snapshot): paged.Metrics
+    if closed then error('jessql compact: closed', 2) end
+    return { pages = #directory.pages, rows = directory.entries, cachedPages = cached, pageReads = pageReads }
+  end
+
+  function result.provider(_self: paged.Snapshot): engine.Provider
+    error('jessql compact: sidecar is not a SQL table', 2)
+  end
+
+  function result.close(_self: paged.Snapshot)
+    if closed then return end
+    closed = true
+    cache = {}
+    closeReader()
+  end
+  return result
+end
+
+return compact

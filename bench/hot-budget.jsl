@@ -1,0 +1,64 @@
+--!strict
+-- Compare stats fast paths and hot-overlay write overhead across revisions.
+-- Usage: jess run --trusted --package . bench/hot-budget.jsl [stats|ingest|churn] [rows] [probes] [metered]
+local sql = require('@jessql')
+local fs = require('@dream/fs')
+local mode = arg[1] or 'stats'
+local total = tonumber(arg[2]) or 3000
+local probes = tonumber(arg[3]) or 600
+local metered = arg[4] == 'metered'
+if mode ~= 'stats' and mode ~= 'ingest' and mode ~= 'churn' then error('unknown mode') end
+if total < 100 or total > 20000 or total % 1 ~= 0 then error('invalid rows') end
+if probes < 1 or probes > 10000 or probes % 1 ~= 0 then error('invalid probes') end
+local base = fs.join(fs.cwd() :: string, '.jessql-hot-budget-bench-' .. mode)
+
+local function clean()
+  for _, suffix in { '.jql-lock', '.jql-manifest', '.jql-manifest.tmp' } do
+    fs.remove(base .. suffix)
+  end
+
+  for epoch = 1, 6 do
+    local prefix = base .. string.format('.g%08d', epoch)
+    for _, ending in { '.rows', '.deleted', '.wal', '.wal.lock' } do
+      fs.remove(prefix .. ending)
+    end
+  end
+end
+
+clean()
+local db = sql.managed.open(base, { tableName = 'events',
+  columns = { 'id', 'room', 'body' }, primaryKey = 'id', rowLayout = 'packed',
+  maxHotBytes = if metered then 1000000000 else nil })
+local started = os.clock()
+local inserted = 0
+while inserted < total do
+  local last = math.min(total, inserted + 64)
+  db:transaction(function(tx)
+    for key = inserted + 1, last do
+      tx:insert({ id = key, room = 'r', body = string.rep('x', 48) })
+    end
+  end)
+  inserted = last
+end
+local ingested = os.clock()
+local checked = 0
+if mode == 'stats' then
+  for _ = 1, probes do
+    local state = db:stats()
+    checked += state.hotRows + state.tombstones
+  end
+elseif mode == 'churn' then
+  for index = 1, probes do
+    db:upsert({ id = (index % total) + 1, room = 'r',
+      body = string.rep('y', 48 + index % 8) })
+  end
+else
+  checked = db:stats().hotRows
+end
+local finished = os.clock()
+assert(db:stats().hotRows == total)
+db:close()
+clean()
+print(string.format('mode=%s rows=%d probes=%d metered=%s ingest_cpu_ms=%.3f operation_cpu_ms=%.3f checked=%d',
+  mode, total, probes, tostring(metered),
+  (ingested - started) * 1000, (finished - ingested) * 1000, checked))

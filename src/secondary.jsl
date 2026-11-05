@@ -1,0 +1,437 @@
+--!strict
+--!native
+-- Immutable partition/ordered-value/primary-key index bound to a cold snapshot.
+-- The existing checksummed JQLP2 page format is reused for this sidecar.
+local paged = require('@jessql/paged')
+local compact = require('@jessql/compactsecondary')
+local fs = require('@dream/fs')
+
+export type Row = { [string]: unknown }
+export type Index = {
+  partitionColumn: string, orderColumn: string, orderKind: string,
+  complete: boolean, count: number,
+  iterate: (self: Index, prefix: unknown, descending: boolean?,
+    lower: unknown?, upper: unknown?, lowerStrict: boolean?, upperStrict: boolean?) -> () -> Row?,
+  close: (self: Index) -> (),
+  stats: (self: Index) -> paged.Metrics,
+}
+
+export type BuildOptions = { pageBytes: number?, cachePages: number?, runRows: number?, mergeFanIn: number?, format: string? }
+export type BuildMetrics = { rows: number, entries: number, spilledRuns: number,
+  mergeOperations: number, maxBufferedEntries: number, maxOpenReaders: number }
+
+local secondary = {}
+local HexBytes: { string } = {}
+for value = 0, 255 do HexBytes[value + 1] = string.format('%02x', value) end
+
+local function findColumn(columns: { string }, name: string): boolean
+  for _, column in columns do if column == name then return true end end
+  return false
+end
+
+local function component(value: unknown): string
+  local kind = type(value)
+  if kind == 'boolean' then return if value == true then 'b1' else 'b0' end
+
+  if kind == 'number' then
+    local number = value :: number
+    if number ~= number or math.abs(number) == math.huge then error('jessql secondary: invalid number', 3) end
+    if number == 0 then number = 0 end
+    local bits = buffer.create(8)
+    buffer.writef64(bits, 0, number)
+    local hi, lo = buffer.readu32(bits, 4), buffer.readu32(bits, 0)
+    if bit32.band(hi, 0x80000000) ~= 0 then
+      hi, lo = bit32.bnot(hi), bit32.bnot(lo)
+    else
+      hi = bit32.bxor(hi, 0x80000000)
+    end
+    return string.format('n%08x%08x', hi, lo)
+  end
+
+  if kind == 'string' then
+    local valueString = value :: string
+    if utf8.len(valueString) == nil then error('jessql secondary: invalid UTF-8', 3) end
+    -- Hex encoding preserves unsigned UTF-8 byte order, including prefixes.
+    local parts: { string } = {}
+    parts[1] = 's'
+    for index = 1, #valueString do
+      parts[index + 1] = HexBytes[string.byte(valueString, index) + 1]
+    end
+    return table.concat(parts) .. '!'
+  end
+  error('jessql secondary: invalid indexed value', 3)
+end
+
+local function prefixKey(prefix: unknown): string
+  return 'z' .. component(prefix) .. '|'
+end
+
+-- Merge bounded immutable runs with an in-memory min-heap of at most
+-- `fanIn` entries. Sources have independent one-page caches, and are closed
+-- after successful creation *or* any source/decode/write failure.
+local function writeSidecar(path: string, nextRow: () -> Row?, options: paged.Options?, compressed: boolean)
+  if compressed then compact.create(path, nextRow, options)
+  else paged.create(path, { 'id', 'pk' }, 'id', nextRow, options) end
+end
+
+local function mergeRuns(path: string, paths: { string }, options: paged.Options?,
+  metrics: BuildMetrics, markers: { Row }?, compressed: boolean?)
+  local readers: { paged.Snapshot } = {}
+  local iterators: { () -> Row? } = {}
+  local heap: { { row: Row, source: number } } = {}
+  local function smaller(left: { row: Row, source: number }, right: { row: Row, source: number }): boolean
+    return (left.row.id :: string) < (right.row.id :: string)
+  end
+
+  local function push(entry: { row: Row, source: number })
+    local pos = #heap + 1
+    while pos > 1 do
+      local parent = math.floor(pos / 2)
+      if not smaller(entry, heap[parent]) then break end
+      heap[pos] = heap[parent]
+      pos = parent
+    end
+    heap[pos] = entry
+  end
+
+  local function pop(): { row: Row, source: number }?
+    local count = #heap
+    if count == 0 then return nil end
+    local first = heap[1]
+    local last = heap[count]
+    heap[count] = nil
+    if count > 1 then
+      local pos = 1
+      while pos * 2 < count do
+        local child = pos * 2
+        if child + 1 < count and smaller(heap[child + 1], heap[child]) then child += 1 end
+        if not smaller(heap[child], last) then break end
+        heap[pos] = heap[child]
+        pos = child
+      end
+      heap[pos] = last
+    end
+
+    return first
+  end
+
+  -- Reader opening, page decoding, and paged.create can throw; close every opened source.
+  local ok, failure = pcall(function()
+    for index, sourcePath in paths do
+      local reader = paged.open(sourcePath, { cachePages = 1 })
+      readers[#readers + 1] = reader
+      local iterator = reader:iterateRows()
+      iterators[index] = iterator
+      local row = iterator()
+      if row then push({ row = row, source = index }) end
+    end
+    metrics.maxOpenReaders = math.max(metrics.maxOpenReaders, #readers)
+    local markerPosition = 0
+    local function nextRow(): Row?
+      if markers and markerPosition < #markers then
+        markerPosition += 1
+        return markers[markerPosition]
+      end
+      local entry = pop()
+      if not entry then return nil end
+      local row = iterators[entry.source]()
+      if row then push({ row = row, source = entry.source }) end
+      return entry.row
+    end
+    writeSidecar(path, nextRow, options, compressed == true)
+  end)
+
+  for _, reader in readers do reader:close() end
+  if not ok then error(failure, 2) end
+  metrics.mergeOperations += 1
+end
+
+local function writeRun(path: string, rows: { Row }, options: paged.Options?)
+  table.sort(rows, function(left, right) return (left.id :: string) < (right.id :: string) end)
+  local cursor = 0
+  paged.create(path, { 'id', 'pk' }, 'id', function(): Row?
+    cursor += 1
+    return rows[cursor]
+  end, options)
+end
+
+-- `runRows` bounds in-memory key sorting independently of input size.
+-- The fan-in limits simultaneously opened run files during compaction.
+-- This is an external, tiered merge sort: completed runs are reclaimed
+-- incrementally, not retained in an O(total rows) run list.
+function secondary.create(path: string, snapshotPath: string, partitionColumn: string,
+  orderColumn: string, options: BuildOptions?): BuildMetrics
+  local compressed = options ~= nil and options.format == 'compact'
+  if options and options.format ~= nil and options.format ~= 'paged'
+    and options.format ~= 'compact' then error('jessql secondary: unsupported format', 2) end
+  local runRows = if options and options.runRows then options.runRows else 16384
+  local fanIn = if options and options.mergeFanIn then options.mergeFanIn else 8
+  if runRows < 2 or runRows > 262144 or runRows % 1 ~= 0
+    or fanIn < 2 or fanIn > 32 or fanIn % 1 ~= 0 then
+    error('jessql secondary: invalid external-sort limits', 2)
+  end
+
+  -- The index-builder tuning options are not part of the snapshot I/O API.
+  local pageOptions: paged.Options? = if options then {
+    pageBytes = options.pageBytes, cachePages = options.cachePages,
+  } else nil
+
+  local snapshot = paged.open(snapshotPath, pageOptions)
+  local metrics: BuildMetrics = { rows = 0, entries = 0, spilledRuns = 0,
+    mergeOperations = 0, maxBufferedEntries = 0, maxOpenReaders = 0 }
+  local scratch: { [string]: boolean } = {}
+  local prefix: string? = nil
+  -- Validation, scratch creation, and external merging can throw; cleanup must still run.
+  local ok, failure = pcall(function()
+    if partitionColumn == orderColumn or partitionColumn == snapshot.primaryKey
+      or orderColumn == snapshot.primaryKey or not findColumn(snapshot.columns, partitionColumn)
+      or not findColumn(snapshot.columns, orderColumn) then
+      error('jessql secondary: invalid index columns')
+    end
+
+    local keys: { Row } = {}
+    -- A fixed-size cache avoids repeatedly hex-encoding shared partitions,
+    -- without growing proportionally to high-cardinality partition columns.
+    local cachedPrefixes: { [string]: string } = {}
+    local cachedKeys: { string } = {}
+    local nextEvict = 1
+    local function partitionPrefix(partition: unknown): string
+      if type(partition) ~= 'string' then return prefixKey(partition) end
+      local value = partition :: string
+      local cached = cachedPrefixes[value]
+      if cached then return cached end
+      local encoded = prefixKey(value)
+      if #cachedKeys < 128 then
+        cachedKeys[#cachedKeys + 1] = value
+      else
+        cachedPrefixes[cachedKeys[nextEvict]] = nil
+        cachedKeys[nextEvict] = value
+        nextEvict = if nextEvict == 128 then 1 else nextEvict + 1
+      end
+      cachedPrefixes[value] = encoded
+      return encoded
+    end
+
+    local tiers: { { string } } = {}
+    local suffix = 0
+    local function newRun(): string
+      if not prefix then
+        -- The exclusive reservation prevents concurrent builders from sharing
+        -- scratch paths. Do not remove files owned by another process.
+        for _ = 1, 16 do
+          local candidate = path .. '.sort-' .. tostring(math.random(1, 2147483647))
+          local count = fs.writeFile(candidate .. '.owner', 'jessql',
+            { exclusive = true, createParents = true })
+          if count ~= 6 then continue end
+          prefix = candidate
+          scratch[candidate .. '.owner'] = true
+          break
+        end
+
+        if not prefix then error('jessql secondary: cannot reserve sort workspace') end
+      end
+      suffix += 1
+      local result = (prefix :: string) .. '-' .. tostring(suffix)
+      scratch[result] = true
+      return result
+    end
+
+    local function addRun(runPath: string, level: number)
+      local tier = tiers[level]
+      if not tier then tier = {}; tiers[level] = tier end
+      tier[#tier + 1] = runPath
+
+      if #tier >= fanIn then
+        local merged = newRun()
+        mergeRuns(merged, tier, pageOptions, metrics)
+        for _, old in tier do
+          fs.remove(old)
+          scratch[old] = nil
+        end
+        tiers[level] = {}
+        addRun(merged, level + 1)
+      end
+    end
+
+    local function spill()
+      if #keys == 0 then return end
+      metrics.maxBufferedEntries = math.max(metrics.maxBufferedEntries, #keys)
+      local run = newRun()
+      writeRun(run, keys, pageOptions)
+      metrics.spilledRuns += 1
+      keys = {}
+      addRun(run, 1)
+    end
+
+    local nextRow = snapshot:iterateRows({ snapshot.primaryKey, partitionColumn, orderColumn })
+    local count, skipped, orderKind = 0, 0, ''
+    while true do
+      local row = nextRow()
+      if not row then break end
+      local partition, ordered = row[partitionColumn], row[orderColumn]
+      if partition == nil or ordered == nil then
+        skipped += 1
+      else
+        local currentKind = type(ordered)
+        if orderKind == '' then orderKind = currentKind
+        elseif orderKind ~= currentKind then orderKind = 'mixed' end
+
+        keys[#keys + 1] = {
+          id = partitionPrefix(partition) .. component(ordered) .. '|' .. component(row[snapshot.primaryKey]),
+          pk = row[snapshot.primaryKey],
+        }
+
+        if #keys >= runRows then spill() end
+      end
+      count += 1
+    end
+    metrics.rows, metrics.entries = count, count - skipped
+    local marker: { Row } = {
+      { id = '!identity', pk = snapshot.identity },
+      { id = '!partition', pk = partitionColumn },
+      { id = '!order', pk = orderColumn },
+      { id = '!kind', pk = orderKind },
+      { id = '!complete', pk = skipped == 0 },
+      { id = '!count', pk = count },
+      { id = '!entries', pk = metrics.entries },
+    }
+    table.sort(marker, function(left, right) return (left.id :: string) < (right.id :: string) end)
+
+    if prefix then spill() end
+
+    if not prefix then
+      -- Small indexes include their keys after metadata in one sorted sidecar.
+      local entries = keys
+      table.sort(entries, function(left, right) return (left.id :: string) < (right.id :: string) end)
+      local position = 0
+      writeSidecar(path, function(): Row?
+        position += 1
+        if position <= #marker then return marker[position] end
+        return entries[position - #marker]
+      end, pageOptions, compressed)
+      metrics.maxBufferedEntries = math.max(metrics.maxBufferedEntries, #entries)
+    else
+      local remaining: { string } = {}
+      for _, tier in tiers do
+        for _, name in tier do remaining[#remaining + 1] = name end
+      end
+
+      while #remaining > fanIn do
+        local compacted: { string } = {}
+        for offset = 1, #remaining, fanIn do
+          local batch: { string } = {}
+          for index = offset, math.min(offset + fanIn - 1, #remaining) do
+            batch[#batch + 1] = remaining[index]
+          end
+          local merged = newRun()
+          mergeRuns(merged, batch, pageOptions, metrics)
+          compacted[#compacted + 1] = merged
+          for _, old in batch do
+            fs.remove(old)
+            scratch[old] = nil
+          end
+        end
+        remaining = compacted
+      end
+      mergeRuns(path, remaining, pageOptions, metrics, marker, compressed)
+    end
+  end)
+  snapshot:close()
+
+  for name in scratch do fs.remove(name) end
+  if not ok then error(failure, 2) end
+  return metrics
+end
+
+function secondary.open(path: string, snapshot: paged.Snapshot, options: paged.Options?): Index
+  -- The legacy JQLP2 reader remains available for previously built sidecars.
+  -- Dispatch by magic without mapping even six bytes of a potentially
+  -- truncated sidecar; positional mode should never depend on mmap.
+  local head, openError = fs.readAt(path, 0, 6)
+  if not head then error('jessql secondary: ' .. tostring(openError), 2) end
+  local pages = if head and buffer.tostring(head) == 'JQLS1\n'
+    then compact.open(path, options) else paged.open(path, options)
+  -- Close the reader after *any* metadata failure, including a corrupt
+  -- non-first metadata page. Never leak a failed sidecar-open handle.
+  local ok, metadata = pcall(function(): Row
+    if pages.primaryKey ~= 'id' or #pages.columns ~= 2
+      or pages.columns[1] ~= 'id' or pages.columns[2] ~= 'pk'
+      or pages.keyKind ~= 'string' then error('jessql secondary: invalid index schema') end
+    local identity = pages:get('!identity')
+    if not identity or identity.pk ~= snapshot.identity then
+      error('jessql secondary: snapshot identity mismatch')
+    end
+    local partition = pages:get('!partition')
+    local ordered = pages:get('!order')
+    local kind = pages:get('!kind')
+    local complete = pages:get('!complete')
+    local count = pages:get('!count')
+    local entries = pages:get('!entries')
+    if not partition or not ordered or not kind or not complete or not count or not entries
+      or type(partition.pk) ~= 'string' or type(ordered.pk) ~= 'string'
+      or type(kind.pk) ~= 'string' or type(complete.pk) ~= 'boolean'
+      or count.pk ~= snapshot.count or type(entries.pk) ~= 'number'
+      or (entries.pk :: number) ~= pages.count - 7
+      or ((complete.pk :: boolean) and entries.pk ~= snapshot.count)
+      or not findColumn(snapshot.columns, partition.pk :: string)
+      or not findColumn(snapshot.columns, ordered.pk :: string) then
+      error('jessql secondary: damaged index metadata')
+    end
+
+    return { partition = partition.pk, ordered = ordered.pk,
+      kind = kind.pk, complete = complete.pk, count = count.pk }
+  end)
+
+  if not ok then pages:close(); error(metadata, 2) end
+  local info = metadata :: Row
+  local partitionName, orderName = info.partition :: string, info.ordered :: string
+  local closed = false
+  local result = {} :: Index
+  result.partitionColumn, result.orderColumn = partitionName, orderName
+  result.orderKind, result.complete, result.count = info.kind :: string, info.complete :: boolean, info.count :: number
+
+  function result.iterate(_self: Index, prefix: unknown, descending: boolean?,
+    lower: unknown?, upper: unknown?, lowerStrict: boolean?, upperStrict: boolean?): () -> Row?
+    if closed then error('jessql secondary: index closed', 2) end
+    local root = prefixKey(prefix)
+    local start, finish = root, root .. '~'
+    if lower ~= nil then
+      start = root .. component(lower) .. (if lowerStrict then '|~' else '|')
+    end
+
+    if upper ~= nil then
+      finish = root .. component(upper) .. (if upperStrict then '|' else '|~')
+    end
+    local nextEntry = pages:iterateRows(nil, descending, start, finish, false, true)
+    return function(): Row?
+      if closed then error('jessql secondary: index closed', 2) end
+
+      while true do
+        local entry = nextEntry()
+        if not entry then return nil end
+        local key = entry.pk
+        local row = snapshot:get(key)
+        if not row or row[partitionName] ~= prefix
+          or row[orderName] == nil
+          or entry.id ~= root .. component(row[orderName]) .. '|' .. component(key) then
+          error('jessql secondary: index row mismatch', 2)
+        end
+        return row
+      end
+    end
+  end
+
+  function result.stats(_self: Index): paged.Metrics
+    if closed then error('jessql secondary: index closed', 2) end
+    return pages:stats()
+  end
+
+  function result.close(_self: Index)
+    if closed then return end
+    closed = true
+    pages:close()
+  end
+  return result
+end
+
+return secondary

@@ -1,0 +1,320 @@
+--!strict
+--!native
+-- Explicitly bounded SQL DML over JessQL's existing transactional store.
+-- No expression evaluation, multiple statements, or implicit SQL string interpolation.
+local lexer = require('@jessql/lexer')
+
+local mutations = {}
+local Null = {}
+mutations.NULL = Null -- explicit parameter NULL; nil holes are not valid parameter arrays
+
+export type Value = { kind: string, value: unknown, slot: number?, column: string?, op: string?, rhs: Value? }
+export type Assignment = { column: string, value: Value }
+export type Statement = {
+  kind: string, table: string, columns: { string }, valueRows: { { Value } },
+  assignments: { Assignment }, whereColumn: string?, whereOp: string?, whereValue: Value?, parameterCount: number,
+  ignoreConflict: boolean, conflictColumn: string?,
+}
+
+-- Keep this interface independent of the storage module to avoid a dependency cycle.
+export type Writer = {
+  primaryKey: (self: Writer, name: string) -> string,
+  hasColumn: (self: Writer, name: string, column: string) -> boolean,
+  insert: (self: Writer, name: string, row: { [string]: unknown }) -> (),
+  get: (self: Writer, name: string, key: unknown) -> { [string]: unknown }?,
+  keysWhere: (self: Writer, name: string, column: string, value: unknown) -> { unknown },
+  keysRange: (self: Writer, name: string, column: string, op: string, value: unknown) -> { unknown },
+  update: (self: Writer, name: string, key: unknown, changes: { [string]: unknown }, unset: { string }?) -> boolean,
+  delete: (self: Writer, name: string, key: unknown) -> boolean,
+}
+
+local function identifier(token: lexer.Token): string
+  if token.kind ~= 'word' and token.kind ~= 'ident' then
+    error('jessql DML: expected identifier at byte ' .. tostring(token.at), 0)
+  end
+  local value = string.lower(token.text)
+  if not string.match(value, '^[%a_][%w_]*$') then
+    error('jessql DML: invalid identifier at byte ' .. tostring(token.at), 0)
+  end
+  return value
+end
+
+function mutations.parse(sql: string): Statement
+  local tokens = lexer.lex(sql)
+  local position, parameterCount = 1, 0
+  local function peek(): lexer.Token return tokens[position] end
+
+  local function isWord(word: string): boolean
+    local token = peek()
+    return token.kind == 'word' and token.value == word
+  end
+
+  local function accept(symbol: string): boolean
+    local token = peek()
+    if token.kind == 'symbol' and token.text == symbol then position += 1; return true end
+    return false
+  end
+
+  local function requireWord(word: string)
+    if not isWord(word) then error('jessql DML: expected ' .. word .. ' at byte ' .. tostring(peek().at), 0) end
+    position += 1
+  end
+
+  local function requireSymbol(symbol: string)
+    if not accept(symbol) then error('jessql DML: expected ' .. symbol .. ' at byte ' .. tostring(peek().at), 0) end
+  end
+
+  local function readIdentifier(): string
+    local value = identifier(peek())
+    position += 1
+    return value
+  end
+
+  local function readValue(): Value
+    if accept('?') then
+      parameterCount += 1
+      return { kind = 'param', value = nil, slot = parameterCount }
+    end
+    local negative = if accept('-') then -1 elseif accept('+') then 1 else nil
+    local token = peek()
+    if token.kind == 'number' then
+      position += 1
+      return { kind = 'literal', value = if negative then (token.value :: number) * negative else token.value }
+    end
+
+    if negative then error('jessql DML: sign requires a number at byte ' .. tostring(token.at), 0) end
+
+    if token.kind == 'string' then
+      position += 1
+      return { kind = 'literal', value = token.value }
+    end
+
+    if isWord('TRUE') or isWord('FALSE') or isWord('NULL') then
+      position += 1
+      return { kind = 'literal', value = if token.value == 'TRUE' then true
+        elseif token.value == 'FALSE' then false else nil }
+    end
+    error('jessql DML: only literals and ? parameters are supported at byte ' .. tostring(token.at), 0)
+  end
+
+  local kind, name
+  local columns: { string } = {}
+  local valueRows: { { Value } } = {}
+  local assignments: { Assignment } = {}
+  local whereColumn: string? = nil
+  local whereOp: string? = nil
+  local whereValue: Value? = nil
+  local ignoreConflict = false
+  local conflictColumn: string? = nil
+
+  if isWord('INSERT') then
+    position += 1
+    kind = 'insert'
+    requireWord('INTO')
+    name = readIdentifier()
+    requireSymbol('(')
+    repeat
+      columns[#columns + 1] = readIdentifier()
+    until not accept(',')
+    requireSymbol(')')
+    requireWord('VALUES')
+    repeat
+      requireSymbol('(')
+      local values: { Value } = {}
+      repeat
+        values[#values + 1] = readValue()
+      until not accept(',')
+      requireSymbol(')')
+      if #columns ~= #values then error('jessql DML: column/value arity mismatch', 0) end
+      valueRows[#valueRows + 1] = values
+      if #valueRows > 1024 then error('jessql DML: too many VALUES rows (max 1024)', 0) end
+    until not accept(',')
+
+    if isWord('ON') then
+      position += 1
+      requireWord('CONFLICT')
+      if accept('(') then
+        conflictColumn = readIdentifier()
+        requireSymbol(')')
+      end
+      requireWord('DO')
+      requireWord('NOTHING')
+      ignoreConflict = true
+    end
+  elseif isWord('UPDATE') then
+    position += 1
+    kind = 'update'
+    name = readIdentifier()
+    requireWord('SET')
+    repeat
+      local column = readIdentifier()
+      requireSymbol('=')
+      local token = peek()
+      local value: Value
+      if (token.kind == 'word' or token.kind == 'ident')
+        and token.value ~= 'TRUE' and token.value ~= 'FALSE' and token.value ~= 'NULL' then
+        local source = readIdentifier()
+        local operator = if accept('+') then '+' elseif accept('-') then '-' else nil
+        if not operator then error('jessql DML: expected + or - after column reference', 0) end
+        value = ({ kind = 'arithmetic', value = nil, column = source, op = operator, rhs = readValue() } :: Value)
+      else
+        value = readValue()
+      end
+      assignments[#assignments + 1] = { column = column, value = value }
+    until not accept(',')
+    requireWord('WHERE')
+    whereColumn = readIdentifier()
+    local operator = peek()
+    if operator.kind ~= 'symbol' or (operator.text ~= '=' and operator.text ~= '<'
+      and operator.text ~= '<=' and operator.text ~= '>' and operator.text ~= '>=') then
+      error('jessql DML: expected indexed comparison (=, <, <=, >, >=)', 0)
+    end
+    whereOp = operator.text
+    position += 1
+    whereValue = readValue()
+  elseif isWord('DELETE') then
+    position += 1
+    kind = 'delete'
+    requireWord('FROM')
+    name = readIdentifier()
+    requireWord('WHERE')
+    whereColumn = readIdentifier()
+    local operator = peek()
+    if operator.kind ~= 'symbol' or (operator.text ~= '=' and operator.text ~= '<'
+      and operator.text ~= '<=' and operator.text ~= '>' and operator.text ~= '>=') then
+      error('jessql DML: expected indexed comparison (=, <, <=, >, >=)', 0)
+    end
+    whereOp = operator.text
+    position += 1
+    whereValue = readValue()
+  else
+    error('jessql DML: expected INSERT, UPDATE or DELETE', 0)
+  end
+
+  accept(';')
+  if peek().kind ~= 'eof' then
+    error('jessql DML: unexpected token at byte ' .. tostring(peek().at), 0)
+  end
+
+  return {
+    kind = kind, table = name, columns = columns, valueRows = valueRows,
+    assignments = assignments, whereColumn = whereColumn, whereOp = whereOp,
+    whereValue = whereValue, parameterCount = parameterCount,
+    ignoreConflict = ignoreConflict, conflictColumn = conflictColumn,
+  }
+end
+
+function mutations.execute(statement: Statement, tx: Writer, params: { unknown }?): number
+  local args = params or {}
+  if type(args) ~= 'table' or #args ~= statement.parameterCount then
+    error('jessql DML: parameter count mismatch; use sql.NULL for explicit NULL', 2)
+  end
+
+  local function resolve(value: Value): unknown
+    local out = if value.kind == 'param' then args[value.slot :: number] else value.value
+    if out == Null then return nil end
+
+    if value.kind == 'param' and out == nil then
+      error('jessql DML: missing parameter; use sql.NULL for explicit NULL', 3)
+    end
+    return out
+  end
+
+  if statement.kind == 'insert' then
+    local seen: { [string]: boolean } = {}
+    for _, column in statement.columns do
+      if seen[column] then error('jessql DML: duplicate INSERT column', 2) end
+      if not tx:hasColumn(statement.table, column) then error('jessql DML: unknown INSERT column', 2) end
+      seen[column] = true
+    end
+    local pk = tx:primaryKey(statement.table)
+    if statement.conflictColumn and statement.conflictColumn ~= pk then
+      error('jessql DML: conflict target must be the primary key', 2)
+    end
+    local affected = 0
+    for _, values in statement.valueRows do
+      local row: { [string]: unknown } = {}
+      for index, column in statement.columns do
+        row[column] = resolve(values[index])
+      end
+      local key = row[pk]
+      if not (statement.ignoreConflict and key ~= nil and tx:get(statement.table, key) ~= nil) then
+        tx:insert(statement.table, row)
+        affected += 1
+      end
+    end
+    return affected
+  end
+
+  -- Collect a bounded, stable key snapshot before changing secondary indexes.
+  -- Non-PK predicates must have a declared secondary index.
+  local value = resolve(statement.whereValue :: Value)
+  local keys = if statement.whereOp == '=' then
+    tx:keysWhere(statement.table, statement.whereColumn :: string, value)
+    else tx:keysRange(statement.table, statement.whereColumn :: string,
+      statement.whereOp :: string, value)
+  if statement.kind == 'delete' then
+    local affected = 0
+    for _, key in keys do
+      if tx:delete(statement.table, key) then affected += 1 end
+    end
+    return affected
+  end
+  local seen: { [string]: boolean } = {}
+  local pk = tx:primaryKey(statement.table)
+  -- Validate even if the WHERE predicate matches zero rows. In particular,
+  -- an invalid assignment must not be silently accepted on an empty table.
+  for _, assignment in statement.assignments do
+    if seen[assignment.column] then error('jessql DML: duplicate UPDATE column', 2) end
+    seen[assignment.column] = true
+    if assignment.column == pk or not tx:hasColumn(statement.table, assignment.column) then
+      error('jessql DML: cannot update column', 2)
+    end
+    local expression = assignment.value
+    if expression.kind == 'arithmetic' then
+      if not tx:hasColumn(statement.table, expression.column :: string) then
+        error('jessql DML: unknown arithmetic source column', 2)
+      end
+      local delta = resolve(expression.rhs :: Value)
+      if delta ~= nil and type(delta) ~= 'number' then
+        error('jessql DML: arithmetic operand must be a number', 2)
+      end
+    else
+      resolve(expression)
+    end
+  end
+
+  local affected = 0
+  for _, key in keys do
+    local original = tx:get(statement.table, key)
+    if not original then continue end
+    local changes: { [string]: unknown } = {}
+    local unset: { string } = {}
+    for _, assignment in statement.assignments do
+      local expression = assignment.value
+      local nextValue: unknown
+      if expression.kind == 'arithmetic' then
+        local previous = original[expression.column :: string]
+        local delta = resolve(expression.rhs :: Value)
+        if previous == nil or delta == nil then
+          nextValue = nil
+        else
+          if type(previous) ~= 'number' or type(delta) ~= 'number' then
+            error('jessql DML: arithmetic requires numeric columns', 2)
+          end
+          nextValue = if expression.op == '+' then previous + delta else previous - delta
+        end
+      else
+        nextValue = resolve(expression)
+      end
+
+      if nextValue == nil then unset[#unset + 1] = assignment.column
+      else changes[assignment.column] = nextValue end
+    end
+
+    if tx:update(statement.table, key, changes, unset) then affected += 1 end
+  end
+  return affected
+end
+
+return mutations

@@ -1,7 +1,8 @@
+--!strict
 local sql = require('@jessql')
 local rowCount = tonumber((...)) or 100000
-local left = table.create(rowCount)
-local right = table.create(rowCount)
+local left: {sql.Row} = table.create(rowCount) :: {sql.Row}
+local right: {sql.Row} = table.create(rowCount) :: {sql.Row}
 
 for index = 1, rowCount do
   left[index] = { id = index, name = 'L' .. tostring(index) }

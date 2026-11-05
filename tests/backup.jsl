@@ -1,0 +1,162 @@
+--!strict
+local sql = require('@jessql')
+local fs = require('@dream/fs')
+local bytes = require('@dream/bytes')
+local json = require('@jess/json')
+local test = require('@jess/test')
+local suite, expect = test.new(), test.expect
+
+local function fixture(name: string): string
+  return fs.join(fs.cwd() :: string, '.jessql-backup-' .. name)
+end
+
+local function cleanup(base: string)
+  for epoch = 1, 16 do
+    local prefix = base .. string.format('.g%08d', epoch)
+    for _, suffix in { '.rows', '.deleted', '.wal', '.wal.lock', '.hot-rows', '.hot-deleted' } do
+      fs.remove(prefix .. suffix)
+    end
+  end
+
+  for _, suffix in { '.jql-manifest', '.jql-manifest.tmp', '.jql-lock' } do
+    fs.remove(base .. suffix)
+  end
+end
+
+local function database(path: string)
+  return sql.managed.open(path, { tableName = 'events', columns = { 'id', 'body' }, primaryKey = 'id' })
+end
+
+local function fails(action: () -> ()): boolean
+  -- Expected rejection: catch the error so the test can assert refusal.
+  local ok = pcall(action)
+  return not ok
+end
+
+local function u32(value: number): string
+  return string.char(value % 256, math.floor(value / 256) % 256,
+    math.floor(value / 65536) % 256, math.floor(value / 16777216) % 256)
+end
+
+suite.describe('offline semantic verification and namespace copy', function()
+  suite.it('runs the real transaction validators without modifying WAL bytes', function()
+    local base = fixture('semantic')
+    cleanup(base)
+    local db = database(base)
+    db:insert({ id = 1, body = 'committed' })
+    db:close()
+    local path = base .. '.g00000001.wal'
+    local intact = assert((fs.readFileString(path)))
+    local before = sql.managed.verify(base)
+    expect(before.ok).toBe(true)
+    local clean = sql.managed.verify(base, { semantic = true })
+    expect(clean.ok).toBe(true)
+    expect(clean.walSemanticReplayChecked).toBe(true)
+
+    -- A well-framed, CRC-correct transaction referencing an unknown table
+    -- evades structural verification but MUST fail semantic replay.
+    local payload = json.encodeTable({ version = 1, sequence = before.walFrames + 1,
+      ops = { { kind = 'put', table = 'nonexistent', row = { id = 5 } } } })
+    local frame = u32(#payload) .. u32(bytes.crc32(payload)) .. payload
+    assert((fs.writeFile(path, intact .. frame)))
+    expect(sql.managed.verify(base).ok).toBe(true)
+    local corrupt = sql.managed.verify(base, { semantic = true })
+    expect(corrupt.ok).toBe(false)
+    expect(corrupt.issues[1].code).toBe('WAL_SEMANTIC_REPLAY_FAILED')
+    expect(corrupt.walSemanticReplayChecked).toBe(false)
+    expect((fs.readFileString(path))).toBe(intact .. frame)
+    assert((fs.writeFile(path, intact)))
+    cleanup(base)
+  end)
+
+  suite.it('backs up multigeneration state, then restores into an empty namespace', function()
+    local source, copy, restored = fixture('source'), fixture('copy'), fixture('restored')
+    cleanup(source); cleanup(copy); cleanup(restored)
+    local db = database(source)
+    db:insert({ id = 1, body = 'original' })
+    db:flush()
+    db:insert({ id = 2, body = 'newer' })
+    db:flush()
+    db:delete(1)
+    db:insert({ id = 3, body = 'hot' })
+    db:close()
+    local original = assert((fs.readFileString(source .. '.jql-manifest')))
+    local saved = sql.managed.backup(source, copy)
+    expect(saved.version).toBe(1)
+    expect(saved.files > 2).toBe(true)
+    expect(saved.semanticVerified).toBe(true)
+    expect(sql.managed.verify(copy, { semantic = true }).ok).toBe(true)
+    expect((fs.readFileString(source .. '.jql-manifest'))).toBe(original)
+    local restoredReport = sql.managed.restore(copy, restored)
+    expect(restoredReport.epoch).toBe(saved.epoch)
+    local reopened = sql.managed.open(restored)
+    expect(reopened:get(1)).toBe(nil)
+    expect((assert(reopened:get(2))).body).toBe('newer')
+    expect((assert(reopened:get(3))).body).toBe('hot')
+    reopened:close()
+    cleanup(source); cleanup(copy); cleanup(restored)
+  end)
+
+  suite.it('refuses active writers and never overwrites existing destination artifacts', function()
+    local source, target = fixture('locked-source'), fixture('locked-target')
+    cleanup(source); cleanup(target)
+    local db = database(source)
+    db:insert({ id = 1, body = 'safe' })
+    expect(fails(function() sql.managed.backup(source, target) end)).toBe(true)
+    db:close()
+    assert((fs.writeFile(target .. '.g00000001.rows', 'evidence')))
+    expect(fails(function() sql.managed.backup(source, target) end)).toBe(true)
+    expect((fs.readFileString(target .. '.g00000001.rows'))).toBe('evidence')
+    cleanup(target)
+    local succeeded = sql.managed.backup(source, target)
+    expect(succeeded.semanticVerified).toBe(true)
+    local manifestBefore = assert((fs.readFileString(target .. '.jql-manifest')))
+    expect(fails(function() sql.managed.backup(source, target) end)).toBe(true)
+    expect((fs.readFileString(target .. '.jql-manifest'))).toBe(manifestBefore)
+    cleanup(source); cleanup(target)
+  end)
+
+  suite.it('refuses semantic corruption without publishing destination files', function()
+    local source, target = fixture('corrupt-source'), fixture('corrupt-target')
+    cleanup(source); cleanup(target)
+    local db = database(source)
+    db:insert({ id = 1, body = 'valid' })
+    db:close()
+    local wal = source .. '.g00000001.wal'
+    local original = assert((fs.readFileString(wal)))
+    local count = sql.managed.verify(source).walFrames
+    local payload = json.encodeTable({ version = 1, sequence = count + 1,
+      ops = { { kind = 'put', table = 'doesnotexist', row = { id = 2 } } } })
+    assert((fs.writeFile(wal, original .. u32(#payload) .. u32(bytes.crc32(payload)) .. payload)))
+    expect(sql.managed.verify(source).ok).toBe(true)
+    expect(fails(function() sql.managed.backup(source, target) end)).toBe(true)
+    expect((fs.exists(target .. '.jql-manifest'))).toBe(false)
+    expect((fs.exists(target .. '.g00000001.rows'))).toBe(false)
+    expect((fs.readFileString(wal)) ~= original).toBe(true)
+    cleanup(source); cleanup(target)
+  end)
+
+  suite.it('copies data larger than one transfer chunk', function()
+    local source, target = fixture('large-source'), fixture('large-target')
+    cleanup(source); cleanup(target)
+    local db = database(source)
+    local body = string.rep('z', 512)
+    db:transaction(function(tx)
+      for id = 1, 640 do tx:insert({ id = id, body = body }) end
+    end)
+    db:checkpoint()
+    db:close()
+    local rows = assert((fs.stat(source .. '.g00000002.rows')))
+    expect(rows.size > 256 * 1024).toBe(true)
+    local copied = sql.managed.backup(source, target)
+    expect(copied.semanticVerified).toBe(true)
+    local reopened = sql.managed.open(target)
+    expect((assert(reopened:get(1))).body).toBe(body)
+    expect((assert(reopened:get(640))).body).toBe(body)
+    reopened:close()
+    cleanup(source); cleanup(target)
+  end)
+
+end)
+
+return suite

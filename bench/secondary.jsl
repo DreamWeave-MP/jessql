@@ -1,0 +1,74 @@
+--!strict
+-- Cold composite-index comparison; all query results are checked by the tests.
+local sql = require('@jessql')
+local fs = require('@dream/fs')
+
+local mode = arg[1] or 'indexed'
+local Count = tonumber(arg[2]) or 24000
+local QueryCount = tonumber(arg[3]) or 40
+local root = fs.cwd() :: string
+local base = fs.join(root, '.jessql-secondary-benchmark')
+local cold, sidecar, wal = base .. '.cold', base .. '.index', base .. '.wal'
+
+local function rss(): number
+  -- Linux-only measurement. Other platforms report -1.
+  local ok, content = pcall(fs.readFileString, '/proc/self/status')
+  if not ok or type(content) ~= 'string' then return -1 end
+  local number = string.match(content, 'VmRSS:%s+(%d+)')
+  return if number then tonumber(number) or -1 else -1
+end
+
+if mode == 'prepare' then
+  fs.remove(cold)
+  fs.remove(sidecar)
+  fs.remove(wal)
+  fs.remove(wal .. '.lock')
+  local cursor = 0
+  local start = os.clock()
+  sql.paged.create(cold, { 'id', 'room', 'stream', 'body' }, 'id', function()
+    cursor += 1
+    if cursor > Count then return nil end
+
+    return { id = cursor, room = 'room-' .. tostring(cursor % 48),
+      stream = math.floor(cursor / 48), body = 'event-' .. tostring(cursor) }
+  end)
+  print('snapshot_build_seconds', os.clock() - start)
+  start = os.clock()
+  sql.secondary.create(sidecar, cold, 'room', 'stream')
+  print('sidecar_build_seconds', os.clock() - start)
+  print('build_rss_KiB', rss())
+  print('rows', Count)
+  local db = sql.hybrid.open(wal, cold, 'events')
+  db:transaction(function(tx)
+    for index = 1, 80 do
+      tx:upsert({ id = index, room = 'room-1', stream = 9999 + index, body = 'hot-' .. tostring(index) })
+    end
+  end)
+  db:close()
+  return
+end
+
+local started = os.clock()
+local db = sql.hybrid.open(wal, cold, 'events', {
+  cachePages = 4, secondaryIndexPath = if mode == 'indexed' then sidecar else nil,
+})
+local openSeconds = os.clock() - started
+local openedRSS = rss()
+started = os.clock()
+local checksum = 0
+for index = 1, QueryCount do
+  local room = 'room-' .. tostring((index * 23) % 48)
+  local cursor = math.floor(Count / 48 * ((index * 7) % 10) / 12)
+  local rows = db:query('SELECT id, stream FROM events WHERE room = ? AND stream >= ? ORDER BY stream LIMIT 12',
+    { room, cursor }).rows
+  for _, row in rows do checksum += (row.id :: number) + (row.stream :: number) end
+end
+local querySeconds = os.clock() - started
+print('mode', mode)
+print('query_count', QueryCount)
+print('open_seconds', openSeconds)
+print('query_seconds', querySeconds)
+print('rss_after_open_KiB', openedRSS)
+print('rss_after_queries_KiB', rss())
+print('checksum', checksum)
+db:close()

@@ -1,0 +1,68 @@
+--!strict
+-- Matched indexed ORDER BY/range+LIMIT benchmark on the same data and SQL.
+-- Both providers are native JessQL; the baseline uses equality hash indexing.
+local sql = require('@jessql')
+local fs = require('@dream/fs')
+
+local total = tonumber((...)) or 30000
+local probes = tonumber(select(2, ...)) or 500
+local BatchSize = 128
+local path = fs.join(assert((fs.cwd())), '.jessql-ordered-bench.wal')
+fs.remove(path)
+fs.remove(path .. '.lock')
+
+local db = sql.open(path)
+db:createTable('events', { 'id', 'sequence', 'room' }, 'id')
+db:transaction(function(tx)
+  for first = 1, total, BatchSize do
+    -- A single insertion stream, intentionally out of order by sequence.
+    for id = first, math.min(first + BatchSize - 1, total) do
+      tx:insert('events', { id = id, sequence = total + 1 - id, room = id % 17 })
+    end
+  end
+end)
+
+local Statement = 'SELECT sequence FROM events WHERE sequence >= ? AND sequence < ? ORDER BY sequence LIMIT 20'
+local query = db:prepare(Statement)
+local function run(): (number, number)
+  local started = os.clock()
+  local rows = 0
+  for iteration = 1, probes do
+    local lower = (iteration * 101) % (total - 200)
+    local result = query.run({ lower, lower + 200 })
+    rows += #result.rows
+  end
+  return os.clock() - started, rows
+end
+
+local function countProbes(): (number, number)
+  local countPlan = db:prepare('SELECT COUNT(*) AS n FROM events WHERE sequence >= ? AND sequence < ?')
+  local started = os.clock()
+  local totalCount = 0
+  for iteration = 1, probes do
+    local lower = (iteration * 101) % (total - 200)
+    totalCount += (countPlan.run({ lower, lower + 200 }).rows[1].n :: number)
+  end
+  return os.clock() - started, totalCount
+end
+
+local countBaseline, baselineCount = countProbes()
+local baseline, originalRows = run()
+local indexedAt = os.clock()
+db:createOrderedIndex('events', 'sequence')
+local buildSeconds = os.clock() - indexedAt
+query = db:prepare(Statement)
+local optimized, indexedRows = run()
+local countOptimized, orderedCount = countProbes()
+assert(originalRows == indexedRows)
+assert(baselineCount == orderedCount)
+
+print(string.format('rows=%d queries=%d result_rows=%d', total, probes, indexedRows))
+print(string.format('hash_baseline_s=%.4f ordered_s=%.4f build_s=%.4f speedup=%.2fx',
+  baseline, optimized, buildSeconds, baseline / optimized))
+print(string.format('count_hash_s=%.4f count_ordered_s=%.4f count_speedup=%.2fx',
+  countBaseline, countOptimized, countBaseline / countOptimized))
+
+db:close()
+fs.remove(path)
+fs.remove(path .. '.lock')

@@ -1,0 +1,870 @@
+--!strict
+--!native
+-- Durable multi-generation lifecycle for one hybrid table.
+-- Flushes retain immutable generations; full checkpoints compact them.
+-- All transitions are synchronous under the managed lock.
+local fs = require('@dream/fs')
+local hybrid = require('@jessql/hybrid')
+local paged = require('@jessql/paged')
+local segments = require('@jessql/segments')
+local tiers = require('@jessql/tiers')
+local engine = require('@jessql/engine')
+local manifest = require('@jessql/managed_manifest')
+local policy = require('@jessql/managed_policy')
+local publicationKernel = require('@jessql/managed_publication')
+local verification = require('@jessql/managed_verification')
+local backupKernel = require('@jessql/managed_backup')
+local observability = require('@jessql/managed_observability')
+
+export type Row = { [string]: unknown }
+export type Options = {
+  tableName: string?, columns: { string }?, primaryKey: string?,
+  cachePages: number?, readMode: string?, rowLayout: string?, pageBytes: number?,
+  maxHotRows: number?, maxHotBytes: number?, maxWalBytes: number?, maxGenerations: number?, runRows: number?, mergeFanIn: number?,
+  compactionFanIn: number?,
+  -- Deterministic fault injection for integration tests. Throws at a named stage.
+  testHook: ((string) -> ())?,
+}
+export type InspectionGeneration = { epoch: number, deleted: boolean, rowsBytes: number,
+  deletedBytes: number? }
+export type Inspection = { version: number, epoch: number, tableName: string,
+  primaryKey: string, columns: { string }, generations: { InspectionGeneration },
+  walBytes: number, coldIdentity: string, walIdentityChecked: boolean }
+export type Transaction = hybrid.Transaction
+export type BatchResult = hybrid.BatchResult
+export type Event = observability.Event
+export type EventBatch = observability.Batch
+export type Observation = { version: number, epoch: number, generations: number,
+  poisoned: boolean, maintenanceError: string?, limits: { maxHotRows: number?,
+    maxHotBytes: number?, maxWalBytes: number?, maxGenerations: number } }
+export type Database = {
+  get: (self: Database, key: unknown) -> Row?,
+  insert: (self: Database, row: Row) -> (),
+  upsert: (self: Database, row: Row) -> (),
+  update: (self: Database, key: unknown, changes: Row) -> boolean,
+  delete: (self: Database, key: unknown) -> boolean,
+  transaction: (self: Database, callback: (Transaction) -> ()) -> (),
+  transactionBatch: (self: Database, callbacks: { (Transaction) -> () }) -> { BatchResult },
+  query: (self: Database, sql: string, params: { unknown }?) -> engine.Result,
+  prepare: (self: Database, sql: string) -> engine.Plan,
+  stats: (self: Database) -> { epoch: number, generations: number, coldRows: number, hotRows: number,
+    tombstones: number, hotPayloadBytes: number?, walBytes: number?, cachedPages: number },
+  maintenanceStatus: (self: Database) -> { lastError: string?, poisoned: boolean },
+  observe: (self: Database) -> Observation,
+  events: (self: Database, after: number?) -> EventBatch,
+  flush: (self: Database) -> number,
+  compact: (self: Database) -> number,
+  checkpoint: (self: Database) -> number,
+  close: (self: Database) -> (),
+}
+
+type Generation = manifest.Generation
+type Manifest = manifest.Manifest
+type Paths = { snapshot: string, deletes: string, wal: string }
+local MaxEpoch = manifest.MaxEpoch
+local managed = {
+  -- Explicitly invoked by the application host; not a durability-path callback.
+  extensions = { v1 = { relay = observability.relay } },
+}
+
+local function assertOK(ok: boolean?, message: string?, action: string)
+  if not ok then error('jessql managed: ' .. action .. ': ' .. tostring(message), 3) end
+end
+
+local function directory(path: string): string
+  local parent = fs.parent(path)
+
+  if not parent then error('jessql managed: missing parent directory', 3) end
+  return parent
+end
+
+local function normalize(path: string): (string, string)
+  if type(path) ~= 'string' or path == '' then error('jessql managed: path required', 3) end
+  local absolute, absoluteError = fs.absolute(path)
+
+  if not absolute then error('jessql managed: ' .. tostring(absoluteError), 3) end
+  local name = fs.fileName(absolute)
+
+  if not name or not fs.isFileName(name) then error('jessql managed: invalid path', 3) end
+  -- Canonical parent prevents aliases to the same managed DB from bypassing its lock.
+  local parent, parentError = fs.canonicalize(directory(absolute))
+
+  if not parent then error('jessql managed: parent: ' .. tostring(parentError), 3) end
+  if not fs.isDir(parent) then error('jessql managed: parent is not a directory', 3) end
+  return fs.join(parent, name), parent
+end
+
+local function paths(base: string, epoch: number): Paths
+  local suffix = string.format('.g%08d', epoch)
+  return { snapshot = base .. suffix .. '.rows', deletes = base .. suffix .. '.deleted',
+    wal = base .. suffix .. '.wal' }
+end
+
+local function readManifest(path: string): Manifest
+  local raw, failure = fs.readFileString(path)
+  if not raw then error('jessql managed: read manifest: ' .. tostring(failure), 3) end
+  return manifest.decode(raw)
+end
+
+-- Publication and durable file sealing are deliberately not pluggable.
+-- The coordinator owns the lock, WAL cutover and poison/failure decisions.
+local seal = publicationKernel.seal
+local removeIfPresent = publicationKernel.removeIfPresent
+
+local function compactScratch(base: string, epoch: number): (string, string)
+  local prefix = base .. string.format('.g%08d.hot-', epoch)
+  return prefix .. 'rows', prefix .. 'deleted'
+end
+
+local function clearScratch(base: string, epoch: number)
+  local rows, deletes = compactScratch(base, epoch)
+  removeIfPresent(rows)
+  removeIfPresent(deletes)
+end
+
+local function clearCandidate(candidatePaths: Paths)
+  removeIfPresent(candidatePaths.wal)
+  removeIfPresent(candidatePaths.wal .. '.lock')
+  removeIfPresent(candidatePaths.snapshot)
+  removeIfPresent(candidatePaths.deletes)
+end
+
+local function indexedPaths(base: string, value: Manifest): ({ string }, { [number]: string })
+  local sources: { string } = {}
+  local deleted: { [number]: string } = {}
+  for index, generation in manifest.generations(value) do
+    local files = paths(base, generation.epoch)
+    sources[index] = files.snapshot
+    if generation.deleted then deleted[index] = files.deletes end
+  end
+  return sources, deleted
+end
+
+-- Open the immutable set independently before starting a WAL: a manifest is
+-- authoritative only if every referenced generation and sidecar validates.
+local function verifyCold(base: string, value: Manifest, options: Options?): string
+  local cachePages = 1
+  local readMode = if options then options.readMode else nil
+  local source: paged.Snapshot
+  if value.version == 1 then
+    source = paged.open(paths(base, value.epoch).snapshot,
+      { cachePages = cachePages, readMode = readMode })
+  else
+    local rows, deletes = indexedPaths(base, value)
+    source = segments.open(rows, { cachePages = cachePages, readMode = readMode,
+      deletePaths = deletes })
+  end
+  local identity = source.identity
+  -- Schema validation can throw; close the candidate reader on failure.
+  local ok, err = pcall(function()
+    if source.primaryKey ~= value.primaryKey or #source.columns ~= #value.columns then
+      error('cold generation schema mismatch')
+    end
+
+    for index, column in value.columns do
+      if source.columns[index] ~= column then error('cold generation schema mismatch') end
+    end
+
+    if identity ~= value.snapshotIdentity then error('cold generation identity mismatch') end
+  end)
+  source:close()
+  if not ok then error('jessql managed: ' .. tostring(err), 3) end
+  return identity
+end
+
+local function coldIdentity(base: string, value: Manifest, options: Options?): string
+  -- On creation the new candidate has no identity in the manifest yet.
+  local rows, deletes = indexedPaths(base, value)
+  local cold = segments.open(rows, { cachePages = 1,
+    readMode = if options then options.readMode else nil, deletePaths = deletes })
+  local token = cold.identity
+  cold:close()
+  return token
+end
+
+local function openHybrid(base: string, value: Manifest, options: Options?,
+  requiredWal: boolean): hybrid.Database
+  local active = paths(base, value.epoch)
+  if requiredWal then
+    local exists, checkError = fs.exists(active.wal)
+    if not exists then error('jessql managed: active WAL missing: ' .. tostring(checkError), 3) end
+  end
+  verifyCold(base, value, options)
+  local source: string | { string } = active.snapshot
+  local deletes: { [number]: string }? = nil
+  if value.version == 2 then source, deletes = indexedPaths(base, value) end
+
+  return hybrid.open(active.wal, source, value.tableName, {
+    durability = 'sync', requireIdentity = requiredWal,
+    trackPayloadBytes = options ~= nil and options.maxHotBytes ~= nil,
+    deletePaths = deletes,
+    rowLayout = if options then options.rowLayout else 'packed',
+    cachePages = if options then options.cachePages else nil,
+    readMode = if options then options.readMode else nil,
+  })
+end
+
+-- Only retire files that were removed from the manifest's generation list.
+-- A WAL is always owned by exactly one epoch; rows can survive many epochs.
+local function retire(base: string, parent: string, prior: Manifest, nextValue: Manifest)
+  local retained: { [number]: boolean } = {}
+  for _, generation in manifest.generations(nextValue) do retained[generation.epoch] = true end
+
+  for _, generation in manifest.generations(prior) do
+    if not retained[generation.epoch] then
+      clearCandidate(paths(base, generation.epoch))
+    end
+  end
+  removeIfPresent(paths(base, prior.epoch).wal)
+  removeIfPresent(paths(base, prior.epoch).wal .. '.lock')
+  local ok, err = fs.syncDirectory(parent)
+  assertOK(ok, err, 'retirement directory')
+end
+
+-- Restart-only orphan collection. The manifest is the sole authority;
+-- no valid generation may be retired merely because its epoch is old.
+-- This runs under the managed lock and after the recovery directory barrier.
+local function collectOrphans(base: string, parent: string, value: Manifest)
+  local names, listError = fs.list(parent)
+  if not names then error('jessql managed: directory list: ' .. tostring(listError), 3) end
+  local referenced: { [number]: Generation } = {}
+  for _, generation in manifest.generations(value) do referenced[generation.epoch] = generation end
+  local prefix = (fs.fileName(base) :: string) .. '.g'
+  local removed = false
+
+  for _, name in names do
+    if string.sub(name, 1, #prefix) ~= prefix then continue end
+    local number, extension = string.match(string.sub(name, #prefix + 1),
+      '^(%d%d%d%d%d%d%d%d)%.([%a%.%-]+)$')
+    if not number or (extension ~= 'rows' and extension ~= 'deleted'
+      and extension ~= 'wal' and extension ~= 'wal.lock'
+      and extension ~= 'hot-rows' and extension ~= 'hot-deleted') then continue end
+
+    local epoch = tonumber(number) :: number
+    if epoch < 1 or epoch > MaxEpoch then continue end
+    local generation = referenced[epoch]
+    if (extension == 'rows' and generation ~= nil)
+      or (extension == 'deleted' and generation ~= nil and generation.deleted)
+      or ((extension == 'wal' or extension == 'wal.lock') and epoch == value.epoch) then
+      continue
+    end
+    -- The known managed filename was not referenced by the verified manifest.
+    removeIfPresent(fs.join(parent, name))
+    removed = true
+  end
+
+  if removed then
+    local ok, err = fs.syncDirectory(parent)
+    assertOK(ok, err, 'orphan cleanup directory')
+  end
+end
+
+-- An absent manifest is not proof this namespace has never held a database.
+-- In particular, replacing or losing CURRENT during recovery must never allow
+-- startup to erase its existing WAL and silently bootstrap empty storage.
+local function requireFreshNamespace(base: string, parent: string)
+  local names, listError = fs.list(parent)
+  if not names then error('jessql managed: initialization directory: ' .. tostring(listError), 3) end
+  local name = fs.fileName(base) :: string
+  local manifestCandidate = name .. '.jql-manifest.tmp'
+  local generationPrefix = name .. '.g'
+  for _, entry in names do
+    if entry == manifestCandidate or
+      (string.sub(entry, 1, #generationPrefix) == generationPrefix
+        and string.match(string.sub(entry, #generationPrefix + 1), '^%d%d%d%d%d%d%d%d')) then
+      error('jessql managed: manifest missing but database artifacts remain (' .. entry
+        .. '); refuse initialization until the manifest is recovered or files explicitly removed', 3)
+    end
+  end
+end
+
+-- Lock-protected offline inventory of the published cold generation set.
+-- This opens no writable hybrid handle, replays no WAL, and retires no files.
+-- It validates cold metadata/identity, but DOES NOT validate WAL frames,
+-- WAL binding, or every payload page. Full recovery still requires open().
+function managed.inspect(path: string): Inspection
+  local base = normalize(path)
+  local lock, lockError = fs.lock(base .. '.jql-lock')
+  if not lock then error('jessql managed: inspection locked: ' .. tostring(lockError), 2) end
+
+  -- Metadata opens can throw on corruption; release the advisory lock before reporting.
+  local ok, result = pcall(function(): Inspection
+    local value = readManifest(base .. '.jql-manifest')
+    local identity = verifyCold(base, value, nil)
+    local files: { InspectionGeneration } = {}
+
+    for _, generation in manifest.generations(value) do
+      local location = paths(base, generation.epoch)
+      local rows, rowsError = fs.stat(location.snapshot)
+      if not rows or not rows.isFile then
+        error('generation rows missing: ' .. tostring(rowsError))
+      end
+      local deletionSize: number? = nil
+      if generation.deleted then
+        local deletes, deletesError = fs.stat(location.deletes)
+        if not deletes or not deletes.isFile then
+          error('generation tombstones missing: ' .. tostring(deletesError))
+        end
+        deletionSize = deletes.size
+      end
+
+      files[#files + 1] = { epoch = generation.epoch,
+        deleted = generation.deleted, rowsBytes = rows.size,
+        deletedBytes = deletionSize }
+    end
+
+    local journal, journalError = fs.stat(paths(base, value.epoch).wal)
+    if not journal or not journal.isFile then
+      error('active WAL missing: ' .. tostring(journalError))
+    end
+    local columns: { string } = {}
+    for index, column in value.columns do columns[index] = column end
+
+    return { version = value.version, epoch = value.epoch,
+      tableName = value.tableName, primaryKey = value.primaryKey,
+      columns = columns, generations = files, walBytes = journal.size,
+      coldIdentity = identity, walIdentityChecked = false }
+  end)
+  lock:unlock()
+  if not ok then error('jessql managed: inspection failed: ' .. tostring(result), 2) end
+  return result :: Inspection
+end
+
+-- Offline integrity scan: no WAL writer, tail truncation, retirement or repair.
+-- The namespace lock guarantees a stable published view for the full scan.
+function managed.verify(path: string, options: verification.Options?): verification.Report
+  local base = normalize(path)
+  local lock, lockError = fs.lock(base .. '.jql-lock')
+  if not lock then error('jessql managed: verification locked: ' .. tostring(lockError), 2) end
+  -- Offline scan can report I/O failures; always release the exclusive namespace lock.
+  local ok, result = pcall(function() return verification.scan(base, options) end)
+  lock:unlock()
+  if not ok then error('jessql managed: verification I/O failure: ' .. tostring(result), 2) end
+  return result :: verification.Report
+end
+
+-- Deep verification and structured recovery diagnostics are the same offline scan.
+-- Neither opens a mutable WAL nor attempts tail repair or auto-bootstrap.
+managed.diagnose = managed.verify
+
+-- Offline backup and restore into an EMPTY destination namespace only. This
+-- is an exclusive, fully verified copy, not online snapshotting or repair.
+function managed.backup(sourcePath: string, destinationPath: string): backupKernel.Result
+  local source = normalize(sourcePath)
+  local destination, parent = normalize(destinationPath)
+  if source == destination then error('jessql backup: source and destination must differ', 2) end
+
+  -- Deterministic acquisition order avoids deadlocking two opposite copies.
+  local first, second = source, destination
+  if second < first then first, second = second, first end
+  local firstLock, firstError = fs.lock(first .. '.jql-lock')
+  if not firstLock then error('jessql backup: namespace locked: ' .. tostring(firstError), 2) end
+  local secondLock, secondError = fs.lock(second .. '.jql-lock')
+  if not secondLock then
+    firstLock:unlock()
+    error('jessql backup: namespace locked: ' .. tostring(secondError), 2)
+  end
+  -- Copy/verification can throw; both namespace locks must always be released.
+  local ok, result = pcall(function() return backupKernel.copy(source, destination, parent) end)
+  secondLock:unlock()
+  firstLock:unlock()
+  if not ok then error(result, 2) end
+  return result :: backupKernel.Result
+end
+
+-- Restores are the same copy protocol: never overwrite a nonempty target.
+managed.restore = managed.backup
+
+-- Managed synchronous generation lifecycle. No background workers or group
+-- commits: each cutover happens while holding this database's exclusive lock.
+local function openManaged(path: string, options: Options?, intent: string): Database
+  local base, parent = normalize(path)
+  local limits = policy.limits(options)
+  local maxHotRows, maxHotBytes, maxWalBytes = limits.maxHotRows, limits.maxHotBytes, limits.maxWalBytes
+  local maxGenerations, compactionFanIn = limits.maxGenerations, limits.compactionFanIn
+  local lock, lockError = fs.lock(base .. '.jql-lock')
+
+  if not lock then error('jessql managed: database locked: ' .. tostring(lockError), 2) end
+  local manifestPath = base .. '.jql-manifest'
+  local value: Manifest? = nil
+  local current: hybrid.Database? = nil
+  -- Open and initialization may fail at any I/O boundary; release the managed lock.
+  local opened, failure = pcall(function()
+    local exists, existsError = fs.exists(manifestPath)
+
+    if exists == nil then error('manifest stat: ' .. tostring(existsError)) end
+
+    if exists then
+      if intent == 'create' then error('database already exists; use openExisting to reopen it') end
+      value = readManifest(manifestPath)
+      manifest.sameSchema(value :: Manifest, options)
+    else
+      if intent == 'existing' then error('database does not exist; use create to initialize it') end
+
+      if not options or not options.tableName or not options.columns or not options.primaryKey then
+        error('first open requires tableName, columns and primaryKey')
+      end
+      local name = string.lower(options.tableName)
+      -- Do not silently rename a user-supplied table.
+      if name ~= options.tableName then error('tableName must be lowercase') end
+      -- Never interpret a lost manifest as a fresh database. Interrupted
+      -- first-time initialization requires an explicit operator reset.
+      requireFreshNamespace(base, parent)
+      local initial = paths(base, 1)
+      paged.create(initial.snapshot, options.columns, options.primaryKey,
+        function(): Row? return nil end, { pageBytes = options.pageBytes })
+      seal(initial.snapshot, parent)
+      local snapshot = paged.open(initial.snapshot, { cachePages = 1 })
+      value = { version = 1, epoch = 1, tableName = name,
+        columns = options.columns, primaryKey = options.primaryKey,
+        snapshotIdentity = snapshot.identity }
+      snapshot:close()
+      manifest.validate(value :: Manifest)
+      current = openHybrid(base, value :: Manifest, options, false)
+      local started = { started = false }
+      publicationKernel.publish(base, parent, value :: Manifest,
+        if options then options.testHook else nil, started)
+    end
+
+    if not current then
+      current = openHybrid(base, value :: Manifest, options, true)
+      -- After an interrupted publication, the new manifest may be visible
+      -- before a parent-directory barrier. Re-fence it before retiring any
+      -- previous generation. Failure only leaves unreachable old files.
+      local synced, syncError = fs.syncDirectory(parent)
+      -- Refuse writes until the observed manifest has a durable directory
+      -- barrier: otherwise an earlier uncertain replacement could roll back
+      -- across another power loss after newly acknowledged WAL commits.
+      assertOK(synced, syncError, 'recovery manifest directory')
+      -- Failed orphan removal only leaks unused files, never active data.
+      pcall(function() collectOrphans(base, parent, value :: Manifest) end)
+    end
+  end)
+
+  if not opened then
+    -- A half-open hybrid must not leave its WAL lock held.
+    if current then pcall(function() (current :: hybrid.Database):close() end) end
+    lock:unlock()
+    error('jessql managed: open: ' .. tostring(failure), 2)
+  end
+
+  local live = current :: hybrid.Database
+  local active = value :: Manifest
+  local closed, poisoned, busy, batchActive = false, false, false, false
+  local lastMaintenanceError: string? = nil
+  local journal = observability.new(64)
+  journal:record('opened', active.epoch)
+
+  -- Only WAL-budgeted databases perform file metadata I/O per commit. This
+  -- measures physical journal growth, including repeated overwrites whose
+  -- live-row count and scalar payload never change.
+  local function currentWalBytes(): number
+    local stat, statError = fs.stat(paths(base, active.epoch).wal)
+    if not stat or not stat.isFile then
+      error('jessql managed: active WAL stat failed: ' .. tostring(statError), 2)
+    end
+    return stat.size
+  end
+
+  -- Recovery cannot forget an unresolved byte watermark. A WAL may contain
+  -- an acknowledged oversized transaction after failed auto-maintenance.
+  -- Do not accept another write until its overlay has been retired.
+  if maxHotRows then
+    -- A recovered WAL may already exceed the row watermark if the previous
+    -- process died after a committed write but before a successful flush.
+    -- Recovered row statistics may throw; poison rather than admit writes.
+    local counted, result = pcall(function() return live:stats() end)
+    if not counted then
+      poisoned = true
+      lastMaintenanceError = 'recovered hot-row accounting failed: ' .. tostring(result)
+    elseif (result.hotRows + result.tombstones) >= maxHotRows then
+      lastMaintenanceError = 'recovered hot rows exceed budget; flush or checkpoint'
+    end
+  end
+
+  if maxHotBytes then
+    -- Recovered payload accounting may fail; keep the database fail-closed.
+    local counted, result = pcall(function() return live:stats().hotPayloadBytes end)
+    if not counted then
+      poisoned = true
+      lastMaintenanceError = 'recovered hot-byte accounting failed: ' .. tostring(result)
+    elseif (result :: number) >= maxHotBytes then
+      lastMaintenanceError = 'recovered hot overlay exceeds byte budget; flush or checkpoint'
+    end
+  end
+
+  if maxWalBytes then
+    -- WAL stat may fail after a crash; preserve fail-closed admission on reopen.
+    local counted, result = pcall(currentWalBytes)
+    if not counted then
+      poisoned = true
+      lastMaintenanceError = 'recovered WAL accounting failed: ' .. tostring(result)
+    elseif (result :: number) >= maxWalBytes then
+      lastMaintenanceError = 'recovered WAL exceeds byte budget; flush or checkpoint'
+    end
+  end
+
+  if lastMaintenanceError then
+    journal:record('recovery-budget-pressure', active.epoch, lastMaintenanceError)
+  end
+  local db = {} :: Database
+
+  local function ready()
+    if batchActive then error('jessql managed: batched commit in progress', 3) end
+    if closed then error('jessql managed: closed', 3) end
+    if poisoned then error('jessql managed: uncertain publication; close and reopen', 3) end
+    if busy then error('jessql managed: generation transition in progress', 3) end
+  end
+
+  function db.get(_self: Database, key: unknown): Row?
+    ready()
+    return live:get(key)
+  end
+
+  function db.query(_self: Database, sql: string, params: { unknown }?): engine.Result
+    ready()
+    return live:query(sql, params)
+  end
+
+  function db.prepare(_self: Database, sql: string): engine.Plan
+    ready()
+    return live:prepare(sql)
+  end
+
+  -- A successful user commit is already synchronized. Auto-maintenance is
+  -- never allowed to turn that acknowledgment into an apparent failed write.
+  local function autoMaintain()
+    if not maxHotRows and not maxHotBytes and not maxWalBytes then return end
+
+    -- Even statistics can throw after WAL synchronization; keep admission
+    -- separate from the transaction's already-successful acknowledgement.
+    local ok, failure = pcall(function()
+      -- A WAL-only watermark must not force a SQL stats query on every commit.
+      local hotRows, tombstones, payloadBytes = 0, 0, nil :: number?
+      if maxHotRows or maxHotBytes then
+        local state = live:stats()
+        hotRows, tombstones, payloadBytes = state.hotRows, state.tombstones, state.hotPayloadBytes
+      end
+      local walBytes = if maxWalBytes then currentWalBytes() else nil
+      local generationCount = if active.version == 1 then 1
+        else #(active.generations :: { Generation })
+      local mode = policy.plan(limits, generationCount,
+        hotRows, tombstones, payloadBytes, walBytes)
+      if mode == 'compact' then db:compact()
+      elseif mode == 'flush' then db:flush() end
+    end)
+    lastMaintenanceError = if ok then nil else tostring(failure)
+    if not ok then journal:record('maintenance-failed', active.epoch, tostring(failure)) end
+  end
+
+  -- An acknowledged commit must remain acknowledged if maintenance fails.
+  -- With a byte watermark configured, reject subsequent writes until manual
+  -- maintenance succeeds, rather than letting an error cause unbounded churn.
+  local function readyToWrite()
+    ready()
+    if (maxHotRows or maxHotBytes or maxWalBytes) and lastMaintenanceError then
+      error('jessql managed: maintenance failed under configured budget; flush or checkpoint', 3)
+    end
+  end
+
+  function db.transaction(_self: Database, callback: (Transaction) -> ())
+    readyToWrite()
+    live:transaction(callback)
+    autoMaintain()
+  end
+
+  -- A single synchronization barrier for the successful independent WAL
+  -- frames. Auto-maintenance runs only after the entire batch is durable;
+  -- it must never turn an acknowledged commit into a failed batch result.
+  function db.transactionBatch(_self: Database, callbacks: { (Transaction) -> () }): { BatchResult }
+    readyToWrite()
+    batchActive = true
+    -- Caller callbacks and the shared WAL sync may fail; release the reentry
+    -- guard even if the underlying WAL has become poisoned and needs reopen.
+    local ok, result = pcall(function() return live:transactionBatch(callbacks) end)
+    batchActive = false
+    if not ok then error(result, 2) end
+    autoMaintain()
+    return result :: { BatchResult }
+  end
+
+  function db.insert(_self: Database, row: Row)
+    readyToWrite()
+    live:insert(row)
+    autoMaintain()
+  end
+
+  function db.upsert(_self: Database, row: Row)
+    readyToWrite()
+    live:upsert(row)
+    autoMaintain()
+  end
+
+  function db.update(_self: Database, key: unknown, changes: Row): boolean
+    readyToWrite()
+    local changed = live:update(key, changes)
+    if changed then autoMaintain() end
+    return changed
+  end
+
+  function db.delete(_self: Database, key: unknown): boolean
+    readyToWrite()
+    local changed = live:delete(key)
+    if changed then autoMaintain() end
+    return changed
+  end
+
+  function db.stats(_self: Database)
+    ready()
+    local result = live:stats()
+    return { epoch = active.epoch, generations = #manifest.generations(active),
+      coldRows = result.coldRows, hotRows = result.hotRows,
+      tombstones = result.tombstones, hotPayloadBytes = result.hotPayloadBytes,
+      walBytes = if maxWalBytes then currentWalBytes() else nil,
+      cachedPages = result.cachedPages }
+  end
+
+  function db.maintenanceStatus(_self: Database): { lastError: string?, poisoned: boolean }
+    if batchActive then error('jessql managed: batched commit in progress', 2) end
+    if closed then error('jessql managed: closed', 2) end
+    return { lastError = lastMaintenanceError, poisoned = poisoned }
+  end
+
+  -- Versioned, pull-only telemetry: a reader cannot affect a WAL acknowledgment.
+  -- These observations are ephemeral and must not be used as change-data capture.
+  function db.observe(_self: Database): Observation
+    if closed then error('jessql managed: closed', 2) end
+    if batchActive then error('jessql managed: batched commit in progress', 2) end
+
+    return { version = 1, epoch = active.epoch,
+      generations = #manifest.generations(active), poisoned = poisoned,
+      maintenanceError = lastMaintenanceError,
+      limits = { maxHotRows = maxHotRows, maxHotBytes = maxHotBytes,
+        maxWalBytes = maxWalBytes, maxGenerations = maxGenerations } }
+  end
+
+  function db.events(_self: Database, after: number?): EventBatch
+    if closed then error('jessql managed: closed', 2) end
+    if batchActive then error('jessql managed: batched commit in progress', 2) end
+    return journal:read(after)
+  end
+
+  -- Publish a new WAL bound to the new immutable generation set. The compact
+  -- mode merges only the newest cold generations plus the hot overlay, so
+  -- older generations are neither decoded nor rewritten. All write methods
+  -- are fenced until the manifest and WAL identity are durably published.
+  local function transition(mode: string): number
+    ready()
+    if active.epoch >= MaxEpoch then error('jessql managed: generation limit', 2) end
+
+    if mode == 'delta' and #manifest.generations(active) >= maxGenerations then
+      error('jessql managed: generation budget reached; compact first', 2)
+    end
+
+    if mode == 'compact' and #manifest.generations(active) < 2 then
+      error('jessql managed: selective compaction needs two cold generations', 2)
+    end
+    busy = true
+    local nextEpoch = active.epoch + 1
+    local candidatePaths = paths(base, nextEpoch)
+    local candidate: hybrid.Database? = nil
+    local publication = { started = false }
+    local mergedCount = 0
+    -- Generation export and publication may fail; keep the old WAL authoritative.
+    local completed, transitionFailure = pcall(function()
+      clearCandidate(candidatePaths)
+      if mode == 'compact' then clearScratch(base, nextEpoch) end
+
+      if mode == 'delta' then
+        live:exportDelta(candidatePaths.snapshot, candidatePaths.deletes, {
+          pageBytes = if options then options.pageBytes else nil,
+          runRows = if options then options.runRows else nil,
+          mergeFanIn = if options then options.mergeFanIn else nil,
+        })
+        seal(candidatePaths.deletes, parent)
+      elseif mode == 'compact' then
+        local generations = manifest.generations(active)
+        mergedCount = math.min(#generations, compactionFanIn)
+        local inputRows: { string } = {}
+        local inputDeletes: { [number]: string } = {}
+        local sources, deletions = indexedPaths(base, active)
+        for index = #generations - mergedCount + 1, #generations do
+          local slot = #inputRows + 1
+          inputRows[slot] = sources[index]
+          if deletions[index] then inputDeletes[slot] = deletions[index] end
+        end
+        local hot = live:stats()
+        if hot.hotRows + hot.tombstones > 0 then
+          local hotRows, hotDeletes = compactScratch(base, nextEpoch)
+          live:exportDelta(hotRows, hotDeletes, {
+            pageBytes = if options then options.pageBytes else nil,
+            runRows = if options then options.runRows else nil,
+            mergeFanIn = if options then options.mergeFanIn else nil,
+          })
+          inputRows[#inputRows + 1] = hotRows
+          inputDeletes[#inputRows] = hotDeletes
+        end
+
+        tiers.compact(candidatePaths.snapshot, candidatePaths.deletes, inputRows, {
+          fanIn = compactionFanIn,
+          cachePages = if options then options.cachePages else 1,
+          pageBytes = if options then options.pageBytes else nil,
+          deletePaths = inputDeletes,
+        })
+        seal(candidatePaths.deletes, parent)
+      else
+        live:exportSnapshot(candidatePaths.snapshot,
+          { pageBytes = if options then options.pageBytes else nil })
+      end
+      seal(candidatePaths.snapshot, parent)
+      local nextValue: Manifest
+      if mode ~= 'full' or active.version == 2 then
+        local generations: { Generation } = {}
+        if mode == 'delta' or mode == 'compact' then
+          local all = manifest.generations(active)
+          local limit = if mode == 'compact' then #all - mergedCount else #all
+          for index = 1, limit do
+            local generation = all[index]
+            generations[#generations + 1] = { epoch = generation.epoch, deleted = generation.deleted }
+          end
+        end
+        generations[#generations + 1] = { epoch = nextEpoch, deleted = mode ~= 'full' }
+        nextValue = manifest.new(active, nextEpoch, '', generations)
+        nextValue.snapshotIdentity = coldIdentity(base, nextValue, options)
+      else
+        local snapshot = paged.open(candidatePaths.snapshot, { cachePages = 1 })
+        nextValue = manifest.new(active, nextEpoch, snapshot.identity, nil)
+        snapshot:close()
+      end
+      manifest.validate(nextValue)
+      if options and options.testHook then options.testHook('candidate-sealed') end
+      candidate = openHybrid(base, nextValue, options, false)
+      if options and options.testHook then options.testHook('wal-ready') end
+      publicationKernel.publish(base, parent, nextValue,
+        if options then options.testHook else nil, publication)
+      local previous, prior = live, active
+      live = candidate :: hybrid.Database
+      candidate = nil
+      active = nextValue
+      previous:close()
+      if options and options.testHook then options.testHook('before-retire') end
+      -- Retirement can fail; old unreferenced files are safe to leave behind.
+      pcall(function() retire(base, parent, prior, nextValue) end)
+      if mode == 'compact' then
+        -- Scratch files are unpublished and safe to leave for restart if cleanup fails.
+        pcall(function() clearScratch(base, nextEpoch) end)
+      end
+    end)
+    busy = false
+    if not completed then
+      -- Closing an unpublished candidate may fail; retain the first error.
+      if candidate then pcall(function() (candidate :: hybrid.Database):close() end) end
+
+      if publication.started then
+        poisoned = true
+        journal:record('publication-uncertain', active.epoch, mode)
+      else
+        journal:record('publication-aborted', active.epoch, mode)
+        -- Failed cleanup after a safe pre-publication fault must not hide that fault.
+        pcall(function() clearCandidate(candidatePaths) end)
+        if mode == 'compact' then
+          -- Reclaim scratch after a caught pre-publication fault.
+          pcall(function() clearScratch(base, nextEpoch) end)
+        end
+        -- Failed manifest temp cleanup must not override the publication error.
+        pcall(function() removeIfPresent(base .. '.jql-manifest.tmp') end)
+      end
+      error('jessql managed: transition failed: ' .. tostring(transitionFailure), 2)
+    end
+    lastMaintenanceError = nil
+    journal:record('generation-published', active.epoch, mode)
+    return active.epoch
+  end
+
+  function db.flush(_self: Database): number
+    ready()
+    local result = live:stats()
+    if result.hotRows + result.tombstones == 0 then
+      -- A churned-out overlay can still leave a large WAL: an empty delta
+      -- generation rotates its journal without rewriting the older tiers.
+      if not maxWalBytes or currentWalBytes() < maxWalBytes then return active.epoch end
+    end
+    return transition('delta')
+  end
+
+  function db.compact(_self: Database): number
+    return transition('compact')
+  end
+
+  function db.checkpoint(_self: Database): number
+    return transition('full')
+  end
+
+  function db.close(_self: Database)
+    if batchActive then error('jessql managed: cannot close during batched commit', 2) end
+    if closed then return end
+    if busy then error('jessql managed: cannot close during publication', 2) end
+    closed = true
+    -- Closing a poisoned handle can fail, but the managed lock must still be released.
+    local ok, err = pcall(function() live:close() end)
+    lock:unlock()
+
+    if not ok then error(err, 2) end
+  end
+  return db
+end
+
+-- Explicit lifecycle intents avoid accidental empty database creation when an
+-- application points at the wrong namespace. The existence check is made
+-- *inside* the managed namespace lock, never as a racy preflight.
+function managed.open(path: string, options: Options?): Database
+  return openManaged(path, options, 'either')
+end
+
+function managed.openExisting(path: string, options: Options?): Database
+  return openManaged(path, options, 'existing')
+end
+
+function managed.create(path: string, options: Options?): Database
+  return openManaged(path, options, 'create')
+end
+
+-- A scoped database callback is guaranteed to release the managed lock even
+-- when application code throws. The first error remains authoritative;
+-- failure to close is never silently discarded if no earlier error occurred.
+local function scoped<T>(opener: (string, Options?) -> Database, path: string,
+  options: Options?, callback: (Database) -> T): T
+  if type(callback) ~= 'function' then
+    error('jessql managed: scoped use requires a callback', 3)
+  end
+  local db = opener(path, options)
+  -- Application callbacks may throw after some commits; always release the lock.
+  local success, outcome = pcall(function() return callback(db) end)
+  -- Even close can throw after a WAL/FS error; report it without losing callback failures.
+  local released, closeFailure = pcall(function() db:close() end)
+  if not success then
+    if not released then
+      error('jessql managed: callback failed: ' .. tostring(outcome)
+        .. '; close also failed: ' .. tostring(closeFailure), 3)
+    end
+    error(outcome, 3)
+  end
+
+  if not released then error('jessql managed: scoped close failed: ' .. tostring(closeFailure), 3) end
+
+  return outcome :: T
+end
+
+function managed.withOpen<T>(path: string, options: Options?, callback: (Database) -> T): T
+  return scoped(managed.open, path, options, callback)
+end
+
+function managed.withExisting<T>(path: string, options: Options?, callback: (Database) -> T): T
+  return scoped(managed.openExisting, path, options, callback)
+end
+
+function managed.withNew<T>(path: string, options: Options, callback: (Database) -> T): T
+  return scoped(managed.create, path, options, callback)
+end
+
+return managed

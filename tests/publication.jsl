@@ -1,0 +1,112 @@
+--!strict
+local fs = require('@dream/fs')
+local publisher = require('@jessql/managed_publication')
+local manifest = require('@jessql/managed_manifest')
+local test = require('@jess/test')
+local suite, expect = test.new(), test.expect
+
+local function fixture(name: string): string
+  return fs.join(fs.cwd() :: string, '.jessql-publication-' .. name)
+end
+
+local function cleanup(base: string)
+  fs.remove(base .. '.jql-manifest.tmp')
+  fs.remove(base .. '.jql-manifest')
+  fs.remove(base .. '.rows')
+end
+
+local function version(epoch: number): manifest.Manifest
+  return { version = 1, epoch = epoch, tableName = 'events',
+    columns = { 'id', 'body' }, primaryKey = 'id', snapshotIdentity = 'abc:2' }
+end
+
+local function readPublished(base: string): manifest.Manifest
+  return manifest.decode(assert((fs.readFileString(base .. '.jql-manifest'))))
+end
+
+suite.describe('durable managed publication protocol', function()
+  suite.it('seals an existing file without altering contents and refuses a missing file', function()
+    local base = fixture('seal')
+    cleanup(base)
+    assert((fs.writeFile(base .. '.rows', 'sealed-data')))
+    publisher.seal(base .. '.rows', fs.cwd() :: string)
+    expect((fs.readFileString(base .. '.rows'))).toBe('sealed-data')
+    -- A missing candidate cannot be sealed and should throw without changing the namespace.
+    local ok = pcall(function() publisher.seal(base .. '.missing', fs.cwd() :: string) end)
+    expect(ok).toBe(false)
+    cleanup(base)
+  end)
+
+  suite.it('publishes an authoritative version after both replacement and directory barrier', function()
+    local base = fixture('success')
+    cleanup(base)
+    local events: { string } = {}
+    local state = { started = false }
+    publisher.publish(base, fs.cwd() :: string, version(1), function(stage)
+      events[#events + 1] = stage
+    end, state)
+    expect(state.started).toBe(true)
+    expect(readPublished(base).epoch).toBe(1)
+    expect(table.concat(events, ',')).toBe('before-replace,after-replace,after-directory-sync')
+    expect((fs.exists(base .. '.jql-manifest.tmp'))).toBe(false)
+    cleanup(base)
+  end)
+
+  suite.it('preserves the old manifest and reports safe abortion before replacement', function()
+    local base = fixture('before')
+    cleanup(base)
+    local parent = fs.cwd() :: string
+    publisher.publish(base, parent, version(1), nil, { started = false })
+    local state = { started = false }
+    -- Catch the injected publication fault so the test can inspect the outcome.
+    local ok = pcall(function()
+      publisher.publish(base, parent, version(2), function(stage)
+        if stage == 'before-replace' then error('injected before-replace') end
+      end, state)
+    end)
+    expect(ok).toBe(false)
+    expect(state.started).toBe(false)
+    expect(readPublished(base).epoch).toBe(1)
+    -- The coordinator may discard this unpublished candidate after aborting.
+    expect((fs.exists(base .. '.jql-manifest.tmp'))).toBe(true)
+    cleanup(base)
+  end)
+
+  suite.it('marks post-replacement exceptions uncertain and retains the new manifest', function()
+    local base = fixture('after')
+    cleanup(base)
+    local parent = fs.cwd() :: string
+    publisher.publish(base, parent, version(1), nil, { started = false })
+    local state = { started = false }
+    -- Catch the injected publication fault so the test can inspect the outcome.
+    local ok = pcall(function()
+      publisher.publish(base, parent, version(2), function(stage)
+        if stage == 'after-replace' then error('injected after-replace') end
+      end, state)
+    end)
+    expect(ok).toBe(false)
+    expect(state.started).toBe(true)
+    expect(readPublished(base).epoch).toBe(2)
+    cleanup(base)
+  end)
+
+  suite.it('conservatively marks an error after directory sync as uncertain', function()
+    local base = fixture('barrier')
+    cleanup(base)
+    local parent = fs.cwd() :: string
+    publisher.publish(base, parent, version(1), nil, { started = false })
+    local state = { started = false }
+    -- Catch the injected publication fault so the test can inspect the outcome.
+    local ok = pcall(function()
+      publisher.publish(base, parent, version(2), function(stage)
+        if stage == 'after-directory-sync' then error('injected after-directory-sync') end
+      end, state)
+    end)
+    expect(ok).toBe(false)
+    expect(state.started).toBe(true)
+    expect(readPublished(base).epoch).toBe(2)
+    cleanup(base)
+  end)
+end)
+
+return suite

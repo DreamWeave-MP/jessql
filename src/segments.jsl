@@ -1,0 +1,513 @@
+--!strict
+--!native
+-- Bounded-fan-in read-only view over immutable JQLP2 snapshots.
+-- Later snapshots shadow earlier rows with the same primary key. No file is
+-- replaced, retired, or published by opening or compacting this view.
+local paged = require('@jessql/paged')
+local secondary = require('@jessql/secondary')
+local engine = require('@jessql/engine')
+
+export type Row = { [string]: unknown }
+export type Options = { cachePages: number?, pageBytes: number?, readMode: string?, deletePaths: { [number]: string }? }
+export type Snapshot = paged.Snapshot & {
+  openIndexes: (self: Snapshot, paths: { string }, options: paged.Options?) -> secondary.Index,
+}
+
+local MaxSources = 8
+local segments = {}
+
+local function compare(leftValue: unknown, rightValue: unknown): number
+  local left, right = type(leftValue), type(rightValue)
+  local ranks = { boolean = 1, number = 2, string = 3 }
+  if left ~= right then return if (ranks[left] or 9) < (ranks[right] or 9) then -1 else 1 end
+  if leftValue == rightValue then return 0 end
+  if left == 'boolean' then return if leftValue == false then -1 else 1 end
+  if left == 'number' then return if (leftValue :: number) < (rightValue :: number) then -1 else 1 end
+  return if (leftValue :: string) < (rightValue :: string) then -1 else 1
+end
+
+-- Use the same primary-key identity as the hot WAL's tombstone table.
+-- Callers of createTombstones supply already-encoded, sorted keys, avoiding
+-- materializing a full deletion set when writing a cold generation.
+local function encodeKey(key: unknown): string
+  if key == nil then error('jessql segments: NULL primary key', 3) end
+  local kind = type(key)
+  if kind == 'string' then return 's' .. (key :: string) end
+  if kind == 'boolean' then return if key == true then 'b1' else 'b0' end
+
+  if kind ~= 'number' or key ~= key or math.abs(key :: number) == math.huge then
+    error('jessql segments: invalid primary key', 3)
+  end
+  local value = key :: number
+  if value == 0 then value = 0 end
+  return 'n' .. string.format('%.17g', value)
+end
+
+local function validEncodedKey(key: unknown): boolean
+  if type(key) ~= 'string' or utf8.len(key :: string) == nil then return false end
+  local text = key :: string
+  if string.sub(text, 1, 1) == 's' then return true end
+  if #text < 2 then return false end
+  if text == 'b0' or text == 'b1' then return true end
+  if string.sub(text, 1, 1) ~= 'n' then return false end
+  local parsed = tonumber(string.sub(text, 2))
+  return parsed ~= nil and encodeKey(parsed) == text
+end
+
+local function project(row: Row, columns: { string }?): Row
+  if not columns then return row end
+  local result: Row = {}
+  for _, column in columns do result[column] = row[column] end
+  return result
+end
+
+local function identical(left: { string }, right: { string }): boolean
+  if #left ~= #right then return false end
+  for index, name in left do if right[index] ~= name then return false end end
+  return true
+end
+
+-- Snapshot paths are ordered oldest to newest. The exact list and order are
+-- part of the hybrid WAL identity; a changed generation list cannot silently
+-- reuse an old overlay. No lossy hash is used to combine identity tokens.
+function segments.open(paths: { string }, options: Options?): Snapshot
+  if type(paths) ~= 'table' or #paths < 1 or #paths > MaxSources then
+    error('jessql segments: expected 1 to 8 snapshot paths', 2)
+  end
+  local readers: { paged.Snapshot } = {}
+  local deletions: { [number]: paged.Snapshot } = {}
+  local seen: { [string]: boolean } = {}
+  local cachePages = if options then options.cachePages else nil
+  local readMode = if options then options.readMode else nil
+  local deletePaths = if options then options.deletePaths else nil
+  if deletePaths then
+    for number, deletePath in deletePaths do
+      if type(number) ~= 'number' or number % 1 ~= 0 or number < 1 or number > #paths
+        or type(deletePath) ~= 'string' or deletePath == '' then
+        error('jessql segments: invalid deletion sidecar mapping', 2)
+      end
+    end
+  end
+
+  -- Snapshot opens and schema validation can throw; close prior readers on failure.
+  local valid, failure = pcall(function()
+    for _, path in paths do
+      if type(path) ~= 'string' or path == '' or seen[path] then
+        error('jessql segments: invalid or duplicate snapshot path')
+      end
+      seen[path] = true
+      local reader = paged.open(path, { cachePages = cachePages or 1, readMode = readMode })
+      if #readers > 0 then
+        if reader.primaryKey ~= readers[1].primaryKey
+          or not identical(reader.columns, readers[1].columns) then
+          reader:close()
+          error('jessql segments: incompatible snapshot schema')
+        end
+      end
+
+      readers[#readers + 1] = reader
+      local deletePath: string? = nil
+      if deletePaths ~= nil then deletePath = (deletePaths :: { [number]: string })[#readers] end
+
+      if deletePath then
+        if seen[deletePath] then error('jessql segments: duplicate deletion path') end
+        seen[deletePath] = true
+        local deleteReader = paged.open(deletePath, { cachePages = cachePages or 1, readMode = readMode })
+        deletions[#readers] = deleteReader
+        if deleteReader.primaryKey ~= 'id' or #deleteReader.columns ~= 2
+          or deleteReader.columns[1] ~= 'id' or deleteReader.columns[2] ~= 'token'
+          or deleteReader.keyKind ~= 'string' then
+          error('jessql segments: invalid deletion sidecar schema')
+        end
+        local marker = deleteReader:get('!identity')
+        if not marker or marker.token ~= reader.identity then
+          error('jessql segments: deletion sidecar identity mismatch')
+        end
+      end
+    end
+  end)
+
+  if not valid then
+    for number = 1, #readers do
+      local deletion = deletions[number]
+      if deletion then deletion:close() end
+    end
+
+    for _, reader in readers do reader:close() end
+    error(failure, 2)
+  end
+
+  local first = readers[1]
+  local count, keyKind = 0, 'empty'
+  local identities: { string } = { 'JQLM1' }
+  for number, reader in readers do
+    count += reader.count
+    local token = reader.identity
+    identities[#identities + 1] = tostring(#token) .. ':' .. token
+    local deleteReader = deletions[number]
+    if deleteReader then
+      local deleteToken = deleteReader.identity
+      identities[#identities + 1] = 'D' .. tostring(#deleteToken) .. ':' .. deleteToken
+    end
+
+    if reader.keyKind ~= 'empty' then
+      if keyKind == 'empty' then keyKind = reader.keyKind
+      elseif keyKind ~= reader.keyKind then keyKind = 'mixed' end
+    end
+  end
+  local identity = table.concat(identities, '|')
+  local primaryKey = first.primaryKey
+  local closed = false
+  local activeIndex: secondary.Index? = nil
+  local snapshot = {} :: Snapshot
+  snapshot.columns, snapshot.primaryKey = first.columns, primaryKey
+  -- Physical row count; duplicate keys in older generations are included.
+  -- SQL COUNT never uses this upper bound: the provider streams exact rows.
+  snapshot.count, snapshot.keyKind, snapshot.identity = count, keyKind, identity
+
+  local function ready()
+    if closed then error('jessql segments: snapshot closed', 3) end
+  end
+
+  function snapshot.get(_self: Snapshot, key: unknown): Row?
+    ready()
+    if key == nil then return nil end
+    local encoded = encodeKey(key)
+    for index = #readers, 1, -1 do
+      local deleteReader = deletions[index]
+      if deleteReader and deleteReader:get(encoded) then return nil end
+      local row = readers[index]:get(key)
+      if row then return row end
+    end
+    return nil
+  end
+
+  function snapshot.iterateRows(_self: Snapshot, columns: { string }?, descending: boolean?,
+    lower: unknown?, upper: unknown?, lowerStrict: boolean?, upperStrict: boolean?): () -> Row?
+    ready()
+    local descendingOrder = descending == true
+    local iterators: { () -> Row? } = {}
+    local heads: { Row? } = {}
+    -- Each open iterator holds at most one decoded row. One page per source
+    -- is cached by default, independent of the total number of input rows.
+    for index, reader in readers do
+      local nextRow = reader:iterateRows(nil, descending, lower, upper, lowerStrict, upperStrict)
+      iterators[index] = nextRow
+      heads[index] = nextRow()
+    end
+
+    return function(): Row?
+      ready()
+      while true do
+        local winner = 0
+        local selected: Row? = nil
+        for index = 1, #readers do
+        local row = heads[index]
+        if not row then continue end
+
+        if not selected then
+          selected, winner = row, index
+        else
+          local difference = compare(row[primaryKey], selected[primaryKey])
+          if (if descendingOrder then difference > 0 else difference < 0)
+            or (difference == 0 and index > winner) then
+            selected, winner = row, index
+          end
+        end
+      end
+
+        if not selected then return nil end
+        local key = selected[primaryKey]
+        -- Advance *all* matching heads before yielding the newest row.
+        -- Older generations cannot resurrect shadowed values.
+        for index = 1, #readers do
+          local row = heads[index]
+          if row and compare(row[primaryKey], key) == 0 then
+            heads[index] = iterators[index]()
+          end
+        end
+        local hidden = false
+        local encoded = encodeKey(key)
+        for index = winner, #readers do
+          local deleteReader = deletions[index]
+          if deleteReader and deleteReader:get(encoded) then hidden = true; break end
+        end
+
+        if not hidden then return project(selected, columns) end
+      end
+    end
+  end
+
+  function snapshot.provider(self: Snapshot): engine.Provider
+    local function queryIterator(request: engine.Request): engine.Iterator
+      local order = request.orderBy
+      local ordered = order ~= nil and #order == 1 and order[1].column == primaryKey
+        and (keyKind == 'number' or keyKind == 'string')
+      local descending = ordered and (order :: { engine.Order })[1].desc
+      local lower: unknown = nil
+      local upper: unknown = nil
+      local lowerStrict, upperStrict = false, false
+      if ordered then
+        for _, constraint in request.constraints do
+          if constraint.column ~= primaryKey then continue end
+          local value = constraint.value
+          if value == nil or type(value) ~= keyKind then continue end
+
+          if constraint.op == '>' or constraint.op == '>=' then
+            if lower == nil or compare(value, lower) > 0
+              or (compare(value, lower) == 0 and constraint.op == '>') then
+              lower, lowerStrict = value, constraint.op == '>'
+            end
+          elseif constraint.op == '<' or constraint.op == '<=' then
+            if upper == nil or compare(value, upper) < 0
+              or (compare(value, upper) == 0 and constraint.op == '<') then
+              upper, upperStrict = value, constraint.op == '<'
+            end
+          end
+        end
+      end
+
+      return { _jessqlIter = 'v1', ordered = ordered,
+        next = self:iterateRows(request.columns, descending, lower, upper, lowerStrict, upperStrict) }
+    end
+
+    return {
+      columns = self.columns,
+      indexes = { [primaryKey] = true },
+      -- `count` intentionally absent: physical rows are not logical rows.
+      lookup = function(column, key, request)
+        if column ~= primaryKey then return nil end
+        local row = self:get(key)
+        return if row then { project(row, request.columns) } else {}
+      end,
+      scan = function(request)
+        local rows: { Row } = {}
+        local nextRow = self:iterateRows(request.columns)
+        while true do
+          local row = nextRow()
+          if not row then break end
+          rows[#rows + 1] = row
+        end
+        return rows
+      end,
+      iterate = queryIterator,
+    }
+  end
+
+  -- Open one snapshot-bound sidecar per generation. Keeping the underlying
+  -- page readers shared avoids duplicating the per-snapshot directory/cache.
+  -- A candidate from an older index is never visible when a newer generation
+  -- contains that key, *even when the newer row moved to another partition*.
+  function snapshot.openIndexes(_self: Snapshot, paths: { string }, indexOptions: paged.Options?): secondary.Index
+    ready()
+    if activeIndex then error('jessql segments: secondary indexes already open', 2) end
+
+    if type(paths) ~= 'table' or #paths ~= #readers then
+      error('jessql segments: expected one sidecar per generation', 2)
+    end
+
+    local indexes: { secondary.Index } = {}
+    -- Index opens can fail on corrupt metadata; close already-open sidecars.
+    local indexOk, indexError = pcall(function()
+      for number, path in paths do
+        if type(path) ~= 'string' or path == '' then
+          error('jessql segments: invalid secondary index path')
+        end
+        local item = secondary.open(path, readers[number], indexOptions)
+        if #indexes > 0 then
+          local original = indexes[1]
+          if item.partitionColumn ~= original.partitionColumn
+            or item.orderColumn ~= original.orderColumn
+            or (item.orderKind ~= original.orderKind and item.orderKind ~= '' and original.orderKind ~= '') then
+            item:close()
+            error('jessql segments: incompatible secondary indexes')
+          end
+        end
+        indexes[#indexes + 1] = item
+      end
+    end)
+
+    if not indexOk then
+      for _, item in indexes do item:close() end
+      error(indexError, 2)
+    end
+
+    local firstIndex = indexes[1]
+    local indexClosed = false
+    local merged = {} :: secondary.Index
+    merged.partitionColumn, merged.orderColumn = firstIndex.partitionColumn, firstIndex.orderColumn
+    merged.orderKind, merged.complete, merged.count = '', true, 0
+    for _, item in indexes do
+      -- An empty tombstone-only generation has no index sort kind. Do not
+      -- disable accelerated reads from otherwise homogeneous generations.
+      if item.count > 0 then
+        if merged.orderKind == '' then merged.orderKind = item.orderKind end
+
+        if item.orderKind == 'mixed' or item.orderKind == '' or not item.complete then
+          merged.complete = false
+        end
+      end
+      merged.count += item.count
+    end
+
+    function merged.iterate(_index: secondary.Index, prefix: unknown, descending: boolean?,
+      lower: unknown?, upper: unknown?, lowerStrict: boolean?, upperStrict: boolean?): () -> Row?
+      ready()
+      if indexClosed then error('jessql segments: index closed', 2) end
+      local reverse = descending == true
+      local advance: { () -> Row? } = {}
+      local heads: { Row? } = {}
+      for number, item in indexes do
+        local nextRow = item:iterate(prefix, descending, lower, upper, lowerStrict, upperStrict)
+        advance[number] = nextRow
+        heads[number] = nextRow()
+      end
+
+      return function(): Row?
+        ready()
+        if indexClosed then error('jessql segments: index closed', 2) end
+
+        while true do
+          local chosen = 0
+          local selected: Row? = nil
+          for number = 1, #indexes do
+            local row = heads[number]
+            if not row then continue end
+
+            if not selected then
+              chosen, selected = number, row
+            else
+              local difference = compare(row[merged.orderColumn], selected[merged.orderColumn])
+              if difference == 0 then difference = compare(row[primaryKey], selected[primaryKey]) end
+
+              if (if reverse then difference > 0 else difference < 0) then
+                chosen, selected = number, row
+              end
+            end
+          end
+
+          if not selected then return nil end
+
+          heads[chosen] = advance[chosen]()
+          -- Never emit a stale index entry from a shadowed snapshot. This
+          -- requires no key-sized seen set and handles changed secondary keys.
+          local shadowed = false
+          local encoded = encodeKey(selected[primaryKey])
+          for newer = chosen, #readers do
+            local deleteReader = deletions[newer]
+            if deleteReader and deleteReader:get(encoded) then
+              shadowed = true
+              break
+            end
+
+            if newer > chosen and readers[newer]:get(selected[primaryKey]) then
+              shadowed = true
+              break
+            end
+          end
+
+          if not shadowed then return selected end
+        end
+      end
+    end
+
+    function merged.stats(_index: secondary.Index): paged.Metrics
+      ready()
+      if indexClosed then error('jessql segments: index closed', 2) end
+      local pages, cached, reads = 0, 0, 0
+      for _, item in indexes do
+        local metrics = item:stats()
+        pages += metrics.pages
+        cached += metrics.cachedPages
+        reads += metrics.pageReads
+      end
+      return { pages = pages, rows = merged.count, cachedPages = cached, pageReads = reads }
+    end
+
+    function merged.close(_index: secondary.Index)
+      if indexClosed then return end
+      indexClosed = true
+      for _, item in indexes do item:close() end
+    end
+    activeIndex = merged
+    return merged
+  end
+
+  function snapshot.stats(_self: Snapshot): paged.Metrics
+    ready()
+    local pages, cached, reads = 0, 0, 0
+    for _, reader in readers do
+      local metrics = reader:stats()
+      pages += metrics.pages
+      cached += metrics.cachedPages
+      reads += metrics.pageReads
+    end
+
+    for number = 1, #readers do
+      local deletion = deletions[number]
+      if not deletion then continue end
+      local metrics = deletion:stats()
+      pages += metrics.pages
+      cached += metrics.cachedPages
+      reads += metrics.pageReads
+    end
+    return { pages = pages, rows = count, cachedPages = cached, pageReads = reads }
+  end
+
+  function snapshot.close(_self: Snapshot)
+    if closed then return end
+    closed = true
+    if activeIndex then activeIndex:close() end
+
+    for number = 1, #readers do
+      local deletion = deletions[number]
+      if deletion then deletion:close() end
+    end
+
+    for _, reader in readers do reader:close() end
+  end
+  return snapshot
+end
+
+-- Publish a separate immutable deletion record set for one snapshot.
+-- Keys are WAL-encoded ('s...', 'n...', 'b0'/'b1'), strictly byte-sorted,
+-- and supplied by a streaming iterator. The first record binds this sidecar
+-- to its own data snapshot. This operation does not rotate or retire a WAL.
+function segments.createTombstones(path: string, source: string, nextKey: () -> string?, options: Options?)
+  local reader = paged.open(source, { cachePages = if options then options.cachePages else 1 })
+  local identity = reader.identity
+  reader:close()
+  local previous = ''
+  local marker = false
+  paged.create(path, { 'id', 'token' }, 'id', function(): Row?
+    if not marker then
+      marker = true
+      return { id = '!identity', token = identity }
+    end
+    local key = nextKey()
+    if key == nil then return nil end
+
+    if not validEncodedKey(key) or key <= previous then
+      error('jessql segments: deletions must be valid sorted encoded primary keys')
+    end
+    previous = key
+    return { id = key, token = '' }
+  end, { pageBytes = if options then options.pageBytes else nil })
+end
+
+-- Bounded-memory explicit compaction. Inputs remain untouched. Caller must
+-- separately publish the resulting generation and rotate its WAL safely.
+function segments.compact(path: string, sources: { string }, options: Options?)
+  local snapshot = segments.open(sources, { cachePages = if options then options.cachePages else 1,
+    deletePaths = if options then options.deletePaths else nil })
+
+  -- Snapshot publication can fail during file creation or source streaming.
+  local succeeded, failure = pcall(function()
+    paged.create(path, snapshot.columns, snapshot.primaryKey,
+      snapshot:iterateRows(), { pageBytes = if options then options.pageBytes else nil })
+  end)
+  snapshot:close()
+  if not succeeded then error(failure, 2) end
+end
+
+return segments

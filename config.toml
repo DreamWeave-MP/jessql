@@ -1,6 +1,6 @@
 base_url = "https://dreamweave-mp.github.io/jessql"
 title = "JessQL"
-description = "A Luau relational query engine for Jess: in-memory tables and arbitrary Jess objects exposed as relations, queried, not stored."
+description = "A strictly typed Luau relational engine with native JSL persistence for Jess."
 compile_sass = true
 build_search_index = true
 generate_feeds = true

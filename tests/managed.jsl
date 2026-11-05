@@ -1,0 +1,710 @@
+--!strict
+local sql = require('@jessql')
+local fs = require('@dream/fs')
+local test = require('@jess/test')
+local suite, expect = test.new(), test.expect
+
+type Row = { [string]: unknown }
+
+local function fixture(name: string): string
+  local cwdResult = fs.cwd()
+  local cwd: string = assert(cwdResult)
+  local base = fs.join(cwd, '.jessql-managed-' .. name)
+  for _, suffix in { '.jql-manifest', '.jql-manifest.tmp', '.jql-lock' } do fs.remove(base .. suffix) end
+
+  for epoch = 1, 32 do
+    local suffix = string.format('.g%08d', epoch)
+    for _, ending in { '.rows', '.deleted', '.wal', '.wal.lock' } do fs.remove(base .. suffix .. ending) end
+  end
+  return base
+end
+
+local function removeFixture(base: string)
+  for _, suffix in { '.jql-manifest', '.jql-manifest.tmp', '.jql-lock' } do fs.remove(base .. suffix) end
+
+  for epoch = 1, 32 do
+    local suffix = string.format('.g%08d', epoch)
+    for _, ending in { '.rows', '.deleted', '.wal', '.wal.lock' } do fs.remove(base .. suffix .. ending) end
+  end
+end
+
+local function initial(base: string, hook: ((string) -> ())?): sql.ManagedDatabase
+  return sql.managed.open(base, { tableName = 'events', columns = { 'id', 'room', 'body' },
+    primaryKey = 'id', cachePages = 1, rowLayout = 'packed', readMode = 'positional',
+    testHook = hook })
+end
+
+suite.describe('durable managed generation publication', function()
+  suite.it('starts from an empty generation, checkpoints updates and deletions, and reopens twice', function()
+    local base = fixture('roundtrip')
+    local db = initial(base, nil)
+    expect(db:stats().epoch).toBe(1)
+    expect(db:stats().coldRows).toBe(0)
+    db:transaction(function(tx)
+      for index = 1, 36 do
+        tx:insert({ id = index, room = if index % 2 == 0 then 'even' else 'odd', body = 'old' })
+      end
+    end)
+    expect(db:stats().hotRows).toBe(36)
+    expect(db:checkpoint()).toBe(2)
+    expect(db:stats().hotRows).toBe(0)
+    expect(db:stats().coldRows).toBe(36)
+    expect((fs.exists(base .. '.g00000001.wal'))).toBe(false)
+    local oldPlan = db:prepare('SELECT id FROM events ORDER BY id LIMIT 1')
+    db:transaction(function(tx)
+      expect(tx:delete(4)).toBe(true)
+      expect(tx:update(5, { body = 'modified' })).toBe(true)
+      tx:upsert({ id = 6, room = 'new', body = 'overwritten' })
+      tx:insert({ id = 37, room = 'next', body = 'added' })
+    end)
+    expect(db:stats().tombstones).toBe(1)
+    expect(db:query('SELECT COUNT(*) AS n FROM events').rows[1].n).toBe(36)
+    expect(db:checkpoint()).toBe(3)
+    expect(db:get(4)).toBe(nil)
+    expect((assert(db:get(5))).body).toBe('modified')
+    expect((assert(db:get(6))).room).toBe('new')
+    expect((assert(db:get(37))).body).toBe('added')
+    expect(db:stats().hotRows).toBe(0)
+    expect(db:stats().tombstones).toBe(0)
+    expect((fs.exists(base .. '.g00000002.rows'))).toBe(false)
+    -- Plans bound to a retired hybrid generation must not keep serving stale rows.
+    expect((pcall(function() oldPlan.run() end))).toBe(false)
+    db:close()
+    local reopened = sql.managed.open(base)
+    expect(reopened:stats().epoch).toBe(3)
+    expect(reopened:query('SELECT COUNT(*) AS n FROM events').rows[1].n).toBe(36)
+    expect((assert(reopened:get(5))).body).toBe('modified')
+    reopened:insert({ id = 38, room = 'future', body = 'reopened' })
+    reopened:close()
+    local verified = sql.managed.open(base)
+    expect((assert(verified:get(38))).body).toBe('reopened')
+    verified:close()
+    removeFixture(base)
+  end)
+
+  suite.it('checks requested schema and prevents two managed owners', function()
+    local base = fixture('lock')
+    local db = initial(base, nil)
+    -- This rejected operation is intentional; verify recovery remains possible.
+    expect((pcall(function() sql.managed.open(base) end))).toBe(false)
+    db:close()
+    -- This rejected operation is intentional; verify recovery remains possible.
+    expect((pcall(function()
+      sql.managed.open(base, { tableName = 'wrong' })
+    end))).toBe(false)
+
+    -- This rejected operation is intentional; verify recovery remains possible.
+    expect((pcall(function()
+      sql.managed.open(base, { primaryKey = 'room' })
+    end))).toBe(false)
+
+    -- This rejected operation is intentional; verify recovery remains possible.
+    expect((pcall(function()
+      sql.managed.open(base, { columns = { 'id', 'body', 'room' } })
+    end))).toBe(false)
+    local reopened = sql.managed.open(base)
+    reopened:close()
+    removeFixture(base)
+  end)
+
+  suite.it('preserves an acknowledged WAL after each pre-publication fault', function()
+    for _, phase in { 'candidate-sealed', 'wal-ready', 'before-replace' } do
+      local base = fixture('before-' .. phase)
+      local inject = false
+      local db = initial(base, function(current: string)
+        if inject and current == phase then error('injected: ' .. phase) end
+      end)
+      db:insert({ id = 1, room = 'x', body = 'durable' })
+      inject = true
+      -- This rejected operation is intentional; verify recovery remains possible.
+      expect((pcall(function() db:checkpoint() end))).toBe(false)
+      expect(db:stats().epoch).toBe(1)
+      expect((assert(db:get(1))).body).toBe('durable')
+      db:insert({ id = 2, room = 'y', body = 'newer' })
+      inject = false
+      expect(db:checkpoint()).toBe(2)
+      db:close()
+      local reopened = sql.managed.open(base)
+      expect((assert(reopened:get(1))).body).toBe('durable')
+      expect((assert(reopened:get(2))).body).toBe('newer')
+      reopened:close()
+      removeFixture(base)
+    end
+  end)
+
+  suite.it('poisons after uncertain publication, yet recovers from the authoritative manifest', function()
+    for _, phase in { 'after-replace', 'after-directory-sync', 'before-retire' } do
+      local base = fixture('after-' .. phase)
+      local inject = false
+      local db = initial(base, function(current: string)
+        if inject and current == phase then error('injected: ' .. phase) end
+      end)
+      db:insert({ id = 1, room = 'initial', body = 'committed' })
+      inject = true
+      -- This rejected operation is intentional; verify recovery remains possible.
+      expect((pcall(function() db:checkpoint() end))).toBe(false)
+      -- This rejected operation is intentional; verify recovery remains possible.
+      expect((pcall(function() db:stats() end))).toBe(false)
+      -- This rejected operation is intentional; verify recovery remains possible.
+      expect((pcall(function() db:insert({ id = 2, room = 'bad', body = 'blocked' }) end))).toBe(false)
+      db:close()
+      local reopened = sql.managed.open(base)
+      expect(reopened:stats().epoch).toBe(2)
+      expect((assert(reopened:get(1))).body).toBe('committed')
+      expect(reopened:get(2)).toBe(nil)
+      reopened:insert({ id = 3, room = 'new', body = 'healthy' })
+      expect(reopened:checkpoint()).toBe(3)
+      reopened:close()
+      removeFixture(base)
+    end
+  end)
+
+  suite.it('fails closed on corrupt manifests rather than reopening a different WAL', function()
+    local base = fixture('corruption')
+    local db = initial(base, nil)
+    db:insert({ id = 'persist', room = 'a', body = 'safe' })
+    db:close()
+    local original = assert((fs.readFileString(base .. '.jql-manifest')))
+    assert((fs.writeFile(base .. '.jql-manifest', original .. 'x')))
+    -- This rejected operation is intentional; verify recovery remains possible.
+    expect((pcall(function() sql.managed.open(base) end))).toBe(false)
+    expect((fs.exists(base .. '.g00000002.wal'))).toBe(false)
+    assert((fs.writeFile(base .. '.jql-manifest', original)))
+    local recovered = sql.managed.open(base)
+    expect((assert(recovered:get('persist'))).body).toBe('safe')
+    recovered:close()
+    removeFixture(base)
+  end)
+
+  suite.it('rejects replaced snapshots even when the WAL exists', function()
+    local base = fixture('identity')
+    local db = initial(base, nil)
+    db:insert({ id = 1, room = 'a', body = 'safe' })
+    db:checkpoint()
+    db:close()
+    -- The original manifest binds the snapshot directory CRC and length.
+    local stale = assert((fs.readFileString(base .. '.g00000002.rows')))
+    assert((fs.writeFile(base .. '.g00000002.rows', stale .. 'x')))
+    -- This rejected operation is intentional; verify recovery remains possible.
+    expect((pcall(function() sql.managed.open(base) end))).toBe(false)
+    assert((fs.writeFile(base .. '.g00000002.rows', stale)))
+    local recovered = sql.managed.open(base)
+    expect((assert(recovered:get(1))).body).toBe('safe')
+    recovered:close()
+    removeFixture(base)
+  end)
+
+  suite.it('repairs a torn synchronized tail and then checkpoints the recovered state', function()
+    local base = fixture('torn-tail')
+    local db = initial(base, nil)
+    db:insert({ id = 10, room = 'x', body = 'first' })
+    db:close()
+    assert((fs.writeFile(base .. '.g00000001.wal', string.char(1, 2, 3), { append = true })))
+    local recovered = sql.managed.open(base)
+    recovered:insert({ id = 11, room = 'x', body = 'second' })
+    expect(recovered:checkpoint()).toBe(2)
+    recovered:close()
+    local finalDb = sql.managed.open(base)
+    expect(finalDb:query('SELECT COUNT(*) AS n FROM events').rows[1].n).toBe(2)
+    finalDb:close()
+    removeFixture(base)
+  end)
+
+  suite.it('cleans a stale unpublished next generation without touching active state', function()
+    local base = fixture('stale')
+    local db = initial(base, nil)
+    db:insert({ id = 1, room = 'x', body = 'safe' })
+    local candidate = base .. '.g00000002'
+    assert((fs.writeFile(candidate .. '.rows', 'orphan')))
+    assert((fs.writeFile(candidate .. '.wal', 'orphan')))
+    assert((fs.writeFile(candidate .. '.wal.lock', 'orphan')))
+    expect(db:checkpoint()).toBe(2)
+    db:close()
+    local opened = sql.managed.open(base)
+    expect((assert(opened:get(1))).body).toBe('safe')
+    opened:close()
+    removeFixture(base)
+  end)
+
+  suite.it('does not let a transaction execute while a generation cutover is underway', function()
+    local base = fixture('reentrant')
+    local db: sql.ManagedDatabase? = nil
+    local refused = false
+    db = initial(base, function(stage: string)
+      if stage == 'candidate-sealed' then
+        -- This rejected operation is intentional; verify recovery remains possible.
+        refused = not pcall(function()
+          (db :: sql.ManagedDatabase):insert({ id = 2, room = 'x', body = 'illegal' })
+        end)
+      end
+    end)
+    local handle = assert(db)
+    handle:insert({ id = 1, room = 'x', body = 'valid' })
+    handle:checkpoint()
+    expect(refused).toBe(true)
+    expect(handle:get(2)).toBe(nil)
+    handle:close()
+    removeFixture(base)
+  end)
+
+
+  suite.it('refuses missing and freshly bootstrapped WAL files for a published epoch', function()
+    local base = fixture('missing-wal')
+    local db = initial(base, nil)
+    db:insert({ id = 7, room = 'a', body = 'acknowledged' })
+    db:close()
+    local journalPath = base .. '.g00000001.wal'
+    local journal = assert((fs.readFileString(journalPath)))
+    fs.remove(journalPath)
+    -- An active manifest must never synthesize an empty WAL.
+    expect((pcall(function() sql.managed.open(base) end))).toBe(false)
+    expect((fs.exists(journalPath))).toBe(false)
+    assert((fs.writeFile(journalPath, 'JQLW1\n')))
+    -- A syntactically valid but unbound WAL must also fail closed.
+    expect((pcall(function() sql.managed.open(base) end))).toBe(false)
+    assert((fs.writeFile(journalPath, journal)))
+    local recovered = sql.managed.open(base)
+    expect((assert(recovered:get(7))).body).toBe('acknowledged')
+    recovered:close()
+    removeFixture(base)
+  end)
+
+  suite.it('refuses to reinitialize abandoned bootstrap files until an explicit reset', function()
+    local base = fixture('bootstrap')
+    -- A failure before initial manifest replacement cannot create an active DB.
+    expect((pcall(function()
+      initial(base, function(stage: string)
+        if stage == 'before-replace' then error('first-open fault') end
+      end)
+    end))).toBe(false)
+    expect((fs.exists(base .. '.jql-manifest'))).toBe(false)
+    expect((fs.exists(base .. '.g00000001.rows'))).toBe(true)
+    -- The manifest is absent, but its first-generation files are not safe to delete.
+    expect((pcall(function() initial(base, nil) end))).toBe(false)
+    removeFixture(base) -- explicit operator reset of uncommitted initialization
+    local db = initial(base, nil)
+    expect(db:stats().epoch).toBe(1)
+    db:insert({ id = 1, room = 'x', body = 'newly initialized' })
+    db:close()
+    local reopened = sql.managed.open(base)
+    expect((assert(reopened:get(1))).body).toBe('newly initialized')
+    reopened:close()
+    removeFixture(base)
+  end)
+
+  suite.it('fails closed if the manifest disappears without truncating the acknowledged WAL', function()
+    local base = fixture('missing-manifest')
+    local db = initial(base, nil)
+    db:insert({ id = 'safe', room = 'r', body = 'acknowledged' })
+    db:close()
+    local manifest = assert((fs.readFileString(base .. '.jql-manifest')))
+    local wal = assert((fs.readFileString(base .. '.g00000001.wal')))
+    assert((fs.remove(base .. '.jql-manifest')))
+
+    -- A missing manifest is never permission to reset an acknowledged journal.
+    expect((pcall(function() initial(base, nil) end))).toBe(false)
+    expect(assert((fs.readFileString(base .. '.g00000001.wal')))).toBe(wal)
+    expect((fs.exists(base .. '.jql-manifest'))).toBe(false)
+
+    -- Restoring exactly the known-good manifest must recover the original row.
+    assert((fs.createDurable(base .. '.jql-manifest', manifest)))
+    local reopened = initial(base, nil)
+    expect((assert(reopened:get('safe'))).body).toBe('acknowledged')
+    reopened:close()
+    removeFixture(base)
+  end)
+
+  suite.it('finishes interrupted retirement only after a successful recovery barrier', function()
+    local base = fixture('retirement')
+    local inject = false
+    local db = initial(base, function(stage: string)
+      if inject and stage == 'after-replace' then error('publication interrupted') end
+    end)
+    db:insert({ id = 1, room = 'x', body = 'durable' })
+    inject = true
+    -- The manifest has been replaced but the old WAL must remain untouched.
+    expect((pcall(function() db:checkpoint() end))).toBe(false)
+    expect((fs.exists(base .. '.g00000001.wal'))).toBe(true)
+    db:close()
+    local reopened = sql.managed.open(base)
+    expect(reopened:stats().epoch).toBe(2)
+    expect((assert(reopened:get(1))).body).toBe('durable')
+    expect((fs.exists(base .. '.g00000001.wal'))).toBe(false)
+    reopened:close()
+    removeFixture(base)
+  end)
+
+  suite.it('matches a reference model across repeated retirements and WAL restarts', function()
+    local base = fixture('model')
+    local db = initial(base, nil)
+    local expected: { [number]: string } = {}
+    for cycle = 1, 4 do
+      for key = 1, 32 do
+        if (key + cycle) % 5 == 0 then
+          db:delete(key)
+          expected[key] = nil
+        else
+          local text = 'cycle-' .. tostring(cycle) .. '-' .. tostring(key)
+          db:upsert({ id = key, room = 'm', body = text })
+          expected[key] = text
+        end
+      end
+      expect(db:checkpoint()).toBe(cycle + 1)
+      db:close()
+      db = sql.managed.open(base)
+      local count = 0
+      for key = 1, 32 do
+        local row = db:get(key)
+        if expected[key] then
+          expect((assert(row)).body).toBe(expected[key])
+          count += 1
+        else
+          expect(row).toBe(nil)
+        end
+      end
+      expect(db:query('SELECT COUNT(*) AS n FROM events').rows[1].n).toBe(count)
+    end
+    db:close()
+    removeFixture(base)
+  end)
+
+  suite.it('rejects a WAL copied from a previously published cold generation', function()
+    local base = fixture('rebind')
+    local db = initial(base, nil)
+    db:insert({ id = 1, room = 'a', body = 'first' })
+    local oldJournal = assert((fs.readFileString(base .. '.g00000001.wal')))
+    db:checkpoint()
+    db:close()
+    local currentJournal = assert((fs.readFileString(base .. '.g00000002.wal')))
+    assert((fs.writeFile(base .. '.g00000002.wal', oldJournal)))
+    -- The WAL's snapshot token is not the published manifest's token.
+    expect((pcall(function() sql.managed.open(base) end))).toBe(false)
+    assert((fs.writeFile(base .. '.g00000002.wal', currentJournal)))
+    local verified = sql.managed.open(base)
+    expect((assert(verified:get(1))).body).toBe('first')
+    verified:close()
+    removeFixture(base)
+  end)
+end)
+
+suite.describe('managed multi-generation delta flushing', function()
+  suite.it('publishes overlay rows and tombstones without rewriting older generations', function()
+    local base = fixture('delta-roundtrip')
+    local db = initial(base, nil)
+    db:transaction(function(tx)
+      for index = 1, 24 do
+        tx:insert({ id = index, room = 'initial', body = 'old-' .. tostring(index) })
+      end
+    end)
+    expect(db:flush()).toBe(2)
+    expect(db:stats().generations).toBe(2)
+    expect(db:stats().hotRows).toBe(0)
+    expect(db:flush()).toBe(2) -- no-op when the overlay is empty
+    expect((fs.exists(base .. '.g00000001.rows'))).toBe(true)
+    expect((fs.exists(base .. '.g00000001.wal'))).toBe(false)
+    db:transaction(function(tx)
+      expect(tx:delete(1)).toBe(true)
+      expect(tx:update(2, { body = 'updated' })).toBe(true)
+      tx:upsert({ id = 3, room = 'moved', body = 'new' })
+      tx:insert({ id = 25, room = 'later', body = 'added' })
+    end)
+    expect(db:flush()).toBe(3)
+    expect(db:stats().generations).toBe(3)
+    expect((fs.exists(base .. '.g00000003.deleted'))).toBe(true)
+    expect((fs.exists(base .. '.g00000002.rows'))).toBe(true)
+    expect(db:get(1)).toBe(nil)
+    expect((assert(db:get(2))).body).toBe('updated')
+    expect((assert(db:get(3))).room).toBe('moved')
+    expect(db:query('SELECT COUNT(*) AS n FROM events').rows[1].n).toBe(24)
+    db:close()
+    local reopened = sql.managed.open(base)
+    expect(reopened:stats().generations).toBe(3)
+    expect(reopened:get(1)).toBe(nil)
+    expect((assert(reopened:get(25))).body).toBe('added')
+    reopened:upsert({ id = 1, room = 'reborn', body = 'correct' })
+    expect(reopened:flush()).toBe(4)
+    expect((assert(reopened:get(1))).body).toBe('correct')
+    expect(reopened:checkpoint()).toBe(5)
+    expect(reopened:stats().generations).toBe(1)
+    expect((fs.exists(base .. '.g00000002.rows'))).toBe(false)
+    expect((fs.exists(base .. '.g00000003.deleted'))).toBe(false)
+    reopened:close()
+    local final = sql.managed.open(base)
+    expect((assert(final:get(1))).body).toBe('correct')
+    expect(final:query('SELECT COUNT(*) AS n FROM events').rows[1].n).toBe(25)
+    final:close()
+    removeFixture(base)
+  end)
+
+  suite.it('automatically flushes at a row threshold and compacts at the generation budget', function()
+    local base = fixture('auto-limit')
+    local db = sql.managed.open(base, { tableName = 'events',
+      columns = { 'id', 'room', 'body' }, primaryKey = 'id',
+      maxHotRows = 3, maxGenerations = 2 })
+
+    for index = 1, 21 do
+      db:insert({ id = index, room = 'a', body = tostring(index) })
+      expect(db:stats().hotRows < 3).toBe(true)
+      expect(db:stats().generations <= 2).toBe(true)
+      expect(db:maintenanceStatus().lastError).toBe(nil)
+    end
+    expect(db:stats().epoch > 3).toBe(true)
+    expect(db:query('SELECT COUNT(*) AS n FROM events').rows[1].n).toBe(21)
+    db:close()
+    local reopened = sql.managed.open(base)
+    for index = 1, 21 do expect((assert(reopened:get(index))).body).toBe(tostring(index)) end
+    reopened:close()
+    removeFixture(base)
+  end)
+
+  suite.it('preserves deleted keys across generations and repeated restarts', function()
+    local base = fixture('delta-model')
+    local db = initial(base, nil)
+    local expected: { [number]: string } = {}
+    for round = 1, 5 do
+      db:transaction(function(tx)
+        for key = 1, 18 do
+          if (key + round) % 4 == 0 then
+            tx:delete(key)
+            expected[key] = nil
+          else
+            local body = 'r' .. tostring(round) .. '-' .. tostring(key)
+            tx:upsert({ id = key, room = 'model', body = body })
+            expected[key] = body
+          end
+        end
+      end)
+      expect(db:flush()).toBe(round + 1)
+      db:close()
+      db = sql.managed.open(base)
+      local count = 0
+      for key = 1, 18 do
+        local found = db:get(key)
+        if expected[key] then
+          expect((assert(found)).body).toBe(expected[key])
+          count += 1
+        else
+          expect(found).toBe(nil)
+        end
+      end
+      expect(db:query('SELECT COUNT(*) AS n FROM events').rows[1].n).toBe(count)
+    end
+    db:checkpoint()
+    db:close()
+    removeFixture(base)
+  end)
+
+  suite.it('retries a failed unpublished delta without losing an acknowledged write', function()
+    local base = fixture('delta-pre-fault')
+    local inject = false
+    local db = initial(base, function(stage: string)
+      if inject and stage == 'before-replace' then error('refuse delta manifest') end
+    end)
+    db:insert({ id = 1, room = 'x', body = 'committed' })
+    inject = true
+    -- A rejected pre-publication flush is intentional; verify the live WAL survives.
+    expect((pcall(function() db:flush() end))).toBe(false)
+    expect(db:stats().epoch).toBe(1)
+    expect((assert(db:get(1))).body).toBe('committed')
+    inject = false
+    expect(db:flush()).toBe(2)
+    db:close()
+    local reopened = sql.managed.open(base)
+    expect((assert(reopened:get(1))).body).toBe('committed')
+    reopened:close()
+    removeFixture(base)
+  end)
+
+  suite.it('recovers a published delta after uncertain manifest replacement', function()
+    local base = fixture('delta-post-fault')
+    local inject = false
+    local db = initial(base, function(stage: string)
+      if inject and stage == 'after-replace' then error('power failure simulation') end
+    end)
+    db:insert({ id = 1, room = 'old', body = 'ack' })
+    expect(db:flush()).toBe(2)
+    db:upsert({ id = 1, room = 'new', body = 'new-ack' })
+    inject = true
+    -- Uncertain publication must reject subsequent reads; reopen for recovery.
+    expect((pcall(function() db:flush() end))).toBe(false)
+    expect(db:maintenanceStatus().poisoned).toBe(true)
+    -- A poisoned handle must reject reads; recovery resumes on a new handle.
+    expect((pcall(function() db:get(1) end))).toBe(false)
+    db:close()
+    local recovered = sql.managed.open(base)
+    expect(recovered:stats().epoch).toBe(3)
+    expect(recovered:stats().generations).toBe(3)
+    expect((assert(recovered:get(1))).body).toBe('new-ack')
+    recovered:close()
+    removeFixture(base)
+  end)
+
+  suite.it('preserves an acknowledged auto-flush write across uncertain publication', function()
+    local base = fixture('auto-post-fault')
+    local inject = false
+    local db = sql.managed.open(base, { tableName = 'events',
+      columns = { 'id', 'room', 'body' }, primaryKey = 'id', maxHotRows = 1,
+      testHook = function(stage: string)
+        if inject and stage == 'after-replace' then error('lost response during publication') end
+      end })
+    inject = true
+    -- This insert commits first; its automatic cutover may then become uncertain.
+    db:insert({ id = 42, room = 'x', body = 'already committed' })
+    expect(db:maintenanceStatus().poisoned).toBe(true)
+    expect(db:maintenanceStatus().lastError ~= nil).toBe(true)
+    -- An uncertain generation cutover prevents reads until recovery.
+    expect((pcall(function() db:get(42) end))).toBe(false)
+    db:close()
+    local recovered = sql.managed.open(base)
+    expect(recovered:stats().epoch).toBe(2)
+    expect((assert(recovered:get(42))).body).toBe('already committed')
+    recovered:close()
+    removeFixture(base)
+  end)
+
+  suite.it('reports automatic maintenance failure without misreporting a committed write', function()
+    local base = fixture('auto-fault')
+    local inject = false
+    local db = sql.managed.open(base, { tableName = 'events',
+      columns = { 'id', 'room', 'body' }, primaryKey = 'id', maxHotRows = 1,
+      testHook = function(stage: string)
+        if inject and stage == 'before-replace' then error('failed flush') end
+      end })
+    inject = true
+    db:insert({ id = 7, room = 'x', body = 'acknowledged' })
+    expect(db:stats().epoch).toBe(1)
+    expect(db:maintenanceStatus().lastError ~= nil).toBe(true)
+    expect((assert(db:get(7))).body).toBe('acknowledged')
+    inject = false
+    expect(db:flush()).toBe(2)
+    db:close()
+    local reopened = sql.managed.open(base)
+    expect((assert(reopened:get(7))).body).toBe('acknowledged')
+    reopened:close()
+    removeFixture(base)
+  end)
+
+  suite.it('collects only unreferenced managed files after a recovery barrier', function()
+    local base = fixture('orphans')
+    local db = initial(base, nil)
+    db:insert({ id = 1, room = 'x', body = 'stable' })
+    db:flush()
+    db:upsert({ id = 2, room = 'x', body = 'new' })
+    db:flush()
+    db:close()
+    local old = base .. '.g00000002.rows'
+    local fresh = base .. '.g00000003.deleted'
+    expect((fs.exists(old))).toBe(true)
+    expect((fs.exists(fresh))).toBe(true)
+    assert((fs.writeFile(base .. '.g00000002.wal', 'obsolete journal')))
+    assert((fs.writeFile(base .. '.g00000006.rows', 'orphan')))
+    assert((fs.writeFile(base .. '.g00000006.deleted', 'orphan')))
+    assert((fs.writeFile(base .. '.g00000006.wal', 'orphan')))
+    assert((fs.writeFile(base .. '.g00000006.rows.backup', 'preserve me')))
+    local opened = sql.managed.open(base)
+    expect((assert(opened:get(1))).body).toBe('stable')
+    expect((assert(opened:get(2))).body).toBe('new')
+    expect((fs.exists(old))).toBe(true)
+    expect((fs.exists(fresh))).toBe(true)
+    expect((fs.exists(base .. '.g00000002.wal'))).toBe(false)
+    expect((fs.exists(base .. '.g00000006.rows'))).toBe(false)
+    expect((fs.exists(base .. '.g00000006.deleted'))).toBe(false)
+    expect((fs.exists(base .. '.g00000006.wal'))).toBe(false)
+    expect((fs.exists(base .. '.g00000006.rows.backup'))).toBe(true)
+    opened:close()
+    fs.remove(base .. '.g00000006.rows.backup')
+    removeFixture(base)
+  end)
+
+  suite.it('retires all compacted generations after recovery from an interrupted full checkpoint', function()
+    local base = fixture('orphan-compact')
+    local inject = false
+    local db = initial(base, function(stage: string)
+      if inject and stage == 'after-replace' then error('retirement interrupted') end
+    end)
+
+    for index = 1, 4 do
+      db:insert({ id = index, room = 'x', body = tostring(index) })
+      db:flush()
+    end
+    inject = true
+    -- An uncertain publication retains all old generations for recovery.
+    expect((pcall(function() db:checkpoint() end))).toBe(false)
+    expect((fs.exists(base .. '.g00000002.rows'))).toBe(true)
+    expect((fs.exists(base .. '.g00000004.rows'))).toBe(true)
+    db:close()
+    local recovered = sql.managed.open(base)
+    expect(recovered:stats().generations).toBe(1)
+    for index = 1, 4 do
+      expect((assert(recovered:get(index))).body).toBe(tostring(index))
+    end
+    expect((fs.exists(base .. '.g00000002.rows'))).toBe(false)
+    expect((fs.exists(base .. '.g00000004.rows'))).toBe(false)
+    recovered:close()
+    removeFixture(base)
+  end)
+
+  suite.it('rejects a stale WAL whose binding describes a different cold set', function()
+    local base = fixture('delta-wal-rebind')
+    local db = initial(base, nil)
+    db:insert({ id = 1, room = 'a', body = 'original' })
+    local oldWal = assert((fs.readFileString(base .. '.g00000001.wal')))
+    db:flush()
+    db:close()
+    local path = base .. '.g00000002.wal'
+    local currentWal = assert((fs.readFileString(path)))
+    assert((fs.writeFile(path, oldWal)))
+    -- The WAL identity refers to the old single-snapshot generation.
+    expect((pcall(function() sql.managed.open(base) end))).toBe(false)
+    assert((fs.writeFile(path, currentWal)))
+    local reopened = sql.managed.open(base)
+    expect((assert(reopened:get(1))).body).toBe('original')
+    reopened:close()
+    removeFixture(base)
+  end)
+
+  suite.it('rejects flush past the configured generation budget without losing state', function()
+    local base = fixture('delta-budget')
+    local db = sql.managed.open(base, { tableName = 'events',
+      columns = { 'id', 'room', 'body' }, primaryKey = 'id', maxGenerations = 2 })
+    db:insert({ id = 1, room = 'a', body = 'first' })
+    expect(db:flush()).toBe(2)
+    db:insert({ id = 2, room = 'a', body = 'second' })
+    -- Deliberate budget rejection must not publish a new manifest.
+    expect((pcall(function() db:flush() end))).toBe(false)
+    expect(db:stats().epoch).toBe(2)
+    expect((assert(db:get(2))).body).toBe('second')
+    expect(db:checkpoint()).toBe(3)
+    expect(db:stats().generations).toBe(1)
+    db:close()
+    removeFixture(base)
+  end)
+
+  suite.it('fails closed if an old referenced generation or deletion sidecar is corrupted', function()
+    local base = fixture('delta-corrupt')
+    local db = initial(base, nil)
+    db:insert({ id = 'a', room = 'before', body = 'payload' })
+    db:flush()
+    db:delete('a')
+    db:flush()
+    db:close()
+    local old = base .. '.g00000002.rows'
+    local content = assert((fs.readFileString(old)))
+    assert((fs.writeFile(old, content .. 'damage')))
+    -- A corrupt historical generation must cause the opener to fail closed.
+    expect((pcall(function() sql.managed.open(base) end))).toBe(false)
+    assert((fs.writeFile(old, content)))
+    local sidecar = base .. '.g00000003.deleted'
+    local original = assert((fs.readFileString(sidecar)))
+    assert((fs.writeFile(sidecar, original .. 'damage')))
+    -- A corrupt deletion sidecar must cause the opener to fail closed.
+    expect((pcall(function() sql.managed.open(base) end))).toBe(false)
+    assert((fs.writeFile(sidecar, original)))
+    local recovered = sql.managed.open(base)
+    expect(recovered:get('a')).toBe(nil)
+    recovered:close()
+    removeFixture(base)
+  end)
+end)
+
+return suite

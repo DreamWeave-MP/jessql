@@ -1,0 +1,241 @@
+--!strict
+-- Read-only, offline verification of published managed generations and WAL.
+-- Does not repair torn tails, initialize journals, or publish a manifest.
+-- Caller MUST own the exclusive managed namespace lock.
+local fs = require('@dream/fs')
+local bytes = require('@dream/bytes')
+local json = require('@jess/json')
+local paged = require('@jessql/paged')
+local segments = require('@jessql/segments')
+local manifest = require('@jessql/managed_manifest')
+local storage = require('@jessql/storage')
+
+export type Issue = { code: string, stage: string, message: string, recovery: string }
+type Failure = { code: string, message: string }
+local function defect(code: string, message: string): never
+  error({ code = code, message = message }, 0)
+end
+export type Report = {
+  version: number, ok: boolean, epoch: number?, manifestVersion: number?,
+  coldRowsScanned: number, walBytes: number, walFrames: number,
+  coldPagesChecked: boolean, walFramesChecked: boolean,
+  walIdentityChecked: boolean, walSemanticReplayChecked: boolean,
+  issues: { Issue },
+  disposition: string,
+}
+local Magic = 'JQLW1\n'
+local HeaderBytes = 8
+local MaxFrameBytes = 16 * 1024 * 1024
+export type Options = { semantic: boolean? }
+local verification = {}
+
+local function generation(base: string, epoch: number, extension: string): string
+  return base .. string.format('.g%08d.', epoch) .. extension
+end
+
+local function problem(result: Report, stage: string, code: string, message: string)
+  result.ok = false
+  result.disposition = 'requires-operator-review'
+  local recovery = if stage == 'manifest' then 'Restore the original manifest from a consistent backup; do not bootstrap.'
+    elseif stage == 'cold' then 'Preserve the directory and restore the affected immutable generation.'
+    else 'Preserve WAL bytes and investigate before reopening; never blindly retry uncertain writes.'
+  result.issues[#result.issues + 1] = {
+    stage = stage, code = code, message = message, recovery = recovery,
+  }
+end
+
+local function cold(base: string, value: manifest.Manifest): (number, string)
+  local rows = {} :: { string }
+  local deleted = {} :: { [number]: string }
+  for index, item in manifest.generations(value) do
+    rows[index] = generation(base, item.epoch, 'rows')
+    if item.deleted then deleted[index] = generation(base, item.epoch, 'deleted') end
+  end
+
+  local snapshot: paged.Snapshot
+  if value.version == 1 then
+    snapshot = paged.open(rows[1], { cachePages = 1 })
+  else
+    snapshot = segments.open(rows, { cachePages = 1, deletePaths = deleted })
+  end
+  local identity = snapshot.identity
+  -- Metadata validators may throw on corruption; always close the reader before reporting.
+  local metadataOK, metadataFailure = pcall(function()
+    if snapshot.primaryKey ~= value.primaryKey or #snapshot.columns ~= #value.columns
+      or snapshot.identity ~= value.snapshotIdentity then error('cold generation identity/schema mismatch') end
+
+    for index, column in value.columns do
+      if snapshot.columns[index] ~= column then error('cold generation schema mismatch') end
+    end
+  end)
+  snapshot:close()
+  if not metadataOK then error(tostring(metadataFailure), 2) end
+
+  -- Read EVERY row in each physical generation, including shadowed rows.
+  -- A merged logical scan alone would skip corrupt pages in obsolete tiers.
+  -- Deletion sidecars are also scanned in their entirety (not just markers).
+  local scanned = 0
+  for index, name in rows do
+    local function scan(path: string)
+      local reader = paged.open(path, { cachePages = 1 })
+      -- Decoding a damaged page may throw; close the page reader and report the fault.
+      local ok, failure = pcall(function()
+        local nextRow = reader:iterateRows()
+        while true do
+          local row = nextRow()
+          if not row then break end
+          scanned += 1
+        end
+      end)
+      reader:close()
+      if not ok then error(tostring(failure), 2) end
+    end
+    scan(name)
+    if deleted[index] then scan(deleted[index]) end
+  end
+  return scanned, identity
+end
+
+-- WAL frame format is the exact JQLW1 storage framing: little-endian
+-- length/CRC32 followed by JSON with sequential transaction numbers.
+-- Structural verification intentionally DOES NOT claim full semantic replay.
+local function wal(base: string, value: manifest.Manifest, identity: string,
+  report: Report)
+  local path = generation(base, value.epoch, 'wal')
+  local reader, openError = fs.open(path)
+  if not reader then error('WAL open: ' .. tostring(openError), 2) end
+
+  -- Each malformed WAL frame must become a structured verification failure.
+  local verified, failure = pcall(function()
+    local size = reader:size()
+    report.walBytes = size
+    local header = reader:readAt(0, #Magic)
+    if not header or buffer.tostring(header) ~= Magic then defect('WAL_HEADER_INVALID', 'WAL header invalid') end
+    local offset, sequence, bound = #Magic, 0, false
+    while offset < size do
+      if size - offset < HeaderBytes then defect('WAL_TORN_TAIL', 'WAL incomplete frame header at ' .. tostring(offset)) end
+      local data = reader:readAt(offset, HeaderBytes)
+      if not data or buffer.len(data :: buffer) ~= HeaderBytes then defect('WAL_READ_FAILED', 'WAL header read failed') end
+      local length, checksum = buffer.readu32(data :: buffer, 0), buffer.readu32(data :: buffer, 4)
+      if length == 0 or length > MaxFrameBytes then defect('WAL_FRAME_LENGTH_INVALID', 'WAL invalid frame size at ' .. tostring(offset)) end
+
+      if size - offset - HeaderBytes < length then
+        defect('WAL_TORN_TAIL', 'WAL incomplete frame body at ' .. tostring(offset))
+      end
+      local body = reader:readAt(offset + HeaderBytes, length)
+      if not body or buffer.len(body :: buffer) ~= length then defect('WAL_READ_FAILED', 'WAL body read failed') end
+      local payload = buffer.tostring(body :: buffer)
+      if bytes.crc32(payload) ~= checksum then defect('WAL_CHECKSUM_MISMATCH', 'WAL checksum mismatch at ' .. tostring(offset)) end
+      local transaction = json.decode(payload) :: { [string]: unknown }
+      if type(transaction) ~= 'table' or transaction.version ~= 1
+        or transaction.sequence ~= sequence + 1 or type(transaction.ops) ~= 'table' then
+        defect('WAL_SEQUENCE_INVALID', 'WAL transaction metadata invalid at ' .. tostring(offset))
+      end
+
+      for _, operation in transaction.ops :: { { [string]: unknown } } do
+        if type(operation) ~= 'table' or type(operation.kind) ~= 'string'
+          or type(operation.table) ~= 'string' then
+          defect('WAL_OPERATION_INVALID', 'WAL operation shape invalid at ' .. tostring(offset))
+        end
+        local kind = operation.kind
+        if kind == 'put' then
+          if type(operation.row) ~= 'table' then defect('WAL_OPERATION_INVALID', 'WAL put missing row') end
+
+          if operation.table == '__jessql_hybrid_identity' then
+            local row = operation.row :: { [string]: unknown }
+            if row.id == 'snapshot' then
+              if row.token ~= identity or row.name ~= value.tableName then
+                defect('WAL_IDENTITY_MISMATCH', 'WAL cold-set binding mismatch')
+              end
+              bound = true
+            end
+          end
+        elseif kind == 'del' then
+          if operation.key == nil then defect('WAL_OPERATION_INVALID', 'WAL delete missing key') end
+
+          if operation.table == '__jessql_hybrid_identity'
+            and operation.key == 'snapshot' then defect('WAL_IDENTITY_MISMATCH', 'WAL deleted cold-set binding') end
+        elseif kind == 'create' then
+          if type(operation.columns) ~= 'table' or type(operation.primaryKey) ~= 'string' then
+            defect('WAL_OPERATION_INVALID', 'WAL create missing schema')
+          end
+        elseif kind == 'index' or kind == 'addcol' or kind == 'composite' then
+          if type(operation.column) ~= 'string' then defect('WAL_OPERATION_INVALID', 'WAL index/column invalid') end
+
+          if kind == 'composite' and type(operation.suffix) ~= 'string' then
+            defect('WAL_OPERATION_INVALID', 'WAL composite suffix invalid')
+          end
+        else
+          defect('WAL_OPERATION_INVALID', 'WAL unknown operation: ' .. tostring(kind))
+        end
+      end
+      sequence += 1
+      offset += HeaderBytes + length
+      report.walFrames += 1
+    end
+    report.walFramesChecked = true
+    if not bound then defect('WAL_IDENTITY_MISSING', 'WAL snapshot binding absent') end
+    report.walIdentityChecked = true
+  end)
+  reader:close()
+  if not verified then error(failure, 2) end
+end
+
+function verification.scan(base: string, options: Options?): Report
+  local report: Report = { version = 1, ok = true, epoch = nil, manifestVersion = nil,
+    disposition = 'structurally-verified', coldRowsScanned = 0, walBytes = 0, walFrames = 0,
+    coldPagesChecked = false, walFramesChecked = false,
+    walIdentityChecked = false, walSemanticReplayChecked = false, issues = {} }
+  local raw, readError = fs.readFileString(base .. '.jql-manifest')
+  if not raw then
+    problem(report, 'manifest', 'MANIFEST_UNREADABLE', tostring(readError))
+    return report
+  end
+  -- Invalid manifests are reported rather than interrupting an offline scan.
+  local valid, parsed = pcall(function() return manifest.decode(raw) end)
+  if not valid then
+    problem(report, 'manifest', 'MANIFEST_INVALID', tostring(parsed))
+    return report
+  end
+  local value = parsed :: manifest.Manifest
+  report.epoch, report.manifestVersion = value.epoch, value.version
+
+  -- Missing or corrupt cold pages are reported without modifying them.
+  local coldOK, count, identity = pcall(function() return cold(base, value) end)
+  if not coldOK then
+    problem(report, 'cold', 'COLD_INVALID', tostring(count))
+    return report
+  end
+  report.coldRowsScanned = count :: number
+  report.coldPagesChecked = true
+  -- Malformed WAL frames are reported without attempting replay or repair.
+  local walOK, walError = pcall(function() wal(base, value, identity :: string, report) end)
+  if not walOK then
+    local code, detail = 'WAL_DECODE_OR_IO_FAILED', tostring(walError)
+    if type(walError) == 'table' then
+      local failure = walError :: Failure
+      code, detail = failure.code, failure.message
+    end
+    problem(report, 'wal', code, detail)
+  end
+
+  if report.ok and options and options.semantic then
+    -- Exact storage replay validation, after immutable pages and WAL framing
+    -- have already passed. A semantic error is never an excuse to repair data.
+    local replayOK, replayResult = pcall(function()
+      return storage.verifyReplay(generation(base, value.epoch, 'wal'))
+    end)
+
+    if not replayOK then
+      problem(report, 'wal', 'WAL_SEMANTIC_REPLAY_FAILED', tostring(replayResult))
+    elseif replayResult ~= report.walFrames then
+      problem(report, 'wal', 'WAL_REPLAY_SEQUENCE_MISMATCH', 'semantic replay frame count mismatch')
+    else
+      report.walSemanticReplayChecked = true
+      report.disposition = 'semantically-verified'
+    end
+  end
+  return report
+end
+
+return verification

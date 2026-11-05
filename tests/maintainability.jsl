@@ -1,0 +1,153 @@
+--!strict
+local sql = require('@jessql')
+local manifest = require('@jessql/managed_manifest')
+local policy = require('@jessql/managed_policy')
+local fs = require('@dream/fs')
+local test = require('@jess/test')
+local suite, expect = test.new(), test.expect
+
+local function fixture(name: string): string
+  return fs.join(fs.cwd() :: string, '.jessql-maintainability-' .. name)
+end
+
+local function cleanup(base: string)
+  for epoch = 1, 8 do
+    local prefix = base .. string.format('.g%08d', epoch)
+    for _, extension in { '.rows', '.deleted', '.wal', '.wal.lock', '.hot-rows', '.hot-deleted' } do
+      fs.remove(prefix .. extension)
+    end
+  end
+
+  for _, extension in { '.jql-lock', '.jql-manifest', '.jql-manifest.tmp' } do
+    fs.remove(base .. extension)
+  end
+end
+
+local function newDatabase(base: string)
+  return sql.managed.open(base, {
+    tableName = 'events', columns = { 'id', 'body' }, primaryKey = 'id',
+  })
+end
+
+-- Expected failures are part of the API contract; do not accidentally
+-- pass pcall's additional return values into @jess/test matchers.
+local function fails(action: () -> ()): boolean
+  -- Intentionally catch the contract violation and assert that it fails.
+  local ok = pcall(action)
+  return not ok
+end
+
+suite.describe('pure managed lifecycle components', function()
+  suite.it('roundtrips both manifest layouts without filesystem I/O', function()
+    local v1 = manifest.new({ version = 1, epoch = 1,
+      tableName = 'events', columns = { 'id' }, primaryKey = 'id',
+      snapshotIdentity = 'abc:2' }, 2, 'abcd:3', nil)
+    local roundtrip = manifest.decode(manifest.encode(v1))
+    expect(roundtrip.epoch).toBe(2)
+    expect(roundtrip.snapshotIdentity).toBe('abcd:3')
+    local v2 = manifest.new(v1, 3, 'JQLM1|example', {
+      { epoch = 1, deleted = false }, { epoch = 3, deleted = true },
+    })
+    local decoded = manifest.decode(manifest.encode(v2))
+    expect(#manifest.generations(decoded)).toBe(2)
+    expect((decoded.generations :: { manifest.Generation })[2].deleted).toBe(true)
+    local valid = manifest.encode(v2)
+    expect(fails(function() manifest.decode(string.sub(valid, 1, #valid - 4) .. 'bad\n') end)).toBe(true)
+    expect(fails(function() manifest.sameSchema(decoded, { primaryKey = 'wrong' }) end)).toBe(true)
+    expect(fails(function()
+      manifest.validate(manifest.new(v1, 3, 'JQLM1|wrong', {
+        { epoch = 3, deleted = false }, { epoch = 2, deleted = true },
+      }))
+    end)).toBe(true)
+  end)
+
+  suite.it('chooses maintenance deterministically without disk operations', function()
+    local limits = policy.limits({ maxHotRows = 5, maxHotBytes = 90,
+      maxWalBytes = 2048, maxGenerations = 3, compactionFanIn = 2 })
+    expect(policy.plan(limits, 1, 1, 0, 10, 1500)).toBe(nil)
+    expect(policy.plan(limits, 1, 4, 1, 10, 1500)).toBe('flush')
+    expect(policy.plan(limits, 1, 0, 0, 100, 1500)).toBe('flush')
+    expect(policy.plan(limits, 1, 0, 0, 0, 2500)).toBe('flush')
+    expect(policy.plan(limits, 3, 0, 0, 0, 2500)).toBe('compact')
+    expect(policy.plan(policy.limits(), 1, 10^6, 10^6, nil, nil)).toBe(nil)
+    expect(fails(function() policy.limits({ maxWalBytes = 0 }) end)).toBe(true)
+  end)
+end)
+
+suite.describe('managed offline inspection', function()
+  suite.it('inspects published cold metadata without opening a writable WAL', function()
+    local base = fixture('inventory')
+    cleanup(base)
+    local db = newDatabase(base)
+    db:insert({ id = 1, body = 'hello' })
+    expect(fails(function() sql.managed.inspect(base) end)).toBe(true)
+    db:flush()
+    db:close()
+    local manifestBefore = fs.readFileString(base .. '.jql-manifest')
+    local result = sql.managed.inspect(base)
+    local manifestAfter = fs.readFileString(base .. '.jql-manifest')
+    expect(manifestBefore).toBe(manifestAfter)
+    expect(result.version).toBe(2)
+    expect(result.epoch).toBe(2)
+    expect(result.tableName).toBe('events')
+    expect(#result.generations).toBe(2)
+    expect(result.generations[2].deleted).toBe(true)
+    expect(result.generations[2].rowsBytes > 0).toBe(true)
+    expect(result.walBytes > 0).toBe(true)
+    expect(result.walIdentityChecked).toBe(false)
+    local reopened = sql.managed.open(base)
+    expect((assert(reopened:get(1))).body).toBe('hello')
+    reopened:close()
+    cleanup(base)
+  end)
+
+  suite.it('does not accept or rewrite corrupted manifest checksums', function()
+    local base = fixture('checksum')
+    cleanup(base)
+    local db = newDatabase(base)
+    db:close()
+    local original = assert((fs.readFileString(base .. '.jql-manifest')))
+    assert((fs.writeFile(base .. '.jql-manifest', original .. 'corrupted')))
+    expect(fails(function() sql.managed.inspect(base) end)).toBe(true)
+    expect((fs.readFileString(base .. '.jql-manifest'))).toBe(original .. 'corrupted')
+    assert((fs.writeFile(base .. '.jql-manifest', original)))
+    expect(sql.managed.inspect(base).epoch).toBe(1)
+    cleanup(base)
+  end)
+
+  suite.it('does not confuse inventory with WAL replay verification', function()
+    local base = fixture('wal-unchecked')
+    cleanup(base)
+    local db = newDatabase(base)
+    db:insert({ id = 10, body = 'committed' })
+    db:close()
+    -- A sufficiently large WAL payload corruption is not read by inspect().
+    -- Full recovery refuses mismatched identities instead of silently repairing.
+    assert((fs.writeFile(base .. '.g00000001.wal', 'JQLW1\n')))
+    local inventory = sql.managed.inspect(base)
+    expect(inventory.walIdentityChecked).toBe(false)
+    expect(inventory.walBytes).toBe(6)
+    expect(fails(function() sql.managed.open(base) end)).toBe(true)
+    cleanup(base)
+  end)
+
+  suite.it('refuses missing manifest and generations without repair or bootstrap', function()
+    local base = fixture('missing')
+    cleanup(base)
+    local db = newDatabase(base)
+    db:insert({ id = 1, body = 'retained' })
+    db:close()
+    local manifestBefore = fs.readFileString(base .. '.jql-manifest')
+    fs.remove(base .. '.g00000001.rows')
+    expect(fails(function() sql.managed.inspect(base) end)).toBe(true)
+    expect((fs.readFileString(base .. '.jql-manifest'))).toBe(manifestBefore)
+    cleanup(base)
+    expect(fails(function() sql.managed.inspect(base) end)).toBe(true)
+    -- Inspection must not create a new manifest or WAL.
+    expect((fs.exists(base .. '.jql-manifest'))).toBe(false)
+    expect((fs.exists(base .. '.g00000001.wal'))).toBe(false)
+    cleanup(base)
+  end)
+end)
+
+return suite

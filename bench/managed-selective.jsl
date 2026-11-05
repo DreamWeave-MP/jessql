@@ -1,0 +1,90 @@
+--!strict
+-- Compare selective tail compaction with full checkpoints using the same
+-- committed cold generations, hot changes and synchronized publication.
+-- Usage: jess run --trusted --package . bench/managed-selective.jsl compact|checkpoint [anchorRows] [deltaRows]
+local sql = require('@jessql')
+local fs = require('@dream/fs')
+
+local mode = arg[1] or 'compact'
+local anchorRows = tonumber(arg[2]) or 8000
+local deltaRows = tonumber(arg[3]) or 100
+if mode ~= 'compact' and mode ~= 'checkpoint' then error('mode must be compact or checkpoint') end
+
+if anchorRows < 10 or anchorRows > 1000000 or anchorRows % 1 ~= 0 then
+  error('invalid anchorRows')
+end
+
+if deltaRows < 1 or deltaRows > 10000 or deltaRows % 1 ~= 0 then
+  error('invalid deltaRows')
+end
+
+local base = fs.join(fs.cwd() :: string, '.jessql-selective-bench')
+local function cleanup()
+  for _, suffix in { '.jql-manifest', '.jql-manifest.tmp', '.jql-lock' } do fs.remove(base .. suffix) end
+
+  for epoch = 1, 20 do
+    local prefix = base .. string.format('.g%08d', epoch)
+    for _, suffix in { '.rows', '.deleted', '.wal', '.wal.lock', '.hot-rows', '.hot-deleted' } do
+      fs.remove(prefix .. suffix)
+    end
+  end
+end
+
+cleanup()
+local db = sql.managed.open(base, { tableName = 'events',
+  columns = { 'id', 'room', 'body' }, primaryKey = 'id', cachePages = 4,
+  rowLayout = 'packed', readMode = 'positional', compactionFanIn = 3 })
+local key = 0
+-- Anchor generation: the expensive existing data that selective compaction
+-- must preserve rather than rewrite. The same fixture is rebuilt each run.
+while key < anchorRows do
+  local high = math.min(key + 100, anchorRows)
+  db:transaction(function(tx)
+    for index = key + 1, high do
+      tx:insert({ id = index, room = 'anchor', body = string.rep('x', 48) })
+    end
+  end)
+  key = high
+end
+db:flush()
+local anchorPath = base .. '.g00000002.rows'
+local anchorFile = assert((fs.readFileString(anchorPath)))
+local anchorBytes = #anchorFile
+
+for wave = 1, 4 do
+  db:transaction(function(tx)
+    for offset = 1, deltaRows do
+      tx:upsert({ id = anchorRows + (wave - 1) * deltaRows + offset,
+        room = 'new', body = string.rep('y', 48) })
+    end
+    tx:upsert({ id = wave, room = 'changed', body = 'wave-' .. tostring(wave) })
+  end)
+  db:flush()
+end
+-- An unflushed hot deletion must survive selective compaction even if its
+-- original row stays in the preserved anchor generation.
+assert(db:delete(10))
+db:upsert({ id = 1, room = 'latest', body = 'after-flush' })
+local before = db:stats()
+local started = os.clock()
+if mode == 'compact' then db:compact() else db:checkpoint() end
+local maintenanceCpu = os.clock() - started
+local after = db:stats()
+local anchorRetained = fs.exists(anchorPath) == true
+if anchorRetained then assert((fs.readFileString(anchorPath)) == anchorFile) end
+db:close()
+local reopenStarted = os.clock()
+local reopened = sql.managed.open(base, { readMode = 'positional' })
+local expectedRows = anchorRows + deltaRows * 4 - 1
+assert(reopened:query('SELECT COUNT(*) AS n FROM events').rows[1].n == expectedRows)
+assert((assert(reopened:get(1))).body == 'after-flush')
+assert(reopened:get(10) == nil)
+assert((assert(reopened:get(anchorRows + 4 * deltaRows))).body == string.rep('y', 48))
+assert(reopened:stats().generations == after.generations)
+local reopenCpu = os.clock() - reopenStarted
+reopened:close()
+cleanup()
+print('mode', mode, 'anchorRows', anchorRows, 'deltaRows', deltaRows,
+  'anchorBytes', anchorBytes, 'anchorRetained', anchorRetained,
+  'generationsBefore', before.generations, 'generationsAfter', after.generations,
+  'maintenanceCpu', maintenanceCpu, 'reopenValidateCpu', reopenCpu)

@@ -1,0 +1,58 @@
+--!strict
+-- Compare packed vs row-resident layouts through public JessQL API.
+local sql = require('@jessql')
+local fs = require('@dream/fs')
+local layoutArg, countArg = ...
+local layout: string = if layoutArg ~= nil then tostring(layoutArg) else 'row'
+local count: number = tonumber(countArg) or 40000
+local cwd, cwdError = fs.cwd()
+if not cwd then error(tostring(cwdError)) end
+local path = fs.join(cwd, '.jessql-packed-benchmark-' .. layout .. '.wal')
+fs.remove(path)
+fs.remove(path .. '.lock')
+local function sample(phase: string)
+  local data = fs.readFileString('/proc/self/status')
+  local rss: number = if data then tonumber(string.match(data, 'VmRSS:%s*(%d+)')) or -1 else -1
+  local peak: number = if data then tonumber(string.match(data, 'VmHWM:%s*(%d+)')) or -1 else -1
+  print(string.format('phase=%s layout=%s rss_kb=%d peak_kb=%d', phase, layout, rss, peak))
+end
+local start: number = os.clock()
+local db = sql.open(path, { rowLayout = layout })
+db:createTable('events', { 'id', 'room', 'stream', 'unique_code', 'payload', 'status' }, 'id')
+for first = 1, count, 256 do
+  db:transaction(function(tx)
+    for id = first, math.min(count, first + 255) do
+      tx:insert('events', { id = id, room = 'room' .. (id % 128), stream = id,
+        unique_code = 'event-' .. tostring(id), payload = 'body-' .. tostring(id), status = id % 8 })
+    end
+  end)
+end
+sample('rows')
+db:createIndex('events', 'unique_code')
+db:createIndex('events', 'room')
+db:createOrderedIndex('events', 'stream')
+db:createCompositeIndex('events', 'room', 'stream')
+sample('indexed')
+local indexed: number = os.clock() - start
+local point = db:prepare('SELECT payload FROM events WHERE unique_code = ?')
+local range = db:prepare('SELECT id FROM events WHERE room = ? AND stream > ? ORDER BY stream LIMIT 20')
+local sum, found = 0, 0
+local before: number = os.clock()
+for iteration = 1, 5000 do
+  local id = iteration * 997 % count + 1
+  local result = point.run({ 'event-' .. tostring(id) })
+  assert(#result.rows == 1)
+  sum += #(result.rows[1].payload :: string)
+end
+local pointTime: number = os.clock() - before
+before = os.clock()
+for iteration = 1, 800 do
+  found += #range.run({ 'room' .. (iteration % 128), iteration * 41 % count }).rows
+end
+local rangeTime: number = os.clock() - before
+print(string.format('layout=%s rows=%d build_s=%.5f point_s=%.5f range_s=%.5f checksum=%d found=%d total_s=%.5f',
+  layout, count, indexed, pointTime, rangeTime, sum, found, os.clock()-start))
+sample('queried')
+db:close()
+fs.remove(path)
+fs.remove(path .. '.lock')

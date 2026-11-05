@@ -1,0 +1,59 @@
+--!strict
+--!native
+-- Tiered compaction of many overlapping cold generations. Prepare once;
+-- measure compaction in fresh processes and verify the resulting snapshot.
+local sql = require('@jessql')
+local fs = require('@dream/fs')
+
+local mode = arg[1] or 'compact'
+local generations = tonumber(arg[2]) or 20
+local perGeneration = tonumber(arg[3]) or 5000
+local fanIn = tonumber(arg[4]) or 4
+local base = arg[5] or '.jessql-tiers-bench'
+local paths: { string } = {}
+for generation = 1, generations do paths[generation] = base .. '.' .. tostring(generation) end
+local target = base .. '.out'
+local deletionOutput = base .. '.deleted'
+
+if mode == 'cleanup' or mode == 'prepare' then
+  for _, path in paths do fs.remove(path) end
+  fs.remove(target)
+  fs.remove(deletionOutput)
+  if mode == 'cleanup' then print('cleaned'); return end
+  local step = math.floor(perGeneration * 7 / 8)
+  for generation, path in paths do
+    local index = 0
+    sql.paged.create(path, { 'id', 'body' }, 'id', function()
+      index += 1
+      if index > perGeneration then return nil end
+      local key = (generation - 1) * step + index
+      return { id = key, body = generation }
+    end)
+  end
+  print('prepared', generations, perGeneration)
+  return
+end
+
+if mode == 'compact' then
+  fs.remove(target)
+  fs.remove(deletionOutput)
+  local started = os.clock()
+  local metrics = sql.tiers.compact(target, deletionOutput, paths, { fanIn = fanIn, cachePages = 1 })
+  print('compact', 'cpu_s', os.clock() - started,
+    'groups', metrics.groups, 'passes', metrics.passes, 'max_open', metrics.maxOpenGenerations)
+elseif mode == 'verify' then
+  local opened = sql.paged.open(target)
+  local expected = (generations - 1) * math.floor(perGeneration * 7 / 8) + perGeneration
+  if opened.count ~= expected then error('tier compaction count mismatch') end
+  local checksum = 0
+  local nextRow = opened:iterateRows()
+  while true do
+    local row = nextRow()
+    if not row then break end
+    checksum += (row.id :: number) + (row.body :: number)
+  end
+  print('verify', 'count', opened.count, 'checksum', checksum)
+  opened:close()
+else
+  error('expected prepare, compact, verify or cleanup')
+end

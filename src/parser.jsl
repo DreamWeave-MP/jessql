@@ -69,30 +69,30 @@ local ClauseKeywords = {
   JOIN = true, INNER = true, LEFT = true, RIGHT = true, FULL = true, ON = true,
 }
 
-local function parse(sql): Select
+local function parse(sql: string): Select
   local tokens = lexer.lex(sql)
   local position = 1
   local paramCount = 0
 
-  local function tok() return tokens[position] end
+  local function tok(): lexer.Token return tokens[position] end
 
-  local function advance()
+  local function advance(): lexer.Token
     local token = tokens[position]
     position += 1
     return token
   end
 
-  local function isWord(name)
+  local function isWord(name: string): boolean
     local token = tok()
     return token.kind == 'word' and token.value == name
   end
 
-  local function isSym(name)
+  local function isSym(name: string): boolean
     local token = tok()
     return token.kind == 'symbol' and token.text == name
   end
 
-  local function acceptWord(name)
+  local function acceptWord(name: string): boolean
     if isWord(name) then
       position += 1
       return true
@@ -101,7 +101,7 @@ local function parse(sql): Select
     return false
   end
 
-  local function acceptSym(name)
+  local function acceptSym(name: string): boolean
     if isSym(name) then
       position += 1
       return true
@@ -110,25 +110,25 @@ local function parse(sql): Select
     return false
   end
 
-  local function fail(message)
+  local function fail(message: string): never
     local token = tok()
     error(string.format('jessql parser at byte %d: %s; got %s', token.at, message, token.text), 0)
   end
 
-  local function expectWord(name)
+  local function expectWord(name: string)
     if not acceptWord(name) then fail('expected ' .. name) end
   end
 
-  local function expectSym(name)
+  local function expectSym(name: string)
     if not acceptSym(name) then fail('expected ' .. name) end
   end
 
-  local function ident()
+  local function ident(): string
     local token = tok()
 
     if token.kind == 'ident' then
       position += 1
-      return token.value
+      return token.text
     end
 
     if token.kind == 'word' then
@@ -136,12 +136,12 @@ local function parse(sql): Select
       return token.text
     end
 
-    fail('expected identifier')
+    return fail('expected identifier')
   end
 
-  local parseExpr
+  local parseExpr: (number) -> Expr
 
-  local function primary()
+  local function primary(): Expr
     local token = tok()
 
     if acceptSym('(') then
@@ -175,7 +175,7 @@ local function parse(sql): Select
       local first = ident()
 
       if acceptSym('(') then
-        local args = {}
+        local args: { Expr } = {}
         local star = false
 
         if acceptSym('*') then
@@ -203,10 +203,10 @@ local function parse(sql): Select
       return { tag = 'star' }
     end
 
-    fail('expected expression')
+    return fail('expected expression')
   end
 
-  local precedence = {
+  local precedence: { [string]: number } = {
     OR = 10, AND = 20,
     ['='] = 30, ['!='] = 30, ['<>'] = 30, ['<'] = 30, ['<='] = 30, ['>'] = 30, ['>='] = 30, LIKE = 30,
     ['||'] = 40,
@@ -214,36 +214,36 @@ local function parse(sql): Select
     ['*'] = 60, ['/'] = 60, ['%'] = 60,
   }
 
-  parseExpr = function(minPrec)
-    local left = primary()
+  parseExpr = function(minPrec: number): Expr
+    local left: Expr = primary()
 
     while true do
       local token = tok()
-      local op = nil
-      if token.kind == 'word' and precedence[token.value] then op = token.value end
+      local op: string? = nil
+      if token.kind == 'word' and precedence[token.value :: string] then op = token.value :: string end
       if token.kind == 'symbol' and precedence[token.text] then op = token.text end
-      if op == nil then break end
-      local prec = precedence[op]
+      if not op then break end
+      local prec = precedence[op] or 0
       if prec < minPrec then break end
       position += 1
       local right = parseExpr(prec + 1)
-      left = { tag = 'binary', op = op, left = left, right = right }
+      left = { tag = 'binary', op = op, left = left, right = right } :: Binary
     end
 
     if minPrec <= 30 and acceptWord('IS') then
       local negated = acceptWord('NOT')
       expectWord('NULL')
-      left = { tag = 'isnull', expr = left, negated = negated }
+      left = { tag = 'isnull', expr = left, negated = negated } :: IsNull
     end
 
     return left
   end
 
-  local function source()
+  local function source(): Source
     local parts = { ident() }
     while acceptSym('.') do parts[#parts + 1] = ident() end
     local name = table.concat(parts, '.')
-    local alias = nil
+    local alias: string? = nil
 
     if acceptWord('AS') then
       alias = ident()
@@ -259,11 +259,11 @@ local function parse(sql): Select
   end
 
   expectWord('SELECT')
-  local selectList = {}
+  local selectList: { SelectItem } = {}
 
   repeat
     local expr = parseExpr(0)
-    local alias = nil
+    local alias: string? = nil
 
     if acceptWord('AS') then
       alias = ident()
@@ -280,10 +280,10 @@ local function parse(sql): Select
 
   expectWord('FROM')
   local from = source()
-  local joins = {}
+  local joins: { Join } = {}
 
   while isWord('JOIN') or isWord('INNER') or isWord('LEFT') do
-    local kind = 'inner'
+    local kind: 'inner' | 'left' = 'inner'
 
     if acceptWord('LEFT') then
       kind = 'left'
@@ -298,20 +298,20 @@ local function parse(sql): Select
     joins[#joins + 1] = { kind = kind, source = joined, on = parseExpr(0) }
   end
 
-  local where = nil
+  local where: Expr? = nil
   if acceptWord('WHERE') then where = parseExpr(0) end
 
-  local groupBy = {}
+  local groupBy: { Expr } = {}
 
   if acceptWord('GROUP') then
     expectWord('BY')
     repeat groupBy[#groupBy + 1] = parseExpr(0) until not acceptSym(',')
   end
 
-  local having = nil
+  local having: Expr? = nil
   if acceptWord('HAVING') then having = parseExpr(0) end
 
-  local orderBy = {}
+  local orderBy: { OrderItem } = {}
 
   if acceptWord('ORDER') then
     expectWord('BY')
@@ -324,25 +324,25 @@ local function parse(sql): Select
     until not acceptSym(',')
   end
 
-  local limit = nil
-  local offset = nil
+  local limit: number? = nil
+  local offset: number? = nil
 
   if acceptWord('LIMIT') then
     local token = advance()
-    if token.kind ~= 'number' or token.value < 0 or token.value % 1 ~= 0 then fail('LIMIT needs a nonnegative integer') end
-    limit = token.value
+    if token.kind ~= 'number' or type(token.value) ~= 'number' or token.value < 0 or token.value % 1 ~= 0 then fail('LIMIT needs a nonnegative integer') end
+    limit = token.value :: number
 
     if acceptWord('OFFSET') then
       local offsetToken = advance()
-      if offsetToken.kind ~= 'number' or offsetToken.value < 0 or offsetToken.value % 1 ~= 0 then fail('OFFSET needs a nonnegative integer') end
-      offset = offsetToken.value
+      if offsetToken.kind ~= 'number' or type(offsetToken.value) ~= 'number' or offsetToken.value < 0 or offsetToken.value % 1 ~= 0 then fail('OFFSET needs a nonnegative integer') end
+      offset = offsetToken.value :: number
     end
   end
 
-  if offset == nil and acceptWord('OFFSET') then
+  if not offset and acceptWord('OFFSET') then
     local offsetToken = advance()
-    if offsetToken.kind ~= 'number' or offsetToken.value < 0 or offsetToken.value % 1 ~= 0 then fail('OFFSET needs a nonnegative integer') end
-    offset = offsetToken.value
+    if offsetToken.kind ~= 'number' or type(offsetToken.value) ~= 'number' or offsetToken.value < 0 or offsetToken.value % 1 ~= 0 then fail('OFFSET needs a nonnegative integer') end
+    offset = offsetToken.value :: number
   end
 
   acceptSym(';')

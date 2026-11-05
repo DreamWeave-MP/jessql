@@ -1,0 +1,239 @@
+--!strict
+--!native
+-- Explicit fan-in-bounded compaction of arbitrarily many immutable generations.
+-- Older input files are never replaced, renamed, retired or deleted.
+local segments = require('@jessql/segments')
+local paged = require('@jessql/paged')
+local fs = require('@dream/fs')
+
+export type Options = { fanIn: number?, cachePages: number?, pageBytes: number?,
+  deletePaths: { [number]: string }? }
+export type Metrics = { groups: number, passes: number, maxOpenGenerations: number }
+type Source = { rows: string, deletes: string?, temporary: boolean }
+
+local tiers = {}
+
+local function originalKey(encoded: string): unknown
+  local tag = string.sub(encoded, 1, 1)
+  if tag == 's' then return string.sub(encoded, 2) end
+  if encoded == 'b0' then return false end
+  if encoded == 'b1' then return true end
+
+  if tag == 'n' then
+    local number = tonumber(string.sub(encoded, 2))
+    if number ~= nil then return number end
+  end
+  error('jessql tiers: invalid encoded deletion key', 3)
+end
+
+-- Keep every deletion that remains effective after compacting a group.
+-- A newly inserted row supersedes an older deletion; a remaining deletion
+-- must propagate or rows outside the group could be resurrected later.
+local function mergeDeletions(path: string, rowPath: string, group: { Source }, options: Options?)
+  local readers: { paged.Snapshot } = {}
+  local advances: { () -> paged.Row? } = {}
+  local heads: { string? } = {}
+  local snapshot = paged.open(rowPath, { cachePages = 1 })
+  -- Opening or reading a damaged source can fail; release all open readers.
+  local ok, failure = pcall(function()
+    for index, source in group do
+      local deletionPath = source.deletes
+      if not deletionPath then continue end
+      local reader = paged.open(deletionPath, { cachePages = 1 })
+      readers[#readers + 1] = reader
+      local advance = reader:iterateRows({ 'id' })
+      advances[index] = advance
+      local row = advance()
+      if row and row.id == '!identity' then row = advance() end
+      heads[index] = if row then row.id :: string else nil
+    end
+
+    local previous: string? = nil
+    local function nextKey(): string?
+      while true do
+        local lowest: string? = nil
+        for _, key in heads do
+          if key and (not lowest or key < lowest) then lowest = key end
+        end
+
+        if not lowest then return nil end
+
+        for index, key in heads do
+          if key == lowest then
+            local row = advances[index]()
+            heads[index] = if row then row.id :: string else nil
+          end
+        end
+
+        if lowest ~= previous then
+          previous = lowest
+          if not snapshot:get(originalKey(lowest)) then return lowest end
+        end
+      end
+    end
+
+    segments.createTombstones(path, rowPath, nextKey,
+      { pageBytes = if options then options.pageBytes else nil })
+  end)
+
+  for _, reader in readers do reader:close() end
+  snapshot:close()
+  if not ok then error(failure, 2) end
+end
+
+-- A candidate snapshot and optional deletion sidecar are constructed from a
+-- complete ordered generation list. No durable manifest adoption is implied.
+function tiers.compact(rowsPath: string, deletePath: string?, sources: { string }, options: Options?): Metrics
+  local fanIn = if options and options.fanIn then options.fanIn else 8
+  if type(fanIn) ~= 'number' or fanIn % 1 ~= 0 or fanIn < 2 or fanIn > 8 then
+    error('jessql tiers: invalid fanIn', 2)
+  end
+
+  if type(sources) ~= 'table' or #sources == 0 then error('jessql tiers: no sources', 2) end
+
+  if type(rowsPath) ~= 'string' or rowsPath == '' or fs.exists(rowsPath) then
+    error('jessql tiers: invalid or occupied output', 2)
+  end
+
+  if deletePath and (type(deletePath) ~= 'string' or deletePath == ''
+    or deletePath == rowsPath or fs.exists(deletePath)) then
+    error('jessql tiers: invalid or occupied deletion output', 2)
+  end
+
+  local input: { Source } = {}
+  local used: { [string]: boolean } = { [rowsPath] = true }
+  if deletePath then used[deletePath] = true end
+  local inputDeletions = if options then options.deletePaths else nil
+  if inputDeletions and not deletePath then
+    error('jessql tiers: output deletion sidecar required for deleted inputs', 2)
+  end
+
+  if inputDeletions then
+    for index, path in inputDeletions do
+      if type(index) ~= 'number' or index % 1 ~= 0 or index < 1 or index > #sources
+        or type(path) ~= 'string' or path == '' then
+        error('jessql tiers: invalid deletion path mapping', 2)
+      end
+    end
+  end
+
+  for index, path in sources do
+    if type(path) ~= 'string' or path == '' or used[path] then
+      error('jessql tiers: duplicate or invalid source path', 2)
+    end
+    used[path] = true
+    local deletionPath = if inputDeletions then inputDeletions[index] else nil
+    input[index] = { rows = path, deletes = deletionPath, temporary = false }
+  end
+
+  for _, source in input do
+    local path = source.deletes
+    if path then
+      if used[path] then error('jessql tiers: duplicate or invalid deletion path', 2) end
+      used[path] = true
+    end
+  end
+
+  local prefix: string? = nil
+  local owned: { [string]: boolean } = {}
+  local serial = 0
+  local createdRows, createdDeletes = false, false
+  local metrics: Metrics = { groups = 0, passes = 0, maxOpenGenerations = 0 }
+  local function reservedPath(suffix: string): string
+    serial += 1
+    return (prefix :: string) .. '-' .. tostring(serial) .. suffix
+  end
+
+  -- The exclusive owner file prevents two concurrent compactors from sharing
+  -- scratch names. No scratch file is deleted unless this invocation made it.
+  local ok, failure = pcall(function()
+    if #input > fanIn then
+      for _ = 1, 16 do
+        local candidate = rowsPath .. '.jql-tiers-' .. tostring(math.random(1, 2147483647))
+        local count = fs.writeFile(candidate .. '.owner', 'jessql', { exclusive = true })
+        if count ~= 6 then continue end
+        prefix = candidate
+        owned[candidate .. '.owner'] = true
+        break
+      end
+
+      if not prefix then error('jessql tiers: cannot reserve scratch workspace') end
+    end
+
+    local function build(group: { Source }, destination: string, deletions: string?)
+      local paths: { string } = {}
+      local deletePaths: { [number]: string } = {}
+      local hasDeletes = false
+      for index, source in group do
+        paths[index] = source.rows
+        if source.deletes then
+          deletePaths[index] = source.deletes
+          hasDeletes = true
+        end
+      end
+      metrics.groups += 1
+      metrics.maxOpenGenerations = math.max(metrics.maxOpenGenerations, #group)
+      segments.compact(destination, paths, { cachePages = if options then options.cachePages else 1,
+        pageBytes = if options then options.pageBytes else nil,
+        deletePaths = if hasDeletes then deletePaths else nil })
+
+      if destination ~= rowsPath then owned[destination] = true else createdRows = true end
+
+      if deletions then
+        mergeDeletions(deletions, destination, group, options)
+        if deletions ~= deletePath then owned[deletions] = true else createdDeletes = true end
+      end
+    end
+
+    local active = input
+    while #active > fanIn do
+      metrics.passes += 1
+      local following: { Source } = {}
+      local index = 1
+      while index <= #active do
+        local group: { Source } = {}
+        for position = index, math.min(index + fanIn - 1, #active) do
+          group[#group + 1] = active[position]
+        end
+
+        if #group == 1 then
+          following[#following + 1] = group[1]
+        else
+          local output = reservedPath('.rows')
+          local hasDeletes = false
+          for _, source in group do if source.deletes then hasDeletes = true; break end end
+          local deletionOutput = if hasDeletes then reservedPath('.deleted') else nil
+          build(group, output, deletionOutput)
+          following[#following + 1] = { rows = output,
+            deletes = deletionOutput, temporary = true }
+
+          for _, source in group do
+            if not source.temporary then continue end
+            fs.remove(source.rows)
+            owned[source.rows] = nil
+            if source.deletes then
+              fs.remove(source.deletes)
+              owned[source.deletes] = nil
+            end
+          end
+        end
+        index += fanIn
+      end
+      active = following
+    end
+    build(active, rowsPath, deletePath)
+  end)
+
+  for path in owned do fs.remove(path) end
+
+  if not ok then
+    -- Never delete a competitor's pre-existing file after an exclusive create
+    -- refusal: only unlink public paths this compaction created successfully.
+    if createdRows then fs.remove(rowsPath) end
+    if createdDeletes and deletePath then fs.remove(deletePath) end
+    error(failure, 2)
+  end
+  return metrics
+end
+
+return tiers

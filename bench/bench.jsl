@@ -1,3 +1,4 @@
+--!strict
 -- JessQL, timed from Luau through its public API: ordering, bounded ordering, filters, aggregates,
 -- grouping, joins, streamed providers, and preparing a statement. Every workload returns a
 -- checksum of its result, and the checksum is compared with one worked out from the fixture by a
@@ -13,17 +14,21 @@ end
 
 local filter = ...
 local only = if filter and filter ~= '' then filter else nil
-local RecordCount, JoinCount, SmallCount = 100000, 50000, 400
-local timings = {}
+type Record = {[string]: unknown, id: number, kind: string, name: string, value: number, bucket: number, score: number, rank: number?}
+type LeftRow = {[string]: unknown, id: number, name: string, bucket: number}
+type RightRow = {[string]: unknown, id: number, value: number}
 
-local function median(samples)
+local RecordCount, JoinCount, SmallCount = 100000, 50000, 400
+local timings: {{name: string, seconds: number}} = {}
+
+local function median(samples: {number}): number
   table.sort(samples)
   return samples[(#samples + 1) // 2]
 end
 
 --- Seconds per call of `body`: warmed up, then the median of seven batches of a size that takes
 --- about a tenth of a second, with a full collection between batches.
-local function measure(body)
+local function measure(body: () -> number): number
   jess.bench.collect()
   body()
   local start = os.clock()
@@ -43,7 +48,7 @@ local function measure(body)
 end
 
 --- Times `body`, which must return `expected` before it is timed and after.
-local function workload(name, body, expected)
+local function workload(name: string, body: () -> number, expected: number)
   if only and not string.find(name, only, 1, true) then return end
 
   local got = body()
@@ -58,7 +63,7 @@ end
 
 --- The sum of each position times the number `read` finds there, and the length: the same for
 --- any two orders of `rows` that differ only in where equal numbers stand.
-local function weigh(rows, read)
+local function weigh(rows: sql.SourceRows, read: (sql.SourceRow) -> number): number
   local total = #rows
 
   for position, row in rows do
@@ -68,29 +73,33 @@ local function weigh(rows, read)
   return total
 end
 
-local function readId(row) return row.id end
+local function readId(row: sql.SourceRow): number return row.id :: number end
 
-local function readValue(row) return row.value end
+local function readValue(row: sql.SourceRow): number return row.value :: number end
 
-local function readScore(row) return row.score end
+local function readScore(row: sql.SourceRow): number return row.score :: number end
 
 --- A copy of the `rows` that `keep` accepts, in the order `before` gives when there is one.
-local function reference(rows, keep, before)
-  local out = [for row in rows if not keep or keep(row) => row]
+local function reference<T>(rows: {T}, keep: ((T) -> boolean)?, before: ((T, T) -> boolean)?): {T}
+  local out: {T} = {}
+  for _, row in rows do
+    if not keep or (keep :: (T) -> boolean)(row) then out[#out + 1] = row end
+  end
+
   if before then table.sort(out, before) end
 
   return out
 end
 
 --- The `count` rows of `rows` after the first `skip`.
-local function page(rows, skip, count)
+local function page<T>(rows: {T}, skip: number, count: number): {T}
   local first, last = skip + 1, skip + count
   return rows[first:last]
 end
 
 -- `score` is different in every row, `value` and `bucket` repeat, and `rank` is NULL in every
 -- tenth row.
-local records = table.create(RecordCount)
+local records: {Record} = table.create(RecordCount) :: {Record}
 
 for id = 1, RecordCount do
   records[id] = {
@@ -104,14 +113,15 @@ for id = 1, RecordCount do
   }
 end
 
-local leftRows, rightRows = table.create(JoinCount), table.create(JoinCount)
+local leftRows: {LeftRow} = table.create(JoinCount) :: {LeftRow}
+local rightRows: {RightRow} = table.create(JoinCount) :: {RightRow}
 
 for id = 1, JoinCount do
   leftRows[id] = { id = id, name = `L{id}`, bucket = id % 16 }
   rightRows[id] = { id = id, value = (id * 17) % 10000 }
 end
 
-local smallRows = table.create(SmallCount)
+local smallRows: {RightRow} = table.create(SmallCount) :: {RightRow}
 
 for id = 1, SmallCount do
   smallRows[id] = { id = id, value = (id * 37) % 101 }
@@ -119,13 +129,13 @@ end
 
 --- A provider that hands `rows` over one at a time, through one reused row when the engine
 --- allows it, the way a packed store does.
-local function streamed(rows, columns)
+local function streamed(rows: sql.SourceRows, columns: {string}): sql.Provider
   return {
     columns = columns,
-    iterate = function(request)
+    iterate = function(request: sql.Request): sql.Iterator
       local position = 0
       local volatile = request.allowVolatileRows == true
-      local reused = {}
+      local reused: sql.Row = {}
 
       return {
         _jessqlIter = 'v1',
@@ -151,12 +161,12 @@ local function streamed(rows, columns)
 end
 
 --- A provider that finds its rows by `id` and is never scanned.
-local function indexed(rows, columns)
+local function indexed(rows: sql.SourceRows, columns: {string}): sql.Provider
   return {
     columns = columns,
     indexes = { id = true },
     lookup = function(_column, id, _request)
-      local row = rows[id]
+      local row = rows[id :: number]
       return if row then { row } else {}
     end,
     scan = function(_request) error('jessql bench: the indexed side is not scanned') end,
@@ -174,17 +184,17 @@ db:register('driver', streamed(leftRows, { 'id', 'name', 'bucket' }))
 db:register('looked_up', indexed(rightRows, { 'id', 'value' }))
 
 --- Times `text` run with `params`, its rows reduced by `check`.
-local function query(name, text, params, check, expected)
+local function query(name: string, text: string, params: {unknown}?, check: (sql.SourceRows) -> number, expected: number)
   local plan = db:prepare(text)
   workload(name, function() return check(plan.run(params).rows) end, expected)
 end
 
-local function byScore(left, right) return left.score < right.score end
+local function byScore(left: Record, right: Record): boolean return left.score < right.score end
 
-local function byScoreDescending(left, right) return left.score > right.score end
+local function byScoreDescending(left: Record, right: Record): boolean return left.score > right.score end
 
-local function atLeast(threshold)
-  return function(row) return row.value >= threshold end
+local function atLeast(threshold: number): (sql.SourceRow) -> boolean
+  return function(row: sql.SourceRow): boolean return (row.value :: number) >= threshold end
 end
 
 do
@@ -207,7 +217,7 @@ do
     'SELECT id, value FROM records ORDER BY value',
     nil,
     function(rows) return weigh(rows, readValue) end,
-    weigh(reference(records, nil, function(left, right) return left.value < right.value end), readValue)
+    weigh(reference(records, nil, function(left: Record, right: Record) return left.value < right.value end), readValue)
   )
 
   query(
@@ -216,7 +226,7 @@ do
     nil,
     check,
     weigh(
-      reference(records, nil, function(left, right)
+      reference(records, nil, function(left: Record, right: Record)
         if left.bucket ~= right.bucket then return left.bucket > right.bucket end
 
         return left.score < right.score
@@ -231,7 +241,7 @@ do
     nil,
     function(rows) return weigh(rows, readValue) end,
     weigh(
-      reference(records, nil, function(left, right)
+      reference(records, nil, function(left: Record, right: Record)
         if left.bucket ~= right.bucket then return left.bucket < right.bucket end
 
         return left.value > right.value
@@ -246,7 +256,7 @@ do
     nil,
     check,
     weigh(
-      reference(records, nil, function(left, right)
+      reference(records, nil, function(left: Record, right: Record)
         local leftRank, rightRank = left.rank or -1, right.rank or -1
         if leftRank ~= rightRank then return leftRank < rightRank end
 
@@ -261,7 +271,7 @@ do
     'SELECT id FROM records ORDER BY name',
     nil,
     check,
-    weigh(reference(records, nil, function(left, right) return left.name < right.name end), readId)
+    weigh(reference(records, nil, function(left: Record, right: Record) return left.name < right.name end), readId)
   )
 
   query(
@@ -287,7 +297,7 @@ do
     check,
     weigh(
       page(
-        reference(records, nil, function(left, right)
+        reference(records, nil, function(left: Record, right: Record)
           if left.bucket ~= right.bucket then return left.bucket < right.bucket end
 
           return left.score > right.score
@@ -324,7 +334,7 @@ do
     'SELECT id FROM records WHERE rank < 100',
     nil,
     check,
-    weigh(reference(records, function(row) return row.rank ~= nil and row.rank < 100 end), readId)
+    weigh(reference(records, function(row: Record) return row.rank ~= nil and row.rank < 100 end), readId)
   )
 
   query(
@@ -348,7 +358,7 @@ do
     'SELECT id FROM records WHERE value % 7 = 0 OR bucket = 3',
     nil,
     check,
-    weigh(reference(records, function(row) return row.value % 7 == 0 or row.bucket == 3 end), readId)
+    weigh(reference(records, function(row: Record) return row.value % 7 == 0 or row.bucket == 3 end), readId)
   )
 
   query(
@@ -359,7 +369,7 @@ do
     weigh(records, readValue)
   )
 
-  local function readRank(row) return row.rank or -1 end
+  local function readRank(row: sql.SourceRow): number return (row.rank :: number?) or -1 end
 
   query(
     'project three columns, one NULL in every tenth row, 100k rows',
@@ -388,7 +398,7 @@ do
     'count the rows a filter keeps, 100k rows',
     'SELECT COUNT(*) AS found FROM records WHERE bucket < ?',
     { 48 },
-    function(rows) return rows[1].found end,
+    function(rows) return rows[1].found :: number end,
     kept
   )
 
@@ -399,7 +409,7 @@ do
     nil,
     function(rows)
       local {found, total, mean, low, high, ranked} = rows[1]
-      return found + total + mean + low + high + ranked
+      return (found :: number) + (total :: number) + (mean :: number) + (low :: number) + (high :: number) + (ranked :: number)
     end,
     kept + total + scoreTotal / kept + low + high + ranked
   )
@@ -417,7 +427,7 @@ do
     nil,
     function(rows)
       local {found, total, low, high} = rows[1]
-      return found + total + low + high
+      return (found :: number) + (total :: number) + (low :: number) + (high :: number)
     end,
     SmallCount + smallTotal + smallLow + smallHigh
   )
@@ -435,13 +445,14 @@ do
     'two aggregates over a streamed filter, 100k rows',
     'SELECT COUNT(*) AS found, SUM(value) AS total FROM stream WHERE value >= ?',
     { 2500 },
-    function(rows) return rows[1].found + rows[1].total end,
+    function(rows) return (rows[1].found :: number) + (rows[1].total :: number) end,
     streamedCount + streamedTotal
   )
 end
 
 do
-  local groups, bucketTotals = {}, {}
+  local groups: {[string]: {found: number, total: number}} = {}
+  local bucketTotals: {[number]: number} = {}
 
   for _, row in records do
     bucketTotals[row.bucket] = (bucketTotals[row.bucket] or 0) + row.value
@@ -459,13 +470,13 @@ do
     group.total += row.value
   end
 
-  local totals = {}
+  local totals: {number} = {}
 
   for _, group in groups do
     if group.found >= 10 then table.insert(totals, group.total) end
   end
 
-  table.sort(totals, function(left, right) return left > right end)
+  table.sort(totals, function(left: number, right: number) return left > right end)
   local expected = 0
 
   for position = 1, math.min(25, #totals) do
@@ -478,7 +489,7 @@ do
       FROM records WHERE value >= ? GROUP BY kind, bucket HAVING count(*) >= 10
       ORDER BY total DESC LIMIT 25]],
     { 2500 },
-    function(rows) return sum[for position, row in enumerate(rows) => position * row.total] end,
+    function(rows) return sum[for position, row in enumerate(rows) => position * (row.total :: number)] end,
     expected
   )
 
@@ -488,7 +499,7 @@ do
     bucketExpected += (bucket + 1) * bucketTotals[bucket]
   end
 
-  local function check(rows) return sum[for position, row in enumerate(rows) => position * row.total] end
+  local function check(rows: sql.SourceRows): number return sum[for position, row in enumerate(rows) => position * (row.total :: number)] end
 
   local text = 'SELECT bucket, COUNT(*) AS found, SUM(value) AS total FROM %s GROUP BY bucket ORDER BY bucket'
   query('group by one column, 100k rows', string.format(text, 'records'), nil, check, bucketExpected)
@@ -504,7 +515,7 @@ do
 end
 
 do
-  local joined = reference(rightRows, atLeast(9000), function(left, right)
+  local joined = reference(rightRows, atLeast(9000), function(left: RightRow, right: RightRow)
     if left.value ~= right.value then return left.value > right.value end
 
     return left.id < right.id
@@ -544,7 +555,7 @@ do
     [[SELECT l.bucket, COUNT(r.id) AS found FROM left_rows l LEFT JOIN right_rows r ON l.id = r.id
       WHERE r.value < 5000 GROUP BY l.bucket ORDER BY l.bucket]],
     nil,
-    function(rows) return sum[for position, row in enumerate(rows) => position * row.found] end,
+    function(rows) return sum[for position, row in enumerate(rows) => position * (row.found :: number)] end,
     grouped
   )
 
@@ -560,7 +571,7 @@ do
     'nested-loop join 400 to 400, counted',
     'SELECT COUNT(*) AS found FROM small a JOIN small b ON a.value < b.value',
     nil,
-    function(rows) return rows[1].found end,
+    function(rows) return rows[1].found :: number end,
     pairs
   )
 

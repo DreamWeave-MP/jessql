@@ -1,6 +1,7 @@
+--!strict
 local sql = require('@jessql')
 local rowCount = tonumber((...)) or 500000
-local rows = table.create(rowCount)
+local rows: {sql.Row} = table.create(rowCount) :: {sql.Row}
 
 for index = 1, rowCount do
   rows[index] = { id = index, value = (index * 7919) % 1000000 }

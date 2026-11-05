@@ -1,0 +1,71 @@
+--!strict
+--!native
+-- Reproducible multi-generation benchmark. Run prepare/read/compact separately
+-- so process peak RSS captures the query or compaction phase independently.
+local sql = require('@jessql')
+local fs = require('@dream/fs')
+
+local phase = arg[1] or 'read'
+local rowsPerSegment = tonumber(arg[2]) or 20000
+local base = arg[3] or '.jessql-segments-bench'
+local sourcePaths: { string } = {}
+for index = 1, 4 do sourcePaths[index] = base .. '.' .. tostring(index) end
+local target = base .. '.compact'
+local expected = rowsPerSegment + math.floor(rowsPerSegment * 3 / 4) * 3
+
+if phase == 'prepare' then
+  for generation, path in sourcePaths do
+    fs.remove(path)
+    local first = (generation - 1) * math.floor(rowsPerSegment * 3 / 4) + 1
+    local position = 0
+    sql.paged.create(path, { 'id', 'room', 'stream' }, 'id', function()
+      position += 1
+      if position > rowsPerSegment then return nil end
+      local id = first + position - 1
+      return { id = id, room = 'room-' .. tostring(id % 48), stream = id * 3 + generation }
+    end, { pageBytes = 32768 })
+  end
+  print('prepared', rowsPerSegment, expected)
+elseif phase == 'read' then
+  local opened = sql.segments.open(sourcePaths, { cachePages = 1 })
+  local clockStart = os.clock()
+  local checksum = 0
+  for index = 1, 500 do
+    local key = ((index * 7919) % expected) + 1
+    local row = opened:get(key)
+    if not row then error('missing benchmark key') end
+    checksum += row.id :: number
+  end
+  local db = sql.new()
+  db:register('events', opened:provider())
+  local rangeStart = os.clock()
+  for index = 1, 80 do
+    local lower = ((index * 197) % (expected - 50)) + 1
+    local rows = db:query('SELECT id FROM events WHERE id >= ? ORDER BY id LIMIT 30', { lower }).rows
+    if #rows ~= 30 then error('incomplete benchmark range') end
+    for _, row in rows do checksum += row.id :: number end
+  end
+  local rangeElapsed = os.clock() - rangeStart
+  local count = db:query('SELECT COUNT(*) AS n FROM events').rows[1].n
+  local elapsed = os.clock() - clockStart
+  if count ~= expected then error('benchmark row count mismatch') end
+  local metrics = opened:stats()
+  print('read', 'cpu_s', elapsed, 'range_cpu_s', rangeElapsed,
+    'checksum', checksum, 'rows', count, 'page_reads', metrics.pageReads)
+  opened:close()
+elseif phase == 'compact' then
+  fs.remove(target)
+  local clockStart = os.clock()
+  sql.segments.compact(target, sourcePaths, { cachePages = 1, pageBytes = 32768 })
+  local elapsed = os.clock() - clockStart
+  local opened = sql.paged.open(target)
+  if opened.count ~= expected then error('bad compaction output count') end
+  print('compact', 'cpu_s', elapsed, 'rows', opened.count)
+  opened:close()
+elseif phase == 'cleanup' then
+  for _, path in sourcePaths do fs.remove(path) end
+  fs.remove(target)
+  print('cleaned')
+else
+  error('expected prepare, read, compact or cleanup')
+end

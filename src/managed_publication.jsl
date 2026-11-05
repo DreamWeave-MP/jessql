@@ -1,0 +1,63 @@
+--!strict
+-- Durable, lock-owned publication mechanism for managed generations.
+-- INTERNAL: no public policy hooks or alternative sync implementations.
+-- The caller MUST hold the managed namespace lock and MUST pre-seal and
+-- validate the referenced immutable generations and WAL identity.
+local fs = require('@dream/fs')
+local manifest = require('@jessql/managed_manifest')
+
+export type State = { started: boolean }
+local publication = {}
+
+local function assertOK(ok: boolean?, message: string?, action: string)
+  if not ok then error('jessql managed: ' .. action .. ': ' .. tostring(message), 3) end
+end
+
+-- Missing is not an error; an indeterminate stat result is. Never unlink
+-- anything except known candidate/retired paths selected by the coordinator.
+function publication.removeIfPresent(path: string)
+  local exists, existenceError = fs.exists(path)
+  if exists == nil then error('jessql managed: stat: ' .. tostring(existenceError), 2) end
+
+  if exists then
+    local removed, removeError = fs.remove(path)
+    assertOK(removed, removeError, 'remove ' .. path)
+  end
+end
+
+-- The file was written by a snapshot/compaction provider. Require a file
+-- content/inode barrier and then a parent-directory barrier before any manifest
+-- may make it authoritative. Close failure is not a successful seal.
+function publication.seal(path: string, parent: string)
+  local writer, openError = fs.openWrite(path, { create = false, truncate = false })
+  if not writer then error('jessql managed: seal open: ' .. tostring(openError), 2) end
+  local synced, syncError = writer:syncAll()
+  local closed, closeError = writer:close()
+  assertOK(synced, syncError, 'seal syncAll')
+  assertOK(closed, closeError, 'seal close')
+  local ok, err = fs.syncDirectory(parent)
+  assertOK(ok, err, 'seal directory')
+end
+
+-- The state marks the irreversible *attempt*, not confirmed success.
+-- Any error once started=true is an uncertain publication: poison the live
+-- handle, leave both WALs/generations alone, and reopen via the manifest.
+-- A pre-replace failure permits the coordinator to discard unpublished files.
+function publication.publish(base: string, parent: string, value: manifest.Manifest,
+  hook: ((string) -> ())?, state: State)
+  local candidate = base .. '.jql-manifest.tmp'
+  publication.removeIfPresent(candidate)
+  local text = manifest.encode(value)
+  local count, errorMessage = fs.createDurable(candidate, text)
+  if count ~= #text then error('jessql managed: durable manifest: ' .. tostring(errorMessage), 2) end
+  if hook then hook('before-replace') end
+  state.started = true
+  local ok, failure = fs.replace(candidate, base .. '.jql-manifest')
+  assertOK(ok, failure, 'replace manifest')
+  if hook then hook('after-replace') end
+  ok, failure = fs.syncDirectory(parent)
+  assertOK(ok, failure, 'sync manifest directory')
+  if hook then hook('after-directory-sync') end
+end
+
+return publication

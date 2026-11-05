@@ -1,0 +1,69 @@
+--!strict
+-- Process RSS and query throughput for resident native JessQL storage.
+-- Uses procfs only for Linux benchmark instrumentation, never in the store.
+local sql = require('@jessql')
+local fs = require('@dream/fs')
+local rows = tonumber((...)) or 40000
+local Batch = 256
+local cwd = fs.cwd()
+assert(cwd)
+local path = fs.join(cwd, '.jessql-rss-bench.wal')
+fs.remove(path)
+fs.remove(path .. '.lock')
+local function resident(): (number, number)
+  local data = fs.readFileString('/proc/self/status')
+  if not data then return -1, -1 end -- Other platforms have no procfs.
+  local rss = tonumber(string.match(data, 'VmRSS:%s*(%d+)')) or 0
+  local peak = tonumber(string.match(data, 'VmHWM:%s*(%d+)')) or 0
+  return rss, peak
+end
+
+local function sample(phase: string)
+  local rss, hwm = resident()
+  print(string.format('phase=%s rss_kb=%d peak_kb=%d', phase, rss, hwm))
+end
+local begin = os.clock()
+local db = sql.open(path)
+db:createTable('events', { 'id', 'room', 'stream', 'unique_code', 'payload', 'status' }, 'id')
+sample('empty')
+for first = 1, rows, Batch do
+  db:transaction(function(tx)
+    for id = first, math.min(first + Batch - 1, rows) do
+      tx:insert('events', { id = id, room = 'room' .. (id % 128),
+        stream = id, unique_code = 'event-' .. tostring(id), payload = 'body-' .. tostring(id), status = id % 8 })
+    end
+  end)
+end
+sample('rows')
+db:createIndex('events', 'unique_code')
+sample('unique')
+db:createIndex('events', 'room')
+sample('room')
+db:createOrderedIndex('events', 'stream')
+sample('ordered')
+db:createCompositeIndex('events', 'room', 'stream')
+sample('composite')
+local pointPlan = db:prepare('SELECT payload FROM events WHERE unique_code = ?')
+local start = os.clock()
+local sum = 0
+for iteration = 1, 5000 do
+  local id = (iteration * 997) % rows + 1
+  local result = pointPlan.run({ 'event-' .. tostring(id) })
+  assert(#result.rows == 1)
+  local payload = result.rows[1].payload
+  assert(type(payload) == 'string')
+  sum += #payload
+end
+local pointSecs = os.clock() - start
+local range = db:prepare('SELECT id FROM events WHERE room = ? AND stream > ? ORDER BY stream LIMIT 20')
+start = os.clock()
+local found = 0
+for iteration = 1, 800 do
+  found += #range.run({ 'room' .. (iteration % 128), (iteration * 41) % rows }).rows
+end
+print(string.format('rows=%d point_5000_s=%.6f range_800_s=%.6f checksum=%d found=%d total_s=%.4f', rows, pointSecs, os.clock()-start, sum, found, os.clock()-begin))
+sample('queried')
+db:close()
+sample('closed')
+fs.remove(path)
+fs.remove(path .. '.lock')

@@ -1,0 +1,555 @@
+--!strict
+--!native
+-- Immutable, checksummed row pages with a bounded decoded-page cache.
+-- The format is deliberately separate from the transactional WAL.
+local fs = require('@dream/fs')
+local bytes = require('@dream/bytes')
+local json = require('@jess/json')
+local engine = require('@jessql/engine')
+
+export type Row = { [string]: unknown }
+export type Options = { pageBytes: number?, cachePages: number?, readMode: string? }
+export type Metrics = { pages: number, rows: number, cachedPages: number, pageReads: number }
+export type Snapshot = {
+  columns: { string }, primaryKey: string, count: number, identity: string, keyKind: string,
+  get: (self: Snapshot, key: unknown) -> Row?,
+  iterateRows: (self: Snapshot, columns: { string }?, descending: boolean?,
+    lower: unknown?, upper: unknown?, lowerStrict: boolean?, upperStrict: boolean?) -> () -> Row?,
+  provider: (self: Snapshot) -> engine.Provider,
+  stats: (self: Snapshot) -> Metrics,
+  close: (self: Snapshot) -> (),
+}
+
+type Page = { first: unknown, last: unknown, offset: number, length: number, rows: number, checksum: number }
+type Cached = { keys: { unknown }, offsets: { number }, lengths: { number }, body: string,
+  older: number?, newer: number? }
+type Directory = { version: number, columns: { string }, primaryKey: string, count: number,
+  pages: { Page }, keyKind: string }
+local Magic = 'JQLP2\n'
+local Tail = 'JQPF'
+local DefaultPageBytes = 32768
+local DefaultCachePages = 4
+local MaxRowBytes = 4 * 1024 * 1024
+local MaxFileBytes = 4294967295
+
+local paged = {}
+
+local function scalar(value: unknown): boolean
+  if value == nil then return true end
+  if type(value) == 'string' then return utf8.len(value :: string) ~= nil end
+  if type(value) == 'boolean' then return true end
+  return type(value) == 'number' and value == value and math.abs(value :: number) < math.huge
+end
+
+local function compare(leftValue: unknown, rightValue: unknown): number
+  local left, right = type(leftValue), type(rightValue)
+  local ranks = { boolean = 1, number = 2, string = 3 }
+  if left ~= right then return if (ranks[left] or 9) < (ranks[right] or 9) then -1 else 1 end
+  if leftValue == rightValue then return 0 end
+  if left == 'boolean' then return if leftValue == false then -1 else 1 end
+  if left == 'number' then return if (leftValue :: number) < (rightValue :: number) then -1 else 1 end
+  return if (leftValue :: string) < (rightValue :: string) then -1 else 1
+end
+
+local function word(value: number): string
+  local item = buffer.create(4)
+  buffer.writeu32(item, 0, value)
+  return buffer.tostring(item)
+end
+
+local function numberAt(value: string, offset: number): number
+  if offset < 1 or offset + 3 > #value then error('jessql paged: truncated record', 3) end
+  local b0, b1, b2, b3 = string.byte(value, offset, offset + 3)
+  return b0 + b1 * 256 + b2 * 65536 + b3 * 16777216
+end
+
+-- A numeric snapshot stores keys as JSON objects of the form {"key":<number>}.
+-- Decode that narrow, validated grammar without constructing one JSON table
+-- per key on every cold-page miss. Unrecognized keys use the normal decoder.
+local function numericKey(body: string, first: number, length: number): number?
+  if length < 9 or string.sub(body, first, first + 6) ~= '{"key":'
+    or string.byte(body, first + length - 1) ~= 125 then return nil end
+  local last = first + length - 2
+  local index = first + 7
+  local char = string.byte(body, index)
+  if char == 45 then index += 1; char = string.byte(body, index) end
+
+  if char == 48 then index += 1
+  elseif char ~= nil and char >= 49 and char <= 57 then
+    repeat
+      index += 1
+      char = string.byte(body, index)
+    until char == nil or char < 48 or char > 57
+  else return nil end
+
+  char = string.byte(body, index)
+  if char == 46 then
+    index += 1
+    char = string.byte(body, index)
+    if char == nil or char < 48 or char > 57 then return nil end
+
+    repeat
+      index += 1
+      char = string.byte(body, index)
+    until char == nil or char < 48 or char > 57
+  end
+
+  char = string.byte(body, index)
+  if char == 69 or char == 101 then
+    index += 1
+    char = string.byte(body, index)
+    if char == 43 or char == 45 then index += 1; char = string.byte(body, index) end
+    if char == nil or char < 48 or char > 57 then return nil end
+
+    repeat
+      index += 1
+      char = string.byte(body, index)
+    until char == nil or char < 48 or char > 57
+  end
+
+  if index ~= last + 1 then return nil end
+  local result = tonumber(string.sub(body, first + 7, last))
+  if result == nil or result ~= result or math.abs(result) == math.huge then return nil end
+  return result
+end
+
+-- Most event IDs and Matrix keys are UTF-8 with no JSON escapes. Keep
+-- those byte strings intact; escaped strings still use the full JSON parser.
+local function plainStringKey(body: string, first: number, length: number): string?
+  if length < 10 or string.sub(body, first, first + 7) ~= '{"key":"'
+    or string.sub(body, first + length - 2, first + length - 1) ~= '"}' then return nil end
+  local value = string.sub(body, first + 8, first + length - 3)
+  if string.find(value, '[\\"%c]') or utf8.len(value) == nil then return nil end
+  return value
+end
+
+local function validateColumns(columns: { string }, primaryKey: string)
+  if #columns == 0 or #columns > 256 then error('jessql paged: invalid column list', 3) end
+  local seen: { [string]: boolean } = {}
+  for _, column in columns do
+    if type(column) ~= 'string' or not string.match(column, '^[%a_][%w_]*$') or seen[column] then
+      error('jessql paged: invalid or duplicate column', 3)
+    end
+    seen[column] = true
+  end
+
+  if not seen[primaryKey] then error('jessql paged: primary key missing', 3) end
+end
+
+local function project(row: Row, columns: { string }?): Row
+  if not columns then return row end
+  local result: Row = {}
+  for _, column in columns do result[column] = row[column] end
+  return result
+end
+
+-- Caller provides strictly ascending primary keys. Snapshot construction is
+-- streaming: at most one row page and the sparse directory are in memory.
+function paged.create(path: string, columns: { string }, primaryKey: string,
+  nextRow: () -> Row?, options: Options?)
+  validateColumns(columns, primaryKey)
+  local pageBytes = if options and options.pageBytes then options.pageBytes else DefaultPageBytes
+  if pageBytes < 512 or pageBytes > 1024 * 1024 or pageBytes % 1 ~= 0 then
+    error('jessql paged: invalid page size', 2)
+  end
+  local created, createError = fs.writeFile(path, Magic, { exclusive = true, createParents = true })
+  if created ~= #Magic then error('jessql paged: ' .. tostring(createError), 2) end
+  local writer, openError = fs.openWrite(path, { create = false, append = true })
+  if not writer then
+    fs.remove(path)
+    error('jessql paged: ' .. tostring(openError), 2)
+  end
+
+  local directory: Directory = { version = 2, columns = columns, primaryKey = primaryKey,
+    count = 0, pages = {}, keyKind = 'empty' }
+  local offset = #Magic
+  local parts: { string } = {}
+  local used, rows = 0, 0
+  local first: unknown = nil
+  local last: unknown = nil
+  local previous: unknown = nil
+  local hadPrevious = false
+  local function write(value: string)
+    if offset + #value > MaxFileBytes then error('jessql paged: snapshot exceeds 4 GiB', 2) end
+    local count, failure = writer:write(value)
+    if count ~= #value then error('jessql paged: write failed: ' .. tostring(failure), 2) end
+    offset += #value
+  end
+
+  local function flush()
+    if rows == 0 then return end
+    local body = table.concat(parts)
+    local checksum = bytes.crc32(body)
+    write(word(#body) .. word(checksum) .. body)
+    directory.pages[#directory.pages + 1] = {
+      first = first, last = last, offset = offset - #body - 8, length = #body, rows = rows, checksum = checksum,
+    }
+    parts, used, rows = {}, 0, 0
+    first, last = nil, nil
+  end
+
+  -- Keep snapshot creation atomic on exceptions raised by the row source or filesystem.
+  local ok, failure = pcall(function()
+    while true do
+      local row = nextRow()
+      if not row then break end
+      if type(row) ~= 'table' then error('jessql paged: row must be an object') end
+      local key = row[primaryKey]
+      if key == nil or not scalar(key) then error('jessql paged: invalid key') end
+
+      if directory.keyKind == 'empty' then directory.keyKind = type(key)
+      elseif directory.keyKind ~= type(key) then directory.keyKind = 'mixed' end
+
+      if hadPrevious and compare(previous, key) >= 0 then error('jessql paged: keys not strictly ascending') end
+
+      for column, value in row do
+        if type(column) ~= 'string' then error('jessql paged: invalid column') end
+        if not scalar(value) then error('jessql paged: invalid scalar') end
+        local allowed = false
+        for _, known in columns do
+          if column == known then allowed = true; break end
+        end
+
+        if not allowed then error('jessql paged: unknown column') end
+      end
+      local keyText = json.encodeTable({ key = key })
+      local rowText = json.encodeTable(row)
+      if #rowText > MaxRowBytes then error('jessql paged: row exceeds limit') end
+      local record = word(#keyText) .. word(#rowText) .. keyText .. rowText
+      if rows > 0 and used + #record > pageBytes then flush() end
+      if rows == 0 then first = key end
+      last = key
+      parts[#parts + 1] = record
+      rows += 1
+      used += #record
+      directory.count += 1
+      previous, hadPrevious = key, true
+    end
+    flush()
+    local metadata = json.encodeTable(directory)
+    if #metadata > 16 * 1024 * 1024 then error('jessql paged: directory too large') end
+    write(metadata .. word(#metadata) .. word(bytes.crc32(metadata)) .. Tail)
+  end)
+  local closed, closeFailure = writer:close()
+  if not ok or not closed then
+    fs.remove(path)
+    error('jessql paged: create failed: ' .. tostring(failure or closeFailure), 2)
+  end
+end
+
+function paged.open(path: string, options: Options?): Snapshot
+  local cacheLimit = if options and options.cachePages then options.cachePages else DefaultCachePages
+  if cacheLimit < 1 or cacheLimit > 4096 or cacheLimit % 1 ~= 0 then
+    error('jessql paged: invalid cachePages', 2)
+  end
+  local mode = if options and options.readMode then options.readMode else 'mapped'
+  if mode ~= 'mapped' and mode ~= 'positional' then
+    error('jessql paged: readMode must be mapped or positional', 2)
+  end
+  local reader: dream_fs_Reader? = nil
+  local positional: dream_fs_PositionalReader? = nil
+  local openError: string? = nil
+  if mode == 'positional' then
+    positional, openError = fs.openPositional(path)
+  else
+    reader, openError = fs.open(path)
+  end
+
+  if not reader and not positional then error('jessql paged: ' .. tostring(openError), 2) end
+
+  local function closeReader()
+    if reader then reader:close() end
+    if positional then positional:close() end
+  end
+  local closed = false
+  local function read(offset: number, length: number): string
+    if closed then error('jessql paged: snapshot closed', 3) end
+    local data = if positional then positional:readAt(offset, length)
+      else (reader :: dream_fs_Reader):readAt(offset, length)
+    if not data or buffer.len(data) ~= length then error('jessql paged: short read', 3) end
+    return buffer.tostring(data)
+  end
+  local size: number
+  if positional then
+    local measured, sizeError = positional:size()
+    if not measured then
+      closeReader()
+      error('jessql paged: size: ' .. tostring(sizeError), 2)
+    end
+    size = measured
+  else
+    size = (reader :: dream_fs_Reader):size()
+  end
+  local directoryChecksum = 0
+  -- Close the reader if footer validation or directory parsing raises.
+  local ok, parsed = pcall(function(): Directory
+    if size < #Magic + 12 or read(0, #Magic) ~= Magic then error('jessql paged: invalid header') end
+    local tail = read(size - 12, 12)
+    if string.sub(tail, 9, 12) ~= Tail then error('jessql paged: invalid footer') end
+    local length, checksum = numberAt(tail, 1), numberAt(tail, 5)
+    if length > 16 * 1024 * 1024 or length > size - #Magic - 12 then
+      error('jessql paged: invalid directory length')
+    end
+    local text = read(size - 12 - length, length)
+    if bytes.crc32(text) ~= checksum then error('jessql paged: directory checksum mismatch') end
+    directoryChecksum = checksum
+    local result = json.decode(text) :: Directory
+    if type(result) ~= 'table' or result.version ~= 2 or type(result.pages) ~= 'table'
+      or type(result.columns) ~= 'table' or type(result.count) ~= 'number'
+      or type(result.keyKind) ~= 'string' then
+      error('jessql paged: invalid directory')
+    end
+    validateColumns(result.columns, result.primaryKey)
+    local expected, total = #Magic, 0
+    local previous: unknown = nil
+    for _, page in result.pages do
+      if type(page) ~= 'table' or type(page.offset) ~= 'number'
+        or type(page.length) ~= 'number' or page.length <= 0 or page.rows <= 0
+        or page.offset ~= expected or type(page.checksum) ~= 'number'
+        or not scalar(page.first) or not scalar(page.last)
+        or page.first == nil or page.last == nil or compare(page.first, page.last) > 0
+        or (previous ~= nil and compare(previous, page.first) >= 0) then
+        error('jessql paged: invalid page directory')
+      end
+      expected += 8 + page.length
+      total += page.rows
+      previous = page.last
+    end
+
+    if expected ~= size - 12 - length or total ~= result.count then
+      error('jessql paged: directory does not match file')
+    end
+    return result
+  end)
+
+  if not ok then closeReader(); error(parsed, 2) end
+  local directory = parsed :: Directory
+  local cache: { [number]: Cached } = {}
+  local cacheSize, pageReads = 0, 0
+  local leastRecent: number? = nil
+  local mostRecent: number? = nil
+  local snapshot = {} :: Snapshot
+  snapshot.columns, snapshot.primaryKey, snapshot.count = directory.columns, directory.primaryKey, directory.count
+  snapshot.identity = string.format('%08x:%d', directoryChecksum, size)
+  snapshot.keyKind = directory.keyKind
+
+  local function pageAt(index: number): Cached
+    if closed then error('jessql paged: snapshot closed', 3) end
+    local found = cache[index]
+    if found then
+      -- Move the cache hit to the MRU tail in constant time. Do not scan
+      -- hundreds of cached pages on every miss to find an eviction victim.
+      if mostRecent ~= index then
+        local older, newer = found.older, found.newer
+        if older then (cache[older] :: Cached).newer = newer else leastRecent = newer end
+        if newer then (cache[newer] :: Cached).older = older end
+        found.older, found.newer = mostRecent, nil
+        if mostRecent then (cache[mostRecent] :: Cached).newer = index end
+        mostRecent = index
+      end
+      return found
+    end
+    local page = directory.pages[index]
+    -- The directory already contains the page length: fetch the header and body
+    -- in one positional read instead of issuing two filesystem calls per miss.
+    local frame = read(page.offset, page.length + 8)
+    if numberAt(frame, 1) ~= page.length then error('jessql paged: page length mismatch', 2) end
+    local body = string.sub(frame, 9)
+    if numberAt(frame, 5) ~= page.checksum or page.checksum ~= bytes.crc32(body) then
+      error('jessql paged: page checksum mismatch', 2)
+    end
+    local keys: { unknown } = {}
+    local offsets: { number }, lengths: { number } = {}, {}
+    local offset = 1
+    local previous: unknown = nil
+    while offset <= #body do
+      local keySize, rowSize = numberAt(body, offset), numberAt(body, offset + 4)
+      if keySize == 0 or rowSize == 0 or offset + 7 + keySize + rowSize > #body then
+        error('jessql paged: invalid row lengths', 2)
+      end
+      local keyStart = offset + 8
+      local key: unknown = nil
+      if directory.keyKind == 'number' then key = numericKey(body, keyStart, keySize)
+      elseif directory.keyKind == 'string' then key = plainStringKey(body, keyStart, keySize) end
+
+      if key == nil then
+        local keyObject = json.decode(string.sub(body, keyStart, keyStart + keySize - 1)) :: Row
+        if type(keyObject) ~= 'table' then error('jessql paged: invalid key object', 2) end
+        key = keyObject.key
+      end
+
+      if key == nil or not scalar(key) or (previous ~= nil and compare(previous, key) >= 0) then
+        error('jessql paged: invalid row key ordering', 2)
+      end
+      keys[#keys + 1] = key
+      offsets[#offsets + 1] = offset + 8 + keySize
+      lengths[#lengths + 1] = rowSize
+      previous = key
+      offset += 8 + keySize + rowSize
+    end
+
+    if #keys ~= page.rows or compare(keys[1], page.first) ~= 0
+      or compare(keys[#keys], page.last) ~= 0 then
+      error('jessql paged: page directory mismatch', 2)
+    end
+
+    if cacheSize >= cacheLimit then
+      local victim = leastRecent :: number
+      local nextOldest = (cache[victim] :: Cached).newer
+      cache[victim] = nil
+      leastRecent = nextOldest
+      if nextOldest then (cache[nextOldest] :: Cached).older = nil else mostRecent = nil end
+      cacheSize -= 1
+    end
+
+    local item: Cached = { keys = keys, offsets = offsets, lengths = lengths,
+      body = body, older = mostRecent, newer = nil }
+    cache[index] = item
+    if mostRecent then (cache[mostRecent] :: Cached).newer = index
+    else leastRecent = index end
+    mostRecent = index
+    cacheSize += 1
+    pageReads += 1
+    return item
+  end
+
+  local function rowAt(page: Cached, position: number, columns: { string }?): Row
+    local start = page.offsets[position]
+    local row = json.decode(string.sub(page.body, start, start + page.lengths[position] - 1)) :: Row
+    if type(row) ~= 'table' or row[snapshot.primaryKey] ~= page.keys[position] then
+      error('jessql paged: row/key mismatch', 2)
+    end
+    return project(row, columns)
+  end
+
+  function snapshot.get(_self: Snapshot, key: unknown): Row?
+    if key == nil or not scalar(key) then return nil end
+    local low, high = 1, #directory.pages
+    while low <= high do
+      local middle = math.floor((low + high) / 2)
+      local item = directory.pages[middle]
+      if compare(key, item.first) < 0 then high = middle - 1
+      elseif compare(key, item.last) > 0 then low = middle + 1
+      else
+        local page = pageAt(middle)
+        local left, right = 1, #page.keys
+        while left <= right do
+          local position = math.floor((left + right) / 2)
+          local comparison = compare(key, page.keys[position])
+          if comparison == 0 then return rowAt(page, position, nil) end
+          if comparison < 0 then right = position - 1 else left = position + 1 end
+        end
+        return nil
+      end
+    end
+    return nil
+  end
+
+  function snapshot.iterateRows(_self: Snapshot, columns: { string }?, descending: boolean?,
+    lower: unknown?, upper: unknown?, lowerStrict: boolean?, upperStrict: boolean?): () -> Row?
+    local backwards = descending == true
+    local pages = directory.pages
+    local pageNumber = if backwards then #pages else 1
+    local step = if backwards then -1 else 1
+    local index = if backwards then math.huge else 0
+
+    -- Seek directly into the relevant page when an ordered bound is available.
+    if backwards and upper ~= nil then
+      local low, high = 1, #pages
+      while low <= high do
+        local middle = math.floor((low + high) / 2)
+        if compare(pages[middle].first, upper) <= 0 then
+          pageNumber = middle
+          low = middle + 1
+        else high = middle - 1 end
+      end
+
+      if high == 0 then pageNumber = 0 end
+    elseif not backwards and lower ~= nil then
+      local low, high = 1, #pages
+      pageNumber = #pages + 1
+      while low <= high do
+        local middle = math.floor((low + high) / 2)
+        if compare(pages[middle].last, lower) >= 0 then
+          pageNumber = middle
+          high = middle - 1
+        else low = middle + 1 end
+      end
+    end
+
+    return function(): Row?
+      if closed then error('jessql paged: snapshot closed', 2) end
+
+      while pageNumber >= 1 and pageNumber <= #pages do
+        local page = pageAt(pageNumber)
+        if backwards and index == math.huge then index = #page.keys + 1 end
+        index += step
+        if index < 1 or index > #page.keys then
+          pageNumber += step
+          index = if backwards then math.huge else 0
+          continue
+        end
+        local key = page.keys[index]
+        if lower ~= nil then
+          local comparison = compare(key, lower)
+          if comparison < 0 or (comparison == 0 and lowerStrict == true) then
+            if backwards then return nil end
+            continue
+          end
+        end
+
+        if upper ~= nil then
+          local comparison = compare(key, upper)
+          if comparison > 0 or (comparison == 0 and upperStrict == true) then
+            if not backwards then return nil end
+            continue
+          end
+        end
+        return rowAt(page, index, columns)
+      end
+      return nil
+    end
+  end
+
+  function snapshot.provider(self: Snapshot): engine.Provider
+    return {
+      columns = self.columns,
+      indexes = { [self.primaryKey] = true },
+      count = function() return self.count end,
+      lookup = function(column, key, request)
+        if column ~= self.primaryKey then return nil end
+        local row = self:get(key)
+        return if row then { project(row, request.columns) } else {}
+      end,
+      scan = function(request)
+        local rows: { Row } = {}
+        local nextRow = self:iterateRows(request.columns)
+        while true do
+          local row = nextRow()
+          if not row then break end
+          rows[#rows + 1] = row
+        end
+        return rows
+      end,
+      iterate = function(request): engine.Iterator
+        local nextRow = self:iterateRows(request.columns)
+        return { _jessqlIter = 'v1', next = nextRow }
+      end,
+    }
+  end
+
+  function snapshot.stats(_self: Snapshot): Metrics
+    if closed then error('jessql paged: snapshot closed', 2) end
+    return { pages = #directory.pages, rows = directory.count, cachedPages = cacheSize, pageReads = pageReads }
+  end
+
+  function snapshot.close(_self: Snapshot)
+    if closed then return end
+    closed = true
+    cache = {}
+    closeReader()
+  end
+  return snapshot
+end
+
+return paged

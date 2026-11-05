@@ -1,0 +1,385 @@
+--!strict
+local sql = require('@jessql')
+local managed = require('@jessql/managed')
+local fs = require('@dream/fs')
+local test = require('@jess/test')
+local expect = test.expect
+local suite = test.new()
+
+local function fixture(label: string): string
+  local cwd = fs.cwd() :: string
+  return fs.join(cwd, '.jessql-hot-budget-' .. label)
+end
+
+local function cleanup(base: string)
+  -- The managed runtime owns epoch retirement. Remove only our test fixtures.
+  for epoch = 1, 15 do
+    local prefix = base .. string.format('.g%08d', epoch)
+    for _, extension in { '.rows', '.deleted', '.wal', '.wal.lock', '.hot-rows', '.hot-deleted' } do
+      fs.remove(prefix .. extension)
+    end
+  end
+
+  for _, extension in { '.jql-lock', '.jql-manifest', '.jql-manifest.tmp' } do
+    fs.remove(base .. extension)
+  end
+  fs.remove(base)
+  fs.remove(base .. '.lock')
+end
+
+local function newManaged(base: string, options: managed.Options?)
+  return sql.managed.open(base, {
+    tableName = 'events', columns = { 'id', 'room', 'body' }, primaryKey = 'id',
+    maxHotBytes = if options then options.maxHotBytes else nil,
+    maxWalBytes = if options then options.maxWalBytes else nil,
+    maxGenerations = if options then options.maxGenerations else nil,
+    compactionFanIn = if options then options.compactionFanIn else nil,
+    testHook = if options then options.testHook else nil,
+  })
+end
+
+suite.describe('transactional hot payload accounting', function()
+  for _, layout in { 'row', 'packed' } do
+    suite.it('tracks upserts, transaction-local overwrites, nulls, and WAL recovery: ' .. layout, function()
+      local path = fixture('overlay-' .. layout .. '.wal')
+      cleanup(path)
+      local db = sql.open(path, { rowLayout = layout, trackPayloadBytes = true })
+      db:createTable('t', { 'id', 'value', 'flag' }, 'id')
+      expect(db:tableFootprint('t').payloadBytes).toBe(0)
+      db:transaction(function(tx)
+        tx:upsert('t', { id = 'a', value = 'first', flag = true })
+        tx:upsert('t', { id = 'a', value = 'x', flag = false })
+        tx:upsert('t', { id = 'b', value = 42 })
+      end)
+      -- a: 1 + 1 + 1; b: 1 + 8 = 12 logical scalar bytes.
+      expect(db:tableFootprint('t').rows).toBe(2)
+      expect(db:tableFootprint('t').payloadBytes).toBe(12)
+      db:update('t', 'b', { value = 'longer' }, { 'flag' })
+      expect(db:tableFootprint('t').payloadBytes).toBe(10)
+      db:delete('t', 'a')
+      expect(db:tableFootprint('t').payloadBytes).toBe(7)
+      db:insert('t', { id = 'c', value = 'ü' })
+      expect(db:tableFootprint('t').payloadBytes).toBe(10)
+      -- Failed callbacks must not perturb counters or WAL state.
+      expect((pcall(function()
+        db:transaction(function(tx)
+          tx:upsert('t', { id = 'c', value = string.rep('x', 400) })
+          error('abort transaction')
+        end)
+      end))).toBe(false)
+      expect(db:tableFootprint('t').payloadBytes).toBe(10)
+      db:close()
+      local reopened = sql.open(path, { rowLayout = layout, trackPayloadBytes = true })
+      expect(reopened:tableFootprint('t').rows).toBe(2)
+      expect(reopened:tableFootprint('t').payloadBytes).toBe(10)
+      expect(reopened:stats().t.payloadBytes).toBe(10)
+      reopened:close()
+      cleanup(path)
+    end)
+  end
+
+  for _, layout in { 'row', 'packed' } do
+    suite.it('matches a deterministic mutation model across restarts: ' .. layout, function()
+      local path = fixture('model-' .. layout .. '.wal')
+      cleanup(path)
+      local db = sql.open(path, { rowLayout = layout, trackPayloadBytes = true })
+      db:createTable('t', { 'id', 'value', 'enabled' }, 'id')
+      local model: { [number]: { [string]: unknown } } = {}
+      for batch = 1, 12 do
+        db:transaction(function(tx)
+          for index = 1, 11 do
+            local key = (batch * 13 + index * 7) % 29 + 1
+            if index % 4 == 0 then
+              tx:delete('t', key)
+              model[key] = nil
+            else
+              local row: { [string]: unknown } = { id = key,
+                value = string.rep('q', (batch * index) % 41),
+                enabled = if index % 3 == 0 then true else nil }
+              tx:upsert('t', row)
+              model[key] = row
+            end
+          end
+        end)
+        local expectedCount, expectedBytes = 0, 0
+        for _, row in model do
+          expectedCount += 1
+          expectedBytes += 8 + #(row.value :: string)
+          if row.enabled ~= nil then expectedBytes += 1 end
+        end
+        expect(db:tableFootprint('t').rows).toBe(expectedCount)
+        expect(db:tableFootprint('t').payloadBytes).toBe(expectedBytes)
+        if batch % 3 == 0 then
+          db:close()
+          db = sql.open(path, { rowLayout = layout, trackPayloadBytes = true })
+          expect(db:tableFootprint('t').payloadBytes).toBe(expectedBytes)
+        end
+      end
+      db:close()
+      cleanup(path)
+    end)
+  end
+
+  suite.it('leaves byte accounting disabled for unconfigured databases', function()
+    local base = fixture('disabled')
+    cleanup(base)
+    local db = newManaged(base)
+    db:insert({ id = 1, room = 'r', body = 'unmetered' })
+    expect(db:stats().hotRows).toBe(1)
+    expect(db:stats().hotPayloadBytes).toBe(nil)
+    db:close()
+    cleanup(base)
+  end)
+
+  suite.it('flushes on a byte watermark, including after a single oversized transaction', function()
+    local base = fixture('bytes')
+    cleanup(base)
+    local db = newManaged(base, { maxHotBytes = 100, maxGenerations = 4 })
+    db:insert({ id = 1, room = 'r', body = string.rep('x', 50) })
+    expect(db:stats().epoch).toBe(1)
+    expect(db:stats().hotPayloadBytes).toBe(59)
+    db:transaction(function(tx)
+      tx:insert({ id = 2, room = 'r', body = string.rep('y', 300) })
+      tx:insert({ id = 3, room = 'r', body = 'third' })
+    end)
+    -- The transaction is atomic; the post-ack maintenance is not permitted
+    -- to fail it or split its rows into separate WAL commits.
+    expect(db:stats().epoch).toBe(2)
+    expect(db:stats().hotPayloadBytes).toBe(0)
+    expect((assert(db:get(2))).body).toBe(string.rep('y', 300))
+    db:close()
+    local reopened = sql.managed.open(base, { maxHotBytes = 100 })
+    expect(reopened:stats().hotPayloadBytes).toBe(0)
+    expect((assert(reopened:get(3))).body).toBe('third')
+    reopened:close()
+    cleanup(base)
+  end)
+
+  suite.it('counts cold tombstone payloads and clears them on flush', function()
+    local base = fixture('tombstone')
+    cleanup(base)
+    local db = newManaged(base, { maxHotBytes = 1000 })
+    db:insert({ id = 7, room = 'a', body = 'old' })
+    db:flush()
+    db:delete(7)
+    expect(db:stats().hotRows).toBe(0)
+    expect(db:stats().tombstones).toBe(1)
+    -- encoded numeric primary key 'n7' in tombstone id column.
+    expect(db:stats().hotPayloadBytes).toBe(2)
+    db:flush()
+    expect(db:stats().hotPayloadBytes).toBe(0)
+    expect(db:get(7)).toBe(nil)
+    db:close()
+    cleanup(base)
+  end)
+
+  suite.it('fails closed on subsequent writes when byte-budget maintenance fails', function()
+    local base = fixture('backpressure')
+    cleanup(base)
+    local inject = true
+    local db = newManaged(base, { maxHotBytes = 20,
+      testHook = function(stage: string)
+        if inject and stage == 'candidate-sealed' then error('induced disk failure') end
+      end })
+    -- WAL commit already succeeded before export errors. Never report that
+    -- write as failed, and do not silently grow the hot overlay forever.
+    db:insert({ id = 1, room = 'r', body = string.rep('a', 30) })
+    expect(db:stats().hotPayloadBytes).toBe(39)
+    expect(db:maintenanceStatus().lastError ~= nil).toBe(true)
+    expect((assert(db:get(1))).body).toBe(string.rep('a', 30))
+    -- The configured maintenance watermark deliberately rejects this insert.
+    expect((pcall(function()
+      db:insert({ id = 2, room = 'r', body = 'blocked' })
+    end))).toBe(false)
+    expect(db:get(2)).toBe(nil)
+    inject = false
+    expect(db:flush()).toBe(2)
+    expect(db:maintenanceStatus().lastError).toBe(nil)
+    db:insert({ id = 2, room = 'r', body = 'works' })
+    expect((assert(db:get(2))).body).toBe('works')
+    db:close()
+    local reopened = sql.managed.open(base, { maxHotBytes = 20 })
+    expect((assert(reopened:get(1))).body).toBe(string.rep('a', 30))
+    expect((assert(reopened:get(2))).body).toBe('works')
+    reopened:close()
+    cleanup(base)
+  end)
+
+  suite.it('restores byte-budget backpressure after recovering an oversized WAL', function()
+    local base = fixture('recovered-pressure')
+    cleanup(base)
+    local inject = false
+    local db = newManaged(base, { maxHotBytes = 16,
+      testHook = function(stage: string)
+        if inject and stage == 'before-replace' then error('injected failed cutover') end
+      end })
+    inject = true
+    db:insert({ id = 1, room = 'r', body = string.rep('k', 24) })
+    expect(db:maintenanceStatus().lastError ~= nil).toBe(true)
+    db:close()
+    local reopened = sql.managed.open(base, { maxHotBytes = 16 })
+    expect(reopened:maintenanceStatus().lastError ~= nil).toBe(true)
+    expect((assert(reopened:get(1))).body).toBe(string.rep('k', 24))
+    -- Reopening a failed maintenance operation cannot bypass write backpressure.
+    expect((pcall(function()
+      reopened:insert({ id = 2, room = 'r', body = 'unsafe' })
+    end))).toBe(false)
+    expect(reopened:flush()).toBe(2)
+    expect(reopened:maintenanceStatus().lastError).toBe(nil)
+    reopened:insert({ id = 2, room = 'r', body = 'safe' })
+    reopened:close()
+    cleanup(base)
+  end)
+
+  suite.it('automatically compacts under repeated byte-budget pressure', function()
+    local base = fixture('compaction-pressure')
+    cleanup(base)
+    local db = newManaged(base, { maxHotBytes = 16, maxGenerations = 2,
+      compactionFanIn = 2 })
+
+    for key = 1, 12 do
+      db:upsert({ id = key, room = 'r', body = string.rep('a', 32) })
+      expect(db:stats().hotPayloadBytes).toBe(0)
+      expect(db:stats().generations <= 2).toBe(true)
+      expect(db:maintenanceStatus().lastError).toBe(nil)
+    end
+    db:close()
+    local reopened = sql.managed.open(base, { maxHotBytes = 16, maxGenerations = 2,
+      compactionFanIn = 2 })
+
+    for key = 1, 12 do
+      expect((assert(reopened:get(key))).body).toBe(string.rep('a', 32))
+    end
+    reopened:close()
+    cleanup(base)
+  end)
+
+  suite.it('rejects invalid hot byte limits before acquiring an exclusive lock', function()
+    local base = fixture('invalid')
+    cleanup(base)
+    for _, invalid in { 0, -1, 1.5, 1000000000001, math.huge } do
+      -- Invalid options must be rejected without leaving a locked database.
+      expect((pcall(function() newManaged(base, { maxHotBytes = invalid }) end))).toBe(false)
+    end
+    local db = newManaged(base, { maxHotBytes = 64 })
+    db:close()
+    cleanup(base)
+  end)
+
+  suite.it('rotates a churned WAL when live-row and payload budgets stay small', function()
+    local base = fixture('wal-churn')
+    cleanup(base)
+    local db = newManaged(base, { maxHotBytes = 2048, maxWalBytes = 2048, maxGenerations = 5 })
+    db:insert({ id = 1, room = 'r', body = 'one' })
+    for index = 1, 90 do
+      db:upsert({ id = 1, room = 'r', body = if index % 2 == 0 then 'even' else 'odd' })
+    end
+    local stats = db:stats()
+    expect(stats.epoch > 1).toBe(true)
+    expect(stats.hotRows <= 1).toBe(true)
+    expect((stats.hotPayloadBytes :: number) < 100).toBe(true)
+    expect((stats.walBytes :: number) < 2048).toBe(true)
+    expect((assert(db:get(1))).body).toBe('even')
+    db:close()
+    local reopened = sql.managed.open(base, { maxWalBytes = 2048, maxHotBytes = 2048 })
+    expect((assert(reopened:get(1))).body).toBe('even')
+    expect((reopened:stats().walBytes :: number) < 2048).toBe(true)
+    reopened:close()
+    cleanup(base)
+  end)
+
+  suite.it('rotates an oversized WAL even when the hot overlay is empty', function()
+    local base = fixture('wal-empty-hot')
+    cleanup(base)
+    local db = newManaged(base, { maxWalBytes = 2048 })
+    for _ = 1, 45 do
+      db:insert({ id = 1, room = 'r', body = 'temporary' })
+      db:delete(1)
+    end
+    expect(db:stats().epoch > 1).toBe(true)
+    expect(db:stats().hotRows).toBe(0)
+    expect((db:stats().walBytes :: number) < 2048).toBe(true)
+    db:close()
+    local reopened = sql.managed.open(base, { maxWalBytes = 2048 })
+    expect(reopened:get(1)).toBe(nil)
+    reopened:close()
+    cleanup(base)
+  end)
+
+  suite.it('restores WAL-budget backpressure after failed maintenance and restart', function()
+    local base = fixture('wal-failure')
+    cleanup(base)
+    local inject = true
+    local db = newManaged(base, { maxWalBytes = 2048,
+      testHook = function(stage: string)
+        if inject and stage == 'candidate-sealed' then error('injected sealing fault') end
+      end })
+    db:insert({ id = 1, room = 'r', body = string.rep('w', 2400) })
+    expect(db:maintenanceStatus().lastError ~= nil).toBe(true)
+    expect((assert(db:get(1))).body).toBe(string.rep('w', 2400))
+    -- This write is intentionally rejected under unresolved WAL pressure.
+    expect((pcall(function()
+      db:insert({ id = 2, room = 'r', body = 'blocked' })
+    end))).toBe(false)
+    db:close()
+    local reopened = sql.managed.open(base, { maxWalBytes = 2048 })
+    expect(reopened:maintenanceStatus().lastError ~= nil).toBe(true)
+    expect((assert(reopened:get(1))).body).toBe(string.rep('w', 2400))
+    -- Reopening must not bypass failed maintenance admission control.
+    expect((pcall(function()
+      reopened:insert({ id = 2, room = 'r', body = 'blocked' })
+    end))).toBe(false)
+    inject = false
+    expect(reopened:flush()).toBe(2)
+    expect(reopened:maintenanceStatus().lastError).toBe(nil)
+    reopened:insert({ id = 2, room = 'r', body = 'safe' })
+    reopened:close()
+    cleanup(base)
+  end)
+
+  suite.it('rejects invalid WAL budgets before creating database files', function()
+    local base = fixture('invalid-wal-budget')
+    cleanup(base)
+    for _, threshold in { -1, 0, 1023, 1.5, 1000000000001 } do
+      -- Invalid budgets are supposed to reject before touching any files.
+      expect((pcall(function()
+        newManaged(base, { maxWalBytes = threshold })
+      end))).toBe(false)
+      expect((fs.exists(base .. '.jql-manifest'))).toBe(false)
+    end
+    cleanup(base)
+  end)
+
+  suite.it('restores row-budget admission after an unsuccessful maintenance cutover', function()
+    local base = fixture('row-failure')
+    cleanup(base)
+    local db = sql.managed.open(base, {
+      tableName = 'events', columns = { 'id', 'room', 'body' }, primaryKey = 'id', maxHotRows = 1,
+      testHook = function(stage: string)
+        if stage == 'candidate-sealed' then error('injected row maintenance fault') end
+      end,
+    })
+    db:insert({ id = 1, room = 'r', body = 'committed' })
+    expect(db:maintenanceStatus().lastError ~= nil).toBe(true)
+    -- A committed write survives failed maintenance, but later writes are fenced.
+    expect((pcall(function()
+      db:insert({ id = 2, room = 'r', body = 'blocked' })
+    end))).toBe(false)
+    db:close()
+    local reopened = sql.managed.open(base, { maxHotRows = 1 })
+    expect((assert(reopened:get(1))).body).toBe('committed')
+    expect(reopened:maintenanceStatus().lastError ~= nil).toBe(true)
+    -- Restart must not bypass row-budget pressure.
+    expect((pcall(function()
+      reopened:insert({ id = 2, room = 'r', body = 'blocked' })
+    end))).toBe(false)
+    expect(reopened:flush()).toBe(2)
+    expect(reopened:maintenanceStatus().lastError).toBe(nil)
+    reopened:insert({ id = 2, room = 'r', body = 'new' })
+    reopened:close()
+    cleanup(base)
+  end)
+
+end)
+
+return suite

@@ -1,0 +1,44 @@
+--!strict
+-- Compare allocating compatibility nodes against the internal pair cursor.
+-- Run: jess run --trusted --package . bench/ordered-pairs.jsl 40000
+local ordered = require('@jessql/ordered')
+local count = tonumber((...)) or 40000
+assert(count > 0 and count <= 300000)
+local tree: ordered.Tree? = nil
+for value = 1, count do
+  tree = ordered.insert(tree, value, 'k' .. tostring(value))
+end
+
+local function legacy(): (number, number)
+  local started = os.clock()
+  local checksum = 0
+  for _ = 1, 8 do
+    local advance = ordered.iterate(tree, false, nil, false, nil, false)
+    while true do
+      local node = advance()
+      if not node then break end
+      checksum += node.value :: number
+    end
+  end
+  return os.clock() - started, checksum
+end
+
+local function pairs(): (number, number)
+  local started = os.clock()
+  local checksum = 0
+  for _ = 1, 8 do
+    local advance = ordered.iteratePairs(tree, false, nil, false, nil, false)
+    while true do
+      local value = advance()
+      if value == nil then break end
+      checksum += value :: number
+    end
+  end
+  return os.clock() - started, checksum
+end
+
+local oldTime, oldChecksum = legacy()
+local pairTime, pairChecksum = pairs()
+assert(oldChecksum == pairChecksum)
+print(string.format('nodes=%d passes=8 legacy_s=%.5f pairs_s=%.5f checksum=%.0f',
+  count, oldTime, pairTime, oldChecksum))

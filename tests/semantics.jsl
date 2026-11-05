@@ -1,3 +1,4 @@
+--!strict
 -- What ORDER BY, WHERE and the aggregates answer, each compared with a plain loop over the same
 -- rows: NULLs, infinities, both zeros, strings, values that do not compare, and every provider
 -- shape the engine reads rows through.
@@ -13,7 +14,11 @@ local Columns = { 'id', 'score', 'rank', 'bucket', 'name', 'label', 'mixed', 'ex
 
 -- `score` and `name` are different in every row; `rank` and `label` repeat and are NULL in some;
 -- `mixed` is a number in one row and a string in the next; `extreme` is NULL in every seventh.
-local Things = {}
+type Thing = {[string]: unknown, id: number, score: number, rank: number?, bucket: number, name: string, label: string?, mixed: number | string, extreme: number?}
+type Owner = {[string]: unknown, thing: number, owner: string, weight: number}
+type BigRow = {[string]: unknown, id: number, value: number, score: number, gap: number?, tier: number, late: (number | string)?}
+
+local Things: {Thing} = {}
 
 for id = 1, Count do
   Things[id] = {
@@ -28,7 +33,7 @@ for id = 1, Count do
   }
 end
 
-local Owners = {}
+local Owners: {Owner} = {}
 
 for id = 1, 60 do
   Owners[id] = { thing = id * 3, owner = `o{id % 9}`, weight = (id * 5) % 13 }
@@ -36,13 +41,13 @@ end
 
 --- A provider that hands `rows` over one at a time, through one reused row when `volatile` and
 --- the engine allows it.
-local function streamed(rows, columns, volatile)
+local function streamed(rows: sql.SourceRows, columns: {string}, volatile: boolean): sql.Provider
   return {
     columns = columns,
-    iterate = function(request)
+    iterate = function(request: sql.Request): sql.Iterator
       local position = 0
       local reuse = volatile and request.allowVolatileRows == true
-      local reused = {}
+      local reused: sql.Row = {}
 
       return {
         _jessqlIter = 'v1',
@@ -76,21 +81,23 @@ local function database()
   return db
 end
 
-local function column(name)
-  return function(row) return row[name] end
+local function column(name: string): (sql.SourceRow) -> unknown
+  return function(row: sql.SourceRow): unknown return row[name] end
 end
+
+type SortKey = {read: (sql.SourceRow) -> unknown, desc: boolean}
 
 --- Whether `left` goes before `right` under ORDER BY `keys`: NULL before every value, and after
 --- every value under DESC.
-local function before(keys, left, right)
+local function before(keys: {SortKey}, left: sql.SourceRow, right: sql.SourceRow): boolean
   for _, key in keys do
     local leftKey, rightKey = key.read(left), key.read(right)
     if leftKey == rightKey then continue end
     if leftKey == nil then return not key.desc end
     if rightKey == nil then return key.desc end
-    if key.desc then return leftKey > rightKey end
+    if key.desc then return (leftKey :: number) > (rightKey :: number) end
 
-    return leftKey < rightKey
+    return (leftKey :: number) < (rightKey :: number)
   end
 
   return false
@@ -98,15 +105,15 @@ end
 
 --- The `rows` that `keep` accepts, ordered by `keys` with an insertion sort: rows whose keys are
 --- all equal stay in the order they came in.
-local function reference(rows, keep, keys)
-  local out = {}
+local function reference<T>(rows: {T}, keep: ((T) -> boolean)?, keys: {SortKey}?): {T}
+  local out: {T} = {}
 
   for _, row in rows do
     if keep and not keep(row) then continue end
 
     local position = #out + 1
 
-    while keys and position > 1 and before(keys, row, out[position - 1]) do
+    while keys and position > 1 and before(keys, row :: sql.SourceRow, out[position - 1] :: sql.SourceRow) do
       position -= 1
     end
 
@@ -117,11 +124,11 @@ local function reference(rows, keep, keys)
 end
 
 --- `rows` as a query selecting `names` returns them.
-local function project(rows, names, skip, count)
-  local out = {}
+local function project(rows: sql.SourceRows, names: {string}, skip: number?, count: number?): {sql.Row}
+  local out: {sql.Row} = {}
 
   for position = (skip or 0) + 1, math.min(#rows, (skip or 0) + (count or #rows)) do
-    local result = {}
+    local result: sql.Row = {}
 
     for _, name in names do
       result[name] = rows[position][name]
@@ -133,18 +140,18 @@ local function project(rows, names, skip, count)
   return out
 end
 
-local function ascending(name) return { read = column(name), desc = false } end
+local function ascending(name: string): SortKey return { read = column(name), desc = false } end
 
-local function descending(name) return { read = column(name), desc = true } end
+local function descending(name: string): SortKey return { read = column(name), desc = true } end
 
 --- The first `keep` of `rows` under `keys`, as a heap that holds `keep` rows gives them: a row is
 --- taken while there is room, and after that when it goes before the last row held, whose place
 --- it takes. Which of several rows with equal keys are held, and in what order, is what the heap
 --- and the sort of what it holds make of them.
-local function bounded(rows, keys, keep)
-  local heap = {}
+local function bounded<T>(rows: {T}, keys: {SortKey}, keep: number): {T}
+  local heap: {T} = {}
 
-  local function goesBefore(left, right) return before(keys, left, right) end
+  local function goesBefore(left: T, right: T) return before(keys, left :: sql.SourceRow, right :: sql.SourceRow) end
 
   local function siftUp(index)
     while index > 1 do
@@ -240,8 +247,8 @@ suite.describe('ORDER BY', function()
 
   suite.it('orders by an expression, and by a SELECT alias', function()
     local db = database()
-    local negated = { read = function(row) return row.score * -1 end, desc = false }
-    local remainder = { read = function(row) return row.id % 7 end, desc = true }
+    local negated: SortKey = { read = function(row: sql.SourceRow) return (row.score :: number) * -1 end, desc = false }
+    local remainder: SortKey = { read = function(row: sql.SourceRow) return (row.id :: number) % 7 end, desc = true }
     local byRemainder = reference(Things, nil, { remainder, ascending 'id' })
     local aliased = {}
 
@@ -257,7 +264,7 @@ suite.describe('ORDER BY', function()
     local db = database()
     local byScore = reference(Things, nil, { ascending 'score' })
     local byRank = reference(Things, nil, { descending 'rank', ascending 'score' })
-    local byBucket = reference(Things, function(row) return row.rank ~= nil and row.rank >= 3 end, { ascending 'bucket', descending 'score' })
+    local byBucket = reference(Things, function(row: Thing) return row.rank ~= nil and row.rank >= 3 end, { ascending 'bucket', descending 'score' })
     local pages = { { 7, 0 }, { 7, 13 }, { 1, 0 }, { 50, 20 }, { 50, 220 }, { 500, 0 }, { 0, 3 }, { 240, 0 } }
 
     for _, source in { 'things', 'stream', 'volatile' } do
@@ -286,13 +293,13 @@ suite.describe('ORDER BY', function()
       expect(#rows).toBe(Count)
 
       for position, row in rows do
-        total += row.id
+        total += row.id :: number
         expect(seen[row.id]).toBeNil()
         seen[row.id] = true
         if position == 1 then continue end
 
         local previous = rows[position - 1].bucket
-        expect(if downwards then previous >= row.bucket else previous <= row.bucket).toBe(true)
+        expect(if downwards then (previous :: number) >= (row.bucket :: number) else (previous :: number) <= (row.bucket :: number)).toBe(true)
       end
 
       expect(total).toBe(Count * (Count + 1) / 2)
@@ -319,7 +326,8 @@ suite.describe('ORDER BY', function()
 
   suite.it('orders many rows by keys that repeat, down to a key that does not, with LIMIT and without', function()
     local db = sql.new()
-    local rows, columns = {}, { 'id', 'value', 'score', 'gap', 'tier', 'late' }
+    local rows: {BigRow} = {}
+    local columns = { 'id', 'value', 'score', 'gap', 'tier', 'late' }
 
     for id = 1, 6000 do
       rows[id] = {
@@ -337,14 +345,17 @@ suite.describe('ORDER BY', function()
     db:register('volatile', streamed(rows, columns, true))
 
     --- The rows `keep` accepts in the order `keys` and then `id` give.
-    local function ordered(keep, keys)
-      local out = [for row in rows if not keep or keep(row) => row]
+    local function ordered(keep: ((BigRow) -> boolean)?, keys: {SortKey}): {BigRow}
+      local out: {BigRow} = {}
+      for _, row in rows do
+        if not keep or (keep :: (BigRow) -> boolean)(row) then out[#out + 1] = row end
+      end
       table.insert(keys, ascending 'id')
       table.sort(out, function(left, right) return before(keys, left, right) end)
       return out
     end
 
-    local cases = {
+    local cases: {{unknown}} = {
       { 'ORDER BY value, id LIMIT 10', ordered(nil, { ascending 'value' }), 0, 10 },
       { 'ORDER BY value DESC, id LIMIT 10 OFFSET 990', ordered(nil, { descending 'value' }), 990, 10 },
       { 'ORDER BY gap, value DESC, id LIMIT 25', ordered(nil, { ascending 'gap', descending 'value' }), 0, 25 },
@@ -362,11 +373,17 @@ suite.describe('ORDER BY', function()
 
     for _, source in { 'big', 'stream', 'volatile' } do
       for _, case in cases do
-        expect({ case[1], db:query(`SELECT id FROM {source} {case[1]}`).rows }).toEqual { case[1], project(case[2], { 'id' }, case[3], case[4]) }
+        local tail = case[1] :: string
+        local expectedRows = case[2] :: sql.SourceRows
+        local offset, limit = case[3] :: number, case[4] :: number
+        expect({ tail, db:query(`SELECT id FROM {source} {tail}`).rows }).toEqual {
+          tail, project(expectedRows, { 'id' }, offset, limit),
+        }
       end
     end
 
-    local groups, byValue = {}, {}
+    local groups: {{[string]:unknown, value:number, found:number}} = {}
+    local byValue: {[number]: {[string]:unknown, value:number, found:number}} = {}
 
     for _, row in rows do
       local group = byValue[row.value]
@@ -381,9 +398,9 @@ suite.describe('ORDER BY', function()
     end
 
     table.sort(groups, function(left, right)
-      if left.found ~= right.found then return left.found > right.found end
+      if left.found ~= right.found then return (left.found :: number) > (right.found :: number) end
 
-      return left.value < right.value
+      return (left.value :: number) < (right.value :: number)
     end)
 
     local text = 'SELECT value, COUNT(*) AS found FROM %s GROUP BY value ORDER BY found DESC, value'
@@ -413,7 +430,7 @@ suite.describe('ORDER BY', function()
     db:register('stream', streamed(rows, columns, false))
     db:register('volatile', streamed(rows, columns, true))
 
-    local orderings = {
+    local orderings: {{unknown}} = {
       { 'bucket', { ascending 'bucket' } },
       { 'bucket DESC', { descending 'bucket' } },
       { 'gap', { ascending 'gap' } },
@@ -431,7 +448,7 @@ suite.describe('ORDER BY', function()
     local filtered = [for row in rows if row.bucket < 9 => row]
 
     for _, ordering in orderings do
-      local text, keys = ordering[1], ordering[2]
+      local text, keys = ordering[1] :: string, ordering[2] :: {SortKey}
 
       local function goesBefore(left, right) return before(keys, left, right) end
 
@@ -464,7 +481,8 @@ suite.describe('ORDER BY', function()
       end
     end
 
-    local groups, byGap = {}, {}
+    local groups: {{[string]:unknown, bucket:number, gap:number?, found:number, least:number}} = {}
+    local byGap: {[string]: {[string]:unknown, bucket:number, gap:number?, found:number, least:number}} = {}
 
     for _, row in rows do
       local key = `{row.bucket}:{row.gap}`
@@ -479,8 +497,13 @@ suite.describe('ORDER BY', function()
       group.found += 1
     end
 
-    for _, ordering in { { 'found', { ascending 'found' } }, { 'found DESC', { descending 'found' } }, { 'gap, found DESC', { ascending 'gap', descending 'found' } } } do
-      local text, keys = ordering[1], ordering[2]
+    local groupedOrderings: {{unknown}} = {
+      { 'found', { ascending 'found' } }, { 'found DESC', { descending 'found' } },
+      { 'gap, found DESC', { ascending 'gap', descending 'found' } },
+    }
+
+    for _, ordering in groupedOrderings do
+      local text, keys = ordering[1] :: string, ordering[2] :: {SortKey}
       local sorted = table.clone(groups)
       table.sort(sorted, function(left, right) return before(keys, left, right) end)
 
@@ -517,11 +540,14 @@ suite.describe('ORDER BY', function()
 
   suite.it('orders joined rows by keys from either side', function()
     local db = database()
-    local joined = {}
+    local joined: {{[string]: unknown, id: number, score: number, owner: string, weight: number}} = {}
 
     for _, owner in Owners do
       local thing = Things[owner.thing]
-      table.insert(joined, { id = thing.id, score = thing.score, owner = owner.owner, weight = owner.weight })
+      local joinedRow: {[string]: unknown, id: number, score: number, owner: string, weight: number} = {
+        id = thing.id, score = thing.score, owner = owner.owner, weight = owner.weight,
+      }
+      table.insert(joined, joinedRow)
     end
 
     local keys = { descending 'weight', ascending 'owner', ascending 'score' }
@@ -534,7 +560,8 @@ suite.describe('ORDER BY', function()
 
   suite.it('orders groups by their aggregates', function()
     local db = database()
-    local groups, byBucket = {}, {}
+    local groups: {{[string]:unknown, bucket:number, total:number, found:number}} = {}
+    local byBucket: {[number]: {[string]:unknown, bucket:number, total:number, found:number}} = {}
 
     for _, row in Things do
       local group = byBucket[row.bucket]
@@ -559,8 +586,8 @@ suite.describe('ORDER BY', function()
 end)
 
 --- The ids of the rows of `source` that `text` keeps, and the ids `keep` keeps of `Things`.
-local function kept(db, source, text, params, keep)
-  local got = [for row in db:query(`SELECT id FROM {source} WHERE {text}`, params).rows => row.id]
+local function kept(db: sql.Database, source: string, text: string, params: {unknown}?, keep: (Thing) -> boolean): ({number}, {number})
+  local got = [for row in db:query(`SELECT id FROM {source} WHERE {text}`, params).rows => row.id :: number]
   local wanted = [for row in Things if keep(row) => row.id]
 
   return got, wanted
@@ -570,20 +597,20 @@ suite.describe('WHERE', function()
   suite.it('compares a number with a literal and with a parameter, and never passes NULL', function()
     local db = database()
 
-    local comparisons = {
-      { '=', function(cell, value) return cell == value end },
-      { '!=', function(cell, value) return cell ~= value end },
-      { '<>', function(cell, value) return cell ~= value end },
-      { '<', function(cell, value) return cell < value end },
-      { '<=', function(cell, value) return cell <= value end },
-      { '>', function(cell, value) return cell > value end },
-      { '>=', function(cell, value) return cell >= value end },
+    local comparisons: {{op: string, holds: (number, number) -> boolean}} = {
+      { op = '=', holds = function(cell: number, value: number) return cell == value end },
+      { op = '!=', holds = function(cell: number, value: number) return cell ~= value end },
+      { op = '<>', holds = function(cell: number, value: number) return cell ~= value end },
+      { op = '<', holds = function(cell: number, value: number) return cell < value end },
+      { op = '<=', holds = function(cell: number, value: number) return cell <= value end },
+      { op = '>', holds = function(cell: number, value: number) return cell > value end },
+      { op = '>=', holds = function(cell: number, value: number) return cell >= value end },
     }
 
     for _, source in { 'things', 'stream', 'volatile' } do
       for _, comparison in comparisons do
-        local op, holds = comparison[1], comparison[2]
-        local function keep(row) return row.rank ~= nil and holds(row.rank, 4) end
+        local op, holds = comparison.op, comparison.holds
+        local function keep(row: Thing): boolean return row.rank ~= nil and holds(row.rank, 4) end
 
         local got, wanted = kept(db, source, `rank {op} 4`, nil, keep)
         expect(got).toEqual(wanted)
@@ -723,7 +750,7 @@ suite.describe('WHERE', function()
       total += row.value
     end
 
-    db:register('holed', { columns = { 'value' }, scan = function(_request) return rows end })
+    db:register('holed', { columns = { 'value' }, scan = function(_request) return rows :: sql.SourceRows end })
     expect(db:query('SELECT COUNT(*) AS found, SUM(value) AS total FROM holed WHERE value > 2').rows).toEqual { { found = visited, total = total } }
     expect(#db:query('SELECT value FROM holed WHERE value > 2 ORDER BY value').rows).toBe(visited)
   end)
@@ -840,11 +867,13 @@ suite.describe('aggregates', function()
       MIN(score) AS lowest, MAX(score) AS highest, MIN(extreme) AS floor, MAX(extreme) AS ceiling
       FROM %s WHERE %s]]
 
-    local filters = {
-      { 'id > 0', function(_row) return true end },
-      { 'bucket < 3', function(row) return row.bucket < 3 end },
-      { 'score >= 0.25 AND rank != 5', function(row) return row.score >= 0.25 and row.rank ~= nil and row.rank ~= 5 end },
-      { "label = 'iron'", function(row) return row.label == 'iron' end },
+    local filters: {{text: string, keep: (Thing) -> boolean}} = {
+      { text = 'id > 0', keep = function(_row: Thing) return true end },
+      { text = 'bucket < 3', keep = function(row: Thing) return row.bucket < 3 end },
+      { text = 'score >= 0.25 AND rank != 5', keep = function(row: Thing)
+        return row.score >= 0.25 and row.rank ~= nil and row.rank ~= 5
+      end },
+      { text = "label = 'iron'", keep = function(row: Thing) return row.label == 'iron' end },
     }
 
     for _, source in { 'things', 'stream', 'volatile' } do
@@ -853,7 +882,7 @@ suite.describe('aggregates', function()
         local total, scores = 0, 0
 
         for _, row in Things do
-          if not filter[2](row) then continue end
+          if not filter.keep(row) then continue end
 
           wanted.found += 1
           scores += row.score
@@ -875,7 +904,7 @@ suite.describe('aggregates', function()
 
         wanted.total, wanted.mean = total, total / wanted.ranked
         wanted.scores, wanted.middle = scores, scores / wanted.found
-        expect(db:query(string.format(text, source, filter[1])).rows).toEqual { wanted }
+        expect(db:query(string.format(text, source, filter.text)).rows).toEqual { wanted }
       end
     end
   end)
@@ -931,7 +960,7 @@ suite.describe('aggregates', function()
     expect(row.least ~= row.least and row.greatest ~= row.greatest and row.total ~= row.total).toBe(true)
     expect(db:query(string.format(text, 'none')).rows).toEqual { { found = 0, held = 0 } }
     expect(db:query(string.format(text, 'later') .. ' WHERE value > 100').rows).toEqual { { found = 0, held = 0 } }
-    expect(1 / db:query('SELECT SUM(value) AS total FROM later WHERE value = 0').rows[1].total).toBe(math.huge)
+    expect(1 / (db:query('SELECT SUM(value) AS total FROM later WHERE value = 0').rows[1].total :: number)).toBe(math.huge)
   end)
 
   suite.it('give over many rows what a loop over them gives, whatever some of the rows are', function()
@@ -987,7 +1016,7 @@ suite.describe('aggregates', function()
 
     -- A row the WHERE drops is not read for the aggregates, whatever it holds.
     expectAggregates(function(row, id)
-      if id == 700 then row.score = tostring(row.score) end
+      if id == 700 then (row :: sql.Row).score = tostring(row.score) end
     end, '!= 700', function(row) return row.id ~= 700 end)
 
     expectAggregates(function(row, id)
@@ -1004,7 +1033,7 @@ suite.describe('aggregates', function()
     local total = 0
 
     for _, row in rows do
-      total += row.score
+      total += row.score :: number
     end
 
     db:table('held', rows, { 'id', 'score' })
@@ -1028,7 +1057,7 @@ suite.describe('aggregates', function()
 
     for position = 1, 700 do
       -- Luau adds a string that reads as a number, so the sum goes on through it.
-      rows[position].other = '2'
+      (rows[position] :: sql.Row).other = '2'
       local wanted = { found = 700, held = 700, least = rows[1].value, greatest = rows[1].value }
       local total, others = 0, 0
 

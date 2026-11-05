@@ -1,0 +1,121 @@
+--!strict
+-- Reproducible separate-process RSS and query comparison. Not a durability benchmark.
+local sql = require('@jessql')
+local fs = require('@dream/fs')
+
+local mode = arg[1] or 'hybrid'
+local Count = tonumber(arg[2]) or 30000
+local Changed = 500
+local root = fs.cwd() :: string
+local base = fs.join(root, '.jessql-hybrid-benchmark')
+local snapshotPath, hotPath, residentPath = base .. '.cold', base .. '.wal', base .. '.resident'
+
+local function rss(): number
+  -- /proc is Linux-only; non-Linux benchmarks report unavailable RSS.
+  local ok, value = pcall(fs.readFileString, '/proc/self/status')
+  if not ok or type(value) ~= 'string' then return -1 end
+  local bytes = string.match(value, 'VmRSS:%s+(%d+)')
+  return if bytes then tonumber(bytes) or -1 else -1
+end
+
+local function row(id: number): { [string]: unknown }
+  return { id = id, room = 'room-' .. tostring(id % 128), body = 'event-' .. tostring(id) }
+end
+
+if mode == 'prepare' then
+  fs.remove(snapshotPath)
+  fs.remove(hotPath)
+  fs.remove(hotPath .. '.lock')
+  fs.remove(residentPath)
+  fs.remove(residentPath .. '.lock')
+  local cursor = 0
+  local start = os.clock()
+  sql.paged.create(snapshotPath, { 'id', 'room', 'body' }, 'id', function()
+    cursor += 1
+    if cursor > Count then return nil end
+    return row(cursor)
+  end)
+  print('snapshot_create_seconds', os.clock() - start)
+
+  local db = sql.hybrid.open(hotPath, snapshotPath, 'events')
+  db:transaction(function(tx)
+    for index = 1, Changed do
+      tx:upsert({ id = index, room = 'hot', body = 'modified-' .. tostring(index) })
+      tx:delete(index + Changed)
+      tx:insert({ id = Count + index, room = 'hot', body = 'inserted-' .. tostring(index) })
+    end
+  end)
+  db:close()
+
+  local resident = sql.open(residentPath, { rowLayout = 'packed' })
+  resident:createTable('events', { 'id', 'room', 'body' }, 'id')
+  resident:createOrderedIndex('events', 'id')
+  for offset = 1, Count, 200 do
+    resident:transaction(function(tx)
+      for index = offset, math.min(offset + 199, Count) do
+        tx:insert('events', row(index))
+      end
+    end)
+  end
+
+  resident:transaction(function(tx)
+    for index = 1, Changed do
+      tx:upsert('events', { id = index, room = 'hot', body = 'modified-' .. tostring(index) })
+      tx:delete('events', index + Changed)
+      tx:insert('events', { id = Count + index, room = 'hot', body = 'inserted-' .. tostring(index) })
+    end
+  end)
+  resident:close()
+  print('prepared_rows', Count)
+  return
+end
+
+local started = os.clock()
+local residentDb: sql.PersistentDatabase? = nil
+local hybridDb: sql.HybridDatabase? = nil
+if mode == 'resident' then
+  residentDb = sql.open(residentPath, { rowLayout = 'packed' })
+else
+  hybridDb = sql.hybrid.open(hotPath, snapshotPath, 'events', { cachePages = 4 })
+end
+
+local function readRow(key: number): { [string]: unknown }?
+  if residentDb then return residentDb:get('events', key) end
+  return (hybridDb :: sql.HybridDatabase):get(key)
+end
+
+local function query(statement: string, params: { unknown }?): sql.Result
+  if residentDb then return residentDb:query(statement, params) end
+  return (hybridDb :: sql.HybridDatabase):query(statement, params)
+end
+
+local function close()
+  if residentDb then residentDb:close() else (hybridDb :: sql.HybridDatabase):close() end
+end
+local opened = os.clock() - started
+local afterOpen = rss()
+local checksum = 0
+started = os.clock()
+for index = 1, 300 do
+  local key = ((index * 9781) % Count) + 1
+  local event = readRow(key)
+  if event then checksum += event.id :: number end
+end
+local points = os.clock() - started
+started = os.clock()
+for _ = 1, 3 do
+  local result = query('SELECT id FROM events WHERE id >= ? ORDER BY id LIMIT 20', { Count - 200 })
+  for _, item in result.rows do checksum += item.id :: number end
+end
+local ranges = os.clock() - started
+local total = query('SELECT COUNT(*) AS n FROM events').rows[1].n
+print('mode', mode)
+print('configured_rows', Count)
+print('reopen_seconds', opened)
+print('rss_after_open_KiB', afterOpen)
+print('rss_after_queries_KiB', rss())
+print('points_300_seconds', points)
+print('ranges_3_seconds', ranges)
+print('rows', total)
+print('checksum', checksum)
+close()

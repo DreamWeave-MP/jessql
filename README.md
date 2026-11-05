@@ -1,12 +1,143 @@
 # jessql
 
-A Luau relational query engine packaged as a Jess JPK. It is deliberately a query engine, not a
-storage engine: in-memory tables and arbitrary Jess/JPK objects can be exposed as relational
-providers without copying their domain semantics into JessQL.
+A strictly typed Luau relational query engine and **native JSL persistence package** for Jess.
+JessQL 0.2.0 includes in-memory SQL, virtual providers, WAL-backed transactions,
+immutable generations, offline verification, and backup/restore. It requires no
+SQLite/native database driver, database server, or experimental feature toggle.
+
+**Deployment scope:** use the managed synchronous single-writer API for persistence.
+It has been validated on the supplied Linux Jess 0.3.0 / Luau 0.745 runtime,
+but is **not certified for physical power loss or untested operating systems**.
+See the [0.2.0 release and deployment guide](docs/RELEASE-0.2.0.md) and
+[application guide](docs/APPLICATION-GUIDE.md).
+
+
+## Release, installation and license
+
+**Version:** `0.2.0` · **SPDX license:** `MIT OR Apache-2.0` — choose either
+[MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE).
+
+Use JessQL as a normal JPK dependency; no experimental opt-in, special
+activation, or non-Jess database server is required. As with any Jess package,
+the host must activate its layer and grant the filesystem capabilities needed
+by the chosen storage operations. A pure in-memory query needs no database files.
+
+For a new durable database, provision with `sql.managed.create(base, options)`;
+for subsequent startups, use `sql.managed.openExisting(base, options?)`.
+The old `managed.open` open-or-create entry remains available. See the
+[0.2.0 release notes and deployment checklist](docs/RELEASE-0.2.0.md).
+
+## Recommended managed application pattern
+
+Use [`managed.create`](docs/APPLICATION-GUIDE.md) for explicit first-time provisioning and
+`managed.openExisting` for normal startup; this avoids silently initializing an
+empty namespace because of an application path typo. Scoped helpers
+`managed.withNew`, `managed.withExisting`, and `managed.withOpen` reliably close
+the handle after one callback, including when the callback raises. The original
+`managed.open` remains available as a compatible open-or-create API.
+See the [application developer guide](docs/APPLICATION-GUIDE.md) for typed
+examples, transactions, maintenance failures, safe Jess mod integration, and recovery.
+
+## Operator and maintainer documentation
+
+The managed storage path has deliberately conservative durability boundaries.
+Start with the [operator and recovery runbook](docs/OPERATIONS.md) for offline
+inventory, backups, uncertain acknowledgements, and corruption handling; see
+[the lifecycle and extension architecture](docs/LIFECYCLE-ARCHITECTURE.md) for
+manifest validation, durable publication, maintenance policy, test gates, and supported extension
+seams. The [durable publication developer contract](docs/PUBLICATION-PROTOCOL.md)
+covers fail-closed cutover sequencing and why it is not moddable. The
+[adversarial audit](docs/ADVERSARIAL-ARCHITECTURE-REVIEW.md) records
+remaining correctness and portability risks.
+
+`sql.managed.inspect(base)` acquires the managed lock and inventories the
+published manifest, immutable generations and active WAL file size **without
+opening a writable database or repairing anything**. It validates cold
+metadata, not full payload pages or WAL replay. It cannot inspect an active
+managed writer; run it offline. See the runbook before relying on it.
+
+## Hybrid hot/cold pages (advanced API)
+
+JessQL includes a self-contained immutable page provider and a single-table hybrid overlay:
+
+```luau
+local sql = require('@jessql')
+-- First create a sorted immutable snapshot using sql.paged.create(...).
+local db = sql.hybrid.open('events.hot.wal', 'events.gen1', 'events', {
+    cachePages = 8, rowLayout = 'packed',
+})
+db:upsert({ id = 100, room = 'main', body = 'edited' })
+local next = db:query('SELECT id FROM events WHERE id >= ? ORDER BY id LIMIT 20', { 95 })
+db:exportSnapshot('events.gen2') -- does not activate or durably publish it
+```
+
+Hot rows and tombstones are WAL-backed and transactions see staged changes.
+The snapshot is checksummed, read-only, and opened with a bounded page cache.
+See [Hybrid storage details and limitations](docs/HYBRID.md) before using this
+experimental API. Power-loss durability, automatic segment promotion, and
+bounded total RSS are **not yet provided**.
+
+## Synchronized group commits
+
+`db:transactionBatch({ function(tx) ... end, ... })` lets a synchronized native,
+hybrid, or managed WAL store commit up to 256 **independent** transactions per
+`syncData()` barrier without collapsing them into one SQL transaction. Callback
+failures are isolated, and uncertain I/O outcomes require reopening before retry.
+This is an explicit synchronous batching primitive, **not** a worker-based
+concurrent writer service. See [durable batch semantics and benchmarks](docs/GROUP-COMMITS.md).
+
+## Managed synchronized generations (0.2.0)
+
+`sql.managed.open(base, { tableName, columns, primaryKey })` now owns a
+synchronized WAL and an ordered set of immutable JQLP2 generations under a
+checksum-framed, durably replaced manifest. `db:flush()` publishes a small
+hot-overlay delta and tombstone sidecar without rewriting older generations.
+`db:compact()` merges the newest cold generations with the hot overlay without
+rewriting older tiers, while `db:checkpoint()` still rebuilds the entire view.
+Set `maxHotRows` or opt-in `maxHotBytes` to trigger synchronous automatic
+maintenance after committed operations. Set `maxWalBytes` for an opt-in
+active-WAL-size watermark (useful for repeated updates of unchanged keys).
+All three maintenance budgets block subsequent writes after failed upkeep,
+including after restart, until explicit successful maintenance. The byte watermark measures live scalar
+payload only, **not physical RSS**; `stats().hotPayloadBytes` is `nil` without
+byte tracking. A failed byte-budget maintenance attempt preserves the already
+acknowledged commit but blocks subsequent writes until maintenance succeeds;
+recovery also restores backpressure for an over-budget WAL. `maxGenerations`
+bounds the immutable generation count (2–8), selectively compacting newer tiers
+when that limit is reached. Interrupted publication is recoverable or fails
+closed; uncertain outcomes require close/reopen. This is **not** a hard
+memory limit, an online compaction scheduler, or verified physical power-cut
+durability. The original `sql.open(..., { durability = 'sync' })` still refuses
+its legacy checkpoint. See [managed generations](docs/MANAGED-GENERATIONS.md),
+[selective compaction](docs/SELECTIVE-COMPACTION.md), and
+[hot-byte maintenance](docs/HOT-BYTE-BUDGET.md), and the
+[adversarial architecture review](docs/ADVERSARIAL-ARCHITECTURE-REVIEW.md).
+
+## Experimental segmented cold indexes and immutable deletions
+
+JessQL can now merge `secondaryIndexPaths` across up to eight immutable cold
+generations, with newest-generation-wins behavior, WAL shadowing, and a
+bounded sorted cursor for Matrix-style `(room, stream)` reads. It also supports
+**explicit immutable deletion sidecars** attached to individual generations;
+compaction respects deleted keys without silently resurrecting old rows.
+
+These APIs do **not** automatically rotate or retire the WAL, switch active
+generation lists, delete cold files, or claim power-loss durability. See
+[segment semantics and safety](docs/SEGMENTS.md) and
+[segment-index benchmark](BENCHMARKS.md#segmented-cold-secondary-index-merge).
+
+## Experimental bounded hot-delta candidates
+
+`db:exportDelta(rowsPath, deletedPath, { runRows = 8192, mergeFanIn = 8 })`
+streams **only** committed hot rows and WAL tombstones to a pair of immutable
+candidate files, using an external sorter with bounded input batches.
+This avoids rebuilding the entire cold logical dataset per flush. It does not
+rotate the existing WAL, adopt the candidate, or reclaim previous generations.
+See [delta-flush semantics and benchmarks](docs/DELTA-FLUSH.md).
 
 ## Package
 
-- package: `org.dreamweave.jessql` 0.1.6
+- package: `org.dreamweave.jessql` **0.2.0**
 - layer: `jessql.core`
 - module: `@jessql`
 
@@ -30,6 +161,42 @@ LIMIT 20]], { 500 })
 
 Prepared queries expose `run(params)` and `explain()`. `explain()` reports projection-pruned scans,
 join strategies, grouping, aggregate count, and parameter count.
+
+
+## Native transactional persistence (0.2.0)
+
+```luau
+local sql = require('@jessql')
+local db = sql.open('data/app.wal')
+db:createTable('events', { 'id', 'room', 'body' }, 'id')
+db:createIndex('events', 'room')
+db:transaction(function(tx)
+  tx:insert('events', { id = '1', room = 'lobby', body = 'hello' })
+end)
+local rows = db:query('SELECT body FROM events WHERE room = ?', { 'lobby' }).rows
+db:checkpoint()
+db:close()
+```
+
+For lower resident memory use on large event tables, opt into the optional
+packed column representation with `sql.open(path, { rowLayout = 'packed' })`.
+It uses f64/boolean buffers, dictionary-coded repeated strings and chunked byte
+arenas for unique strings, and lazily constructs row dictionaries on reads.
+The default remains `row`; both layouts reopen the **same WAL** without migration.
+The ordered AVL indexes now use 20-byte native-buffer node metadata instead of
+per-node Luau dictionaries for both resident layouts, with reusable node slots.
+Indexed scans can use allocation-free ordered key pairs, and packed rows share
+slot lookup with deleted-key history instead of keeping a second key hash map.
+See [compact ordered indexes](docs/PERSISTENCE.md#compact-ordered-indexes).
+See [packed resident columns](docs/PERSISTENCE.md#optional-packed-resident-columns-experimental)
+and [benchmarks](BENCHMARKS.md#experimental-packed-resident-columns--hypervectors-jess-030).
+A standalone `bench/hypervectors.jsl` explores approximate binary hypervector
+similarity but does not participate in SQL correctness or row compression.
+
+No SQLite bindings are involved. The engine uses Jess filesystem, bytes and JSON primitives.
+**The raw `sql.open` buffered mode is not equivalent to the synchronized managed API;**
+use `managed.create` / `managed.openExisting` for durable-write acknowledgment.
+See [docs/PERSISTENCE.md](docs/PERSISTENCE.md) for the full contract and limitations.
 
 ## Provider protocol
 
@@ -70,8 +237,11 @@ JessQL can combine an indexed lookup side with a lazy ordered driver and stop as
 `LIKE`, arithmetic/comparison/boolean operators, `IS [NOT] NULL`, and `COUNT`, `SUM`, `AVG`,
 `MIN`, `MAX`. Scalar functions include `LOWER`, `UPPER`, `LENGTH`, `ABS`, and `COALESCE`.
 
-No persistent page store, WAL, transactions, mutations, subqueries/CTEs, set operators, or window
-functions are implemented yet.
+The raw WAL store provides checksummed transactions, indexed providers, crash-tail recovery,
+and snapshot compaction; the managed API additionally exposes immutable paged generations.
+The SQL parser supports restricted parameterized DML but not general SQL DDL,
+MVCC, subqueries/CTEs, set operators, or window functions.
+See [Native persistence architecture and safety boundary](docs/PERSISTENCE.md).
 
 ## 0.1.1 execution work
 
@@ -125,3 +295,104 @@ paths, including indexed joins grouped by a value from the lookup side.
 `db:table()` exposes exact cardinality automatically. The optimization is intentionally narrow so a
 provider cannot accidentally claim it handled filtered/grouped SQL. This was added under MJ12/Gaia
 pressure: asking how many catalog rows exist should not decode a billion stars.
+
+
+### Native ordered storage and SQL writes (experimental)
+
+The native JSL WAL store now provides ordered range indexes and strictly
+parameterized SQL mutations without SQLite or any additional native driver:
+
+```luau
+local db = require('@jessql').open('events.wal')
+db:createTable('events', { 'id', 'stream', 'room' }, 'id')
+db:createOrderedIndex('events', 'stream')
+db:exec('INSERT INTO events (id, stream, room) VALUES (?, ?, ?)', { 1, 10, '!test' })
+local rows = db:query('SELECT id FROM events WHERE stream >= ? ORDER BY stream LIMIT 10', { 5 })
+db:close()
+```
+
+See [the persistence documentation](docs/PERSISTENCE.md) for supported SQL,
+NULL binding, transaction semantics, range index limitations and the missing
+power-loss durability barrier.
+
+### Scoped ordered indexes
+
+An experimental two-column `db:createCompositeIndex('events', 'room_id', 'stream_id')`
+keeps per-room ordered stream indexes, including bounded ascending/descending
+queries and exact range counts. This is pure JSL and uses the existing WAL;
+see `docs/PERSISTENCE.md` and `bench/composite.jsl` for guarantees and limits.
+
+Repeated persistent `db:query(sql, params)` calls now reuse bounded LRU
+compiled plans (`queryCacheEntries`, default 64, 0 disables), invalidating on
+schema changes. The cache never retains results. Use `db:cacheStats()` and
+`bench/query-cache.jsl` to assess hot-query benefits.
+
+## Resident index memory optimizations
+
+The native storage provider represents singleton equality and ordered-index postings
+inline, so unique values no longer allocate a multi-table posting list. Duplicate
+postings use one position map and compact tombstones, including NULL keys in
+ordered indexes. Journal contents and all public query/mutation semantics remain
+unchanged. See `bench/rss.jsl` and [persistence architecture](docs/PERSISTENCE.md).
+This is an in-memory optimization, not an on-disk page store or a durability claim.
+
+### Experimental cold composite indexes
+
+Immutable snapshots can now have a separate `(partition, ordered value)`
+sidecar, including correct WAL overlay merging for selected hybrid SQL queries.
+See [docs/SECONDARY-INDEXES.md](docs/SECONDARY-INDEXES.md) for API use,
+measured latency/RSS tradeoffs, and the unbounded build-memory limitation.
+
+## Bounded secondary-index construction (experimental)
+
+`sql.secondary.create(path, snapshotPath, partition, order, { runRows = 16384,
+mergeFanIn = 8 })` sorts immutable cold sidecars using bounded in-memory
+runs and tiered on-disk merging. It returns build diagnostics. This preserves
+the existing JQLP2 sidecar and its read behavior; large index construction
+requires temporary disk space and may take longer than the original
+all-in-memory sort. See `docs/SECONDARY-INDEXES.md` and
+`bench/secondary-build.jsl` for measured RSS/CPU tradeoffs.
+
+### Experimental immutable segment views
+
+`sql.segments.open({ 'old.cold', 'new.cold' })` combines up to eight immutable
+snapshots with newest-row-wins reads and ordered streaming SQL. `sql.hybrid.open`
+accepts the same ordered path list, keeping transactional changes and deletions
+in its existing WAL. `sql.segments.compact('merged.cold', { ... })` produces a
+new candidate snapshot without publishing it or retiring inputs. See
+[docs/SEGMENTS.md](docs/SEGMENTS.md) for the physical-row count caveat,
+recovery boundary, unsupported multi-segment sidecars, and safe cutover rules.
+
+### Synchronized journals and positional snapshots (new Jess runtime)
+
+The newer Jess filesystem API allows `sql.open(path, { durability = 'sync' })`
+to retain a writer and synchronize each committed transaction frame. Buffered
+mode remains the default. Sync-mode checkpoints are deliberately refused until
+safe generation publication and recovery are implemented. Cold snapshots and
+hybrid views can opt into `readMode = 'positional'` to avoid memory mapping.
+See [New Runtime Integration](docs/NEW-RUNTIME-INTEGRATION.md) for the API,
+limitations, and measured tradeoffs.
+
+## Offline verification and versioned extensions
+
+Before deploying managed JessQL, review [Offline verification, diagnostics, and
+versioned integrations](docs/VERIFICATION-AND-EXTENSIONS.md).
+`sql.managed.inspect(base)` remains a quick cold metadata inventory;
+`sql.managed.verify(base)` / `diagnose(base)` perform an offline read-only scan
+of physical cold pages and WAL structure with structured issue codes. These
+checks do not certify semantic replay or physical power-loss durability.
+
+The pull-only `db:events(cursor)` and `db:observe()` APIs expose version-1
+operational state. Jess application hosts may explicitly use
+`sql.managed.extensions.v1.relay(...)` to forward telemetry into their
+interface/event systems without callbacks in the transaction path.
+
+**Strict typing is a zero-exception release requirement.** Run
+`jess run --trusted scripts/check_strict.jsl` to check all shipped JSL
+modules, tests, and benchmarks with Jess's native package checker. All files
+explicitly declare `--!strict`. The gate rejects missing directives, a
+partial package check, and **any** diagnostic; there is no legacy debt allowance.
+See [the strict type-checking contract](docs/STRICT-TYPING.md).
+
+Offline verification, semantic WAL replay, backup and restore are documented in
+[Offline Verification and Backup](docs/OFFLINE-VERIFICATION-AND-BACKUP.md).
