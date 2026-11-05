@@ -9,6 +9,7 @@ local json = require('@jess/json')
 local hybrid = require('@jessql/hybrid')
 local paged = require('@jessql/paged')
 local segments = require('@jessql/segments')
+local tiers = require('@jessql/tiers')
 local engine = require('@jessql/engine')
 
 export type Row = { [string]: unknown }
@@ -16,6 +17,7 @@ export type Options = {
   tableName: string?, columns: { string }?, primaryKey: string?,
   cachePages: number?, readMode: string?, rowLayout: string?, pageBytes: number?,
   maxHotRows: number?, maxGenerations: number?, runRows: number?, mergeFanIn: number?,
+  compactionFanIn: number?,
   -- Deterministic fault injection for integration tests. Throws at a named stage.
   testHook: ((string) -> ())?,
 }
@@ -33,6 +35,7 @@ export type Database = {
     tombstones: number, cachedPages: number },
   maintenanceStatus: (self: Database) -> { lastError: string?, poisoned: boolean },
   flush: (self: Database) -> number,
+  compact: (self: Database) -> number,
   checkpoint: (self: Database) -> number,
   close: (self: Database) -> (),
 }
@@ -202,6 +205,17 @@ local function removeIfPresent(path: string)
   end
 end
 
+local function compactScratch(base: string, epoch: number): (string, string)
+  local prefix = base .. string.format('.g%08d.hot-', epoch)
+  return prefix .. 'rows', prefix .. 'deleted'
+end
+
+local function clearScratch(base: string, epoch: number)
+  local rows, deletes = compactScratch(base, epoch)
+  removeIfPresent(rows)
+  removeIfPresent(deletes)
+end
+
 local function clearCandidate(candidatePaths: Paths)
   removeIfPresent(candidatePaths.wal)
   removeIfPresent(candidatePaths.wal .. '.lock')
@@ -326,9 +340,10 @@ local function collectOrphans(base: string, parent: string, value: Manifest)
   for _, name in names do
     if string.sub(name, 1, #prefix) ~= prefix then continue end
     local number, extension = string.match(string.sub(name, #prefix + 1),
-      '^(%d%d%d%d%d%d%d%d)%.([%a%.]+)$')
+      '^(%d%d%d%d%d%d%d%d)%.([%a%.%-]+)$')
     if not number or (extension ~= 'rows' and extension ~= 'deleted'
-      and extension ~= 'wal' and extension ~= 'wal.lock') then continue end
+      and extension ~= 'wal' and extension ~= 'wal.lock'
+      and extension ~= 'hot-rows' and extension ~= 'hot-deleted') then continue end
 
     local epoch = tonumber(number) :: number
     if epoch < 1 or epoch > MaxEpoch then continue end
@@ -386,6 +401,12 @@ function managed.open(path: string, options: Options?): Database
   if type(maxGenerations) ~= 'number' or maxGenerations % 1 ~= 0
     or maxGenerations < 2 or maxGenerations > 8 then
     error('jessql managed: invalid maxGenerations', 2)
+  end
+  local compactionFanIn = if options and options.compactionFanIn ~= nil
+    then options.compactionFanIn else 3
+  if type(compactionFanIn) ~= 'number' or compactionFanIn % 1 ~= 0
+    or compactionFanIn < 2 or compactionFanIn > 8 then
+    error('jessql managed: invalid compactionFanIn', 2)
   end
   local lock, lockError = fs.lock(base .. '.jql-lock')
 
@@ -487,7 +508,7 @@ function managed.open(path: string, options: Options?): Database
       local state = live:stats()
       if state.hotRows + state.tombstones < threshold then return end
 
-      if #generationList(active) >= maxGenerations then db:checkpoint()
+      if #generationList(active) >= maxGenerations then db:compact()
       else db:flush() end
     end)
     lastMaintenanceError = if ok then nil else tostring(failure)
@@ -538,29 +559,67 @@ function managed.open(path: string, options: Options?): Database
     return { lastError = lastMaintenanceError, poisoned = poisoned }
   end
 
-  -- Publish a new WAL bound to either a full compacted snapshot or the
-  -- previous immutable generations plus one hot delta. Keep the old WAL
-  -- authoritative until the manifest is synchronized.
-  local function transition(asDelta: boolean): number
+  -- Publish a new WAL bound to the new immutable generation set. The compact
+  -- mode merges only the newest cold generations plus the hot overlay, so
+  -- older generations are neither decoded nor rewritten. All write methods
+  -- are fenced until the manifest and WAL identity are durably published.
+  local function transition(mode: string): number
     ready()
     if active.epoch >= MaxEpoch then error('jessql managed: generation limit', 2) end
 
-    if asDelta and #generationList(active) >= maxGenerations then
-      error('jessql managed: generation budget reached; checkpoint first', 2)
+    if mode == 'delta' and #generationList(active) >= maxGenerations then
+      error('jessql managed: generation budget reached; compact first', 2)
+    end
+
+    if mode == 'compact' and #generationList(active) < 2 then
+      error('jessql managed: selective compaction needs two cold generations', 2)
     end
     busy = true
     local nextEpoch = active.epoch + 1
     local candidatePaths = paths(base, nextEpoch)
     local candidate: hybrid.Database? = nil
     local publication = { started = false }
-  -- Generation export and publication may fail; keep the old WAL authoritative.
+    local mergedCount = 0
+    -- Generation export and publication may fail; keep the old WAL authoritative.
     local completed, transitionFailure = pcall(function()
       clearCandidate(candidatePaths)
-      if asDelta then
+      if mode == 'compact' then clearScratch(base, nextEpoch) end
+
+      if mode == 'delta' then
         live:exportDelta(candidatePaths.snapshot, candidatePaths.deletes, {
           pageBytes = if options then options.pageBytes else nil,
           runRows = if options then options.runRows else nil,
           mergeFanIn = if options then options.mergeFanIn else nil,
+        })
+        seal(candidatePaths.deletes, parent)
+      elseif mode == 'compact' then
+        local generations = generationList(active)
+        mergedCount = math.min(#generations, compactionFanIn)
+        local inputRows: { string } = {}
+        local inputDeletes: { [number]: string } = {}
+        local sources, deletions = indexedPaths(base, active)
+        for index = #generations - mergedCount + 1, #generations do
+          local slot = #inputRows + 1
+          inputRows[slot] = sources[index]
+          if deletions[index] then inputDeletes[slot] = deletions[index] end
+        end
+        local hot = live:stats()
+        if hot.hotRows + hot.tombstones > 0 then
+          local hotRows, hotDeletes = compactScratch(base, nextEpoch)
+          live:exportDelta(hotRows, hotDeletes, {
+            pageBytes = if options then options.pageBytes else nil,
+            runRows = if options then options.runRows else nil,
+            mergeFanIn = if options then options.mergeFanIn else nil,
+          })
+          inputRows[#inputRows + 1] = hotRows
+          inputDeletes[#inputRows] = hotDeletes
+        end
+
+        tiers.compact(candidatePaths.snapshot, candidatePaths.deletes, inputRows, {
+          fanIn = compactionFanIn,
+          cachePages = if options then options.cachePages else 1,
+          pageBytes = if options then options.pageBytes else nil,
+          deletePaths = inputDeletes,
         })
         seal(candidatePaths.deletes, parent)
       else
@@ -569,14 +628,17 @@ function managed.open(path: string, options: Options?): Database
       end
       seal(candidatePaths.snapshot, parent)
       local nextValue: Manifest
-      if asDelta or active.version == 2 then
+      if mode ~= 'full' or active.version == 2 then
         local generations: { Generation } = {}
-        if asDelta then
-          for _, generation in generationList(active) do
+        if mode == 'delta' or mode == 'compact' then
+          local all = generationList(active)
+          local limit = if mode == 'compact' then #all - mergedCount else #all
+          for index = 1, limit do
+            local generation = all[index]
             generations[#generations + 1] = { epoch = generation.epoch, deleted = generation.deleted }
           end
         end
-        generations[#generations + 1] = { epoch = nextEpoch, deleted = asDelta }
+        generations[#generations + 1] = { epoch = nextEpoch, deleted = mode ~= 'full' }
         nextValue = newManifest(active, nextEpoch, '', generations)
         nextValue.snapshotIdentity = coldIdentity(base, nextValue, options)
       else
@@ -598,6 +660,10 @@ function managed.open(path: string, options: Options?): Database
       if options and options.testHook then options.testHook('before-retire') end
       -- Retirement can fail; old unreferenced files are safe to leave behind.
       pcall(function() retire(base, parent, prior, nextValue) end)
+      if mode == 'compact' then
+        -- Scratch files are unpublished and safe to leave for restart if cleanup fails.
+        pcall(function() clearScratch(base, nextEpoch) end)
+      end
     end)
     busy = false
     if not completed then
@@ -609,6 +675,10 @@ function managed.open(path: string, options: Options?): Database
       else
         -- Failed cleanup after a safe pre-publication fault must not hide that fault.
         pcall(function() clearCandidate(candidatePaths) end)
+        if mode == 'compact' then
+          -- Reclaim scratch after a caught pre-publication fault.
+          pcall(function() clearScratch(base, nextEpoch) end)
+        end
         -- Failed manifest temp cleanup must not override the publication error.
         pcall(function() removeIfPresent(base .. '.jql-manifest.tmp') end)
       end
@@ -622,11 +692,15 @@ function managed.open(path: string, options: Options?): Database
     ready()
     local result = live:stats()
     if result.hotRows + result.tombstones == 0 then return active.epoch end
-    return transition(true)
+    return transition('delta')
+  end
+
+  function db.compact(_self: Database): number
+    return transition('compact')
   end
 
   function db.checkpoint(_self: Database): number
-    return transition(false)
+    return transition('full')
   end
 
   function db.close(_self: Database)
