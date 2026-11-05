@@ -5,7 +5,7 @@ local test = require('@jess/test')
 local suite, expect = test.new(), test.expect
 
 local function basePath(name: string): string
-  return fs.join(assert(fs.cwd()), '.jessql-tiers-' .. name)
+  return fs.join(assert((fs.cwd())), '.jessql-tiers-' .. name)
 end
 
 local function cleanup(base: string, count: number)
@@ -159,7 +159,7 @@ suite.describe('fan-in bounded immutable tier compaction', function()
         { deletePaths = { [1] = base .. '.1.deleted' } })
     end)
     expect(invalid).toBe(false)
-    expect(fs.exists(base .. '.out')).toBe(false)
+    expect((fs.exists(base .. '.out'))).toBe(false)
     -- A missing input must not partially publish or delete the valid source.
     -- A missing source in the group throws; the test continues to inspect cleanup.
     local corrupted = pcall(function()
@@ -167,16 +167,16 @@ suite.describe('fan-in bounded immutable tier compaction', function()
         { fanIn = 2, deletePaths = { [1] = base .. '.1.deleted' } })
     end)
     expect(corrupted).toBe(false)
-    expect(fs.exists(base .. '.out')).toBe(false)
-    expect(fs.exists(base .. '.1')).toBe(true)
-    expect(fs.exists(base .. '.1.deleted')).toBe(true)
-    assert(fs.writeFile(base .. '.out', 'do not touch', { exclusive = true }))
+    expect((fs.exists(base .. '.out'))).toBe(false)
+    expect((fs.exists(base .. '.1'))).toBe(true)
+    expect((fs.exists(base .. '.1.deleted'))).toBe(true)
+    assert((fs.writeFile(base .. '.out', 'do not touch', { exclusive = true })))
     -- Existing output files must remain intact after a rejected compaction.
     local occupied = pcall(function()
       sql.tiers.compact(base .. '.out', nil, { base .. '.1' })
     end)
     expect(occupied).toBe(false)
-    expect(assert(fs.readFileString(base .. '.out'))).toBe('do not touch')
+    expect(assert((fs.readFileString(base .. '.out')))).toBe('do not touch')
     cleanup(base, 2)
   end)
 end)

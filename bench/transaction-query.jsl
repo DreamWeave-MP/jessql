@@ -4,7 +4,7 @@
 local sql = require('@jessql')
 local fs = require('@dream/fs')
 
-local path = fs.join(assert(fs.cwd()), '.jessql-transaction-query-bench.wal')
+local path = fs.join(assert((fs.cwd())), '.jessql-transaction-query-bench.wal')
 fs.remove(path)
 fs.remove(path .. '.lock')
 
@@ -26,7 +26,7 @@ db:transaction(function(tx)
   for id = 1, Iterations do
     local row = tx:query(statement, { id }).rows[1]
     assert(row.payload == id * 2)
-    sum += row.payload
+    sum += row.payload :: number
   end
   cachedElapsed = os.clock() - started
 
@@ -36,7 +36,7 @@ db:transaction(function(tx)
   for id = 1, Iterations do
     local row = tx:query(statement .. ' -- probe ' .. tostring(id), { id }).rows[1]
     assert(row.payload == id * 2)
-    sum += row.payload
+    sum += row.payload :: number
   end
   uniqueElapsed = os.clock() - started
 end)

@@ -4,7 +4,7 @@ local sql = require('@jessql')
 local fs = require('@dream/fs')
 
 local cycles = tonumber((...)) or 20000
-local path = fs.join(assert(fs.cwd()), '.jessql-churn-bench.wal')
+local path = fs.join(assert((fs.cwd())), '.jessql-churn-bench.wal')
 fs.remove(path)
 fs.remove(path .. '.lock')
 

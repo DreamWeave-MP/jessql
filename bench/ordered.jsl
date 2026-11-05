@@ -7,7 +7,7 @@ local fs = require('@dream/fs')
 local total = tonumber((...)) or 30000
 local probes = tonumber(select(2, ...)) or 500
 local BatchSize = 128
-local path = fs.join(assert(fs.cwd()), '.jessql-ordered-bench.wal')
+local path = fs.join(assert((fs.cwd())), '.jessql-ordered-bench.wal')
 fs.remove(path)
 fs.remove(path .. '.lock')
 
@@ -41,7 +41,7 @@ local function countProbes(): (number, number)
   local totalCount = 0
   for iteration = 1, probes do
     local lower = (iteration * 101) % (total - 200)
-    totalCount += countPlan.run({ lower, lower + 200 }).rows[1].n
+    totalCount += (countPlan.run({ lower, lower + 200 }).rows[1].n :: number)
   end
   return os.clock() - started, totalCount
 end

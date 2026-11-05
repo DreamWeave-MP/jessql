@@ -7,7 +7,7 @@ local fs = require('@dream/fs')
 local requested = tonumber((...)) or 4000
 local Batch = 20
 local total = math.max(Batch, math.floor(requested / Batch) * Batch)
-local root = fs.join(assert(fs.cwd()), '.jessql-bulk-bench')
+local root = fs.join(assert((fs.cwd())), '.jessql-bulk-bench')
 
 local function path(kind: string): string
   return root .. '-' .. kind .. '.wal'

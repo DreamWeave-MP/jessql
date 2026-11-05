@@ -4,7 +4,7 @@ local sql = require('@jessql')
 local fs = require('@dream/fs')
 
 local probes = tonumber((...)) or 3000
-local path = fs.join(assert(fs.cwd()), '.jessql-query-cache-bench.wal')
+local path = fs.join(assert((fs.cwd())), '.jessql-query-cache-bench.wal')
 fs.remove(path)
 fs.remove(path .. '.lock')
 local db = sql.open(path)
@@ -21,7 +21,7 @@ local function measure(capacity: number): (number, number)
   local checksum = 0
   for iteration = 1, probes do
     local id = iteration % 1000 + 1
-    checksum += current:query(Statement, { id }).rows[1].value
+    checksum += (current:query(Statement, { id }).rows[1].value :: number)
   end
   local elapsed = os.clock() - started
   current:close()

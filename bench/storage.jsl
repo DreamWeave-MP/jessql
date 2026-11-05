@@ -5,7 +5,7 @@ local fs = require('@dream/fs')
 
 local total = tonumber((...)) or 5000
 local batchSize = tonumber(select(2, ...)) or 64
-local path = fs.join(assert(fs.cwd()), '.jessql-benchmark.wal')
+local path = fs.join(assert((fs.cwd())), '.jessql-benchmark.wal')
 fs.remove(path)
 fs.remove(path .. '.lock')
 local start = os.clock()
@@ -33,7 +33,7 @@ local written = os.clock()
 local plan = db:prepare('SELECT COUNT(*) AS n FROM events WHERE room = ?')
 for index = 1, 1000 do
   local result = plan.run({ 'room-' .. tostring(index % 128) })
-  assert(result.rows[1].n >= 0)
+  assert((result.rows[1].n :: number) >= 0)
 end
 local queried = os.clock()
 
@@ -44,7 +44,7 @@ local reopened = sql.open(path)
 assert(reopened:query('SELECT COUNT(*) AS n FROM events').rows[1].n == total)
 local recovered = os.clock()
 reopened:close()
-local file = assert(fs.stat(path))
+local file = assert((fs.stat(path)))
 print(string.format('rows=%d batch=%d wal_bytes=%d', total, batchSize, file.size))
 print(string.format('setup=%.3fs append=%.3fs %.0f rows/s', initialized-start, written-initialized, total/(written-initialized)))
 print(string.format('indexed_1000=%.3fs checkpoint=%.3fs reopen=%.3fs', queried-written, checkpointed-queried, recovered-checkpointed))

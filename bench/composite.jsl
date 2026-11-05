@@ -8,7 +8,7 @@ local total = tonumber((...)) or 25000
 local probes = tonumber(select(2, ...)) or 150
 local Rooms = 64
 local BatchSize = 128
-local path = fs.join(assert(fs.cwd()), '.jessql-composite-bench.wal')
+local path = fs.join(assert((fs.cwd())), '.jessql-composite-bench.wal')
 fs.remove(path)
 fs.remove(path .. '.lock')
 
@@ -40,7 +40,7 @@ local function measure(): (number, number, number, number, number, number, numbe
   start = os.clock()
   for iteration = 1, probes do
     local minimum = (iteration * 97) % (total - 2000)
-    countedRows += counting.run({ 'room' .. (iteration % Rooms), minimum, minimum + 1500 }).rows[1].n
+    countedRows += counting.run({ 'room' .. (iteration % Rooms), minimum, minimum + 1500 }).rows[1].n :: number
   end
   local countTime = os.clock() - start
   local matchedRows, matchedCounts = 0, 0
@@ -53,7 +53,7 @@ local function measure(): (number, number, number, number, number, number, numbe
   start = os.clock()
   for iteration = 1, probes do
     local id = (iteration * 97) % total + 1
-    matchedCounts += pointCount.run({ 'room' .. (id % Rooms), id }).rows[1].n
+    matchedCounts += pointCount.run({ 'room' .. (id % Rooms), id }).rows[1].n :: number
   end
   return selectTime, countTime, pointTime, os.clock() - start,
     selectedRows, countedRows, matchedRows, matchedCounts

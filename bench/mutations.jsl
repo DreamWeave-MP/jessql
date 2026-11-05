@@ -4,7 +4,7 @@ local sql = require('@jessql')
 local fs = require('@dream/fs')
 
 local total = tonumber((...)) or 5000
-local path = fs.join(assert(fs.cwd()), '.jessql-mutation-bench.wal')
+local path = fs.join(assert((fs.cwd())), '.jessql-mutation-bench.wal')
 fs.remove(path)
 fs.remove(path .. '.lock')
 local db = sql.open(path)
@@ -25,7 +25,7 @@ db:transaction(function(tx)
 end)
 local cached = os.clock()
 assert(db:query('SELECT COUNT(*) AS n FROM values').rows[1].n == total)
-assert(db:get('values', total).value == total * 2)
+assert((assert(db:get('values', total))).value == total * 2)
 print(string.format('updates_per_mode=%d parse_each_s=%.4f prepared_s=%.4f speedup=%.2fx',
   total, parsed - started, cached - parsed, (parsed - started) / (cached - parsed)))
 db:close()
