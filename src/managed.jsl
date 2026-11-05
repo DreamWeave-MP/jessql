@@ -12,6 +12,8 @@ local engine = require('@jessql/engine')
 local manifest = require('@jessql/managed_manifest')
 local policy = require('@jessql/managed_policy')
 local publicationKernel = require('@jessql/managed_publication')
+local verification = require('@jessql/managed_verification')
+local observability = require('@jessql/managed_observability')
 
 export type Row = { [string]: unknown }
 export type Options = {
@@ -29,6 +31,11 @@ export type Inspection = { version: number, epoch: number, tableName: string,
   walBytes: number, coldIdentity: string, walIdentityChecked: boolean }
 export type Transaction = hybrid.Transaction
 export type BatchResult = hybrid.BatchResult
+export type Event = observability.Event
+export type EventBatch = observability.Batch
+export type Observation = { version: number, epoch: number, generations: number,
+  poisoned: boolean, maintenanceError: string?, limits: { maxHotRows: number?,
+    maxHotBytes: number?, maxWalBytes: number?, maxGenerations: number } }
 export type Database = {
   get: (self: Database, key: unknown) -> Row?,
   insert: (self: Database, row: Row) -> (),
@@ -42,6 +49,8 @@ export type Database = {
   stats: (self: Database) -> { epoch: number, generations: number, coldRows: number, hotRows: number,
     tombstones: number, hotPayloadBytes: number?, walBytes: number?, cachedPages: number },
   maintenanceStatus: (self: Database) -> { lastError: string?, poisoned: boolean },
+  observe: (self: Database) -> Observation,
+  events: (self: Database, after: number?) -> EventBatch,
   flush: (self: Database) -> number,
   compact: (self: Database) -> number,
   checkpoint: (self: Database) -> number,
@@ -52,7 +61,10 @@ type Generation = manifest.Generation
 type Manifest = manifest.Manifest
 type Paths = { snapshot: string, deletes: string, wal: string }
 local MaxEpoch = manifest.MaxEpoch
-local managed = {}
+local managed = {
+  -- Explicitly invoked by the application host; not a durability-path callback.
+  extensions = { v1 = { relay = observability.relay } },
+}
 
 local function assertOK(ok: boolean?, message: string?, action: string)
   if not ok then error('jessql managed: ' .. action .. ': ' .. tostring(message), 3) end
@@ -317,6 +329,23 @@ function managed.inspect(path: string): Inspection
   return result :: Inspection
 end
 
+-- Offline integrity scan: no WAL writer, tail truncation, retirement or repair.
+-- The namespace lock guarantees a stable published view for the full scan.
+function managed.verify(path: string): verification.Report
+  local base = normalize(path)
+  local lock, lockError = fs.lock(base .. '.jql-lock')
+  if not lock then error('jessql managed: verification locked: ' .. tostring(lockError), 2) end
+  -- Offline scan can report I/O failures; always release the exclusive namespace lock.
+  local ok, result = pcall(function() return verification.scan(base) end)
+  lock:unlock()
+  if not ok then error('jessql managed: verification I/O failure: ' .. tostring(result), 2) end
+  return result :: verification.Report
+end
+
+-- Deep verification and structured recovery diagnostics are the same offline scan.
+-- Neither opens a mutable WAL nor attempts tail repair or auto-bootstrap.
+managed.diagnose = managed.verify
+
 -- Managed synchronous generation lifecycle. No background workers or group
 -- commits: each cutover happens while holding this database's exclusive lock.
 function managed.open(path: string, options: Options?): Database
@@ -391,6 +420,8 @@ function managed.open(path: string, options: Options?): Database
   local active = value :: Manifest
   local closed, poisoned, busy, batchActive = false, false, false, false
   local lastMaintenanceError: string? = nil
+  local journal = observability.new(64)
+  journal:record('opened', active.epoch)
 
   -- Only WAL-budgeted databases perform file metadata I/O per commit. This
   -- measures physical journal growth, including repeated overwrites whose
@@ -440,6 +471,10 @@ function managed.open(path: string, options: Options?): Database
       lastMaintenanceError = 'recovered WAL exceeds byte budget; flush or checkpoint'
     end
   end
+
+  if lastMaintenanceError then
+    journal:record('recovery-budget-pressure', active.epoch, lastMaintenanceError)
+  end
   local db = {} :: Database
 
   local function ready()
@@ -487,6 +522,7 @@ function managed.open(path: string, options: Options?): Database
       elseif mode == 'flush' then db:flush() end
     end)
     lastMaintenanceError = if ok then nil else tostring(failure)
+    if not ok then journal:record('maintenance-failed', active.epoch, tostring(failure)) end
   end
 
   -- An acknowledged commit must remain acknowledged if maintenance fails.
@@ -560,6 +596,25 @@ function managed.open(path: string, options: Options?): Database
     if batchActive then error('jessql managed: batched commit in progress', 2) end
     if closed then error('jessql managed: closed', 2) end
     return { lastError = lastMaintenanceError, poisoned = poisoned }
+  end
+
+  -- Versioned, pull-only telemetry: a reader cannot affect a WAL acknowledgment.
+  -- These observations are ephemeral and must not be used as change-data capture.
+  function db.observe(_self: Database): Observation
+    if closed then error('jessql managed: closed', 2) end
+    if batchActive then error('jessql managed: batched commit in progress', 2) end
+
+    return { version = 1, epoch = active.epoch,
+      generations = #manifest.generations(active), poisoned = poisoned,
+      maintenanceError = lastMaintenanceError,
+      limits = { maxHotRows = maxHotRows, maxHotBytes = maxHotBytes,
+        maxWalBytes = maxWalBytes, maxGenerations = maxGenerations } }
+  end
+
+  function db.events(_self: Database, after: number?): EventBatch
+    if closed then error('jessql managed: closed', 2) end
+    if batchActive then error('jessql managed: batched commit in progress', 2) end
+    return journal:read(after)
   end
 
   -- Publish a new WAL bound to the new immutable generation set. The compact
@@ -675,7 +730,9 @@ function managed.open(path: string, options: Options?): Database
 
       if publication.started then
         poisoned = true
+        journal:record('publication-uncertain', active.epoch, mode)
       else
+        journal:record('publication-aborted', active.epoch, mode)
         -- Failed cleanup after a safe pre-publication fault must not hide that fault.
         pcall(function() clearCandidate(candidatePaths) end)
         if mode == 'compact' then
@@ -688,6 +745,7 @@ function managed.open(path: string, options: Options?): Database
       error('jessql managed: transition failed: ' .. tostring(transitionFailure), 2)
     end
     lastMaintenanceError = nil
+    journal:record('generation-published', active.epoch, mode)
     return active.epoch
   end
 
