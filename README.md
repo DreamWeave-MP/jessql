@@ -6,6 +6,22 @@ also adds an **experimental, all-JSL append-only transactional store**, without 
 database dependency. It is not yet safe for power-loss-critical production workloads.
 
 
+## Operator and maintainer documentation
+
+The managed storage path has deliberately conservative durability boundaries.
+Start with the [operator and recovery runbook](docs/OPERATIONS.md) for offline
+inventory, backups, uncertain acknowledgements, and corruption handling; see
+[the lifecycle and extension architecture](docs/LIFECYCLE-ARCHITECTURE.md) for
+manifest validation, maintenance policy, test gates, and supported extension
+seams. The [adversarial audit](docs/ADVERSARIAL-ARCHITECTURE-REVIEW.md) records
+remaining correctness and portability risks.
+
+`sql.managed.inspect(base)` acquires the managed lock and inventories the
+published manifest, immutable generations and active WAL file size **without
+opening a writable database or repairing anything**. It validates cold
+metadata, not full payload pages or WAL replay. It cannot inspect an active
+managed writer; run it offline. See the runbook before relying on it.
+
 ## Experimental hybrid hot/cold pages
 
 The native persistence branch now includes a self-contained immutable page

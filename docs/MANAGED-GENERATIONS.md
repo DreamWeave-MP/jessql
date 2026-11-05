@@ -38,6 +38,17 @@ The parent directory must exist before first open. Only one managed owner
 may open a base path at a time; the parent is canonicalized before taking the
 nonblocking OS advisory lock.
 
+## Offline inspection and operating guidance
+
+Close the writer before running `sql.managed.inspect(base)`. It acquires the
+exclusive managed lock and returns the published manifest's epoch, schema,
+immutable generation sizes, cold identity, and active WAL byte count. It does
+**not** replay the WAL or validate all page payloads; `walIdentityChecked` is
+always `false`. A successful inventory is **not** a clean bill of health.
+See [operations and recovery](OPERATIONS.md) for incident handling and offline
+backups and [lifecycle architecture](LIFECYCLE-ARCHITECTURE.md) for durability
+invariants and extension boundaries.
+
 ## On-disk layout
 
 For a base path `data/events`:
