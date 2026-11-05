@@ -1,0 +1,37 @@
+--!strict
+--!native
+-- Benchmark large decoded-page cache churn in separate processes.
+local sql = require('@jessql')
+local fs = require('@dream/fs')
+
+local mode = arg[1] or 'read'
+local rows = tonumber(arg[2]) or 12000
+local queries = tonumber(arg[3]) or 8000
+local cachePages = tonumber(arg[4]) or 512
+local path = arg[5] or '.jessql-cache-bench.pages'
+
+if mode == 'cleanup' then fs.remove(path); return end
+
+if mode == 'prepare' then
+  fs.remove(path)
+  local id = 0
+  sql.paged.create(path, { 'id', 'payload' }, 'id', function()
+    id += 1
+    return if id <= rows then { id = id, payload = string.rep('x', 400) } else nil
+  end, { pageBytes = 512 })
+  print('prepared', rows)
+  return
+end
+
+if mode ~= 'read' then error('expected prepare, read or cleanup') end
+local opened = sql.paged.open(path, { cachePages = cachePages })
+local started = os.clock()
+local checksum = 0
+for query = 1, queries do
+  local id = (query * 7919) % rows + 1
+  checksum += (assert(opened:get(id)).id :: number)
+end
+local metrics = opened:stats()
+print('read', 'cpu_s', os.clock() - started,
+  'checksum', checksum, 'page_reads', metrics.pageReads, 'cached_pages', metrics.cachedPages)
+opened:close()

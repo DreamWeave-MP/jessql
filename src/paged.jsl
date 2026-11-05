@@ -21,7 +21,8 @@ export type Snapshot = {
 }
 
 type Page = { first: unknown, last: unknown, offset: number, length: number, rows: number, checksum: number }
-type Cached = { keys: { unknown }, offsets: { number }, lengths: { number }, body: string, age: number }
+type Cached = { keys: { unknown }, offsets: { number }, lengths: { number }, body: string,
+  older: number?, newer: number? }
 type Directory = { version: number, columns: { string }, primaryKey: string, count: number,
   pages: { Page }, keyKind: string }
 local Magic = 'JQLP2\n'
@@ -296,7 +297,9 @@ function paged.open(path: string, options: Options?): Snapshot
   if not ok then reader:close(); error(parsed, 2) end
   local directory = parsed :: Directory
   local cache: { [number]: Cached } = {}
-  local cacheSize, ticks, pageReads = 0, 0, 0
+  local cacheSize, pageReads = 0, 0
+  local leastRecent: number? = nil
+  local mostRecent: number? = nil
   local snapshot = {} :: Snapshot
   snapshot.columns, snapshot.primaryKey, snapshot.count = directory.columns, directory.primaryKey, directory.count
   snapshot.identity = string.format('%08x:%d', directoryChecksum, size)
@@ -304,9 +307,20 @@ function paged.open(path: string, options: Options?): Snapshot
 
   local function pageAt(index: number): Cached
     if closed then error('jessql paged: snapshot closed', 3) end
-    ticks += 1
     local found = cache[index]
-    if found then found.age = ticks; return found end
+    if found then
+      -- Move the cache hit to the MRU tail in constant time. Do not scan
+      -- hundreds of cached pages on every miss to find an eviction victim.
+      if mostRecent ~= index then
+        local older, newer = found.older, found.newer
+        if older then (cache[older] :: Cached).newer = newer else leastRecent = newer end
+        if newer then (cache[newer] :: Cached).older = older end
+        found.older, found.newer = mostRecent, nil
+        if mostRecent then (cache[mostRecent] :: Cached).newer = index end
+        mostRecent = index
+      end
+      return found
+    end
     local page = directory.pages[index]
     -- The directory already contains the page length: fetch the header and body
     -- in one positional read instead of issuing two filesystem calls per miss.
@@ -352,15 +366,20 @@ function paged.open(path: string, options: Options?): Snapshot
     end
 
     if cacheSize >= cacheLimit then
-      local oldest, oldestAge = 0, math.huge
-      for slot, candidate in cache do
-        if candidate.age < oldestAge then oldest, oldestAge = slot, candidate.age end
-      end
-      cache[oldest] = nil
+      local victim = leastRecent :: number
+      local nextOldest = (cache[victim] :: Cached).newer
+      cache[victim] = nil
+      leastRecent = nextOldest
+      if nextOldest then (cache[nextOldest] :: Cached).older = nil else mostRecent = nil end
       cacheSize -= 1
     end
-    local item = { keys = keys, offsets = offsets, lengths = lengths, body = body, age = ticks }
+
+    local item: Cached = { keys = keys, offsets = offsets, lengths = lengths,
+      body = body, older = mostRecent, newer = nil }
     cache[index] = item
+    if mostRecent then (cache[mostRecent] :: Cached).newer = index
+    else leastRecent = index end
+    mostRecent = index
     cacheSize += 1
     pageReads += 1
     return item

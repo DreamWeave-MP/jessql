@@ -105,6 +105,28 @@ suite.describe('immutable page provider', function()
     expect(fs.exists(path)).toBe(false)
   end)
 
+  suite.it('evicts the true least-recent page and caps cache growth', function()
+    local path = fixture('lru')
+    local id = 0
+    sql.paged.create(path, { 'id', 'body' }, 'id', function()
+      id += 1
+      return if id <= 12 then { id = id, body = string.rep('y', 400) } else nil
+    end, { pageBytes = 512 })
+    local opened = sql.paged.open(path, { cachePages = 2 })
+    expect((assert(opened:get(1))).id).toBe(1)
+    expect((assert(opened:get(2))).id).toBe(2)
+    expect((assert(opened:get(1))).id).toBe(1) -- Refresh page 1.
+    expect(opened:stats().pageReads).toBe(2)
+    expect((assert(opened:get(3))).id).toBe(3) -- Evicts page 2.
+    expect((assert(opened:get(1))).id).toBe(1) -- Must still be resident.
+    expect(opened:stats().pageReads).toBe(3)
+    expect((assert(opened:get(2))).id).toBe(2) -- Miss after eviction.
+    expect(opened:stats().pageReads).toBe(4)
+    expect(opened:stats().cachedPages).toBe(2)
+    opened:close()
+    fs.remove(path)
+  end)
+
   suite.it('refuses corrupt page bytes before returning any affected row', function()
     local path = fixture('corrupt')
     local counter = 0
