@@ -185,14 +185,16 @@ end
 
 local function sqlTruthy(value) return value ~= nil and value ~= false end
 
-local function like(value, pattern)
+local function like(value: unknown, pattern: unknown): boolean?
   if value == nil or pattern == nil then return nil end
-  value = tostring(value)
-  pattern = tostring(pattern)
-  local valueIndex, patternIndex, starValueIndex, starPatternIndex = 1, 1, nil, nil
+  local textValue = tostring(value)
+  local textPattern = tostring(pattern)
+  local valueIndex, patternIndex = 1, 1
+  local starValueIndex: number? = nil
+  local starPatternIndex: number? = nil
 
-  while valueIndex <= #value do
-    local patternChar = string.sub(pattern, patternIndex, patternIndex)
+  while valueIndex <= #textValue do
+    local patternChar = string.sub(textPattern, patternIndex, patternIndex)
 
     if patternChar == '_' then
       valueIndex += 1
@@ -201,10 +203,10 @@ local function like(value, pattern)
       starPatternIndex = patternIndex + 1
       starValueIndex = valueIndex
       patternIndex += 1
-    elseif patternChar ~= '' and string.sub(value, valueIndex, valueIndex) == patternChar then
+    elseif patternChar ~= '' and string.sub(textValue, valueIndex, valueIndex) == patternChar then
       valueIndex += 1
       patternIndex += 1
-    elseif starPatternIndex ~= nil then
+    elseif starPatternIndex and starValueIndex then
       starValueIndex += 1
       valueIndex = starValueIndex
       patternIndex = starPatternIndex
@@ -213,11 +215,11 @@ local function like(value, pattern)
     end
   end
 
-  while string.sub(pattern, patternIndex, patternIndex) == '%' do patternIndex += 1 end
-  return patternIndex > #pattern
+  while string.sub(textPattern, patternIndex, patternIndex) == '%' do patternIndex += 1 end
+  return patternIndex > #textPattern
 end
 
-local function compileLiteralLike(pattern)
+local function compileLiteralLike(pattern: unknown): ((unknown) -> boolean?)?
   if type(pattern) ~= 'string' then return nil end
   local firstPercent = string.find(pattern, '%', 1, true)
   local firstUnderscore = string.find(pattern, '_', 1, true)
@@ -259,7 +261,7 @@ end
 local function bindColumn(expr, sources)
   if expr.sourceIndex ~= nil and expr.boundName ~= nil then return expr.sourceIndex, expr.boundName end
   local name = lower(expr.name)
-  local sourceIndex = nil
+  local sourceIndex: number? = nil
 
   if expr.qualifier then
     local qualifier = lower(expr.qualifier)
@@ -271,18 +273,18 @@ local function bindColumn(expr, sources)
       end
     end
 
-    if sourceIndex == nil then error('jessql: unknown table/alias ' .. expr.qualifier, 0) end
+    if not sourceIndex then error('jessql: unknown table/alias ' .. expr.qualifier, 0) end
   else
-    local hit = nil
+    local hit: number? = nil
 
     for index, source in sources do
       if source.columnSet[name] then
-        if hit ~= nil then error('jessql: ambiguous column ' .. expr.name, 0) end
+        if hit then error('jessql: ambiguous column ' .. expr.name, 0) end
         hit = index
       end
     end
 
-    if hit == nil then error('jessql: unknown column ' .. expr.name, 0) end
+    if not hit then error('jessql: unknown column ' .. expr.name, 0) end
     sourceIndex = hit
   end
 
