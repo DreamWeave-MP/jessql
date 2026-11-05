@@ -1,0 +1,80 @@
+--!strict
+local sql = require('@jessql')
+local fs = require('@dream/fs')
+local test = require('@jess/test')
+local expect = test.expect
+local suite = test.new()
+
+local function fixture(name: string): string
+  local path = fs.join(fs.cwd() :: string, '.jessql-new-runtime-' .. name .. '.wal')
+  fs.remove(path)
+  fs.remove(path .. '.lock')
+  return path
+end
+
+local function clean(path: string)
+  fs.remove(path)
+  fs.remove(path .. '.lock')
+end
+
+suite.describe('synchronized journal', function()
+  suite.it('synchronizes committed frames and replays them', function()
+    local path = fixture('sync')
+    local db = sql.open(path, { durability = 'sync', rowLayout = 'packed' })
+    db:createTable('events', { 'id', 'room', 'payload' }, 'id')
+    db:transaction(function(tx)
+      tx:insert('events', { id = '1', room = 'a', payload = 'first' })
+      tx:insert('events', { id = '2', room = 'b', payload = 'second' })
+    end)
+    db:close()
+    local nextDb = sql.open(path, { durability = 'sync' })
+    expect((assert(nextDb:get('events', '1'))).payload).toBe('first')
+    expect(nextDb:query('SELECT COUNT(*) AS n FROM events').rows[1].n).toBe(2)
+    nextDb:close()
+    clean(path)
+  end)
+
+  suite.it('synchronizes a torn-tail repair before appending again', function()
+    local path = fixture('tail')
+    local db = sql.open(path, { durability = 'sync' })
+    db:createTable('events', { 'id' }, 'id')
+    db:insert('events', { id = 1 })
+    db:close()
+    local written = fs.writeFile(path, string.char(0, 0, 0), { append = true })
+    assert(written)
+    local recovered = sql.open(path, { durability = 'sync' })
+    recovered:insert('events', { id = 2 })
+    recovered:close()
+    local verified = sql.open(path, { durability = 'sync', recoverTail = false })
+    expect(verified:query('SELECT COUNT(*) AS n FROM events').rows[1].n).toBe(2)
+    verified:close()
+    clean(path)
+  end)
+
+  suite.it('rejects unsafe checkpoint publication without poisoning the journal', function()
+    local path = fixture('checkpoint')
+    local db = sql.open(path, { durability = 'sync' })
+    db:createTable('events', { 'id' }, 'id')
+    -- The sync-mode checkpoint must throw until generation publication is safe.
+    local accepted = pcall(function() db:checkpoint() end)
+    expect(accepted).toBe(false)
+    db:insert('events', { id = 'safe' })
+    db:close()
+    local reopened = sql.open(path, { durability = 'sync' })
+    expect((assert(reopened:get('events', 'safe'))).id).toBe('safe')
+    reopened:close()
+    clean(path)
+  end)
+
+  suite.it('rejects unknown durability modes before creating a database', function()
+    local path = fixture('unknown')
+    -- Unknown durability modes throw before the database is created.
+    local accepted = pcall(function() sql.open(path, { durability = 'magic' }) end)
+    expect(accepted).toBe(false)
+    local exists = fs.exists(path)
+    expect(exists).toBe(false)
+    clean(path)
+  end)
+end)
+
+return suite

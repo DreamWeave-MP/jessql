@@ -12,7 +12,7 @@ local packed = require('@jessql/packed')
 local mutations = require('@jessql/mutations')
 
 export type Row = { [string]: unknown }
-export type Options = { maxFrameBytes: number?, recoverTail: boolean?, queryCacheEntries: number?, rowLayout: string? }
+export type Options = { maxFrameBytes: number?, recoverTail: boolean?, queryCacheEntries: number?, rowLayout: string?, durability: string? }
 export type Store = {
   createTable: (self: Store, name: string, columns: { string }, primaryKey: string) -> (),
   createIndex: (self: Store, name: string, column: string) -> (),
@@ -104,6 +104,8 @@ type DatabaseState = {
   busy: boolean,
   poisoned: boolean,
   rowLayout: string,
+  durability: string,
+  walWriter: dream_fs_Writer?,
 }
 
 local Magic = 'JQLW1\n'
@@ -1546,8 +1548,12 @@ local function load(state: DatabaseState, recoverTail: boolean)
     local writer, err = fs.openWrite(state.path, { create = false, truncate = false })
     if not writer then error('jessql storage: ' .. tostring(err), 2) end
     local ok, truncateError = writer:truncate(offset)
+    local synced, syncError = true, nil
+    if ok and state.durability == 'sync' then synced, syncError = writer:syncAll() end
     local closed, closeError = writer:close()
-    if not ok or not closed then error('jessql storage: ' .. tostring(truncateError or closeError), 2) end
+    if not ok or not synced or not closed then
+      error('jessql storage: tail recovery failed: ' .. tostring(truncateError or syncError or closeError), 2)
+    end
   end
 end
 
@@ -1555,12 +1561,26 @@ local function write(state: DatabaseState, ops: { Operation })
   if #ops == 0 then return end
   local payload = json.encodeTable({ version = 1, sequence = state.sequence + 1, ops = ops })
   local record = frame(payload, state.maxFrameBytes)
-  local count, err = fs.writeFile(state.path, record, { append = true, create = false })
+  local count: number?, err: string?
+  if state.durability == 'sync' then
+    count, err = (state.walWriter :: dream_fs_Writer):write(record)
+  else
+    count, err = fs.writeFile(state.path, record, { append = true, create = false })
+  end
+
   if count ~= #record then
     state.poisoned = true
     error('jessql storage: append failed (reopen required): ' .. tostring(err), 2)
   end
-  -- The append is already visible. A subsequent apply failure is uncertain
+
+  if state.durability == 'sync' then
+    local synced, syncError = (state.walWriter :: dream_fs_Writer):syncData()
+    if not synced then
+      state.poisoned = true
+      error('jessql storage: sync failed (reopen required): ' .. tostring(syncError), 2)
+    end
+  end
+  -- The append has crossed the requested visibility/durability boundary. A subsequent apply failure is uncertain
   -- state, never an ordinary rollback: close/reopen before any further work.
   local ok, applyError = pcall(apply, state, ops)
   if not ok then
@@ -1589,22 +1609,38 @@ function storage.open(path: string, options: Options?): Store
     error('jessql storage: rowLayout must be row or packed', 2)
   end
 
+  local durability = if options and options.durability then options.durability else 'buffered'
+  if durability ~= 'buffered' and durability ~= 'sync' then
+    error('jessql storage: durability must be buffered or sync', 2)
+  end
+
   local lock, err = fs.lock(path .. '.lock', { createParents = true })
   if not lock then error('jessql storage: database locked: ' .. tostring(err), 2) end
 
   local state: DatabaseState = {
     path = path, lock = lock, engine = queryEngine.new(), tables = {}, sequence = 0, schemaVersion = 0,
     maxFrameBytes = max or DefaultMaxFrame, closed = false, busy = false, poisoned = false,
-    rowLayout = rowLayout or 'row',
+    rowLayout = rowLayout or 'row', durability = durability, walWriter = nil,
   }
 
   -- Opening can fail on invalid frames; release the advisory lock on failure.
   local ok, failure = pcall(function()
     if not fs.exists(path) then
-      local count, writeError = fs.writeFile(path, Magic, { exclusive = true, createParents = true })
+      local count, writeError: string?
+      if durability == 'sync' then
+        count, writeError = fs.createDurable(path, Magic)
+      else
+        count, writeError = fs.writeFile(path, Magic, { exclusive = true, createParents = true })
+      end
+
       if count ~= #Magic then error('jessql storage: ' .. tostring(writeError)) end
     end
     load(state, options == nil or options.recoverTail ~= false)
+    if durability == 'sync' then
+      local writer, openError = fs.openWrite(path, { append = true, create = false })
+      if not writer then error('jessql storage: sync writer: ' .. tostring(openError)) end
+      state.walWriter = writer
+    end
   end)
 
   if not ok then lock:unlock(); error(failure, 2) end
@@ -1870,6 +1906,12 @@ function storage.open(path: string, options: Options?): Store
 
   function db.checkpoint(_self: Store)
     ready()
+    -- The legacy checkpoint replaces the active WAL without a generation
+    -- manifest. Refuse to claim a durable commit contract for that operation.
+    if state.durability == 'sync' then
+      error('jessql storage: synced checkpoint requires durable generation publication', 2)
+    end
+
     if state.busy then error('jessql storage: checkpoint inside transaction', 2) end
     -- Write a new compact log beside the live log; rename only after a complete close.
     -- The old log stays usable if snapshot construction fails.
@@ -2001,7 +2043,13 @@ function storage.open(path: string, options: Options?): Store
     if state.closed then return end
     if state.busy then error('jessql storage: close inside transaction', 2) end
     state.closed = true
+    local closed, closeError = true, nil
+    if state.walWriter then
+      closed, closeError = state.walWriter:close()
+      state.walWriter = nil
+    end
     state.lock:unlock()
+    if not closed then error('jessql storage: close: ' .. tostring(closeError), 2) end
   end
   return db
 end
