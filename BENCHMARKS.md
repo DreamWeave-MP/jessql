@@ -653,3 +653,14 @@ unconfigured databases. These are process CPU measurements from `os.clock`,
 not p99 latency, a physical power-cut test, or a controlled SQLite/RocksDB
 comparison. `maxHotBytes` is explicitly **not** a hard RSS cap. See
 [hot-byte maintenance semantics](docs/HOT-BYTE-BUDGET.md).
+
+## Grouped synchronized WAL transactions (experimental)
+
+The 960-transaction test compares identical CRC-framed WAL records while
+amortizing `syncData()` over 32 callbacks, not combining transactions. Seven
+alternating fresh-process Linux x64 runs produced median `os.clock()` of
+**262.527 ms** (solo) versus **28.304 ms** (batch), and process wall times of
+**0.42 s** versus **0.18 s**; both wrote **186,158 bytes** of WAL. This is an
+isolated sequential-submission benchmark, not concurrent multi-client throughput.
+See [docs/GROUP-COMMITS.md](docs/GROUP-COMMITS.md) for exact commands, failure
+contract, and limitations. Raw results are in the replay archive.

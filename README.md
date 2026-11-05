@@ -28,6 +28,15 @@ See [Hybrid storage details and limitations](docs/HYBRID.md) before using this
 experimental API. Power-loss durability, automatic segment promotion, and
 bounded total RSS are **not yet provided**.
 
+## Synchronized group commits
+
+`db:transactionBatch({ function(tx) ... end, ... })` lets a synchronized native,
+hybrid, or managed WAL store commit up to 256 **independent** transactions per
+`syncData()` barrier without collapsing them into one SQL transaction. Callback
+failures are isolated, and uncertain I/O outcomes require reopening before retry.
+This is an explicit synchronous batching primitive, **not** a worker-based
+concurrent writer service. See [durable batch semantics and benchmarks](docs/GROUP-COMMITS.md).
+
 ## Experimental durable managed generations
 
 `sql.managed.open(base, { tableName, columns, primaryKey })` now owns a
