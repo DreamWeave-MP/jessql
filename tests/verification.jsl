@@ -1,0 +1,165 @@
+--!strict
+local sql = require('@jessql')
+local fs = require('@dream/fs')
+local test = require('@jess/test')
+local suite, expect = test.new(), test.expect
+
+local function fixture(name: string): string
+  return fs.join(fs.cwd() :: string, '.jessql-verify-' .. name)
+end
+
+local function cleanup(base: string)
+  for epoch = 1, 15 do
+    local prefix = base .. string.format('.g%08d', epoch)
+    for _, extension in { '.rows', '.deleted', '.wal', '.wal.lock', '.hot-rows', '.hot-deleted' } do
+      fs.remove(prefix .. extension)
+    end
+  end
+
+  for _, extension in { '.jql-lock', '.jql-manifest', '.jql-manifest.tmp' } do
+    fs.remove(base .. extension)
+  end
+end
+
+local function database(base: string)
+  return sql.managed.open(base, { tableName = 'events', columns = { 'id', 'body' }, primaryKey = 'id' })
+end
+
+local function fails(action: () -> ()): boolean
+  -- Expected failure from locked or corrupt database; compare the outcome.
+  local ok = pcall(action)
+  return not ok
+end
+
+suite.describe('read-only offline integrity verification', function()
+  suite.it('verifies a full snapshot, delta generations, WAL binding and immutable contents', function()
+    local base = fixture('success')
+    cleanup(base)
+    local db = database(base)
+    db:insert({ id = 1, body = 'one' })
+    db:flush()
+    db:insert({ id = 2, body = 'two' })
+    db:flush()
+    db:delete(1)
+    db:close()
+    local before = assert((fs.readFileString(base .. '.g00000003.wal')))
+    local result = sql.managed.verify(base)
+    expect(result.ok).toBe(true)
+    expect(result.version).toBe(1)
+    expect(result.epoch).toBe(3)
+    expect(result.coldPagesChecked).toBe(true)
+    expect(result.walFramesChecked).toBe(true)
+    expect(result.walIdentityChecked).toBe(true)
+    expect(result.walSemanticReplayChecked).toBe(false)
+    expect(result.walFrames > 0).toBe(true)
+    expect(result.coldRowsScanned > 0).toBe(true)
+    expect((fs.readFileString(base .. '.g00000003.wal'))).toBe(before)
+    local reopened = sql.managed.open(base)
+    expect(reopened:get(1)).toBe(nil)
+    expect((assert(reopened:get(2))).body).toBe('two')
+    reopened:close()
+    cleanup(base)
+  end)
+
+  suite.it('refuses verification while a writer holds the namespace lock', function()
+    local base = fixture('locked')
+    cleanup(base)
+    local db = database(base)
+    expect(fails(function() sql.managed.verify(base) end)).toBe(true)
+    db:close()
+    expect(sql.managed.verify(base).ok).toBe(true)
+    cleanup(base)
+  end)
+
+  suite.it('reports checksum or incomplete frame without repairing the WAL', function()
+    local base = fixture('bad-wal')
+    cleanup(base)
+    local db = database(base)
+    db:insert({ id = 5, body = 'present' })
+    db:close()
+    local walPath = base .. '.g00000001.wal'
+    local intact = assert((fs.readFileString(walPath)))
+    assert((fs.writeFile(walPath, intact .. 'x')))
+    local result = sql.managed.verify(base)
+    expect(result.ok).toBe(false)
+    expect(result.issues[1].stage).toBe('wal')
+    expect(result.issues[1].code).toBe('WAL_TORN_TAIL')
+    expect((fs.readFileString(walPath))).toBe(intact .. 'x')
+    assert((fs.writeFile(walPath, string.sub(intact, 1, #intact - 2))))
+    expect(sql.managed.verify(base).ok).toBe(false)
+    cleanup(base)
+  end)
+
+  suite.it('returns an actionable checksum code when a complete WAL frame is tampered with', function()
+    local base = fixture('wal-crc')
+    cleanup(base)
+    local db = database(base)
+    db:insert({ id = 1, body = 'value' })
+    db:close()
+    local path = base .. '.g00000001.wal'
+    local original = assert((fs.readFileString(path)))
+    -- JQLW1 magic (6 bytes), frame length (4 bytes), then 4 CRC bytes.
+    local location = #'JQLW1\n' + 5
+    local damaged = string.sub(original, 1, location - 1)
+      .. string.char((string.byte(original, location) + 1) % 256)
+      .. string.sub(original, location + 1)
+    assert((fs.writeFile(path, damaged)))
+    local report = sql.managed.verify(base)
+    expect(report.ok).toBe(false)
+    expect(report.disposition).toBe('requires-operator-review')
+    expect(report.issues[1].code).toBe('WAL_CHECKSUM_MISMATCH')
+    expect(report.issues[1].recovery ~= '').toBe(true)
+    expect((fs.readFileString(path))).toBe(damaged)
+    assert((fs.writeFile(path, original)))
+    expect(sql.managed.diagnose(base).ok).toBe(true)
+    cleanup(base)
+  end)
+
+  suite.it('reports manifest and page errors without modifying files', function()
+    local base = fixture('bad-cold')
+    cleanup(base)
+    local db = database(base)
+    db:insert({ id = 5, body = 'present' })
+    db:checkpoint()
+    db:close()
+    local file = base .. '.g00000002.rows'
+    local original = assert((fs.readFileString(file)))
+    assert((fs.writeFile(file, string.sub(original, 1, #original - 5))))
+    local damaged = sql.managed.verify(base)
+    expect(damaged.ok).toBe(false)
+    expect(damaged.issues[1].code).toBe('COLD_INVALID')
+    assert((fs.writeFile(file, original)))
+    local manifestPath = base .. '.jql-manifest'
+    local manifestData = assert((fs.readFileString(manifestPath)))
+    assert((fs.writeFile(manifestPath, 'broken')))
+    local invalid = sql.managed.verify(base)
+    expect(invalid.ok).toBe(false)
+    expect(invalid.issues[1].code).toBe('MANIFEST_INVALID')
+    expect((fs.readFileString(manifestPath))).toBe('broken')
+    assert((fs.writeFile(manifestPath, manifestData)))
+    expect(sql.managed.verify(base).ok).toBe(true)
+    cleanup(base)
+  end)
+
+  suite.it('rejects a WAL belonging to the wrong generation even with intact frames', function()
+    local base = fixture('binding')
+    cleanup(base)
+    local db = database(base)
+    db:insert({ id = 1, body = 'old' })
+    db:flush()
+    db:close()
+    local current = base .. '.g00000002.wal'
+    local original = assert((fs.readFileString(current)))
+    local oldWal = base .. '.g00000001.wal'
+    -- The retired WAL is normally absent. A valid header alone is not a binding.
+    assert((fs.writeFile(current, 'JQLW1\n')))
+    local result = sql.managed.verify(base)
+    expect(result.ok).toBe(false)
+    expect(result.walIdentityChecked).toBe(false)
+    assert((fs.writeFile(current, original)))
+    expect(sql.managed.verify(base).ok).toBe(true)
+    cleanup(base)
+  end)
+end)
+
+return suite
