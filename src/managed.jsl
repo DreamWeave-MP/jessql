@@ -16,7 +16,7 @@ export type Row = { [string]: unknown }
 export type Options = {
   tableName: string?, columns: { string }?, primaryKey: string?,
   cachePages: number?, readMode: string?, rowLayout: string?, pageBytes: number?,
-  maxHotRows: number?, maxHotBytes: number?, maxGenerations: number?, runRows: number?, mergeFanIn: number?,
+  maxHotRows: number?, maxHotBytes: number?, maxWalBytes: number?, maxGenerations: number?, runRows: number?, mergeFanIn: number?,
   compactionFanIn: number?,
   -- Deterministic fault injection for integration tests. Throws at a named stage.
   testHook: ((string) -> ())?,
@@ -34,7 +34,7 @@ export type Database = {
   query: (self: Database, sql: string, params: { unknown }?) -> engine.Result,
   prepare: (self: Database, sql: string) -> engine.Plan,
   stats: (self: Database) -> { epoch: number, generations: number, coldRows: number, hotRows: number,
-    tombstones: number, hotPayloadBytes: number?, cachedPages: number },
+    tombstones: number, hotPayloadBytes: number?, walBytes: number?, cachedPages: number },
   maintenanceStatus: (self: Database) -> { lastError: string?, poisoned: boolean },
   flush: (self: Database) -> number,
   compact: (self: Database) -> number,
@@ -414,6 +414,7 @@ function managed.open(path: string, options: Options?): Database
   local base, parent = normalize(path)
   local maxHotRows = if options and options.maxHotRows ~= nil then options.maxHotRows else nil
   local maxHotBytes = if options and options.maxHotBytes ~= nil then options.maxHotBytes else nil
+  local maxWalBytes = if options and options.maxWalBytes ~= nil then options.maxWalBytes else nil
   local maxGenerations = if options and options.maxGenerations ~= nil
     then options.maxGenerations else 8
   if maxHotRows ~= nil and (type(maxHotRows) ~= 'number' or maxHotRows % 1 ~= 0
@@ -424,6 +425,13 @@ function managed.open(path: string, options: Options?): Database
   if maxHotBytes ~= nil and (type(maxHotBytes) ~= 'number' or maxHotBytes % 1 ~= 0
     or maxHotBytes < 1 or maxHotBytes > 1000000000000) then
     error('jessql managed: invalid maxHotBytes', 2)
+  end
+
+  -- A WAL has a nonzero bootstrap/header size even with an empty overlay.
+  -- Extremely small thresholds would make every first commit immediately rotate.
+  if maxWalBytes ~= nil and (type(maxWalBytes) ~= 'number' or maxWalBytes % 1 ~= 0
+    or maxWalBytes < 1024 or maxWalBytes > 1000000000000) then
+    error('jessql managed: invalid maxWalBytes', 2)
   end
 
   if type(maxGenerations) ~= 'number' or maxGenerations % 1 ~= 0
@@ -502,16 +510,53 @@ function managed.open(path: string, options: Options?): Database
   local active = value :: Manifest
   local closed, poisoned, busy, batchActive = false, false, false, false
   local lastMaintenanceError: string? = nil
+
+  -- Only WAL-budgeted databases perform file metadata I/O per commit. This
+  -- measures physical journal growth, including repeated overwrites whose
+  -- live-row count and scalar payload never change.
+  local function currentWalBytes(): number
+    local stat, statError = fs.stat(paths(base, active.epoch).wal)
+    if not stat or not stat.isFile then
+      error('jessql managed: active WAL stat failed: ' .. tostring(statError), 2)
+    end
+    return stat.size
+  end
+
   -- Recovery cannot forget an unresolved byte watermark. A WAL may contain
   -- an acknowledged oversized transaction after failed auto-maintenance.
   -- Do not accept another write until its overlay has been retired.
+  if maxHotRows then
+    -- A recovered WAL may already exceed the row watermark if the previous
+    -- process died after a committed write but before a successful flush.
+    -- Recovered row statistics may throw; poison rather than admit writes.
+    local counted, result = pcall(function() return live:stats() end)
+    if not counted then
+      poisoned = true
+      lastMaintenanceError = 'recovered hot-row accounting failed: ' .. tostring(result)
+    elseif (result.hotRows + result.tombstones) >= maxHotRows then
+      lastMaintenanceError = 'recovered hot rows exceed budget; flush or checkpoint'
+    end
+  end
+
   if maxHotBytes then
+    -- Recovered payload accounting may fail; keep the database fail-closed.
     local counted, result = pcall(function() return live:stats().hotPayloadBytes end)
     if not counted then
       poisoned = true
       lastMaintenanceError = 'recovered hot-byte accounting failed: ' .. tostring(result)
     elseif (result :: number) >= maxHotBytes then
       lastMaintenanceError = 'recovered hot overlay exceeds byte budget; flush or checkpoint'
+    end
+  end
+
+  if maxWalBytes then
+    -- WAL stat may fail after a crash; preserve fail-closed admission on reopen.
+    local counted, result = pcall(currentWalBytes)
+    if not counted then
+      poisoned = true
+      lastMaintenanceError = 'recovered WAL accounting failed: ' .. tostring(result)
+    elseif (result :: number) >= maxWalBytes then
+      lastMaintenanceError = 'recovered WAL exceeds byte budget; flush or checkpoint'
     end
   end
   local db = {} :: Database
@@ -541,15 +586,19 @@ function managed.open(path: string, options: Options?): Database
   -- A successful user commit is already synchronized. Auto-maintenance is
   -- never allowed to turn that acknowledgment into an apparent failed write.
   local function autoMaintain()
-    if not maxHotRows and not maxHotBytes then return end
+    if not maxHotRows and not maxHotBytes and not maxWalBytes then return end
 
     -- Even statistics can throw after the WAL was synchronized. Never turn
     -- an acknowledged user mutation into an apparent failed transaction.
     local ok, failure = pcall(function()
-      local state = live:stats()
-      local rowPressure = maxHotRows ~= nil and state.hotRows + state.tombstones >= maxHotRows
-      local bytePressure = maxHotBytes ~= nil and (state.hotPayloadBytes :: number) >= maxHotBytes
-      if not rowPressure and not bytePressure then return end
+      local rowPressure, bytePressure = false, false
+      if maxHotRows or maxHotBytes then
+        local state = live:stats()
+        rowPressure = maxHotRows ~= nil and state.hotRows + state.tombstones >= maxHotRows
+        bytePressure = maxHotBytes ~= nil and (state.hotPayloadBytes :: number) >= maxHotBytes
+      end
+      local walPressure = maxWalBytes ~= nil and currentWalBytes() >= maxWalBytes
+      if not rowPressure and not bytePressure and not walPressure then return end
 
       if #generationList(active) >= maxGenerations then db:compact()
       else db:flush() end
@@ -562,8 +611,8 @@ function managed.open(path: string, options: Options?): Database
   -- maintenance succeeds, rather than letting an error cause unbounded churn.
   local function readyToWrite()
     ready()
-    if maxHotBytes and lastMaintenanceError then
-      error('jessql managed: maintenance failed under hot-byte budget; flush or checkpoint', 3)
+    if (maxHotRows or maxHotBytes or maxWalBytes) and lastMaintenanceError then
+      error('jessql managed: maintenance failed under byte budget; flush or checkpoint', 3)
     end
   end
 
@@ -620,6 +669,7 @@ function managed.open(path: string, options: Options?): Database
     return { epoch = active.epoch, generations = #generationList(active),
       coldRows = result.coldRows, hotRows = result.hotRows,
       tombstones = result.tombstones, hotPayloadBytes = result.hotPayloadBytes,
+      walBytes = if maxWalBytes then currentWalBytes() else nil,
       cachedPages = result.cachedPages }
   end
 
@@ -761,7 +811,11 @@ function managed.open(path: string, options: Options?): Database
   function db.flush(_self: Database): number
     ready()
     local result = live:stats()
-    if result.hotRows + result.tombstones == 0 then return active.epoch end
+    if result.hotRows + result.tombstones == 0 then
+      -- A churned-out overlay can still leave a large WAL: an empty delta
+      -- generation rotates its journal without rewriting the older tiers.
+      if not maxWalBytes or currentWalBytes() < maxWalBytes then return active.epoch end
+    end
     return transition('delta')
   end
 
