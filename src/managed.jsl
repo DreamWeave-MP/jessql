@@ -1,0 +1,437 @@
+--!strict
+--!native
+-- Durable, single-snapshot generation lifecycle for one hybrid table.
+-- This is intentionally NOT a background LSM scheduler: a checkpoint runs
+-- synchronously under the managed lock, so no transaction crosses the cutover.
+local fs = require('@dream/fs')
+local bytes = require('@dream/bytes')
+local json = require('@jess/json')
+local hybrid = require('@jessql/hybrid')
+local paged = require('@jessql/paged')
+local engine = require('@jessql/engine')
+
+export type Row = { [string]: unknown }
+export type Options = {
+  tableName: string?, columns: { string }?, primaryKey: string?,
+  cachePages: number?, readMode: string?, rowLayout: string?, pageBytes: number?,
+  -- Deterministic fault injection for integration tests. Throws at a named stage.
+  testHook: ((string) -> ())?,
+}
+export type Transaction = hybrid.Transaction
+export type Database = {
+  get: (self: Database, key: unknown) -> Row?,
+  insert: (self: Database, row: Row) -> (),
+  upsert: (self: Database, row: Row) -> (),
+  update: (self: Database, key: unknown, changes: Row) -> boolean,
+  delete: (self: Database, key: unknown) -> boolean,
+  transaction: (self: Database, callback: (Transaction) -> ()) -> (),
+  query: (self: Database, sql: string, params: { unknown }?) -> engine.Result,
+  prepare: (self: Database, sql: string) -> engine.Plan,
+  stats: (self: Database) -> { epoch: number, coldRows: number, hotRows: number,
+    tombstones: number, cachedPages: number },
+  checkpoint: (self: Database) -> number,
+  close: (self: Database) -> (),
+}
+
+type Manifest = { version: number, epoch: number, tableName: string,
+  columns: { string }, primaryKey: string, snapshotIdentity: string }
+type Paths = { snapshot: string, wal: string }
+
+local Magic = 'JQLM1\n'
+local MaxManifest = 65536
+local MaxEpoch = 99999999
+local managed = {}
+
+local function assertOK(ok: boolean?, message: string?, action: string)
+  if not ok then error('jessql managed: ' .. action .. ': ' .. tostring(message), 3) end
+end
+
+local function directory(path: string): string
+  local parent = fs.parent(path)
+
+  if not parent then error('jessql managed: missing parent directory', 3) end
+  return parent
+end
+
+local function normalize(path: string): (string, string)
+  if type(path) ~= 'string' or path == '' then error('jessql managed: path required', 3) end
+  local absolute, absoluteError = fs.absolute(path)
+
+  if not absolute then error('jessql managed: ' .. tostring(absoluteError), 3) end
+  local name = fs.fileName(absolute)
+
+  if not name or not fs.isFileName(name) then error('jessql managed: invalid path', 3) end
+  -- Canonical parent prevents aliases to the same managed DB from bypassing its lock.
+  local parent, parentError = fs.canonicalize(directory(absolute))
+
+  if not parent then error('jessql managed: parent: ' .. tostring(parentError), 3) end
+  if not fs.isDir(parent) then error('jessql managed: parent is not a directory', 3) end
+  return fs.join(parent, name), parent
+end
+
+local function paths(base: string, epoch: number): Paths
+  local suffix = string.format('.g%08d', epoch)
+  return { snapshot = base .. suffix .. '.rows', wal = base .. suffix .. '.wal' }
+end
+
+local function validateSchema(value: Manifest)
+  if value.version ~= 1 or type(value.epoch) ~= 'number' or value.epoch % 1 ~= 0
+    or value.epoch < 1 or value.epoch > MaxEpoch or type(value.tableName) ~= 'string'
+    or not string.match(value.tableName, '^[%a_][%w_]*$')
+    or value.tableName ~= string.lower(value.tableName)
+    or value.tableName == '__jessql_hybrid_deleted'
+    or value.tableName == '__jessql_hybrid_identity'
+    or type(value.primaryKey) ~= 'string' or type(value.snapshotIdentity) ~= 'string'
+    or not string.match(value.snapshotIdentity, '^[%x]+:%d+$')
+    or type(value.columns) ~= 'table' or #value.columns == 0 or #value.columns > 256 then
+    error('jessql managed: invalid manifest schema', 3)
+  end
+  local unique: { [string]: boolean } = {}
+
+  for index, name in value.columns do
+    if type(index) ~= 'number' or type(name) ~= 'string'
+      or not string.match(name, '^[%a_][%w_]*$') or unique[name] then
+      error('jessql managed: invalid manifest columns', 3)
+    end
+    unique[name] = true
+  end
+
+  if not unique[value.primaryKey] then error('jessql managed: missing primary key', 3) end
+end
+
+local function manifestText(value: Manifest): string
+  validateSchema(value)
+  local body = json.encodeTable(value)
+
+  if #body > MaxManifest - 64 then error('jessql managed: manifest too large', 3) end
+  return Magic .. body .. '\n' .. tostring(bytes.crc32(body)) .. '\n'
+end
+
+local function readManifest(path: string): Manifest
+  local raw, failure = fs.readFileString(path)
+
+  if not raw then error('jessql managed: read manifest: ' .. tostring(failure), 3) end
+
+  if #raw > MaxManifest or string.sub(raw, 1, #Magic) ~= Magic then
+    error('jessql managed: invalid manifest header', 3)
+  end
+  local body, checksum = string.match(string.sub(raw, #Magic + 1), '^(.*)\n(%d+)\n$')
+
+  if not body or not checksum or tonumber(checksum) ~= bytes.crc32(body) then
+    error('jessql managed: manifest checksum mismatch', 3)
+  end
+  local decoded = json.decode(body) :: Manifest
+
+  if type(decoded) ~= 'table' then error('jessql managed: invalid manifest', 3) end
+  validateSchema(decoded)
+  return decoded
+end
+
+local function sameSchema(left: Manifest, options: Options?)
+  if not options then return end
+
+  if options.tableName ~= nil and options.tableName ~= left.tableName then
+    error('jessql managed: requested table name mismatch', 3)
+  end
+
+  if options.primaryKey ~= nil and options.primaryKey ~= left.primaryKey then
+    error('jessql managed: requested primary key mismatch', 3)
+  end
+
+  if options.columns ~= nil then
+    if #options.columns ~= #left.columns then error('jessql managed: column mismatch', 3) end
+
+    for index, column in options.columns do
+      if column ~= left.columns[index] then error('jessql managed: column mismatch', 3) end
+    end
+  end
+end
+
+local function seal(path: string, parent: string)
+  local writer, openError = fs.openWrite(path, { create = false, truncate = false })
+
+  if not writer then error('jessql managed: seal open: ' .. tostring(openError), 3) end
+  local synced, syncError = writer:syncAll()
+  local closed, closeError = writer:close()
+  assertOK(synced, syncError, 'seal syncAll')
+  assertOK(closed, closeError, 'seal close')
+  local ok, err = fs.syncDirectory(parent)
+  assertOK(ok, err, 'seal directory')
+end
+
+local function removeIfPresent(path: string)
+  local exists, existenceError = fs.exists(path)
+
+  if exists == nil then error('jessql managed: stat: ' .. tostring(existenceError), 3) end
+
+  if exists then
+    local removed, removeError = fs.remove(path)
+    assertOK(removed, removeError, 'remove ' .. path)
+  end
+end
+
+local function clearCandidate(candidatePaths: Paths)
+  removeIfPresent(candidatePaths.wal)
+  removeIfPresent(candidatePaths.wal .. '.lock')
+  removeIfPresent(candidatePaths.snapshot)
+end
+
+local function verifySnapshot(candidatePaths: Paths, value: Manifest, options: Options?)
+  local snapshot = paged.open(candidatePaths.snapshot, { cachePages = 1,
+    readMode = if options then options.readMode else nil })
+
+  -- Schema and identity validation can throw; always release its reader.
+  local ok, err = pcall(function()
+    if snapshot.identity ~= value.snapshotIdentity or snapshot.primaryKey ~= value.primaryKey
+      or #snapshot.columns ~= #value.columns then error('snapshot identity or schema mismatch') end
+
+    for index, column in value.columns do
+      if snapshot.columns[index] ~= column then error('snapshot column mismatch') end
+    end
+  end)
+  snapshot:close()
+
+  if not ok then error('jessql managed: ' .. tostring(err), 3) end
+end
+
+local function openHybrid(candidatePaths: Paths, value: Manifest, options: Options?,
+  requiredWal: boolean): hybrid.Database
+  if requiredWal then
+    local exists, checkError = fs.exists(candidatePaths.wal)
+    if not exists then error('jessql managed: active WAL missing: ' .. tostring(checkError), 3) end
+  end
+  verifySnapshot(candidatePaths, value, options)
+  return hybrid.open(candidatePaths.wal, candidatePaths.snapshot, value.tableName, {
+    durability = 'sync', requireIdentity = requiredWal,
+    rowLayout = if options then options.rowLayout else 'packed',
+    cachePages = if options then options.cachePages else nil,
+    readMode = if options then options.readMode else nil,
+  })
+end
+
+local function durableManifest(base: string, parent: string, value: Manifest,
+  hook: ((string) -> ())?, state: { started: boolean })
+  local candidate = base .. '.jql-manifest.tmp'
+  removeIfPresent(candidate)
+  local text = manifestText(value)
+  local count, errorMessage = fs.createDurable(candidate, text)
+
+  if count ~= #text then error('jessql managed: durable manifest: ' .. tostring(errorMessage), 3) end
+  if hook then hook('before-replace') end
+  -- Once replacement is attempted, failure is an uncertain publication.
+  -- Never remove either candidate generation or the old WAL in this state.
+  state.started = true
+  local ok, failure = fs.replace(candidate, base .. '.jql-manifest')
+  assertOK(ok, failure, 'replace manifest')
+
+  if hook then hook('after-replace') end
+  ok, failure = fs.syncDirectory(parent)
+  assertOK(ok, failure, 'sync manifest directory')
+
+  if hook then hook('after-directory-sync') end
+end
+
+-- A durable, explicit checkpoint is the initial managed cutover primitive.
+-- No auto flushing, multi-generation delta publication, or worker scheduling yet.
+function managed.open(path: string, options: Options?): Database
+  local base, parent = normalize(path)
+  local lock, lockError = fs.lock(base .. '.jql-lock')
+
+  if not lock then error('jessql managed: database locked: ' .. tostring(lockError), 2) end
+  local manifestPath = base .. '.jql-manifest'
+  local value: Manifest? = nil
+  local current: hybrid.Database? = nil
+  -- Open and initialization may fail at any I/O boundary; release the managed lock.
+  local opened, failure = pcall(function()
+    local exists, existsError = fs.exists(manifestPath)
+
+    if exists == nil then error('manifest stat: ' .. tostring(existsError)) end
+
+    if exists then
+      value = readManifest(manifestPath)
+      sameSchema(value :: Manifest, options)
+    else
+      if not options or not options.tableName or not options.columns or not options.primaryKey then
+        error('first open requires tableName, columns and primaryKey')
+      end
+      local name = string.lower(options.tableName)
+      -- Do not silently rename a user-supplied table.
+      if name ~= options.tableName then error('tableName must be lowercase') end
+      local initial = paths(base, 1)
+      clearCandidate(initial) -- an unreferenced, uncommitted interrupted initialization
+      removeIfPresent(base .. '.jql-manifest.tmp')
+      paged.create(initial.snapshot, options.columns, options.primaryKey,
+        function(): Row? return nil end, { pageBytes = options.pageBytes })
+      seal(initial.snapshot, parent)
+      local snapshot = paged.open(initial.snapshot, { cachePages = 1 })
+      value = { version = 1, epoch = 1, tableName = name,
+        columns = options.columns, primaryKey = options.primaryKey,
+        snapshotIdentity = snapshot.identity }
+      snapshot:close()
+      validateSchema(value :: Manifest)
+      current = openHybrid(initial, value :: Manifest, options, false)
+      local started = { started = false }
+      durableManifest(base, parent, value :: Manifest, if options then options.testHook else nil, started)
+    end
+
+    if not current then
+      current = openHybrid(paths(base, (value :: Manifest).epoch), value :: Manifest, options, true)
+      -- After an interrupted publication, the new manifest may be visible
+      -- before a parent-directory barrier. Re-fence it before retiring any
+      -- previous generation. Failure only leaves unreachable old files.
+      local synced, syncError = fs.syncDirectory(parent)
+      -- Refuse writes until the observed manifest has a durable directory
+      -- barrier: otherwise an earlier uncertain replacement could roll back
+      -- across another power loss after newly acknowledged WAL commits.
+      assertOK(synced, syncError, 'recovery manifest directory')
+      if (value :: Manifest).epoch > 1 then
+        -- Orphan cleanup cannot affect the already-open authoritative WAL.
+        pcall(function() clearCandidate(paths(base, (value :: Manifest).epoch - 1)) end)
+      end
+    end
+  end)
+
+  if not opened then
+    -- A half-open hybrid must not leave its WAL lock held.
+    if current then pcall(function() (current :: hybrid.Database):close() end) end
+    lock:unlock()
+    error('jessql managed: open: ' .. tostring(failure), 2)
+  end
+
+  local live = current :: hybrid.Database
+  local active = value :: Manifest
+  local closed, poisoned, busy = false, false, false
+  local db = {} :: Database
+
+  local function ready()
+    if closed then error('jessql managed: closed', 3) end
+    if poisoned then error('jessql managed: uncertain publication; close and reopen', 3) end
+    if busy then error('jessql managed: generation transition in progress', 3) end
+  end
+
+  function db.get(_self: Database, key: unknown): Row?
+    ready()
+    return live:get(key)
+  end
+
+  function db.query(_self: Database, sql: string, params: { unknown }?): engine.Result
+    ready()
+    return live:query(sql, params)
+  end
+
+  function db.prepare(_self: Database, sql: string): engine.Plan
+    ready()
+    return live:prepare(sql)
+  end
+
+  function db.transaction(_self: Database, callback: (Transaction) -> ())
+    ready()
+    live:transaction(callback)
+  end
+
+  function db.insert(_self: Database, row: Row)
+    ready()
+    live:insert(row)
+  end
+
+  function db.upsert(_self: Database, row: Row)
+    ready()
+    live:upsert(row)
+  end
+
+  function db.update(_self: Database, key: unknown, changes: Row): boolean
+    ready()
+    return live:update(key, changes)
+  end
+
+  function db.delete(_self: Database, key: unknown): boolean
+    ready()
+    return live:delete(key)
+  end
+
+  function db.stats(_self: Database)
+    ready()
+    local result = live:stats()
+    return { epoch = active.epoch, coldRows = result.coldRows, hotRows = result.hotRows,
+      tombstones = result.tombstones, cachedPages = result.cachedPages }
+  end
+
+  function db.checkpoint(_self: Database): number
+    ready()
+
+    if active.epoch >= MaxEpoch then error('jessql managed: generation limit', 2) end
+    busy = true
+    local nextEpoch = active.epoch + 1
+    local candidatePaths = paths(base, nextEpoch)
+    local candidate: hybrid.Database? = nil
+    local publication = { started = false }
+    -- Catch candidate export and publication errors to distinguish safe retries from uncertain commits.
+    local completed, checkpointFailure = pcall(function()
+      -- The old WAL remains authoritative until a manifest replacement is durable.
+      clearCandidate(candidatePaths)
+      live:exportSnapshot(candidatePaths.snapshot, { pageBytes = if options then options.pageBytes else nil })
+      seal(candidatePaths.snapshot, parent)
+      local snapshot = paged.open(candidatePaths.snapshot, { cachePages = 1 })
+      local nextValue: Manifest = { version = 1, epoch = nextEpoch, tableName = active.tableName,
+        columns = active.columns, primaryKey = active.primaryKey,
+        snapshotIdentity = snapshot.identity }
+      snapshot:close()
+
+      if options and options.testHook then options.testHook('candidate-sealed') end
+      candidate = openHybrid(candidatePaths, nextValue, options, false)
+
+      if options and options.testHook then options.testHook('wal-ready') end
+      durableManifest(base, parent, nextValue,
+
+        if options then options.testHook else nil, publication)
+      -- No caller-visible operation is allowed to interleave publication.
+      local previous = live
+      live = candidate :: hybrid.Database
+      candidate = nil
+      active = nextValue
+      previous:close()
+
+      if options and options.testHook then options.testHook('before-retire') end
+      -- Best-effort retirement, only after publication and all old handles close.
+      -- Old generations are never required for recovery after this point.
+      local oldPaths = paths(base, nextEpoch - 1)
+      -- Retirement is best effort; an orphan is harmless once the manifest is durable.
+      pcall(function()
+        clearCandidate(oldPaths)
+        fs.syncDirectory(parent)
+      end)
+    end)
+    busy = false
+
+    if not completed then
+      -- Release an unpublished candidate before considering cleanup.
+      if candidate then pcall(function() (candidate :: hybrid.Database):close() end) end
+
+      if publication.started then
+        poisoned = true
+      else
+        -- A pre-publication failure leaves the previous live WAL usable.
+        -- Before replacement, candidate files cannot be authoritative.
+        pcall(function() clearCandidate(candidatePaths) end)
+        -- A leftover replacement manifest is also unreferenced.
+        pcall(function() removeIfPresent(base .. '.jql-manifest.tmp') end)
+      end
+      error('jessql managed: checkpoint failed: ' .. tostring(checkpointFailure), 2)
+    end
+    return active.epoch
+  end
+
+  function db.close(_self: Database)
+    if closed then return end
+    if busy then error('jessql managed: cannot close during publication', 2) end
+    closed = true
+    -- Closing a poisoned handle can fail, but the managed lock must still be released.
+    local ok, err = pcall(function() live:close() end)
+    lock:unlock()
+
+    if not ok then error(err, 2) end
+  end
+  return db
+end
+
+return managed

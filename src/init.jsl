@@ -11,10 +11,12 @@ local secondary = require('@jessql/secondary')
 local segments = require('@jessql/segments')
 local delta = require('@jessql/delta')
 local tiers = require('@jessql/tiers')
+local managed = require('@jessql/managed')
 
 export type Database = engine.Database
 export type PersistentDatabase = storage.Store
 export type HybridDatabase = hybrid.Database
+export type ManagedDatabase = managed.Database
 export type Transaction = storage.Transaction
 export type MutationPlan = storage.MutationPlan
 export type Plan = engine.Plan
@@ -47,6 +49,7 @@ return {
   segments = segments,
   delta = delta,
   tiers = tiers,
+  managed = managed,
   NULL = mutations.NULL,
   parse = parser.parse,
   lex = lexer.lex,

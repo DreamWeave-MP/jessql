@@ -11,7 +11,7 @@ local delta = require('@jessql/delta')
 local fs = require('@dream/fs')
 
 export type Row = { [string]: unknown }
-export type Options = { cachePages: number?, readMode: string?, durability: string?, rowLayout: string?, secondaryIndexPath: string?, secondaryIndexPaths: { string }?, deletePaths: { [number]: string }? }
+export type Options = { cachePages: number?, readMode: string?, durability: string?, rowLayout: string?, secondaryIndexPath: string?, secondaryIndexPaths: { string }?, deletePaths: { [number]: string }?, requireIdentity: boolean? }
 export type Transaction = {
   get: (self: Transaction, key: unknown) -> Row?,
   insert: (self: Transaction, row: Row) -> (),
@@ -437,6 +437,14 @@ function hybrid.open(walPath: string, snapshotPath: string | { string }, tableNa
       error('jessql hybrid: incompatible identity schema')
     end
 
+    -- Managed generation recovery MUST NOT synthesize an identity or schema
+    -- for a missing/replaced WAL. Ordinary unmanaged opens retain their
+    -- historical first-open bootstrap behavior.
+    if options and options.requireIdentity and
+      (not existing[name] or not existing[Tombstones] or not existing[Identity]) then
+      error('jessql hybrid: bound WAL schema missing')
+    end
+
     if not existing[name] then store:createTable(name, cold.columns, cold.primaryKey) end
     if not existing[Tombstones] then store:createTable(Tombstones, { 'id' }, 'id') end
     if not existing[Identity] then store:createTable(Identity, { 'id', 'token', 'name' }, 'id') end
@@ -447,6 +455,9 @@ function hybrid.open(walPath: string, snapshotPath: string | { string }, tableNa
         error('jessql hybrid: snapshot identity mismatch; refuse to replay overlay')
       end
     else
+      if options and options.requireIdentity then
+        error('jessql hybrid: bound WAL identity missing')
+      end
       store:insert(Identity, { id = 'snapshot', token = cold.identity, name = name })
     end
 
