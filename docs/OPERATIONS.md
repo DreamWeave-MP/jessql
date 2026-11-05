@@ -79,7 +79,20 @@ acknowledgement is lost due to a transport/process failure, applications need
 idempotent operation identifiers or a read-after-recovery reconciliation step.
 Blind retry can duplicate business actions.
 
-## Backups: only a conservative offline procedure is supported
+## Supported offline namespace backup / restore
+
+The new `sql.managed.backup(source, destination)` and
+`sql.managed.restore(backup, emptyTarget)` APIs hold exclusive managed locks,
+semantically verify both copies, and publish the target manifest last. The
+writer must be closed and destinations must be unused. See
+[offline verification and backup](OFFLINE-VERIFICATION-AND-BACKUP.md) for the
+supported contract, caveats and examples. **Neither is an online snapshot.**
+
+The manual procedure below remains useful for preserving all files, including
+orphaned generations, forensic evidence, or non-JessQL backup tooling. It is
+not a substitute for the API's semantic verification.
+
+## Manual/off-system backups and forensic evidence
 
 **There is no online point-in-time backup API.** Copying a live WAL alongside a
 manifest and generations can produce an impossible combination. For a backup:

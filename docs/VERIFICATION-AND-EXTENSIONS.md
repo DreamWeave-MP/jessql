@@ -67,7 +67,7 @@ if not report.ok then error('database requires operator investigation') end
 5. A structurally clean report does not replace full replay testing, cold
    semantic validation, transaction reconciliation or physical fault testing.
 
-No repair, backup, replication, snapshot-consistency or salvage API is
+No repair, online backup, replication, snapshot-consistency or salvage API is
 introduced here. Never use this verifier as a write authorization protocol.
 It may perform large, multi-hour linear scans on sufficiently big databases;
 run it during an explicit offline maintenance window.
@@ -183,3 +183,10 @@ CI gate before treating enforcement as continuous.
   disk controller failures, multi-process misuse, or Windows/macOS semantics.
 - A version number is an API-format marker, not permission to reinterpret
   WAL contents, change durable manifest schema or skip compatibility checks.
+
+## Semantic WAL audit and offline copies
+
+`managed.verify(path, { semantic = true })` now validates WAL operations by
+replaying them in transient storage state. The default remains structural for
+compatibility. `managed.backup` and `managed.restore` copy only closed, verified
+namespaces to unused destinations. See [the v1 offline copy contract](OFFLINE-VERIFICATION-AND-BACKUP.md).

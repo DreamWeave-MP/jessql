@@ -356,3 +356,6 @@ interface/event systems without callbacks in the transaction path.
 
 The strict regression gate is `python3 scripts/check-strict.py /path/to/jess`;
 it records remaining `engine.jsl` debt rather than hiding it.
+
+Offline verification, semantic WAL replay, backup and restore are documented in
+[Offline Verification and Backup](docs/OFFLINE-VERIFICATION-AND-BACKUP.md).
