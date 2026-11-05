@@ -91,7 +91,7 @@ local function keyLess(left: unknown, right: unknown): boolean
 end
 
 local function provider(cold: paged.Snapshot, coldIndex: secondary.Index?, tableName: string, primaryKey: string,
-  hotGet: (string, unknown) -> Row?, hotQuery: (string) -> engine.Result): engine.Provider
+  hotGet: (string, unknown) -> Row?, hotQuery: (string, { unknown }?) -> engine.Result): engine.Provider
   local columns = cold.columns
 
   local function get(key: unknown): Row?
@@ -122,13 +122,9 @@ local function provider(cold: paged.Snapshot, coldIndex: secondary.Index?, table
       }
     end
 
-    -- Only hot data is gathered into memory. Cold records remain streaming,
-    -- with a bounded decoded-page cache. Hot keys mask their cold versions.
-    local hotRows = hotQuery(selectAll(tableName)).rows
-    local deletedRows = hotQuery('SELECT id FROM ' .. Tombstones).rows
-    local masked: { [string]: boolean } = {}
-    for _, row in hotRows do masked[encodeKey(row[primaryKey])] = true end
-    for _, row in deletedRows do masked[row.id :: string] = true end
+    -- Defer full hot-overlay materialization until the unindexed fallback.
+    -- Partitioned sidecar reads can use the hot table's equality index and
+    -- probe shadow state for only the cold candidates actually traversed.
     local readColumns: { string } = {}
     local hasPrimaryKey = false
     for _, column in request.columns do
@@ -174,14 +170,12 @@ local function provider(cold: paged.Snapshot, coldIndex: secondary.Index?, table
 
       if prefix ~= nil and compatible then
         local selectedIndex = coldIndex :: secondary.Index
-        local matchingHot: { Row } = {}
-        for _, row in hotRows do
-          if row[coldIndex.partitionColumn] == prefix then
-            if type(row[coldIndex.orderColumn]) ~= coldIndex.orderKind then
-              compatible = false
-              break
-            end
-            matchingHot[#matchingHot + 1] = row
+        local matchingHot = hotQuery('SELECT * FROM ' .. tableName .. ' WHERE '
+          .. selectedIndex.partitionColumn .. ' = ?', { prefix }).rows
+        for _, row in matchingHot do
+          if type(row[selectedIndex.orderColumn]) ~= selectedIndex.orderKind then
+            compatible = false
+            break
           end
         end
 
@@ -200,7 +194,8 @@ local function provider(cold: paged.Snapshot, coldIndex: secondary.Index?, table
           local hotIndex = 1
           local function nextMerged(): Row?
             while coldRow do
-              if not masked[encodeKey((coldRow :: Row)[primaryKey])] then break end
+              local key = (coldRow :: Row)[primaryKey]
+              if not hotGet(tableName, key) and not hotGet(Tombstones, encodeKey(key)) then break end
               coldRow = nextCold()
             end
             local hotRow = matchingHot[hotIndex]
@@ -224,6 +219,14 @@ local function provider(cold: paged.Snapshot, coldIndex: secondary.Index?, table
         end
       end
     end
+
+    -- Other queries keep the established general-purpose overlay path.
+    -- It is intentionally separate from the sidecar's indexed fast path.
+    local hotRows = hotQuery(selectAll(tableName)).rows
+    local deletedRows = hotQuery('SELECT id FROM ' .. Tombstones).rows
+    local masked: { [string]: boolean } = {}
+    for _, row in hotRows do masked[encodeKey(row[primaryKey])] = true end
+    for _, row in deletedRows do masked[row.id :: string] = true end
 
     local order = request.orderBy
     local orderedRead = order ~= nil and #order == 1 and order[1].column == primaryKey
@@ -438,6 +441,16 @@ function hybrid.open(walPath: string, snapshotPath: string | { string }, tableNa
     else
       store:insert(Identity, { id = 'snapshot', token = cold.identity, name = name })
     end
+
+    -- Indexed cold reads should not require scanning every hot row to find
+    -- the matching partition. The index persists in the existing WAL and
+    -- transaction-local queries still reconcile their staged changes.
+    if coldIndex then
+      local column = coldIndex.partitionColumn
+      local current = store:stats()[name]
+      if current.indexSlots[column] == nil then store:createIndex(name, column) end
+    end
+
   end)
 
   if not initialized then
@@ -454,14 +467,14 @@ function hybrid.open(walPath: string, snapshotPath: string | { string }, tableNa
     store:transaction(callback)
   end
 
-  local function newView(getter: (string, unknown) -> Row?, query: (string) -> engine.Result): engine.Database
+  local function newView(getter: (string, unknown) -> Row?, query: (string, { unknown }?) -> engine.Result): engine.Database
     local view = engine.new()
     view:register(name, provider(cold, coldIndex, name, cold.primaryKey, getter, query))
     return view
   end
 
   local view = newView(function(table, key) return store:get(table, key) end,
-    function(sql) return store:query(sql) end)
+    function(sql, params) return store:query(sql, params) end)
   local db = {} :: Database
 
   function db.get(_self: Database, key: unknown): Row?
@@ -502,7 +515,7 @@ function hybrid.open(walPath: string, snapshotPath: string | { string }, tableNa
       apply(function(tx)
       local transaction = {} :: Transaction
       local txView = newView(function(table, key) return tx:get(table, key) end,
-        function(sql) return tx:query(sql) end)
+        function(sql, params) return tx:query(sql, params) end)
       local plans: { [string]: engine.Plan } = {}
 
       local function get(key: unknown): Row?
