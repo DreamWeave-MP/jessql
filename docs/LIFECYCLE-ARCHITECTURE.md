@@ -11,6 +11,7 @@ For practical incident response, see [operator runbook](OPERATIONS.md).
   └─ @jessql/managed  — synchronized lifecycle coordinator / public DB API
        ├─ @jessql/managed_manifest — pure JQLM1 codec, schema invariants
        ├─ @jessql/managed_policy   — pure resource-budget decision
+       ├─ @jessql/managed_publication — durable sealing + manifest cutover
        ├─ @jessql/hybrid           — WAL overlay + cold provider
        ├─ @jessql/paged            — immutable page reader / snapshot writer
        ├─ @jessql/segments         — generation precedence + tombstones
@@ -21,15 +22,19 @@ For practical incident response, see [operator runbook](OPERATIONS.md).
 `managed_manifest` and `managed_policy` are **internal implementation
 modules**, not supported extension/versioning contracts. They contain no
 filesystem I/O, Jess application-domain dependency, worker API, or mutable
-singleton state. This makes validation and decision logic independently
-testable and keeps the durability kernel responsible for all publication.
+singleton state. The separate `managed_publication` module **does** perform
+filesystem operations: it seals generated files and performs the manifest's
+`createDurable` → `replace` → `syncDirectory` publication protocol.
 
-`managed.jsl` still owns paths, locks, synchronous transition sequencing,
-WAL binding, retired-file cleanup, database operations, and failure fencing.
-Further extraction should be driven by safety tests, not by chasing a target
-number of lines. In particular, the next possible seam is an internal durable
-publisher with a single well-documented state machine. **Do not** expose it as
-an interchangeable mod API.
+`managed.jsl` still owns paths, namespace locks, candidate construction, WAL
+binding, active-handle selection, retired-file cleanup, database operations,
+and poison/failure fencing. It calls the publication module only while holding
+the exclusive managed lock and **after** establishing the candidate WAL/cold
+identity. The publisher has no generic callback plugin contract: the optional
+`testHook` in the coordinator is for deterministic fault injection only.
+Neither internal module nor its ordering/synchronization steps is a stable
+modding interface. External application-domain events cannot sit between the
+synchronization barriers.
 
 ## Non-negotiable invariants
 
@@ -72,6 +77,25 @@ replace manifest.tmp → manifest → syncDirectory
    ▼
 activate new hybrid view → close old view → best-effort retirement
 ```
+
+### Publication failure boundaries
+
+| Boundary | `started` flag | Manifest authority | Correct coordinator action |
+|---|---|---|---|
+| Candidate file creation/sealing fails | false | Previous manifest | Discard only unpublished candidates, preserve old WAL |
+| `createDurable` or `before-replace` fails | false | Previous manifest | Candidate temp may remain; clean it under the lock |
+| Replacement attempted or `after-replace` throws | true | Uncertain until reopen | Poison handle; **do not** retire any old file |
+| Directory sync or `after-directory-sync` throws | true | Uncertain to caller | Poison handle; reopen and re-fence directory |
+| Publication returns normally | true | New manifest | Activate candidate; retire only unreferenced files |
+
+`started` records the **attempt**, not proof that `replace` returned success
+or that the parent directory has been synchronized. This is deliberately
+conservative: recovery must read the authoritative manifest, verify cold and
+WAL identity, synchronize the directory, and only then admit writes.
+The publisher is deliberately synchronous, receives no worker/app-domain
+context, and is tested separately in `tests/publication.jsl`. See the
+[durable publication developer contract](PUBLICATION-PROTOCOL.md) for the
+full state machine and extension restrictions.
 
 The pure manifest module validates **versioned metadata**, ordered generation
 numbers, the table schema, and a framed CRC. It does not provide cryptographic

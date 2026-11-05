@@ -46,6 +46,21 @@ Byte counts are physical file sizes at inspection time, not net logical
 row counts. Inventory includes only files referenced by the manifest (not
 scratch files or obsolete orphans).
 
+## The durable-publisher boundary
+
+Manifest publication is a short, lock-owned filesystem operation implemented
+in the internal `managed_publication` module. It is **not** a user-replaceable
+backend, mod callback, or event subscription point. A failed `flush`, `compact`,
+or `checkpoint` before manifest replacement leaves the old WAL authoritative.
+Once replacement has been attempted, the caller cannot know which manifest
+survived until it closes and reopens the database. Never remove candidate
+files or replay transactions based only on the name of the thrown exception.
+
+The test-only publication hook can inject errors at `before-replace`,
+`after-replace`, and `after-directory-sync`; it is **not** a power-loss
+simulator. See [publication failure boundaries](LIFECYCLE-ARCHITECTURE.md#publication-failure-boundaries)
+for the decision table and [test cases](../tests/publication.jsl).
+
 ## Acknowledgements and uncertainty
 
 | Symptom | Interpretation | Safe next action |

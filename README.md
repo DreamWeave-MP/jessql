@@ -12,8 +12,10 @@ The managed storage path has deliberately conservative durability boundaries.
 Start with the [operator and recovery runbook](docs/OPERATIONS.md) for offline
 inventory, backups, uncertain acknowledgements, and corruption handling; see
 [the lifecycle and extension architecture](docs/LIFECYCLE-ARCHITECTURE.md) for
-manifest validation, maintenance policy, test gates, and supported extension
-seams. The [adversarial audit](docs/ADVERSARIAL-ARCHITECTURE-REVIEW.md) records
+manifest validation, durable publication, maintenance policy, test gates, and supported extension
+seams. The [durable publication developer contract](docs/PUBLICATION-PROTOCOL.md)
+covers fail-closed cutover sequencing and why it is not moddable. The
+[adversarial audit](docs/ADVERSARIAL-ARCHITECTURE-REVIEW.md) records
 remaining correctness and portability risks.
 
 `sql.managed.inspect(base)` acquires the managed lock and inventories the
