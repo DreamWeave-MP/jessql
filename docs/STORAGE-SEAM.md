@@ -18,6 +18,17 @@ restore()
 - **Per VM, not per database.** One runtime has one storage backend at a time. A Jess test file
   runs in its own VM, so this is what offline tests need; it is not a per-handle
   `Options.storage` adapter, and two databases in one VM cannot use different backends.
+- **A backend is never replaced under an open database.** Every open database holds a lock taken
+  through the seam; the seam counts them (`vfs.busy()`), and `vfs.use` and the restore function
+  it returns both raise while any is held. Installations nest and are undone innermost first;
+  restoring out of order raises, and each restore works once. So the sequence that would let one
+  transaction span two filesystems is an error at the call that would cause it. A simulated crash
+  (`disk.crash()`) abandons its own locks through `vfs.abandon()`, which exists for that alone.
+- **Open question, to settle before this is called finished:** ownership per database. A
+  production in-memory database, or two databases on different storage in one VM, needs the
+  backend fixed at open and kept by every handle of that database (`Options.storage`, threaded
+  through the storage modules instead of a module-level import). The guard above makes the per-VM
+  seam safe; it does not make it per-database.
 - It changes no file format, no durability step and no public database API.
 - It does not provide multi-table transactions or off-loop commits.
 

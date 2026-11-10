@@ -586,13 +586,16 @@ function memfs.new(options: Options?): Disk
     return found
   end
 
+  -- The table has the shape `@dream/fs` has for every function JessQL uses; its handles are
+  -- tables with the same methods rather than the host's userdata, which a type cannot say.
+  local exposed = (backend :: unknown) :: vfs.Backend
   return {
-    -- The table has the shape `@dream/fs` has for every function JessQL uses; its handles are
-    -- tables with the same methods rather than the host's userdata, which a type cannot say.
-    backend = (backend :: unknown) :: vfs.Backend,
+    backend = exposed,
     crash = function()
       generation += 1
       table.clear(locks)
+      -- The process that held them is gone: the seam must not go on counting its locks.
+      if vfs.backend() == exposed then vfs.abandon() end
       -- Names go back to what the directories last had synchronized, and every file to the bytes
       -- it last had synchronized.
       table.clear(names)
