@@ -3,7 +3,7 @@
 -- INTERNAL: no public policy hooks or alternative sync implementations.
 -- The caller MUST hold the managed namespace lock and MUST pre-seal and
 -- validate the referenced immutable generations and WAL identity.
-local fs = require('@dream/fs')
+local fs = require('@jessql/vfs')
 local manifest = require('@jessql/managed_manifest')
 
 export type State = { started: boolean }

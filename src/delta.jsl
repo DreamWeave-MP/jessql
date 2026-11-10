@@ -4,7 +4,7 @@
 -- Scratch runs are never published as database generations.
 local paged = require('@jessql/paged')
 local segments = require('@jessql/segments')
-local fs = require('@dream/fs')
+local fs = require('@jessql/vfs')
 
 export type Row = { [string]: unknown }
 export type Options = { pageBytes: number?, runRows: number?, mergeFanIn: number?, maxRows: number? }

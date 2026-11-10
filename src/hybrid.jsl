@@ -8,7 +8,7 @@ local paged = require('@jessql/paged')
 local segments = require('@jessql/segments')
 local secondary = require('@jessql/secondary')
 local delta = require('@jessql/delta')
-local fs = require('@dream/fs')
+local fs = require('@jessql/vfs')
 
 export type Row = { [string]: unknown }
 export type Options = { cachePages: number?, readMode: string?, durability: string?, rowLayout: string?, secondaryIndexPath: string?, secondaryIndexPaths: { string }?, deletePaths: { [number]: string }?, requireIdentity: boolean?, trackPayloadBytes: boolean? }

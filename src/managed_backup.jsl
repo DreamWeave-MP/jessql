@@ -2,7 +2,7 @@
 -- Offline, lock-owned copy of the published managed namespace.
 -- No source mutation, no repair, and no destination overwrites. Callers own
 -- BOTH managed namespace locks for the entire validation/copy operation.
-local fs = require('@dream/fs')
+local fs = require('@jessql/vfs')
 local manifest = require('@jessql/managed_manifest')
 local verify = require('@jessql/managed_verification')
 

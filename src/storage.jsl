@@ -3,7 +3,7 @@
 -- JessQL's native append-only store. No external database or FFI dependency.
 -- Records are length-delimited and CRC-protected; one record contains one transaction.
 -- A torn trailing record is discarded. A corrupt complete record fails closed.
-local fs = require('@dream/fs')
+local fs = require('@jessql/vfs')
 local bytes = require('@dream/bytes')
 local json = require('@jess/json')
 local queryEngine = require('@jessql/engine')

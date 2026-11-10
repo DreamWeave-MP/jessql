@@ -1,0 +1,74 @@
+--!strict
+-- The one place JessQL reaches the filesystem. Every storage module requires this instead of
+-- `@dream/fs`, so the disk underneath a database can be replaced: by the in-memory disk in
+-- `@jessql/memfs` for tests that run with no filesystem capability, or by a wrapper that injects
+-- a fault at a chosen durability step.
+--
+-- The seam is per VM, not per database: one runtime has one storage backend at a time. That is
+-- what an application's offline tests need (a Jess test file runs in its own VM), and it keeps
+-- every existing call site, signature and type exactly as it was. A per-database adapter is a
+-- separate, larger change and is not claimed here.
+--
+-- With nothing installed this is `@dream/fs`: each function forwards its arguments unchanged.
+
+local native = require('@dream/fs')
+
+-- What a backend is: the shape of `@dream/fs`. It need only implement the functions below.
+export type Backend = typeof(native)
+
+type WriteOptions = { offset: number?, append: boolean?, create: boolean?, exclusive: boolean?, atomic: boolean?, createParents: boolean? }
+type OpenWriteOptions = { append: boolean?, truncate: boolean?, create: boolean?, exclusive: boolean?, writeThrough: boolean? }
+type RecursiveOptions = { recursive: boolean? }
+type LockOptions = { shared: boolean?, createParents: boolean? }
+
+local current: Backend = native
+local vfs = {}
+
+-- Installs `backend` for this VM and returns a function that puts back what was there.
+function vfs.use(backend: Backend): () -> ()
+  local previous = current
+  current = backend
+  return function() current = previous end
+end
+
+-- The backend in use, and the host filesystem whatever is in use.
+function vfs.backend(): Backend return current end
+function vfs.native(): Backend return native end
+
+-- Paths. Lexical in every backend; `canonicalize` and `cwd` are the backend's own.
+function vfs.join(...: string): string return current.join(...) end
+function vfs.parent(path: string) return current.parent(path) end
+function vfs.fileName(path: string) return current.fileName(path) end
+function vfs.isFileName(name: string) return current.isFileName(name) end
+function vfs.absolute(path: string) return current.absolute(path) end
+function vfs.canonicalize(path: string) return current.canonicalize(path) end
+function vfs.cwd() return current.cwd() end
+
+-- What is there.
+function vfs.exists(path: string) return current.exists(path) end
+function vfs.isFile(path: string) return current.isFile(path) end
+function vfs.isDir(path: string) return current.isDir(path) end
+function vfs.stat(path: string) return current.stat(path) end
+function vfs.list(path: string) return current.list(path) end
+
+-- Reading.
+function vfs.readFile(path: string) return current.readFile(path) end
+function vfs.readFileString(path: string) return current.readFileString(path) end
+function vfs.readAt(path: string, offset: number, length: number) return current.readAt(path, offset, length) end
+function vfs.open(path: string) return current.open(path) end
+function vfs.openPositional(path: string) return current.openPositional(path) end
+
+-- Writing, and the steps that make a write or a name durable.
+function vfs.writeFile(path: string, data: buffer | string, options: WriteOptions?) return current.writeFile(path, data, options) end
+function vfs.openWrite(path: string, options: OpenWriteOptions?) return current.openWrite(path, options) end
+function vfs.createDurable(path: string, data: buffer | string) return current.createDurable(path, data) end
+function vfs.syncDirectory(path: string) return current.syncDirectory(path) end
+function vfs.replace(source: string, destination: string) return current.replace(source, destination) end
+function vfs.rename(from: string, to: string) return current.rename(from, to) end
+function vfs.mkdir(path: string, options: RecursiveOptions?) return current.mkdir(path, options) end
+function vfs.remove(path: string, options: RecursiveOptions?) return current.remove(path, options) end
+
+-- Ownership.
+function vfs.lock(path: string, options: LockOptions?) return current.lock(path, options) end
+
+return vfs

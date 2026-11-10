@@ -2,7 +2,7 @@
 --!native
 -- Immutable, checksummed row pages with a bounded decoded-page cache.
 -- The format is deliberately separate from the transactional WAL.
-local fs = require('@dream/fs')
+local fs = require('@jessql/vfs')
 local bytes = require('@dream/bytes')
 local json = require('@jess/json')
 local engine = require('@jessql/engine')

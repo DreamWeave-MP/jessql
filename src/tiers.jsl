@@ -4,7 +4,7 @@
 -- Older input files are never replaced, renamed, retired or deleted.
 local segments = require('@jessql/segments')
 local paged = require('@jessql/paged')
-local fs = require('@dream/fs')
+local fs = require('@jessql/vfs')
 
 export type Options = { fanIn: number?, cachePages: number?, pageBytes: number?,
   deletePaths: { [number]: string }? }

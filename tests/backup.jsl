@@ -1,6 +1,6 @@
 --!strict
 local sql = require('@jessql')
-local fs = require('@dream/fs')
+local fs = require('@jessql/vfs')
 local bytes = require('@dream/bytes')
 local json = require('@jess/json')
 local test = require('@jess/test')

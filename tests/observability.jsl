@@ -1,7 +1,7 @@
 --!strict
 local sql = require('@jessql')
 local observability = require('@jessql/managed_observability')
-local fs = require('@dream/fs')
+local fs = require('@jessql/vfs')
 local test = require('@jess/test')
 local suite, expect = test.new(), test.expect
 

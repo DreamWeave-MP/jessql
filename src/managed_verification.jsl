@@ -2,7 +2,7 @@
 -- Read-only, offline verification of published managed generations and WAL.
 -- Does not repair torn tails, initialize journals, or publish a manifest.
 -- Caller MUST own the exclusive managed namespace lock.
-local fs = require('@dream/fs')
+local fs = require('@jessql/vfs')
 local bytes = require('@dream/bytes')
 local json = require('@jess/json')
 local paged = require('@jessql/paged')

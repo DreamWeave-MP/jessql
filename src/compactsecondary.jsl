@@ -3,7 +3,7 @@
 -- Experimental immutable JQLS1 sidecar: sorted, prefix-compressed index keys.
 -- Metadata lives in the checksummed directory. Index primary keys are decoded
 -- from their reversible key component, not stored a second time.
-local fs = require('@dream/fs')
+local fs = require('@jessql/vfs')
 local bytes = require('@dream/bytes')
 local json = require('@jess/json')
 local engine = require('@jessql/engine')
