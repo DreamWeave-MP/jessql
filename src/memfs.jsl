@@ -1,0 +1,611 @@
+--!strict
+-- A disk in memory, for `@jessql/vfs`: storage tests that need no filesystem capability, and that
+-- can stop a database at any durability step and see what a restart would find.
+--
+-- It models the one thing a real disk does that a table of strings does not: **what was written
+-- and what would survive are different**. A file has the bytes handed to it and the bytes last
+-- synchronized. A directory has the names in it now and the names last synchronized. `crash()`
+-- throws away everything that was not synchronized, the way `@dream/fs` documents it:
+--
+--   * `writer:syncData()` / `syncAll()` make a file's bytes survive; `flush()` and `close()` do not.
+--   * `createDurable` makes a new file's bytes and its name survive.
+--   * `rename` and `replace` change what is visible, and survive only after `syncDirectory`.
+--   * `writeFile` survives nothing by itself (with `atomic`, its bytes but not its name).
+--
+-- This is the adversarial reading: a real disk often keeps more than it promised. A store that
+-- recovers correctly here has relied on nothing it was not promised. It is a model, not a power
+-- cut: it says nothing about torn sectors, reordered writes inside one file, or a device that
+-- acknowledges a sync it did not perform.
+--
+-- `inject` puts a decision in front of every operation, by name, so a test can fail or crash at
+-- the Nth `syncData`, the first `replace`, and so on. Nothing here touches the host filesystem.
+
+local vfs = require('@jessql/vfs')
+
+-- A file or directory. `durable` is the content as of the last synchronization.
+type Inode = { kind: 'file' | 'dir', data: string, durable: string }
+
+-- Returned by an injector to stop an operation: it then answers `nil, message, kind`.
+export type Fault = { message: string, kind: string? }
+
+-- Called before every operation with its name, its path and how many times that name has been
+-- reached. Return a fault to fail the operation; call `disk.crash()` inside it to crash there.
+export type Injector = (step: string, path: string, occurrence: number) -> Fault?
+
+export type Disk = {
+  -- Install with `vfs.use(disk.backend)`.
+  backend: vfs.Backend,
+  -- Discards everything not synchronized, releases every lock and invalidates every open handle.
+  crash: () -> (),
+  inject: (injector: Injector?) -> (),
+  -- Every operation since creation, as `step path`, in order.
+  steps: () -> { string },
+  -- The bytes visible now, and the bytes a crash would leave, by path. For assertions.
+  visible: () -> { [string]: string },
+  surviving: () -> { [string]: string },
+}
+
+export type Options = { cwd: string? }
+
+local memfs = {}
+
+local function split(path: string): { string }
+  local parts: { string } = {}
+  for part in string.gmatch(path, '[^/]+') do
+    if part == '..' then
+      table.remove(parts)
+    elseif part ~= '.' then
+      table.insert(parts, part)
+    end
+  end
+
+  return parts
+end
+
+local function bytesOf(data: buffer | string, offset: number?, length: number?): string
+  local text = if typeof(data) == 'buffer' then buffer.tostring(data) else data
+  if not offset and not length then return text end
+
+  local first = (offset or 0) + 1
+  return string.sub(text, first, if length then first + length - 1 else #text)
+end
+
+function memfs.new(options: Options?): Disk
+  local cwd = if options and options.cwd then options.cwd else '/memory'
+  -- What is visible now, and what the directories last had synchronized.
+  local names: { [string]: Inode }, durableNames: { [string]: Inode } = {}, {}
+  local locks: { [string]: boolean } = {}
+  local log: { string } = {}
+  local counts: { [string]: number } = {}
+  local injector: Injector? = nil
+  -- Bumped by a crash: a handle opened before it belongs to a process that is gone.
+  local generation = 0
+
+  local function resolve(path: string): string
+    local absolute = if string.sub(path, 1, 1) == '/' then path else `{cwd}/{path}`
+    return '/' .. table.concat(split(absolute), '/')
+  end
+
+  local function parentOf(path: string): string
+    return string.match(path, '^(.*)/[^/]*$') or ''
+  end
+
+  local function directory(path: string): Inode
+    local node: Inode = { kind = 'dir', data = '', durable = '' }
+    names[path] = node
+    -- Directories themselves are not what this models losing: only the entries inside them.
+    durableNames[path] = node
+    return node
+  end
+
+  local function makeParents(path: string)
+    local built = ''
+    for _, part in split(parentOf(path)) do
+      built ..= '/' .. part
+      if not names[built] then directory(built) end
+    end
+  end
+
+  directory('')
+  makeParents(cwd .. '/x')
+
+  -- nil to proceed, or the failure an injector asked for.
+  local function step(name: string, path: string): (string?, string?)
+    table.insert(log, `{name} {path}`)
+    counts[name] = (counts[name] or 0) + 1
+    if not injector then return nil, nil end
+
+    local fault = injector(name, path, counts[name])
+    if fault then return fault.message, fault.kind or 'other' end
+    return nil, nil
+  end
+
+  local function parentMissing(path: string): boolean
+    local parent = names[parentOf(path)]
+    return parent == nil or parent.kind ~= 'dir'
+  end
+
+  local function fileAt(path: string): Inode?
+    local node = names[path]
+    return if node and node.kind == 'file' then node else nil
+  end
+
+  local backend = {}
+
+  function backend.cwd(): string return cwd end
+
+  function backend.join(...: string): string
+    local joined: string = ''
+    local parts: { string } = { ... }
+    for _, part in parts do
+      local restart = string.sub(part, 1, 1) == '/' or #joined == 0
+      local separated = string.sub(joined, -1) == '/'
+      joined = if restart then part elseif separated then joined .. part else `{joined}/{part}`
+    end
+
+    return joined
+  end
+
+  function backend.parent(path: string): string?
+    if path == '' or path == '/' then return nil end
+    local trimmed = string.gsub(path, '/+$', '')
+    local parent = string.match(trimmed, '^(.*)/[^/]*$')
+    if not parent then return '' end
+    return if parent == '' then '/' else parent
+  end
+
+  function backend.fileName(path: string): string?
+    local name = string.match(string.gsub(path, '/+$', ''), '([^/]+)$')
+    return if name and name ~= '.' and name ~= '..' then name else nil
+  end
+
+  function backend.isFileName(name: string): boolean
+    return name ~= '' and name ~= '.' and name ~= '..' and not string.find(name, '[/%z]')
+  end
+
+  function backend.absolute(path: string): (string?, string?, string?)
+    if path == '' then return nil, 'empty path', 'invalidInput' end
+    return if string.sub(path, 1, 1) == '/' then path else `{cwd}/{path}`, nil, nil
+  end
+
+  function backend.canonicalize(path: string): (string?, string?, string?)
+    local resolved = resolve(path)
+    if not names[resolved] then return nil, `{path}: not found`, 'notFound' end
+    return if resolved == '' then '/' else resolved, nil, nil
+  end
+
+  function backend.exists(path: string): boolean return names[resolve(path)] ~= nil end
+
+  function backend.isFile(path: string): boolean return fileAt(resolve(path)) ~= nil end
+
+  function backend.isDir(path: string): boolean
+    local node = names[resolve(path)]
+    return node ~= nil and node.kind == 'dir'
+  end
+
+  function backend.stat(path: string): (unknown, string?, string?)
+    local resolved = resolve(path)
+    local failure, kind = step('stat', resolved)
+    if failure then return nil, failure, kind end
+    local node = names[resolved]
+    if not node then return nil, `{path}: not found`, 'notFound' end
+
+    return {
+      kind = if node.kind == 'dir' then 'directory' else 'file', size = #node.data,
+      isFile = node.kind == 'file', isDir = node.kind == 'dir', isSymlink = false, readonly = false,
+      modified = 0, modifiedSeconds = 0, modifiedNanoseconds = 0,
+    }, nil, nil
+  end
+
+  function backend.list(path: string): ({ string }?, string?, string?)
+    local resolved = resolve(path)
+    local failure, kind = step('list', resolved)
+    if failure then return nil, failure, kind end
+    local node = names[resolved]
+    if not node or node.kind ~= 'dir' then return nil, `{path}: not a directory`, 'notFound' end
+
+    local found: { string } = {}
+    for candidate in names do
+      if candidate ~= resolved and parentOf(candidate) == resolved then
+        table.insert(found, string.sub(candidate, #resolved + 2))
+      end
+    end
+
+    table.sort(found)
+    return found, nil, nil
+  end
+
+  function backend.mkdir(path: string, mkdirOptions: { recursive: boolean? }?): (boolean?, string?, string?)
+    local resolved = resolve(path)
+    if names[resolved] then
+      return if mkdirOptions and mkdirOptions.recursive then true else nil, `{path}: already exists`, 'alreadyExists'
+    end
+
+    if mkdirOptions and mkdirOptions.recursive then makeParents(resolved) end
+    if parentMissing(resolved) then return nil, `{path}: parent not found`, 'notFound' end
+    directory(resolved)
+    return true, nil, nil
+  end
+
+  function backend.remove(path: string, removeOptions: { recursive: boolean? }?): (boolean?, string?, string?)
+    local resolved = resolve(path)
+    local failure, kind = step('remove', resolved)
+    if failure then return nil, failure, kind end
+    local node = names[resolved]
+    if not node then return nil, `{path}: not found`, 'notFound' end
+
+    if node.kind == 'dir' then
+      for candidate in names do
+        if string.sub(candidate, 1, #resolved + 1) == resolved .. '/' then
+          if not (removeOptions and removeOptions.recursive) then return nil, `{path}: directory not empty`, 'other' end
+          names[candidate] = nil
+        end
+      end
+    end
+
+    -- Visible at once; the name comes back after a crash unless the directory was synchronized.
+    names[resolved] = nil
+    return true, nil, nil
+  end
+
+  function backend.readFileString(path: string): (string?, string?, string?)
+    local resolved = resolve(path)
+    local failure, kind = step('readFileString', resolved)
+    if failure then return nil, failure, kind end
+    local node = fileAt(resolved)
+    if not node then return nil, `{path}: not found`, 'notFound' end
+    return node.data, nil, nil
+  end
+
+  function backend.readFile(path: string): (buffer?, string?, string?)
+    local text, failure, kind = backend.readFileString(path)
+    if not text then return nil, failure, kind end
+    return buffer.fromstring(text), nil, nil
+  end
+
+  function backend.readAt(path: string, offset: number, length: number): (buffer?, string?, string?)
+    local resolved = resolve(path)
+    local failure, kind = step('readAt', resolved)
+    if failure then return nil, failure, kind end
+    local node = fileAt(resolved)
+    if not node then return nil, `{path}: not found`, 'notFound' end
+    -- Fewer bytes at the end, as the module function documents.
+    return buffer.fromstring(string.sub(node.data, offset + 1, offset + length)), nil, nil
+  end
+
+  -- A mapped reader: the file as it was when opened.
+  function backend.open(path: string): (unknown, string?, string?)
+    local resolved = resolve(path)
+    local failure, kind = step('open', resolved)
+    if failure then return nil, failure, kind end
+    local node = fileAt(resolved)
+    if not node then return nil, `{path}: not found`, 'notFound' end
+
+    local image = node.data
+    local position = 0
+    local closed = false
+    local reader = {}
+    function reader.size(_self: unknown): number return #image end
+
+    function reader.tell(_self: unknown): number return position end
+
+    function reader.readAt(_self: unknown, at: number, length: number): (buffer?, string?, string?)
+      if closed then error('reader is closed', 2) end
+      if at < 0 or length < 0 or at + length > #image then return nil, 'read past the end of the file', 'unexpectedEof' end
+      return buffer.fromstring(string.sub(image, at + 1, at + length)), nil, nil
+    end
+
+    function reader.read(self: unknown, length: number): (buffer?, string?, string?)
+      local taken = math.min(length, #image - position)
+      local chunk, readFailure, readKind = reader.readAt(self, position, taken)
+      if chunk then position += taken end
+      return chunk, readFailure, readKind
+    end
+
+    function reader.seek(_self: unknown, to: number) position = math.clamp(to, 0, #image) end
+
+    function reader.skip(_self: unknown, count: number) position = math.clamp(position + count, 0, #image) end
+
+    function reader.close(_self: unknown) closed = true end
+
+    return reader, nil, nil
+  end
+
+  -- An unmapped handle: the file as it is at each read.
+  function backend.openPositional(path: string): (unknown, string?, string?)
+    local resolved = resolve(path)
+    local failure, kind = step('openPositional', resolved)
+    if failure then return nil, failure, kind end
+    local node = fileAt(resolved)
+    if not node then return nil, `{path}: not found`, 'notFound' end
+
+    local opened = generation
+    local closed = false
+    local reader = {}
+    function reader.size(_self: unknown): (number?, string?, string?)
+      if closed then error('reader is closed', 2) end
+      return #node.data, nil, nil
+    end
+
+    function reader.readAt(_self: unknown, at: number, length: number): (buffer?, string?, string?)
+      if closed then error('reader is closed', 2) end
+      if opened ~= generation then return nil, 'the handle did not survive the crash', 'other' end
+      if at < 0 or length < 0 or at + length > #node.data then return nil, 'read past the end of the file', 'unexpectedEof' end
+      return buffer.fromstring(string.sub(node.data, at + 1, at + length)), nil, nil
+    end
+
+    function reader.close(_self: unknown) closed = true end
+
+    return reader, nil, nil
+  end
+
+  type WriteOptions = { offset: number?, append: boolean?, create: boolean?, exclusive: boolean?, atomic: boolean?, createParents: boolean? }
+
+  function backend.writeFile(path: string, data: buffer | string, writeOptions: WriteOptions?): (number?, string?, string?)
+    local resolved = resolve(path)
+    local failure, kind = step('writeFile', resolved)
+    if failure then return nil, failure, kind end
+    local settings: WriteOptions = writeOptions or {}
+    local text = bytesOf(data)
+    local node = names[resolved]
+    if node and node.kind == 'dir' then return nil, `{path}: is a directory`, 'other' end
+    if node and settings.exclusive then return nil, `{path}: already exists`, 'alreadyExists' end
+    if not node and settings.create == false then return nil, `{path}: not found`, 'notFound' end
+
+    if settings.createParents then makeParents(resolved) end
+    if parentMissing(resolved) then return nil, `{path}: parent not found`, 'notFound' end
+
+    local file: Inode = if node then node else { kind = 'file', data = '', durable = '' }
+    if settings.append then
+      file.data ..= text
+    elseif settings.offset then
+      local before = string.sub(file.data, 1, settings.offset)
+      before ..= string.rep('\0', settings.offset - #before)
+      file.data = before .. text .. string.sub(file.data, settings.offset + #text + 1)
+    else
+      file.data = text
+    end
+
+    -- `atomic` synchronizes the bytes of what it wrote, never the name.
+    if settings.atomic then file.durable = file.data end
+    names[resolved] = file
+    return #text, nil, nil
+  end
+
+  function backend.createDurable(path: string, data: buffer | string): (number?, string?, string?)
+    local resolved = resolve(path)
+    local failure, kind = step('createDurable', resolved)
+    if failure then return nil, failure, kind end
+    if names[resolved] then return nil, `{path}: already exists`, 'alreadyExists' end
+    if parentMissing(resolved) then return nil, `{path}: parent not found`, 'notFound' end
+
+    local text = bytesOf(data)
+    local file: Inode = { kind = 'file', data = text, durable = text }
+    -- The one call that makes both the bytes and the name survive.
+    names[resolved] = file
+    durableNames[resolved] = file
+    return #text, nil, nil
+  end
+
+  type OpenWriteOptions = { append: boolean?, truncate: boolean?, create: boolean?, exclusive: boolean?, writeThrough: boolean? }
+
+  function backend.openWrite(path: string, openOptions: OpenWriteOptions?): (unknown, string?, string?)
+    local resolved = resolve(path)
+    local failure, kind = step('openWrite', resolved)
+    if failure then return nil, failure, kind end
+    local settings: OpenWriteOptions = openOptions or {}
+    local existing = names[resolved]
+    if existing and existing.kind == 'dir' then return nil, `{path}: is a directory`, 'other' end
+    if existing and settings.exclusive then return nil, `{path}: already exists`, 'alreadyExists' end
+    if not existing and settings.create == false then return nil, `{path}: not found`, 'notFound' end
+    if parentMissing(resolved) then return nil, `{path}: parent not found`, 'notFound' end
+
+    local node: Inode = if existing then existing else { kind = 'file', data = '', durable = '' }
+    names[resolved] = node
+    local append = settings.append == true
+    -- Truncated unless appending, or told not to.
+    local truncate = if settings.truncate ~= nil then settings.truncate == true else not append
+    if truncate and not append then node.data = '' end
+
+    local opened = generation
+    local position = if append then #node.data else 0
+    -- What the script wrote and the operating system has not been handed yet.
+    local pending: { { at: number?, text: string } } = {}
+    local closed = false
+    local poison: string? = nil
+    local writer = {}
+
+    -- nil to proceed; otherwise the failure this call must answer with.
+    local function refuse(name: string): (string?, string?)
+      if closed then error('writer is closed', 3) end
+      if poison then return poison, 'other' end
+      if opened ~= generation then return 'the handle did not survive the crash', 'other' end
+
+      local injected, injectedKind = step(name, resolved)
+      -- Any failure leaves the writer's outcome uncertain: it is poisoned and its buffer dropped.
+      if injected then
+        poison = injected
+        table.clear(pending)
+        return injected, injectedKind
+      end
+
+      return nil, nil
+    end
+
+    local function hand()
+      for _, write in pending do
+        if write.at == nil then
+          node.data ..= write.text
+        else
+          local before = string.sub(node.data, 1, write.at)
+          before ..= string.rep('\0', write.at - #before)
+          node.data = before .. write.text .. string.sub(node.data, write.at + #write.text + 1)
+        end
+      end
+
+      table.clear(pending)
+    end
+
+    function writer.write(_self: unknown, data: buffer | string, offset: number?, length: number?): (number?, string?, string?)
+      local refused, refusedKind = refuse('write')
+      if refused then return nil, refused, refusedKind end
+      local text = bytesOf(data, offset, length)
+      table.insert(pending, { at = if append then nil else position, text = text })
+      position += #text
+      return #text, nil, nil
+    end
+
+    function writer.tell(_self: unknown): number return position end
+
+    function writer.seek(_self: unknown, to: number): (boolean?, string?, string?)
+      local refused, refusedKind = refuse('seek')
+      if refused then return nil, refused, refusedKind end
+      position = to
+      return true, nil, nil
+    end
+
+    function writer.flush(_self: unknown): (boolean?, string?, string?)
+      local refused, refusedKind = refuse('flush')
+      if refused then return nil, refused, refusedKind end
+      hand()
+      return true, nil, nil
+    end
+
+    function writer.truncate(_self: unknown, length: number): (boolean?, string?, string?)
+      local refused, refusedKind = refuse('truncate')
+      if refused then return nil, refused, refusedKind end
+      hand()
+      node.data = string.sub(node.data, 1, length) .. string.rep('\0', length - #node.data)
+      position = math.min(position, length)
+      return true, nil, nil
+    end
+
+    local function synchronize(name: string): (boolean?, string?, string?)
+      local refused, refusedKind = refuse(name)
+      if refused then return nil, refused, refusedKind end
+      hand()
+      -- From here these bytes survive. The file's name is the directory's business.
+      node.durable = node.data
+      return true, nil, nil
+    end
+
+    function writer.syncData(_self: unknown): (boolean?, string?, string?) return synchronize('syncData') end
+
+    function writer.syncAll(_self: unknown): (boolean?, string?, string?) return synchronize('syncAll') end
+
+    function writer.close(_self: unknown): (boolean?, string?, string?)
+      if closed then return true, nil, nil end
+      closed = true
+      if poison then return nil, poison, 'other' end
+      if opened ~= generation then return nil, 'the handle did not survive the crash', 'other' end
+      local injected, injectedKind = step('close', resolved)
+      if injected then return nil, injected, injectedKind end
+      hand()
+      return true, nil, nil
+    end
+
+    return writer, nil, nil
+  end
+
+  function backend.syncDirectory(path: string): (boolean?, string?, string?)
+    local resolved = resolve(path)
+    local failure, kind = step('syncDirectory', resolved)
+    if failure then return nil, failure, kind end
+    local node = names[resolved]
+    if not node or node.kind ~= 'dir' then return nil, `{path}: not a directory`, 'notFound' end
+
+    -- The entries directly inside, as they are now, are what a crash would find.
+    for candidate in durableNames do
+      if parentOf(candidate) == resolved and candidate ~= resolved and not names[candidate] then durableNames[candidate] = nil end
+    end
+
+    for candidate, inode in names do
+      if parentOf(candidate) == resolved and candidate ~= resolved then durableNames[candidate] = inode end
+    end
+
+    return true, nil, nil
+  end
+
+  local function move(name: string, source: string, destination: string): (boolean?, string?, string?)
+    local from, to = resolve(source), resolve(destination)
+    local failure, kind = step(name, to)
+    if failure then return nil, failure, kind end
+    local node = names[from]
+    if not node then return nil, `{source}: not found`, 'notFound' end
+    if parentMissing(to) then return nil, `{destination}: parent not found`, 'notFound' end
+    local target = names[to]
+    if target and target.kind == 'dir' then return nil, `{destination}: is a directory`, 'other' end
+
+    -- Visible at once and atomically; it survives only once the directory is synchronized.
+    names[to] = node
+    names[from] = nil
+    return true, nil, nil
+  end
+
+  function backend.replace(source: string, destination: string): (boolean?, string?, string?)
+    return move('replace', source, destination)
+  end
+
+  function backend.rename(from: string, to: string): (boolean?, string?, string?)
+    return move('rename', from, to)
+  end
+
+  function backend.lock(path: string, lockOptions: { shared: boolean?, createParents: boolean? }?): (unknown, string?, string?)
+    local resolved = resolve(path)
+    local failure, kind = step('lock', resolved)
+    if failure then return nil, failure, kind end
+    if lockOptions and lockOptions.createParents then makeParents(resolved) end
+    if parentMissing(resolved) then return nil, `{path}: parent not found`, 'notFound' end
+    if locks[resolved] then return nil, `{path}: locked`, 'wouldBlock' end
+
+    -- The lock file is made if it is not there, as the operating system's is.
+    if not names[resolved] then names[resolved] = { kind = 'file', data = '', durable = '' } end
+    locks[resolved] = true
+    local opened = generation
+    local held = true
+    local handle = {}
+    function handle.unlock(_self: unknown): boolean
+      if held and opened == generation then locks[resolved] = nil end
+      held = false
+      return true
+    end
+
+    function handle.held(_self: unknown): boolean return held and opened == generation end
+
+    function handle.shared(_self: unknown): boolean return false end
+
+    return handle, nil, nil
+  end
+
+  local function contents(source: { [string]: Inode }, durable: boolean): { [string]: string }
+    local found: { [string]: string } = {}
+    for path, node in source do
+      if node.kind == 'file' then found[path] = if durable then node.durable else node.data end
+    end
+
+    return found
+  end
+
+  return {
+    -- The table has the shape `@dream/fs` has for every function JessQL uses; its handles are
+    -- tables with the same methods rather than the host's userdata, which a type cannot say.
+    backend = (backend :: unknown) :: vfs.Backend,
+    crash = function()
+      generation += 1
+      table.clear(locks)
+      -- Names go back to what the directories last had synchronized, and every file to the bytes
+      -- it last had synchronized.
+      table.clear(names)
+      for path, node in durableNames do
+        if node.kind == 'file' then node.data = node.durable end
+        names[path] = node
+      end
+    end,
+    inject = function(next: Injector?) injector = next end,
+    steps = function(): { string } return table.clone(log) end,
+    visible = function(): { [string]: string } return contents(names, false) end,
+    surviving = function(): { [string]: string } return contents(durableNames, true) end,
+  }
+end
+
+return memfs

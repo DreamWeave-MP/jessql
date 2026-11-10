@@ -1,0 +1,253 @@
+--!strict
+-- The in-memory disk and what it is for: a database that runs with no filesystem capability,
+-- and that can be stopped at any durability step to see what a restart would find.
+local memfs = require('@jessql/memfs')
+local sql = require('@jessql')
+local test = require('@jess/test')
+local vfs = require('@jessql/vfs')
+
+local expect = test.expect
+local suite = test.new()
+
+-- A fresh disk installed for one test body, and the host filesystem restored afterwards.
+local function onDisk(body: (disk: memfs.Disk) -> ())
+  local disk = memfs.new()
+  local restore = vfs.use(disk.backend)
+  -- The body can raise on a failed expectation; the host backend is restored either way.
+  local ok, problem = pcall(body, disk)
+  restore()
+  if not ok then error(problem, 0) end
+end
+
+suite.describe('storage seam', function()
+  suite.it('is the host filesystem until a backend is installed, and again after it is restored', function()
+    expect(vfs.backend() == vfs.native()).toBe(true)
+    local disk = memfs.new()
+    local restore = vfs.use(disk.backend)
+    expect(vfs.backend() == disk.backend).toBe(true)
+    expect((vfs.cwd())).toBe('/memory')
+    restore()
+    expect(vfs.backend() == vfs.native()).toBe(true)
+  end)
+
+  suite.it('keeps a whole database in memory and nothing on the host', function()
+    onDisk(function(disk: memfs.Disk)
+      local path = vfs.join(vfs.cwd() :: string, 'offline.wal')
+      local db = sql.open(path, { durability = 'sync', rowLayout = 'packed' })
+      db:createTable('events', { 'id', 'payload' }, 'id')
+      db:transaction(function(tx)
+        tx:insert('events', { id = '1', payload = 'first' })
+        tx:insert('events', { id = '2', payload = 'second' })
+      end)
+      db:close()
+
+      local reopened = sql.open(path, { durability = 'sync' })
+      expect((assert(reopened:get('events', '1'))).payload).toBe('first')
+      expect(reopened:query('SELECT COUNT(*) AS n FROM events').rows[1].n).toBe(2)
+      reopened:close()
+
+      expect(disk.visible()[path] ~= nil).toBe(true)
+      expect((vfs.native().exists(path))).toBe(false)
+      expect((vfs.native().exists('/memory'))).toBe(false)
+    end)
+  end)
+end)
+
+suite.describe('in-memory disk: what survives a crash', function()
+  suite.it('loses bytes that were written, flushed or closed but never synchronized', function()
+    onDisk(function(disk: memfs.Disk)
+      assert((vfs.createDurable('/memory/log', 'kept|')))
+      local writer = assert((vfs.openWrite('/memory/log', { append = true, create = false })))
+      assert((writer:write('synced|')))
+      assert((writer:syncData()))
+      assert((writer:write('flushed|')))
+      assert((writer:flush()))
+      assert((writer:write('closed')))
+      assert((writer:close()))
+      expect((vfs.readFileString('/memory/log'))).toBe('kept|synced|flushed|closed')
+      expect(disk.surviving()['/memory/log']).toBe('kept|synced|')
+
+      disk.crash()
+      expect((vfs.readFileString('/memory/log'))).toBe('kept|synced|')
+    end)
+  end)
+
+  suite.it('does not show unflushed bytes to another reader', function()
+    onDisk(function(_disk: memfs.Disk)
+      assert((vfs.createDurable('/memory/log', '')))
+      local writer = assert((vfs.openWrite('/memory/log', { append = true, create = false })))
+      assert((writer:write('buffered')))
+      expect((vfs.readFileString('/memory/log'))).toBe('')
+      assert((writer:flush()))
+      expect((vfs.readFileString('/memory/log'))).toBe('buffered')
+      writer:close()
+    end)
+  end)
+
+  suite.it('loses a name that was created, renamed or removed until its directory is synchronized', function()
+    onDisk(function(disk: memfs.Disk)
+      assert((vfs.createDurable('/memory/manifest', 'one')))
+      -- A new file by plain write: neither its bytes nor its name were promised.
+      assert((vfs.writeFile('/memory/scratch', 'x')))
+      -- A checkpoint done properly up to, but not including, the directory sync.
+      local writer = assert((vfs.openWrite('/memory/manifest.next', { create = true, truncate = true })))
+      assert((writer:write('two')))
+      assert((writer:syncAll()))
+      assert((writer:close()))
+      assert((vfs.replace('/memory/manifest.next', '/memory/manifest')))
+      expect((vfs.readFileString('/memory/manifest'))).toBe('two')
+
+      disk.crash()
+      -- The replacement was visible and was not yet persistent: the old version is back.
+      expect((vfs.readFileString('/memory/manifest'))).toBe('one')
+      expect((vfs.exists('/memory/scratch'))).toBe(false)
+      expect((vfs.exists('/memory/manifest.next'))).toBe(false)
+
+      -- The same again with the directory synchronized: now it survives.
+      local again = assert((vfs.openWrite('/memory/manifest.next', { create = true, truncate = true })))
+      assert((again:write('two')))
+      assert((again:syncAll()))
+      assert((again:close()))
+      assert((vfs.replace('/memory/manifest.next', '/memory/manifest')))
+      assert((vfs.syncDirectory('/memory')))
+      disk.crash()
+      expect((vfs.readFileString('/memory/manifest'))).toBe('two')
+
+      -- A removal is a name change too.
+      assert((vfs.remove('/memory/manifest')))
+      expect((vfs.exists('/memory/manifest'))).toBe(false)
+      disk.crash()
+      expect((vfs.exists('/memory/manifest'))).toBe(true)
+    end)
+  end)
+
+  suite.it('releases locks and invalidates open handles at a crash', function()
+    onDisk(function(disk: memfs.Disk)
+      local held = assert((vfs.lock('/memory/owner.lock')))
+      local second, _, kind = vfs.lock('/memory/owner.lock')
+      expect(second).toBe(nil)
+      expect(kind).toBe('wouldBlock')
+      assert((vfs.createDurable('/memory/log', '')))
+      local writer = assert((vfs.openWrite('/memory/log', { append = true, create = false })))
+
+      disk.crash()
+      -- The process that held them is gone.
+      local after = assert((vfs.lock('/memory/owner.lock')))
+      after:unlock()
+      held:unlock()
+      local written, message = writer:write('late')
+      expect(written).toBe(nil)
+      expect(message ~= nil).toBe(true)
+    end)
+  end)
+
+  suite.it('answers as the host filesystem does for what is not there or already there', function()
+    onDisk(function(_disk: memfs.Disk)
+      local missing, _, missingKind = vfs.readFileString('/memory/none')
+      expect(missing).toBe(nil)
+      expect(missingKind).toBe('notFound')
+      assert((vfs.createDurable('/memory/one', 'x')))
+      local again, _, againKind = vfs.createDurable('/memory/one', 'y')
+      expect(again).toBe(nil)
+      expect(againKind).toBe('alreadyExists')
+      local exclusive, _, exclusiveKind = vfs.writeFile('/memory/one', 'z', { exclusive = true })
+      expect(exclusive).toBe(nil)
+      expect(exclusiveKind).toBe('alreadyExists')
+      local absent, _, absentKind = vfs.openWrite('/memory/two', { create = false })
+      expect(absent).toBe(nil)
+      expect(absentKind).toBe('notFound')
+      expect((vfs.readFileString('/memory/one'))).toBe('x')
+      expect(table.concat(assert((vfs.list('/memory'))), ',')).toBe('one')
+    end)
+  end)
+end)
+
+suite.describe('in-memory disk: injected faults', function()
+  suite.it('records every operation by name and fails the one it is told to', function()
+    onDisk(function(disk: memfs.Disk)
+      assert((vfs.createDurable('/memory/log', '')))
+      disk.inject(function(step: string, _path: string, occurrence: number): memfs.Fault?
+        return if step == 'syncData' and occurrence == 2 then { message = 'injected: disk full', kind = 'other' } else nil
+      end)
+      local writer = assert((vfs.openWrite('/memory/log', { append = true, create = false })))
+      assert((writer:write('a')))
+      assert((writer:syncData()))
+      assert((writer:write('b')))
+      local synced, message = writer:syncData()
+      expect(synced).toBe(nil)
+      expect(message).toBe('injected: disk full')
+      -- A failed writer is poisoned: its outcome is uncertain and it accepts nothing more.
+      local later, laterMessage = writer:write('c')
+      expect(later).toBe(nil)
+      expect(laterMessage).toBe('injected: disk full')
+      expect(disk.surviving()['/memory/log']).toBe('a')
+
+      local steps = table.concat(disk.steps(), '\n')
+      expect((string.find(steps, 'createDurable /memory/log', 1, true)) ~= nil).toBe(true)
+      expect((string.find(steps, 'syncData /memory/log', 1, true)) ~= nil).toBe(true)
+    end)
+  end)
+
+  suite.it('finds an acknowledged commit after a crash at every later step, and a consistent database after a fault at any step', function()
+    -- First, record the steps one committed transaction takes.
+    local path = '/memory/sweep.wal'
+    local function prepare()
+      local db = sql.open(path, { durability = 'sync', rowLayout = 'packed' })
+      db:createTable('events', { 'id', 'payload' }, 'id')
+      db:transaction(function(tx) tx:insert('events', { id = '1', payload = 'acknowledged' }) end)
+      return db
+    end
+
+    local total = 0
+    onDisk(function(disk: memfs.Disk)
+      local db = prepare()
+      local before = #disk.steps()
+      db:transaction(function(tx) tx:insert('events', { id = '2', payload = 'second' }) end)
+      total = #disk.steps() - before
+      db:close()
+    end)
+    expect(total > 0).toBe(true)
+
+    -- Then fail each of those steps in turn, crash, and reopen.
+    local outcomes: { string } = {}
+    for failing = 1, total do
+      onDisk(function(disk: memfs.Disk)
+        local db = prepare()
+        local reached = 0
+        disk.inject(function(_step: string, _path: string, _occurrence: number): memfs.Fault?
+          reached += 1
+          return if reached == failing then { message = 'injected fault', kind = 'other' } else nil
+        end)
+
+        -- The commit can raise when its write or sync is refused; that is one of the outcomes.
+        local committed = pcall(function()
+          db:transaction(function(tx) tx:insert('events', { id = '2', payload = 'second' }) end)
+        end)
+        disk.inject(nil)
+        disk.crash()
+
+        local recovered = sql.open(path, { durability = 'sync' })
+        -- The transaction acknowledged before the fault is there, whatever happened after.
+        expect((assert(recovered:get('events', '1'))).payload).toBe('acknowledged')
+        local second = recovered:get('events', '2')
+        -- A commit that was acknowledged is durable. One that was not may or may not have landed,
+        -- but if it did it landed whole.
+        if committed then expect(second ~= nil).toBe(true) end
+        if second then expect(second.payload).toBe('second') end
+        expect(recovered:query('SELECT COUNT(*) AS n FROM events').rows[1].n).toBe(if second then 2 else 1)
+        -- And the recovered database accepts and keeps a new commit.
+        recovered:transaction(function(tx) tx:insert('events', { id = '3', payload = 'after' }) end)
+        recovered:close()
+        disk.crash()
+        local final = sql.open(path, { durability = 'sync' })
+        expect((assert(final:get('events', '3'))).payload).toBe('after')
+        final:close()
+        table.insert(outcomes, `{failing}:{if committed then 'acknowledged' else 'refused'}:{if second then 'present' else 'absent'}`)
+      end)
+    end
+
+    expect(#outcomes).toBe(total)
+  end)
+end)
+
+return suite

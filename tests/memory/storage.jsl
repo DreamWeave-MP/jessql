@@ -1,0 +1,7 @@
+--!strict
+-- The `storage` suite again, unchanged, on the in-memory disk: no filesystem capability is used.
+local memfs = require('@jessql/memfs')
+local vfs = require('@jessql/vfs')
+
+vfs.use(memfs.new().backend)
+return require('../storage')
