@@ -1,0 +1,200 @@
+--!strict
+-- P3-04: a deleted key stays deleted. Seeded random histories of upserts, deletions, flushes,
+-- selective compactions, checkpoints, failed publications, reopens and crashes over a small key
+-- space, so the same key is written, deleted and written again across generations. After every
+-- step the database must equal a model that is a plain table. In memory; deterministic by seed.
+local memfs = require('@jessql/memfs')
+local sql = require('@jessql')
+local test = require('@jess/test')
+
+local expect = test.expect
+local suite = test.new()
+
+type Row = { [string]: unknown }
+
+local Keys = 24
+local Base = '/memory/history'
+-- Where a generation transition can be made to fail, before and after the manifest is replaced.
+local Stages = { 'candidate-sealed', 'wal-ready', 'before-replace', 'after-replace', 'after-directory-sync', 'before-retire' }
+
+-- Park-Miller: the same seed gives the same history on every platform.
+local function generator(seed: number): (bound: number) -> number
+  local state = seed % 2147483646 + 1
+  return function(bound: number): number
+    state = state * 48271 % 2147483647
+    return state % bound + 1
+  end
+end
+
+type History = {
+  steps: number, deletions: number, transitions: number, failedTransitions: number, reopens: number, crashes: number,
+  -- The largest number of immutable generations seen at once.
+  generations: number,
+  problem: string?,
+}
+
+local function run(seed: number, steps: number): History
+  local pick = generator(seed)
+  local disk = memfs.new()
+  local model: { [number]: string } = {}
+  local failAt: string? = nil
+  local history: History = { steps = 0, deletions = 0, transitions = 0, failedTransitions = 0, reopens = 0, crashes = 0, generations = 0 }
+  local trail: { string } = {}
+
+  local function options(): sql.ManagedOptions
+    return { tableName = 'events', columns = { 'id', 'body' }, primaryKey = 'id', cachePages = 1,
+      compactionFanIn = 2, maxGenerations = 4, storage = disk.backend,
+      testHook = function(stage: string)
+        if failAt == stage then
+          failAt = nil
+          error('injected publication fault')
+        end
+      end }
+  end
+
+  local db = sql.managed.create(Base, options())
+
+  -- The whole key space, read back one key at a time and by a scan: both must equal the model.
+  local function compare(): string?
+    local scanned: { [number]: string } = {}
+    for _, row in db:query('SELECT id, body FROM events').rows do
+      local record = row :: Row
+      scanned[record.id :: number] = record.body :: string
+    end
+
+    for key = 1, Keys do
+      local found = db:get(key)
+      local body = if found then found.body :: string else nil
+      if body ~= model[key] then
+        return `key {key}: get gives {tostring(body)}, the model has {tostring(model[key])}`
+      end
+
+      if scanned[key] ~= model[key] then
+        return `key {key}: a scan gives {tostring(scanned[key])}, the model has {tostring(model[key])}`
+      end
+    end
+
+    return nil
+  end
+
+  local function reopen()
+    db = sql.managed.openExisting(Base, options())
+    history.reopens += 1
+  end
+
+  for step = 1, steps do
+    history.steps = step
+    local choice = pick(100)
+    local note: string
+    if choice <= 38 then
+      local key, body = pick(Keys), `s{seed}n{step}`
+      db:upsert({ id = key, body = body })
+      model[key] = body
+      note = `upsert {key}`
+    elseif choice <= 62 then
+      local key = pick(Keys)
+      local existed = db:delete(key)
+      if existed ~= (model[key] ~= nil) then
+        history.problem = `step {step}: delete {key} answered {tostring(existed)} against the model`
+        break
+      end
+
+      model[key] = nil
+      history.deletions += 1
+      note = `delete {key}`
+    elseif choice <= 90 then
+      local kind = pick(3)
+      if pick(4) == 1 then failAt = Stages[pick(#Stages)] end
+
+      local injected = failAt
+      -- A transition may refuse (nothing to merge) or hit the injected fault; either way the
+      -- data must be what the model says, so it is not an error of this test.
+      local ok = pcall(function()
+        if kind == 1 then
+          db:flush()
+        elseif kind == 2 then
+          db:compact()
+        else
+          db:checkpoint()
+        end
+      end)
+      local hit = injected ~= nil and failAt == nil
+      failAt = nil
+      history.transitions += 1
+      note = `{if kind == 1 then 'flush' elseif kind == 2 then 'compact' else 'checkpoint'}{if hit then ` failing at {injected}` else ''}{if ok then '' else ' (raised)'}`
+      if hit then
+        history.failedTransitions += 1
+        -- After a failed publication the handle may be poisoned: close it and open again.
+        pcall(function() db:close() end)
+        reopen()
+      end
+    elseif choice <= 96 then
+      db:close()
+      reopen()
+      note = 'reopen'
+    else
+      -- The process dies with the database open. Every commit so far was acknowledged.
+      disk.crash()
+      history.crashes += 1
+      reopen()
+      note = 'crash'
+    end
+
+    table.insert(trail, note)
+    history.generations = math.max(history.generations, db:stats().generations)
+    local difference = compare()
+    if difference then
+      local from = math.max(1, #trail - 11)
+      history.problem = `seed {seed}, step {step} ({note}): {difference}\n  last steps: {table.concat(trail, ', ', from)}`
+      break
+    end
+  end
+
+  if not history.problem then
+    db:close()
+    -- What is left passes the offline scan with a semantic replay, and reads the same once more.
+    local report = sql.managed.verify(Base, { semantic = true, storage = disk.backend })
+    if not report.ok then
+      history.problem = `seed {seed}: offline verification: {if report.issues[1] then report.issues[1].code else 'UNKNOWN'}`
+    else
+      reopen()
+      history.problem = compare()
+      db:close()
+    end
+  end
+
+  return history
+end
+
+suite.describe('tombstone safety across generations', function()
+  suite.it('never resurrects a deleted key over 40 seeded histories of 160 steps', function()
+    local totals = { deletions = 0, transitions = 0, failed = 0, reopens = 0, crashes = 0, generations = 0 }
+    for seed = 1, 40 do
+      local history = run(seed, 160)
+      expect(history.problem).toBe(nil)
+      totals.deletions += history.deletions
+      totals.transitions += history.transitions
+      totals.failed += history.failedTransitions
+      totals.reopens += history.reopens
+      totals.crashes += history.crashes
+      totals.generations = math.max(totals.generations, history.generations)
+    end
+
+    -- The histories did what they are for: deletions under several generations, failed
+    -- publications before and after the manifest moved, restarts and crashes.
+    expect(totals.deletions > 1000).toBe(true)
+    expect(totals.transitions > 1000).toBe(true)
+    expect(totals.failed > 100).toBe(true)
+    expect(totals.crashes > 100).toBe(true)
+    expect(totals.generations >= 3).toBe(true)
+  end)
+
+  suite.it('gives the same history for the same seed', function()
+    local first, second = run(7, 60), run(7, 60)
+    expect(first.problem).toBe(nil)
+    expect(`{first.deletions} {first.transitions} {first.failedTransitions} {first.reopens} {first.crashes}`)
+      .toBe(`{second.deletions} {second.transitions} {second.failedTransitions} {second.reopens} {second.crashes}`)
+  end)
+end)
+
+return suite
