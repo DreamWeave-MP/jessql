@@ -28,6 +28,7 @@
 -- the same request (an `insert` refuses a duplicate), and a retry of a request that did commit is
 -- `rejected` with a duplicate key instead of being applied twice.
 local catalog = require('@jessql/catalog')
+local ledger = require('@jessql/ledger')
 local mutations = require('@jessql/mutations')
 
 export type Row = { [string]: unknown }
@@ -52,6 +53,11 @@ export type Options = {
   maxBatch: number?,
   -- The most operations in one request (default 256, at most 4096).
   maxOperations: number?,
+  -- A durable ledger of request ids in the same database (`@jessql/ledger`): every request's id
+  -- is written in the request's own frame, and a request whose id is already there is rejected
+  -- with `ledger: already committed`, having changed nothing. Without it, a caller that retries
+  -- must carry its own duplicate guard in the request.
+  ledger: ledger.Options?,
 }
 export type Status = { queued: number, committed: number, rejected: number, unknown: number, batches: number, stopped: boolean, reason: string? }
 export type Writer = {
@@ -162,7 +168,9 @@ local function snapshot(request: unknown, maxOperations: number): (Request?, str
 end
 
 -- One request as one transaction: every operation, or an error that leaves none of them.
-local function apply(tx: catalog.Transaction, request: Request)
+local function apply(tx: catalog.Transaction, request: Request, kept: ledger.Options?)
+  if kept then ledger.enter(tx, kept, request.id) end
+
   for index, operation in request.operations do
     if operation.op == 'insert' then
       tx:insert(operation.table, operation.row :: Row)
@@ -185,6 +193,10 @@ function writer.new(db: catalog.Database, options: Options?): Writer
   if not whole(maxQueued, 1, 65536) then error('jessql writer: invalid maxQueued', 2) end
   if not whole(maxBatch, 1, 256) then error('jessql writer: invalid maxBatch', 2) end
   if not whole(maxOperations, 1, 4096) then error('jessql writer: invalid maxOperations', 2) end
+
+  local kept = if options then options.ledger else nil
+  local ledgerProblem = if kept ~= nil then ledger.problem(kept) else nil
+  if ledgerProblem then error('jessql writer: ' .. ledgerProblem, 2) end
 
   -- A queue that never moves its entries: `head` is the oldest, `tail` the newest.
   local queue: { [number]: Request } = {}
@@ -240,7 +252,7 @@ function writer.new(db: catalog.Database, options: Options?): Writer
 
     local callbacks: { (catalog.Transaction) -> () } = {}
     for index, request in batch do
-      callbacks[index] = function(tx: catalog.Transaction) apply(tx, request) end
+      callbacks[index] = function(tx: catalog.Transaction) apply(tx, request, kept) end
     end
 
     status.batches += 1

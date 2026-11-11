@@ -1,0 +1,187 @@
+--!strict
+-- #33: the durable ledger of request ids. A request commits with its id or not at all; a retry
+-- of one that committed is refused, having changed nothing; what became of a request nobody
+-- heard about is read back from the database; two scopes do not share ids; and pruning is a
+-- bounded, stated end to all of that.
+local ledger = require('@jessql/ledger')
+local memfs = require('@jessql/memfs')
+local sql = require('@jessql')
+local test = require('@jess/test')
+local writer = require('@jessql/writer')
+
+local expect = test.expect
+local suite = test.new()
+
+local Path = '/memory/ledgered'
+local Tables: { sql.CatalogTableSpec } = {
+  { tableName = 'accounts', columns = { 'id', 'balance' }, primaryKey = 'id' },
+  ledger.table('requests'),
+}
+
+-- A request that is NOT safe to apply twice by itself: it adds to a balance.
+local function deposit(id: string, account: number, balance: number): writer.Request
+  return { id = id, operations = { { op = 'upsert', table = 'accounts', row = { id = account, balance = balance } } } }
+end
+
+local function outcomes(acks: { writer.Ack }): string
+  local parts: { string } = {}
+  for _, ack in acks do table.insert(parts, `{ack.id}={ack.outcome}`) end
+
+  return table.concat(parts, ' ')
+end
+
+local function count(db: sql.CatalogDatabase, name: string): number
+  return db:query(`SELECT COUNT(*) AS n FROM {name}`).rows[1].n :: number
+end
+
+suite.describe('the durable request ledger', function()
+  suite.it('refuses a request that already committed, in the same batch or a later one, having changed nothing', function()
+    local disk = memfs.new()
+    local db = sql.catalog.create(Path, { tables = Tables, storage = disk.backend })
+    local options: ledger.Options = { table = 'requests', now = function(): number return 1000 end }
+    local queue = writer.new(db, { ledger = options })
+    queue:submit(deposit('pay-1', 7, 100))
+    expect(outcomes(queue:drain())).toBe('pay-1=committed')
+
+    -- The same id again with another effect: refused, and the first effect stands.
+    queue:submit(deposit('pay-1', 7, 999))
+    queue:submit(deposit('pay-2', 8, 50))
+    local acks = queue:drain()
+    expect(outcomes(acks)).toBe('pay-1=rejected pay-2=committed')
+    expect(ledger.wasCommitted(acks[1].error)).toBe(true)
+    expect(ledger.wasCommitted(acks[2].error)).toBe(false)
+    expect((db:get('accounts', 7) :: { balance: number }).balance).toBe(100)
+    expect(count(db, 'requests')).toBe(2)
+
+    -- A request that fails leaves no id behind: it may be sent again and then commits.
+    queue:submit({ id = 'pay-3', operations = { { op = 'update', table = 'accounts', key = 404, changes = { balance = 1 } } } })
+    local failed = queue:drain()
+    expect(outcomes(failed)).toBe('pay-3=rejected')
+    expect(ledger.wasCommitted(failed[1].error)).toBe(false)
+    expect(ledger.lookup(db, options, { 'pay-3' })['pay-3']).toBe('absent')
+    queue:submit(deposit('pay-3', 9, 5))
+    expect(outcomes(queue:drain())).toBe('pay-3=committed')
+
+    local state = ledger.lookup(db, options, { 'pay-1', 'pay-2', 'pay-3', 'never' })
+    expect(`{state['pay-1']} {state['pay-2']} {state['pay-3']} {state.never}`).toBe('committed committed committed absent')
+    db:close()
+  end)
+
+  suite.it('answers what became of requests whose outcome nobody saw, and makes their retry safe', function()
+    local disk = memfs.new()
+    local db = sql.catalog.create(Path, { tables = Tables, storage = disk.backend })
+    local options: ledger.Options = { table = 'requests' }
+    local queue = writer.new(db, { ledger = options, maxBatch = 3 })
+    for number = 1, 3 do queue:submit(deposit(`pay-{number}`, number, 10 * number)) end
+
+    -- The log's synchronization fails: the writer cannot say, and says so.
+    disk.inject(function(step: string, path: string, _occurrence: number): memfs.Fault?
+      if step == 'syncData' and string.sub(path, -4) == '.wal' then return { message = 'injected sync failure' } end
+      return nil
+    end)
+    expect(outcomes(queue:drain())).toBe('pay-1=unknown pay-2=unknown pay-3=unknown')
+    disk.inject(nil)
+    -- The handle may be poisoned by the failed synchronization; it is closed as far as it can be.
+    pcall(function() db:close() end)
+
+    disk.crash()
+    local reopened = sql.catalog.openExisting(Path, { storage = disk.backend })
+    local state = ledger.lookup(reopened, options, { 'pay-1', 'pay-2', 'pay-3' })
+    -- An id is there exactly when its effect is: never one without the other.
+    local committed = 0
+    for number = 1, 3 do
+      local row = reopened:get('accounts', number)
+      expect((row ~= nil) == (state[`pay-{number}`] == 'committed')).toBe(true)
+      if row then committed += 1 end
+    end
+
+    expect(count(reopened, 'requests')).toBe(committed)
+
+    -- Every one is retried without knowing. Those that had committed are refused as such; the
+    -- rest commit now; each deposit is applied exactly once.
+    local retry = writer.new(reopened, { ledger = options })
+    for number = 1, 3 do retry:submit(deposit(`pay-{number}`, number, 10 * number)) end
+
+    local already, fresh = 0, 0
+    for _, ack in retry:drain() do
+      if ack.outcome == 'committed' then
+        fresh += 1
+      elseif ledger.wasCommitted(ack.error) then
+        already += 1
+      end
+    end
+
+    expect(already).toBe(committed)
+    expect(fresh).toBe(3 - committed)
+    expect(count(reopened, 'accounts')).toBe(3)
+    expect(count(reopened, 'requests')).toBe(3)
+    reopened:close()
+  end)
+
+  suite.it('keeps scopes apart, however their names and ids are spelt', function()
+    local disk = memfs.new()
+    local db = sql.catalog.create(Path, { tables = Tables, storage = disk.backend })
+    local alpha = writer.new(db, { ledger = { table = 'requests', scope = 'tenant-a' } })
+    local beta = writer.new(db, { ledger = { table = 'requests', scope = 'tenant-b' } })
+    alpha:submit(deposit('order-1', 1, 10))
+    beta:submit(deposit('order-1', 2, 20))
+    expect(outcomes(alpha:drain())).toBe('order-1=committed')
+    expect(outcomes(beta:drain())).toBe('order-1=committed')
+    expect(ledger.lookup(db, { table = 'requests', scope = 'tenant-a' }, { 'order-1' })['order-1']).toBe('committed')
+    expect(ledger.lookup(db, { table = 'requests', scope = 'tenant-c' }, { 'order-1' })['order-1']).toBe('absent')
+
+    -- A scope and an id that would run together as plain text do not: the key is framed.
+    expect(ledger.key('ab', 'c') ~= ledger.key('a', 'bc')).toBe(true)
+    expect(ledger.key('1', '2:x') ~= ledger.key('12', ':x')).toBe(true)
+    local joined = writer.new(db, { ledger = { table = 'requests', scope = 'tenant-' } })
+    joined:submit(deposit('aorder-1', 3, 30))
+    expect(outcomes(joined:drain())).toBe('aorder-1=committed')
+    expect(count(db, 'requests')).toBe(3)
+
+    -- Options that are not a ledger's are refused when the writer is made.
+    for _, bad in { { table = '' }, { table = 'requests', scope = string.rep('s', 201) }, { table = 'requests', now = 5 }, {} } :: { unknown } do
+      expect((pcall(writer.new, db, ({ ledger = bad } :: unknown) :: writer.Options))).toBe(false)
+    end
+
+    -- An id too long to be one never reaches the ledger: the writer refuses it at admission,
+    -- and the request beside it commits.
+    expect(alpha:submit(deposit(string.rep('i', 513), 4, 40)).admitted).toBe(false)
+    alpha:submit(deposit('order-2', 5, 50))
+    expect(outcomes(alpha:drain())).toBe('order-2=committed')
+    db:close()
+  end)
+
+  suite.it('prunes old entries a bounded number at a time, after which a retry is applied again', function()
+    local disk = memfs.new()
+    local db = sql.catalog.create(Path, { tables = Tables, storage = disk.backend })
+    local clock = 1000
+    local options: ledger.Options = { table = 'requests', now = function(): number return clock end }
+    local queue = writer.new(db, { ledger = options })
+    for number = 1, 25 do
+      clock = 1000 + number
+      queue:submit(deposit(`old-{number}`, number, number))
+    end
+
+    expect(#queue:drain()).toBe(25)
+    clock = 5000
+    queue:submit(deposit('new-1', 100, 1))
+    queue:drain()
+
+    -- Ten a call, until none older than the line is left; the new one stays.
+    expect(ledger.prune(db, options, 2000, 10)).toBe(10)
+    expect(ledger.prune(db, options, 2000, 10)).toBe(10)
+    expect(ledger.prune(db, options, 2000, 10)).toBe(5)
+    expect(ledger.prune(db, options, 2000, 10)).toBe(0)
+    expect(count(db, 'requests')).toBe(1)
+    expect(ledger.lookup(db, options, { 'new-1' })['new-1']).toBe('committed')
+
+    -- The stated limit: a pruned id is forgotten, and a retry of it is a new request.
+    expect(ledger.lookup(db, options, { 'old-3' })['old-3']).toBe('absent')
+    queue:submit(deposit('old-3', 3, 333))
+    expect(outcomes(queue:drain())).toBe('old-3=committed')
+    expect((db:get('accounts', 3) :: { balance: number }).balance).toBe(333)
+    db:close()
+  end)
+end)
+
+return suite

@@ -120,8 +120,34 @@ the hand-written protocol, with the same median (1.1 ms). Each library run follo
 run of the other protocol on the same disk, which may be all there is to it; it is not
 explained, and it is recorded.
 
+## What became of an `unknown` request: `@jessql/ledger` (#33)
+
+Give the writer `ledger = { table = 'requests', scope = 'tenant-a' }` and put
+`ledger.table('requests')` among the database's tables. Each request's id is then written as a
+row **in the request's own frame**, so the id is in the database exactly when the request's
+changes are, whatever moment a crash chooses, and there is no second store to disagree with.
+
+- A request whose id is already there is `rejected` with `ledger: already committed`
+  (`ledger.wasCommitted(ack.error)`) and changes nothing. That is the answer to a retry.
+- `ledger.lookup(db, options, ids)` answers `committed` or `absent` for each id, from the
+  database as it is: what a caller or an operator asks after a reopen.
+- The scope is part of the key, length-framed: the same id under two scopes is two requests.
+- `ledger.prune(db, options, before, limit)` removes entries older than a time, a bounded number
+  a call. **After an id is pruned a retry of that request is applied again**: retries must stop
+  before retention does. Nothing prunes by itself.
+
+Tested: a duplicate in the same batch and in a later one; a request that failed leaves no id
+and can be sent again; after an injected failure of the log's synchronization and a crash, each
+id is present exactly when its effect is, and a blind retry of all three applies each once; two
+scopes with the same id; pruning ten at a time.
+
+This is exactly-once **application** of a request to one database. It is not exactly-once
+delivery, and it does not span databases.
+
 ## Not there
 
+- A ledger entry does not record the request's content: a different request reusing an id is
+  refused as already committed, not detected as a conflict.
 - **Restart** of a worker that died, and **fairness** between several clients: one client owns
   one worker, first in, first out.
 - The spawning itself is the application's: a worker needs a script domain.
