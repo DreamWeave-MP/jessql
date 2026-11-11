@@ -77,6 +77,15 @@ export type Database = {
   close: (self: Database) -> (),
 }
 
+export type VerifyIssue = { stage: string, tableName: string?, message: string }
+export type VerifyTable = { generations: number, rowsScanned: number }
+-- `coldPagesChecked` says every page of every generation of every table was read and decoded.
+-- `walFramesChecked` is always false: the log's frames are checked by opening the database.
+export type VerifyReport = {
+  ok: boolean, epoch: number?, tables: { [string]: VerifyTable }, coldRowsScanned: number, walBytes: number,
+  coldPagesChecked: boolean, walFramesChecked: boolean, issues: { VerifyIssue },
+}
+
 type Catalog = manifest.Catalog
 type Table = manifest.Table
 type Generation = manifest.Generation
@@ -933,6 +942,90 @@ local function openCatalog(path: string, options: Options?, intent: string): Dat
   end
 
   return db
+end
+
+-- Offline integrity scan of what the manifest names. It takes the database's lock, so it sees one
+-- published state for the whole scan; it opens no log for writing, repairs nothing and removes
+-- nothing. Damage is an issue in the report, not an error: only a held lock raises.
+function catalog.verify(path: string, options: { storage: vfs.Backend? }?): VerifyReport
+  local fs = vfs.resolve(if options then options.storage else nil)
+  local base = normalize(fs, path)
+  local lock, lockError = fs.lock(base .. '.jql-lock')
+  if not lock then error('jessql catalog: verification locked: ' .. tostring(lockError), 2) end
+
+  local report: VerifyReport = { ok = true, epoch = nil, tables = {}, coldRowsScanned = 0, walBytes = 0,
+    coldPagesChecked = false, walFramesChecked = false, issues = {} }
+
+  local function issue(stage: string, tableName: string?, message: string)
+    report.ok = false
+    report.issues[#report.issues + 1] = { stage = stage, tableName = tableName, message = message }
+  end
+
+  -- A manifest that cannot be read or decoded is the first and only finding.
+  local decoded, value = pcall(function() return readManifest(fs, base .. '.jql-manifest') end)
+
+  if not decoded then
+    issue('manifest', nil, tostring(value))
+    lock:unlock()
+    return report
+  end
+  local found = value :: Catalog
+  report.epoch = found.epoch
+  local whole = true
+
+  for _, entry in found.tables do
+    local scanned = 0
+    local sources, deleted = generationPaths(base, entry)
+    local files: { string } = table.clone(sources)
+    for _, sidecar in deleted do files[#files + 1] = sidecar end
+
+    -- Every physical file, shadowed rows included: a merged read would skip a damaged older page.
+    for _, file in files do
+      -- A missing or damaged file raises on open or on the page that is damaged.
+      local read, problem = pcall(function()
+        local reader = paged.open(file, { cachePages = 1, storage = fs })
+        -- Decoding can raise part way; the reader is closed either way.
+        local ok, failure = pcall(function()
+          local nextRow = reader:iterateRows()
+          while nextRow() do scanned += 1 end
+        end)
+        reader:close()
+        if not ok then error(failure, 0) end
+      end)
+
+      if not read then
+        whole = false
+        issue('cold', entry.tableName, tostring(problem))
+      end
+    end
+
+    report.tables[entry.tableName] = { generations = #entry.generations, rowsScanned = scanned }
+    report.coldRowsScanned += scanned
+  end
+
+  -- The generations as one set: each table's schema, and the identity the log is bound to.
+  local opened, colds, identity = pcall(function() return openColds(fs, base, found, nil, 1) end)
+  if not opened then
+    whole = false
+    issue('cold', nil, tostring(colds))
+  else
+    closeAll(colds)
+    if identity ~= found.snapshotIdentity then
+      whole = false
+      issue('cold', nil, 'the generations are not the set the manifest was published for')
+    end
+  end
+
+  report.coldPagesChecked = whole
+  local journal, journalError = fs.stat(walPath(base, found.epoch))
+  if not journal or not journal.isFile then
+    issue('wal', nil, 'active WAL missing: ' .. tostring(journalError))
+  else
+    report.walBytes = journal.size
+  end
+
+  lock:unlock()
+  return report
 end
 
 -- Explicit intents, decided inside the database's lock, so that pointing at the wrong name never

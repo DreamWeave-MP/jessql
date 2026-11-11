@@ -610,4 +610,111 @@ suite.describe('a managed database of several tables under budgets', function()
   end)
 end)
 
+-- A copy of `disk`'s files on a new disk, each passed through `change` (nil drops the file).
+local function copied(disk: memfs.Disk, change: (path: string, body: string) -> string?): memfs.Disk
+  local other = memfs.new()
+  for path, body in disk.visible() do
+    local kept = change(path, body)
+    if kept then assert((other.backend.createDurable(path, kept))) end
+  end
+
+  return other
+end
+
+local function stages(report: sql.CatalogVerifyReport): string
+  local found: { string } = {}
+  for _, issue in report.issues do table.insert(found, `{issue.stage}:{issue.tableName or '-'}`) end
+
+  table.sort(found)
+  return table.concat(found, ' ')
+end
+
+suite.describe('offline verification of a managed database of several tables', function()
+  suite.it('reads every page of every generation and changes nothing', function()
+    local disk = memfs.new()
+    prepare(disk, Quiet)
+    local before = disk.visible()
+    local report = sql.catalog.verify(Path, { storage = disk.backend })
+    expect(stages(report)).toBe('')
+    expect(report.ok).toBe(true)
+    expect(report.epoch).toBe(2)
+    expect(report.coldPagesChecked).toBe(true)
+    -- The log's frames are checked by opening the database, and the report does not claim them.
+    expect(report.walFramesChecked).toBe(false)
+    expect(report.walBytes > 0).toBe(true)
+    expect(report.tables.conversation.generations).toBe(2)
+    -- Two steps were flushed: two conversation rows, and the deletion sidecar's marker row.
+    expect(report.tables.conversation.rowsScanned).toBe(3)
+    expect(report.coldRowsScanned > 8).toBe(true)
+
+    local after = disk.visible()
+    for path, body in before do expect(after[path] == body).toBe(true) end
+
+    for path in after do
+      -- The lock file is the only name a scan may add.
+      if before[path] == nil then expect(path).toBe('/memory/service.jql-lock') end
+    end
+
+    -- And the database opens afterwards as it would have.
+    expect(recover(disk)['3']).toBe(3)
+  end)
+
+  suite.it('reports damage by stage and table instead of raising, and a held lock by raising', function()
+    local disk = memfs.new()
+    prepare(disk, Quiet)
+
+    local damaged = copied(disk, function(path: string, body: string): string?
+      if path ~= '/memory/service.t.conversation.g00000002.rows' then return body end
+      local middle = #body // 2
+      return string.sub(body, 1, middle - 1) .. string.char(bit32.bxor(string.byte(body, middle), 0xff)) .. string.sub(body, middle + 1)
+    end)
+    local damage = sql.catalog.verify(Path, { storage = damaged.backend })
+    expect(damage.ok).toBe(false)
+    expect(damage.coldPagesChecked).toBe(false)
+    expect(string.find(stages(damage), 'cold:conversation', 1, true) ~= nil).toBe(true)
+
+    local missing = copied(disk, function(path: string, body: string): string?
+      return if path == '/memory/service.t.outbox.g00000002.deleted' then nil else body
+    end)
+    expect(string.find(stages(sql.catalog.verify(Path, { storage = missing.backend })), 'cold:outbox', 1, true) ~= nil).toBe(true)
+
+    -- Whole files of the right schema in the wrong tables: every page reads, the set is wrong.
+    local files = disk.visible()
+    local swapped = copied(disk, function(path: string, body: string): string?
+      if path == '/memory/service.t.handled.g00000002.rows' then return files['/memory/service.t.outbox.g00000002.rows'] end
+      if path == '/memory/service.t.outbox.g00000002.rows' then return files['/memory/service.t.handled.g00000002.rows'] end
+      return body
+    end)
+    local swap = sql.catalog.verify(Path, { storage = swapped.backend })
+    expect(swap.ok).toBe(false)
+    expect(string.find(stages(swap), 'cold:-', 1, true) ~= nil).toBe(true)
+
+    local logless = copied(disk, function(path: string, body: string): string?
+      return if string.find(path, '%.wal$') then nil else body
+    end)
+    local lost = sql.catalog.verify(Path, { storage = logless.backend })
+    expect(stages(lost)).toBe('wal:-')
+    expect(lost.coldPagesChecked).toBe(true)
+
+    local torn = copied(disk, function(path: string, body: string): string?
+      return if path == '/memory/service.jql-manifest' then string.sub(body, 1, #body - 3) else body
+    end)
+    local unread = sql.catalog.verify(Path, { storage = torn.backend })
+    expect(stages(unread)).toBe('manifest:-')
+    expect(unread.epoch).toBe(nil)
+
+    local single = memfs.new()
+    sql.managed.create('/memory/service', { tableName = 'events', columns = { 'id' }, primaryKey = 'id', storage = single.backend }):close()
+    expect(stages(sql.catalog.verify(Path, { storage = single.backend }))).toBe('manifest:-')
+
+    local db = reopen(disk)
+    -- The database holds its lock: the scan is refused, not run beside it.
+    local scanned, problem = pcall(function() return sql.catalog.verify(Path, { storage = disk.backend }) end)
+    db:close()
+    expect(scanned).toBe(false)
+    expect(string.find(tostring(problem), 'verification locked', 1, true) ~= nil).toBe(true)
+    expect(sql.catalog.verify(Path, { storage = disk.backend }).ok).toBe(true)
+  end)
+end)
+
 return suite

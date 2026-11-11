@@ -142,6 +142,10 @@ Not built yet, and so limits today:
 
 - The hot rows of every table are resident until a flush, as in the single-table store. Budgets
   bound them (below); without one the caller flushes and compacts.
-- No offline `inspect`, `verify`, `backup` or `restore` for a catalog, and no secondary indexes.
+- `sql.catalog.verify(path)` reads every page of every generation of every table under the
+  database's lock, checks the set against the manifest's identity, and reports damage by stage
+  and table without changing a file. It does not check the log's frames (opening the database
+  does) and says so in its report. No offline `backup` or `restore` for a catalog yet, and no
+  secondary indexes.
 - At most 32 tables and 8 generations a table; the tables are fixed at creation.
 - Verified on the model disk only, like everything the fault laboratory holds.

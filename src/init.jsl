@@ -23,6 +23,7 @@ export type ManagedOptions = managed.Options
 export type CatalogDatabase = catalog.Database
 export type CatalogOptions = catalog.Options
 export type CatalogTableSpec = catalog.TableSpec
+export type CatalogVerifyReport = catalog.VerifyReport
 export type CatalogTransaction = catalog.Transaction
 export type ManagedEvent = managed.Event
 export type ManagedEventBatch = managed.EventBatch
