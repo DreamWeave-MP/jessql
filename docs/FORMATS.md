@@ -44,3 +44,33 @@ Lock files (`.jql-lock`, `.wal.lock`) are empty and carry no format.
 - Corruption inside a known version (bad CRC, truncated page): the verification and durability
   suites, not this one.
 - Byte order and platform differences: the fixtures were written and read on one platform.
+
+## Damage inside a known version (`tests/format-fuzz.jsl`)
+
+Each golden file is changed, one seeded mutation at a time (a flipped byte, a zeroed run, a
+truncation, appended bytes), and the database or snapshot is opened and read on the result. The
+acceptable outcomes are a refusal or exactly the rows that were written; a point read must agree
+with the scan. 400 mutations per file:
+
+| File | Refused | Read intact | Read as an earlier state |
+|---|---|---|---|
+| manifest | 400 | 0 | - |
+| row generations (three files) | 400 each | 0 | - |
+| deletion sidecars (two files) | 400 each | 0 | - |
+| snapshot, compact index, legacy index | 400 each | 0 | - |
+| write-ahead log | 370 | 11 | 19 |
+
+**The immutable formats and the manifest refuse every mutation tried.** No mutation of any file
+produced rows that were never committed.
+
+**The write-ahead log is different, by design, and it is a limit worth knowing.** Nothing else
+commits to where the log ends, so a log that stops short, or whose last frame fails its checksum,
+is what a crash during the last write leaves, and is read as that: the last transaction is
+dropped without a refusal. In 19 of 400 mutations, damage to the tail of the log cost a
+transaction that had been acknowledged. It never produced anything but a state that was once
+committed. Telling a torn last write from later damage would need the log's committed length
+recorded somewhere else; that is not done, and is not proposed here.
+
+Not covered: more than one mutation at a time, mutations chosen by knowledge of the format
+(a valid checksum over changed content), endianness, and candidate formats that do not exist
+yet. This is random damage on small files, not a proof.
