@@ -148,12 +148,34 @@ scopes with the same id; pruning ten at a time.
 This is exactly-once **application** of a request to one database. It is not exactly-once
 delivery, and it does not span databases.
 
+## A worker that is replaced: `service.supervisor`
+
+`service.supervisor(spawn, { path, tables, writer = { ledger = ... } })` is a client that
+replaces its worker. `spawn` starts a worker and answers its handle; it is called again each
+time the worker fails or goes silent, up to `maxRestarts` (default 3). Every request still
+unanswered is then sent to the new worker as it was. One that had in fact committed is refused
+there by the ledger and reported to the caller as what it is, `committed`; one that had not,
+commits. The caller sees `unknown` only when the restarts are used up or no worker can be
+started or opened.
+
+It **requires a ledger** and will not be made without one: retrying a request whose outcome is
+unknown is only safe when a committed request cannot be applied twice. A refusal that is not a
+retry stays a refusal: an id the caller itself sends twice is `rejected`, as is a row that is
+really already there.
+
+Tested through stand-in workers: five requests synchronized and the worker dead before its
+reply (reported `committed` after one restart, applied once); three requests in the mailbox of
+a worker that dies (they commit in the next); workers that die every time (`unknown` after two
+restarts, and the test shows they had in fact committed: unknown is honest); no ledger, no
+supervisor; a worker that cannot be started.
+
 ## Not there
 
+- The supervisor holds a copy of every unanswered request, at most `maxOutstanding` of them,
+  and has only been run over stand-in workers, not real ones.
 - A ledger entry does not record the request's content: a different request reusing an id is
   refused as already committed, not detected as a conflict.
-- **Restart** of a worker that died, and **fairness** between several clients: one client owns
-  one worker, first in, first out.
+- **Fairness** between several clients: one client owns one worker, first in, first out.
 - The spawning itself is the application's: a worker needs a script domain.
 - Death of a worker between the synchronization and its reply: the caller reconciles by id (a
   row keyed by the request's id in the same request makes a retry a duplicate-key rejection).

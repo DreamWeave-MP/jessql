@@ -28,6 +28,7 @@
 --     database, or a retry that carries its own duplicate guard, is how a caller finds out.
 --   * Nothing is ever acknowledged as committed that the worker did not say was synchronized.
 local catalog = require('@jessql/catalog')
+local ledger = require('@jessql/ledger')
 local vfs = require('@jessql/vfs')
 local writer = require('@jessql/writer')
 
@@ -314,6 +315,182 @@ function service.client(lane: Lane, options: ClientOptions?): Client
 
   function self.status(_self: Client): ClientStatus
     return { outstanding = outstanding, stopped = stopped or closed, reason = reason, flushes = flushes }
+  end
+
+  return self
+end
+export type SupervisorOptions = {
+  path: string,
+  tables: { catalog.TableSpec },
+  -- Must name a ledger: retrying a request whose outcome is unknown is only safe when a request
+  -- that did commit cannot be applied twice.
+  writer: writer.Options,
+  client: ClientOptions?,
+  -- How many times a dead or silent worker is replaced before its requests are given up as
+  -- unknown (default 3, at most 100).
+  maxRestarts: number?,
+  openSeconds: number?,
+}
+export type Supervisor = {
+  submit: (self: Supervisor, request: writer.Request) -> Admission,
+  poll: (self: Supervisor, seconds: number?) -> { Ack },
+  close: (self: Supervisor, seconds: number?) -> { Ack },
+  status: (self: Supervisor) -> { outstanding: number, restarts: number, stopped: boolean, reason: string? },
+}
+
+-- A client that replaces its worker. `spawn` starts a worker and answers its lane (for an
+-- application, `jess.worker.spawn { source = service.source }`); it is called once at once and
+-- again each time the worker is given up on. Requests still unanswered then are sent to the new
+-- worker as they were. One that had in fact committed is refused there by the ledger as
+-- already committed, and is reported to the caller as what it is: `committed`. So a caller of a
+-- supervisor sees `unknown` only when the restarts are used up or a worker cannot be opened.
+--
+-- What it holds: a copy of every unanswered request, at most the client's `maxOutstanding`.
+function service.supervisor(spawn: () -> Lane, options: SupervisorOptions): Supervisor
+  local kept = options.writer.ledger
+  if kept == nil or ledger.problem(kept) ~= nil then error('jessql writer service: a supervisor needs a ledger to retry safely', 2) end
+
+  local maxRestarts = if options.maxRestarts ~= nil then options.maxRestarts else 3
+  if typeof(maxRestarts) ~= 'number' or maxRestarts ~= math.floor(maxRestarts) or maxRestarts < 0 or maxRestarts > 100 then
+    error('jessql writer service: invalid maxRestarts', 2)
+  end
+
+  -- Unanswered requests in the order they were first sent, and which of them have been sent to
+  -- more than one worker: only for those does "already committed" mean "committed by us".
+  local held: { [string]: writer.Request } = {}
+  local order: { string } = {}
+  local retried: { [string]: boolean } = {}
+  local outstanding, restarts = 0, 0
+  local stopped, reason = false, nil :: string?
+  local client: Client? = nil
+  local self = {} :: Supervisor
+
+  local function start(): (boolean, string?)
+    -- Starting a worker can raise (no capability, no domain); that is an answer.
+    local ok, lane = pcall(spawn)
+    if not ok or lane == nil then return false, 'no worker could be started' end
+
+    local made = service.client(lane :: Lane, options.client)
+    local opened, problem = made:open(options.path, options.tables, options.writer, options.openSeconds)
+    if not opened then return false, problem or 'the worker did not open the database' end
+
+    client = made
+    return true, nil
+  end
+
+  local function settle(id: string)
+    if held[id] == nil then return end
+
+    held[id], retried[id] = nil, nil
+    outstanding -= 1
+  end
+
+  local function giveUp(why: string): { Ack }
+    stopped, reason = true, why
+    local acks: { Ack } = {}
+    for _, id in order do
+      if held[id] ~= nil then
+        table.insert(acks, { id = id, outcome = 'unknown' :: writer.Outcome, error = why })
+        settle(id)
+      end
+    end
+
+    order = {}
+    return acks
+  end
+
+  -- The worker is gone: another, and everything unanswered sent to it again, in order.
+  local function replace(): string?
+    if restarts >= maxRestarts then return 'the worker was replaced as often as allowed' end
+
+    restarts += 1
+    local started, problem = start()
+    if not started then return problem end
+
+    local remaining: { string } = {}
+    for _, id in order do
+      local request = held[id]
+      if request == nil then continue end
+
+      table.insert(remaining, id)
+      retried[id] = true
+      local admission = (client :: Client):submit(request)
+      if not admission.admitted then return `a request could not be sent again: {tostring(admission.reason)}` end
+    end
+
+    order = remaining
+    return nil
+  end
+
+  local first, firstProblem = start()
+  if not first then stopped, reason = true, firstProblem end
+
+  function self.submit(_self: Supervisor, request: writer.Request): Admission
+    local current = client
+    if stopped or not current then return { admitted = false, reason = 'stopped', outstanding = outstanding } end
+
+    local id = field(request, 'id')
+    if typeof(id) == 'string' and held[id] ~= nil then return { admitted = false, reason = 'duplicate-id', outstanding = outstanding } end
+
+    local admission = current:submit(request)
+    if admission.admitted then
+      held[id :: string] = request
+      table.insert(order, id :: string)
+      outstanding += 1
+    elseif admission.reason == 'stopped' then
+      -- The worker died between two looks: said as backpressure, since the next poll replaces it.
+      return { admitted = false, reason = 'backpressure', outstanding = outstanding }
+    end
+
+    return { admitted = admission.admitted, reason = admission.reason, outstanding = outstanding }
+  end
+
+  function self.poll(_self: Supervisor, seconds: number?): { Ack }
+    local acks: { Ack } = {}
+    local current = client
+    if stopped or not current then return acks end
+
+    local lost = false
+    for _, ack in current:poll(seconds) do
+      if ack.outcome == 'unknown' then
+        lost = true
+      elseif held[ack.id] ~= nil then
+        -- Sent to an earlier worker too, and refused by this one as already there: it committed.
+        local outcome: writer.Outcome = if ack.outcome == 'rejected' and retried[ack.id] and ledger.wasCommitted(ack.error) then 'committed' else ack.outcome
+        table.insert(acks, { id = ack.id, outcome = outcome, error = if outcome == 'committed' then nil else ack.error })
+        settle(ack.id)
+      end
+    end
+
+    if lost or current:status().stopped then
+      local problem = replace()
+      if problem then
+        for _, ack in giveUp(problem) do table.insert(acks, ack) end
+      end
+    end
+
+    return acks
+  end
+
+  function self.close(_self: Supervisor, seconds: number?): { Ack }
+    local acks: { Ack } = {}
+    local current = client
+    if stopped or not current then return acks end
+
+    for _, ack in current:close(seconds) do
+      if held[ack.id] == nil then continue end
+
+      local outcome: writer.Outcome = if ack.outcome == 'rejected' and retried[ack.id] and ledger.wasCommitted(ack.error) then 'committed' else ack.outcome
+      table.insert(acks, { id = ack.id, outcome = outcome, error = if outcome == 'committed' then nil else ack.error })
+      settle(ack.id)
+    end
+
+    stopped, reason = true, 'closed'
+    return acks
+  end
+
+  function self.status(_self: Supervisor): { outstanding: number, restarts: number, stopped: boolean, reason: string? }
+    return { outstanding = outstanding, restarts = restarts, stopped = stopped, reason = reason }
   end
 
   return self
