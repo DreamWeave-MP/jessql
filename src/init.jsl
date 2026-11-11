@@ -12,6 +12,7 @@ local segments = require('@jessql/segments')
 local delta = require('@jessql/delta')
 local tiers = require('@jessql/tiers')
 local managed = require('@jessql/managed')
+local catalog = require('@jessql/catalog')
 
 export type Database = engine.Database
 export type PersistentDatabase = storage.Store
@@ -19,6 +20,10 @@ export type BatchResult = storage.BatchResult
 export type HybridDatabase = hybrid.Database
 export type ManagedDatabase = managed.Database
 export type ManagedOptions = managed.Options
+export type CatalogDatabase = catalog.Database
+export type CatalogOptions = catalog.Options
+export type CatalogTableSpec = catalog.TableSpec
+export type CatalogTransaction = catalog.Transaction
 export type ManagedEvent = managed.Event
 export type ManagedEventBatch = managed.EventBatch
 export type ManagedObservation = managed.Observation
@@ -56,6 +61,7 @@ return {
   delta = delta,
   tiers = tiers,
   managed = managed,
+  catalog = catalog,
   NULL = mutations.NULL,
   parse = parser.parse,
   lex = lexer.lex,

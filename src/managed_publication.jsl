@@ -47,10 +47,16 @@ end
 -- A pre-replace failure permits the coordinator to discard unpublished files.
 function publication.publish(base: string, parent: string, value: manifest.Manifest,
   hook: ((string) -> ())?, state: State, storage: vfs.Backend?)
+  publication.publishText(base, parent, manifest.encode(value), hook, state, storage)
+end
+
+-- The same protocol for a manifest its caller has already validated and encoded: the multi-table
+-- store's record. Nothing here reads `text`.
+function publication.publishText(base: string, parent: string, text: string,
+  hook: ((string) -> ())?, state: State, storage: vfs.Backend?)
   local fs = vfs.resolve(storage)
   local candidate = base .. '.jql-manifest.tmp'
   publication.removeIfPresent(candidate, fs)
-  local text = manifest.encode(value)
   local count, errorMessage = fs.createDurable(candidate, text)
   if count ~= #text then error('jessql managed: durable manifest: ' .. tostring(errorMessage), 2) end
   if hook then hook('before-replace') end

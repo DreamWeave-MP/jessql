@@ -102,13 +102,15 @@ end
 
 local function provider(cold: paged.Snapshot, coldIndex: secondary.Index?, tableName: string, primaryKey: string,
   hotGet: (string, unknown) -> Row?, hotQuery: (string, { unknown }?) -> engine.Result,
-  hotIterate: ((string) -> () -> Row?)?): engine.Provider
+  hotIterate: ((string) -> () -> Row?)?, tombstoneTable: string?): engine.Provider
   local columns = cold.columns
+  -- A database of several tables keeps one tombstone table for each of them.
+  local removedTable = tombstoneTable or Tombstones
 
   local function get(key: unknown): Row?
     local hotRow = hotGet(tableName, key)
     if hotRow then return hotRow end
-    if hotGet(Tombstones, encodeKey(key)) then return nil end
+    if hotGet(removedTable, encodeKey(key)) then return nil end
     return cold:get(key)
   end
 
@@ -206,7 +208,7 @@ local function provider(cold: paged.Snapshot, coldIndex: secondary.Index?, table
           local function nextMerged(): Row?
             while coldRow do
               local key = (coldRow :: Row)[primaryKey]
-              if not hotGet(tableName, key) and not hotGet(Tombstones, encodeKey(key)) then break end
+              if not hotGet(tableName, key) and not hotGet(removedTable, encodeKey(key)) then break end
               coldRow = nextCold()
             end
             local hotRow = matchingHot[hotIndex]
@@ -262,7 +264,7 @@ local function provider(cold: paged.Snapshot, coldIndex: secondary.Index?, table
               if not row then return nil end
 
               local key = row[primaryKey]
-              if not hotGet(tableName, key) and not hotGet(Tombstones, encodeKey(key)) then
+              if not hotGet(tableName, key) and not hotGet(removedTable, encodeKey(key)) then
                 local result: Row = {}
                 for _, column in request.columns do result[column] = row[column] end
                 return result
@@ -276,7 +278,7 @@ local function provider(cold: paged.Snapshot, coldIndex: secondary.Index?, table
     -- Other queries keep the established general-purpose overlay path.
     -- It is intentionally separate from the sidecar's indexed fast path.
     local hotRows = hotQuery(selectAll(tableName)).rows
-    local deletedRows = hotQuery('SELECT id FROM ' .. Tombstones).rows
+    local deletedRows = hotQuery('SELECT id FROM ' .. removedTable).rows
     local masked: { [string]: boolean } = {}
     for _, row in hotRows do masked[encodeKey(row[primaryKey])] = true end
     for _, row in deletedRows do masked[row.id :: string] = true end
@@ -396,6 +398,11 @@ local function provider(cold: paged.Snapshot, coldIndex: secondary.Index?, table
     end,
   }
 end
+
+-- INTERNAL, for the multi-table store: the read path of one table over a hot store it shares
+-- with others. `tombstoneTable` is that table's own tombstones in the shared store.
+hybrid.provider = provider
+hybrid.encodeKey = encodeKey
 
 -- Opens an existing immutable snapshot plus a private mutable WAL.
 -- The snapshot is never modified or deleted by this API.

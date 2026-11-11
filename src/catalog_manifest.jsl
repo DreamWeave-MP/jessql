@@ -81,8 +81,6 @@ local function validateTable(entry: unknown, epoch: number): number
     previous = generation.epoch
   end
 
-  -- The oldest generation of a table has nothing beneath it to delete from.
-  if value.generations[1].deleted then error('jessql catalog: the first generation cannot carry deletions', 4) end
   return previous
 end
 

@@ -77,3 +77,56 @@ nothing. This was verified on the model disk only.
 
 Whether this ships, and whether option B follows, is the maintainer's decision; the prototype is
 a draft so the choice can be made on something that runs.
+
+## Option B, as built (`sql.catalog`)
+
+The maintainer chose B (2026-11-10): a database must never be assumed small enough to stay in
+memory, so several tables live inside one managed database. Option A above stays a prototype.
+
+```luau
+local db = sql.catalog.create('/data/service', { tables = {
+  { tableName = 'reservations', columns = { 'id', 'effect' }, primaryKey = 'id' },
+  { tableName = 'handled', columns = { 'id' }, primaryKey = 'id' },
+} })
+db:transaction(function(tx)
+  tx:insert('reservations', { id = 7, effect = 'send-7' })
+  tx:insert('handled', { id = 7 })
+end)            -- one frame, one synchronization: both rows or neither
+db:flush()      -- every table with anything hot gets a cold generation; one manifest replacement
+```
+
+What it is on disk:
+
+- `<base>.jql-manifest`: record version 3 (`@jessql/catalog_manifest`), every table with its list of
+  generations, under one epoch;
+- `<base>.g<epoch>.wal`: the one log of that epoch, shared by every table, with its committed-length
+  mark;
+- `<base>.t.<table>.g<epoch>.rows` and `.deleted`: a table's cold generations.
+
+How it holds together:
+
+- A transaction is one frame of the shared log, so it is whole or absent in every table at once.
+- A flush or a compaction writes and seals a generation for **every** table that has anything in
+  the log, opens a new log bound to the identity of the whole new cold set, and replaces the
+  manifest once. The old log is retired only after that. A table with nothing hot keeps the
+  generations it had.
+- The log is bound to the cold set by a SHA-256 over every table's name and cold identity. A
+  generation swapped between tables, a log from another epoch, or a missing log is refused at
+  open; a log is never adopted and never rebuilt.
+- A single-table database and a catalog refuse each other's manifest.
+- Reads go through the same provider as the single-table hybrid, one for each table, registered in
+  one engine: a statement can join tables of the database, hot and cold on both sides.
+
+Checked by `tests/catalog.jsl` with the fault laboratory: the five-table service step over cold
+and hot rows, a flush between commits and a compaction between commits, each stopped at every
+storage step (42, 204 and 294 of them) in three modes, the first two with every crashed recovery
+crashed again: 10,411 stopped runs, no violation.
+
+Not built yet, and so limits today:
+
+- No budgets and no automatic maintenance: the caller flushes and compacts. The hot rows of every
+  table are resident until a flush, as in the single-table store.
+- A log that grew by churn that left nothing hot is not rotated by `flush`.
+- No offline `inspect`, `verify`, `backup` or `restore` for a catalog, and no secondary indexes.
+- At most 32 tables and 8 generations a table; the tables are fixed at creation.
+- Verified on the model disk only, like everything the fault laboratory holds.

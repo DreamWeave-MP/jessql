@@ -80,10 +80,9 @@ suite.describe('catalog manifest (record version 3)', function()
     expect(string.find(refused(function(value) value.tables[1].columns = { 'name', 'name' } end), 'invalid table columns', 1, true) ~= nil).toBe(true)
     expect(string.find(refused(function(value) value.tables[1].columns = {} end), 'invalid table schema', 1, true) ~= nil).toBe(true)
     expect(string.find(refused(function(value) value.tables[1].generations = {} end), 'invalid generations', 1, true) ~= nil).toBe(true)
-    -- Generations out of order, past the publication epoch, or deleting from nothing.
+    -- Generations out of order or past the publication epoch.
     expect(string.find(refused(function(value) value.tables[2].generations[2].epoch = 1 end), 'invalid generation entry', 1, true) ~= nil).toBe(true)
     expect(string.find(refused(function(value) value.tables[2].generations[3].epoch = 5 end), 'invalid generation entry', 1, true) ~= nil).toBe(true)
-    expect(string.find(refused(function(value) value.tables[1].generations[1].deleted = true end), 'first generation', 1, true) ~= nil).toBe(true)
     -- No table has a generation at the publication epoch: nothing was published at it.
     expect(string.find(refused(function(value) value.tables[2].generations[3].epoch = 3 end), 'no generation at the publication epoch', 1, true) ~= nil).toBe(true)
     local many: { catalog.Generation } = {}

@@ -1,0 +1,459 @@
+--!strict
+-- #40.1, option B: a managed database of several tables. One log and one manifest epoch for all of
+-- them, cold generations for each. What is held here: reads and writes over hot and cold rows of
+-- several tables; a commit over five tables, a flush and a compaction each stopped at every storage
+-- step and found whole or absent; and the refusals that keep one database's files from being read
+-- as another's.
+local lab = require('@jessql/faultlab')
+local memfs = require('@jessql/memfs')
+local sql = require('@jessql')
+local test = require('@jess/test')
+
+local expect = test.expect
+local suite = test.new()
+
+type Row = { [string]: unknown }
+
+local Path = '/memory/service'
+
+local Tables: { sql.CatalogTableSpec } = {
+  { tableName = 'reservations', columns = { 'id', 'effect' }, primaryKey = 'id' },
+  { tableName = 'handled', columns = { 'id' }, primaryKey = 'id' },
+  { tableName = 'conversation', columns = { 'id', 'body' }, primaryKey = 'id' },
+  { tableName = 'outbox', columns = { 'id' }, primaryKey = 'id' },
+  { tableName = 'counters', columns = { 'id', 'value' }, primaryKey = 'id' },
+}
+
+local function create(disk: memfs.Disk): sql.CatalogDatabase
+  return sql.catalog.create(Path, { tables = Tables, storage = disk.backend, cachePages = 2, pageBytes = 512 })
+end
+
+local function reopen(disk: memfs.Disk): sql.CatalogDatabase
+  return sql.catalog.openExisting(Path, { storage = disk.backend, cachePages = 2, pageBytes = 512 })
+end
+
+-- One handled event: five changes over five tables, one commit.
+local function step(tx: sql.CatalogTransaction, number: number)
+  tx:insert('reservations', { id = number, effect = `send-{number}` })
+  tx:insert('handled', { id = number })
+  tx:insert('conversation', { id = number, body = `event {number}` })
+  -- The outbox holds only the latest step: the previous row goes in the same commit.
+  tx:insert('outbox', { id = number })
+  if number > 1 then tx:delete('outbox', number - 1) end
+
+  tx:upsert('counters', { id = 'total', value = number })
+end
+
+-- What a restart finds, per step. It raises if the tables disagree with each other in a way no
+-- sequence of whole commits could produce, whichever of them are hot and whichever cold.
+local function recover(disk: memfs.Disk): lab.Observed
+  local db = reopen(disk)
+  local observed: lab.Observed = {}
+  local highest = 0
+  for _, name in { 'reservations', 'handled', 'conversation' } do
+    for _, row in db:query(`SELECT id FROM {name}`).rows do
+      local number = (row :: Row).id :: number
+      observed[tostring(number)] = (observed[tostring(number)] or 0) + 1
+      highest = math.max(highest, number)
+    end
+  end
+
+  local counter = db:get('counters', 'total')
+  local total = if counter then counter.value :: number else 0
+  local outbox = db:query('SELECT id FROM outbox').rows
+  -- The point read and the scan are different paths over the same rows.
+  local newest = if highest > 0 then db:get('conversation', highest) else nil
+  db:close()
+
+  if total ~= highest then error(`the counter says {total} and the newest step present is {highest}`, 0) end
+
+  if highest > 0 and (#outbox ~= 1 or (outbox[1] :: Row).id ~= highest) then
+    error(`the outbox holds {#outbox} row(s), not exactly the newest step {highest}`, 0)
+  end
+
+  if highest > 0 and (not newest or newest.body ~= `event {highest}`) then
+    error(`step {highest} is in the scan and not in the point read`, 0)
+  end
+
+  for number = 1, highest do
+    if (observed[tostring(number)] or 0) == 0 then error(`step {number} is missing below step {highest}`, 0) end
+  end
+
+  return observed
+end
+
+local function findings(report: lab.Report): string
+  local texts: { string } = {}
+  for index, artifact in report.violations do
+    if index > 3 then break end
+    table.insert(texts, lab.describe(artifact))
+  end
+
+  return table.concat(texts, '\n')
+end
+
+local function commit(db: sql.CatalogDatabase, ledger: lab.Ledger, number: number)
+  ledger.begin(tostring(number), 3)
+  db:transaction(function(tx) step(tx, number) end)
+  ledger.acknowledge(tostring(number))
+end
+
+-- Two steps, a flush, a third step: every table has cold rows and some have hot ones over them.
+local function prepare(disk: memfs.Disk, ledger: lab.Ledger)
+  local db = create(disk)
+  commit(db, ledger, 1)
+  commit(db, ledger, 2)
+  db:flush()
+  commit(db, ledger, 3)
+  db:close()
+end
+
+local function exercised(body: (db: sql.CatalogDatabase, ledger: lab.Ledger) -> ()): (disk: memfs.Disk, ledger: lab.Ledger) -> ()
+  return function(disk: memfs.Disk, ledger: lab.Ledger)
+    local db = reopen(disk)
+    -- A step or a publication may raise at the fault; the database is closed either way.
+    local ok, problem = pcall(function() body(db, ledger) end)
+    -- close can raise on a handle the fault has poisoned; it is closed as far as it can be.
+    pcall(function() db:close() end)
+    if not ok then error(problem, 0) end
+  end
+end
+
+local function names(disk: memfs.Disk): string
+  local found: { string } = {}
+  for path in disk.visible() do table.insert(found, (string.gsub(path, '^/memory/', ''))) end
+
+  table.sort(found)
+  return table.concat(found, ' ')
+end
+
+local Quiet: lab.Ledger = { begin = function(_id: string, _rows: number) end, acknowledge = function(_id: string) end }
+
+suite.describe('a managed database of several tables', function()
+  suite.it('reads and writes hot and cold rows of every table, and joins them', function()
+    local disk = memfs.new()
+    local db = create(disk)
+    for number = 1, 30 do db:transaction(function(tx) step(tx, number) end) end
+
+    expect(db:flush()).toBe(2)
+    -- Nothing is hot now: a second flush has nothing to publish.
+    expect(db:flush()).toBe(2)
+    expect(db:stats().tables.conversation.coldRows).toBe(30)
+    expect(db:stats().tables.conversation.hotRows).toBe(0)
+
+    -- Over cold rows: an update, a delete, a delete and reinsert, and new rows.
+    expect(db:update('conversation', 7, { body = 'edited' })).toBe(true)
+    expect(db:delete('conversation', 8)).toBe(true)
+    expect(db:delete('conversation', 9)).toBe(true)
+    db:insert('conversation', { id = 9, body = 'again' })
+    for number = 31, 33 do db:transaction(function(tx) step(tx, number) end) end
+
+    expect(db:delete('conversation', 999)).toBe(false)
+    expect(db:update('conversation', 8, { body = 'gone' })).toBe(false)
+
+    local function check(handle: sql.CatalogDatabase)
+      expect((handle:get('conversation', 7) :: Row).body).toBe('edited')
+      expect(handle:get('conversation', 8)).toBe(nil)
+      expect((handle:get('conversation', 9) :: Row).body).toBe('again')
+      expect((handle:get('conversation', 33) :: Row).body).toBe('event 33')
+      expect((handle:get('counters', 'total') :: Row).value).toBe(33)
+      expect(handle:query('SELECT COUNT(*) AS n FROM conversation').rows[1].n).toBe(32)
+      expect(handle:query('SELECT COUNT(*) AS n FROM outbox').rows[1].n).toBe(1)
+      -- Two tables of the database in one statement, hot and cold on both sides.
+      local joined = handle:query('SELECT c.id AS id, r.effect AS effect FROM conversation c JOIN reservations r ON r.id = c.id '
+        .. 'WHERE c.id >= ? ORDER BY c.id', { 29 }).rows
+      expect(#joined).toBe(5)
+      expect((joined[1] :: Row).effect).toBe('send-29')
+      expect((joined[5] :: Row).effect).toBe('send-33')
+    end
+
+    check(db)
+    db:close()
+    local second = reopen(disk)
+    check(second)
+
+    -- Only the tables with anything hot get a generation; every table moves to the new epoch.
+    expect(second:flush()).toBe(3)
+    check(second)
+    local stats = second:stats()
+    expect(stats.epoch).toBe(3)
+    expect(stats.tables.conversation.generations).toBe(3)
+    expect(stats.tables.conversation.tombstones).toBe(0)
+    expect(stats.tables.handled.generations).toBe(3)
+
+    -- A compaction folds each table into one generation and drops what was merged away.
+    expect(second:compact()).toBe(4)
+    check(second)
+    for _, entry in Tables do expect(second:stats().tables[entry.tableName].generations).toBe(1) end
+
+    second:close()
+    expect(names(disk)).toBe('service.g00000004.wal service.g00000004.wal.committed service.g00000004.wal.lock service.jql-lock service.jql-manifest '
+      .. 'service.t.conversation.g00000004.deleted service.t.conversation.g00000004.rows '
+      .. 'service.t.counters.g00000004.deleted service.t.counters.g00000004.rows '
+      .. 'service.t.handled.g00000004.deleted service.t.handled.g00000004.rows '
+      .. 'service.t.outbox.g00000004.deleted service.t.outbox.g00000004.rows '
+      .. 'service.t.reservations.g00000004.deleted service.t.reservations.g00000004.rows')
+    local third = reopen(disk)
+    check(third)
+    third:close()
+  end)
+
+  suite.it('leaves a table that did not change with the generations it had', function()
+    local disk = memfs.new()
+    local db = create(disk)
+    db:insert('handled', { id = 1 })
+    db:insert('counters', { id = 'total', value = 1 })
+    expect(db:flush()).toBe(2)
+    db:insert('handled', { id = 2 })
+    expect(db:flush()).toBe(3)
+    local stats = db:stats()
+    expect(stats.tables.handled.generations).toBe(3)
+    expect(stats.tables.counters.generations).toBe(2)
+    expect(stats.tables.outbox.generations).toBe(1)
+    -- Nothing to merge in a table with one generation and nothing hot; the others are folded.
+    expect(db:compact()).toBe(4)
+    expect(db:stats().tables.outbox.generations).toBe(1)
+    expect(db:stats().tables.handled.generations).toBe(1)
+    -- And then there is nothing to compact at all.
+    local again, problem = pcall(function() return db:compact() end)
+    expect(again).toBe(false)
+    expect(string.find(tostring(problem), 'nothing to compact', 1, true) ~= nil).toBe(true)
+    expect(db:query('SELECT COUNT(*) AS n FROM handled').rows[1].n).toBe(2)
+    db:close()
+  end)
+
+  suite.it('changes no table when a callback raises after touching all of them, and sees its own writes', function()
+    local disk = memfs.new()
+    local db = create(disk)
+    db:transaction(function(tx) step(tx, 1) end)
+    db:flush()
+    -- The callback raises on purpose.
+    local ok = pcall(function()
+      db:transaction(function(tx)
+        step(tx, 2)
+        expect((tx:get('conversation', 2) :: Row).body).toBe('event 2')
+        expect(tx:get('outbox', 1)).toBe(nil)
+        expect(tx:query('SELECT COUNT(*) AS n FROM handled').rows[1].n).toBe(2)
+        expect(tx:delete('reservations', 1)).toBe(true)
+        expect(tx:get('reservations', 1)).toBe(nil)
+        error('stop', 0)
+      end)
+    end)
+    expect(ok).toBe(false)
+    expect(db:query('SELECT COUNT(*) AS n FROM handled').rows[1].n).toBe(1)
+    expect((db:get('reservations', 1) :: Row).effect).toBe('send-1')
+    expect((db:get('outbox', 1) :: Row).id).toBe(1)
+    expect((db:get('counters', 'total') :: Row).value).toBe(1)
+
+    -- A duplicate key is refused against a cold row, and an unknown table by name.
+    local duplicate, duplicateProblem = pcall(function() db:insert('handled', { id = 1 }) end)
+    expect(duplicate).toBe(false)
+    expect(string.find(tostring(duplicateProblem), 'duplicate primary key', 1, true) ~= nil).toBe(true)
+    -- So is a table this database does not have.
+    local unknown, unknownProblem = pcall(function() db:insert('elsewhere', { id = 1 }) end)
+    expect(unknown).toBe(false)
+    expect(string.find(tostring(unknownProblem), 'unknown table elsewhere', 1, true) ~= nil).toBe(true)
+
+    local results = db:transactionBatch({
+      function(tx) step(tx, 2) end,
+      function(tx)
+        step(tx, 3)
+        error('stop', 0)
+      end,
+      function(tx) step(tx, 3) end,
+    })
+    expect(results[1].ok).toBe(true)
+    expect(results[2].ok).toBe(false)
+    expect(results[3].ok).toBe(true)
+    expect((db:get('counters', 'total') :: Row).value).toBe(3)
+    expect(db:query('SELECT COUNT(*) AS n FROM handled').rows[1].n).toBe(3)
+    db:close()
+  end)
+
+  suite.it('keeps a commit over five tables whole or absent at every storage step, hot over cold', function()
+    local report = lab.run({
+      name = 'catalog service steps',
+      prepare = prepare,
+      exercise = exercised(function(db, ledger)
+        for number = 4, 6 do commit(db, ledger, number) end
+      end),
+      recover = recover,
+    }, { crashRecovery = true })
+    expect(findings(report)).toBe('')
+    expect(report.truncated).toBe(false)
+    expect(#report.schedule >= 10).toBe(true)
+    print(`catalog commits: {#report.schedule} storage steps, {report.runs} stopped runs, {#report.violations} violations`)
+  end)
+
+  suite.it('publishes a flush of every table whole or not at all, with commits before and after', function()
+    local report = lab.run({
+      name = 'catalog flush between service steps',
+      prepare = prepare,
+      exercise = exercised(function(db, ledger)
+        commit(db, ledger, 4)
+        db:flush()
+        commit(db, ledger, 5)
+      end),
+      recover = recover,
+    }, { crashRecovery = true })
+    expect(findings(report)).toBe('')
+    expect(report.truncated).toBe(false)
+    -- One publication: one manifest replacement, however many tables it moved.
+    local replacements = 0
+    for _, taken in report.schedule do
+      if string.match(taken, '^replace ') then replacements += 1 end
+    end
+
+    expect(replacements).toBe(1)
+    print(`catalog flush: {#report.schedule} storage steps, {report.runs} stopped runs, {#report.violations} violations`)
+  end)
+
+  suite.it('publishes a compaction of every table whole or not at all, with commits before and after', function()
+    local report = lab.run({
+      name = 'catalog compaction between service steps',
+      prepare = prepare,
+      exercise = exercised(function(db, ledger)
+        commit(db, ledger, 4)
+        db:compact()
+        commit(db, ledger, 5)
+      end),
+      recover = recover,
+    })
+    expect(findings(report)).toBe('')
+    expect(report.truncated).toBe(false)
+    print(`catalog compaction: {#report.schedule} storage steps, {report.runs} stopped runs, {#report.violations} violations`)
+  end)
+
+  suite.it('poisons the handle when the publication is uncertain, and recovers at reopen', function()
+    for _, stage in { 'after-replace', 'after-directory-sync' } do
+      local disk = memfs.new()
+      prepare(disk, Quiet)
+      local armed = true
+      local db = sql.catalog.openExisting(Path, { storage = disk.backend, testHook = function(reached: string)
+        if armed and reached == stage then
+          armed = false
+          error('injected at ' .. reached, 0)
+        end
+      end })
+      db:transaction(function(tx) step(tx, 4) end)
+      -- The publication is interrupted after the manifest was replaced.
+      local flushed = pcall(function() return db:flush() end)
+      expect(flushed).toBe(false)
+      expect(db:maintenanceStatus().poisoned).toBe(true)
+      -- A poisoned handle answers nothing and accepts nothing.
+      local read = pcall(function() return db:get('handled', 1) end)
+      expect(read).toBe(false)
+      db:close()
+      local observed = recover(disk)
+      expect(observed['4']).toBe(3)
+    end
+
+    -- Before the replacement the old epoch stays current and the handle stays usable.
+    local disk = memfs.new()
+    prepare(disk, Quiet)
+    local armed = true
+    local db = sql.catalog.openExisting(Path, { storage = disk.backend, testHook = function(reached: string)
+      if armed and reached == 'before-replace' then
+        armed = false
+        error('injected at ' .. reached, 0)
+      end
+    end })
+    -- The publication is interrupted before the manifest was replaced.
+    local flushed = pcall(function() return db:flush() end)
+    expect(flushed).toBe(false)
+    expect(db:maintenanceStatus().poisoned).toBe(false)
+    expect(db:stats().epoch).toBe(2)
+    db:transaction(function(tx) step(tx, 4) end)
+    expect(db:flush()).toBe(3)
+    db:close()
+    expect(recover(disk)['4']).toBe(3)
+  end)
+
+  suite.it('refuses to open what is not this database, and to begin again over what is left of one', function()
+    local disk = memfs.new()
+    prepare(disk, Quiet)
+
+    -- A single-table database is not a catalog, and a catalog is not a single-table database.
+    local single = sql.managed.create('/memory/single', { tableName = 'events', columns = { 'id' }, primaryKey = 'id', storage = disk.backend })
+    single:close()
+    for _, attempt in {
+      { run = function() sql.catalog.openExisting('/memory/single', { storage = disk.backend }) end, says = 'single-table managed database' },
+      { run = function() sql.managed.openExisting(Path, { storage = disk.backend }) end, says = 'invalid manifest schema' },
+      { run = function() sql.catalog.create(Path, { tables = Tables, storage = disk.backend }) end, says = 'already exists' },
+      { run = function() sql.catalog.openExisting('/memory/absent', { storage = disk.backend }) end, says = 'does not exist' },
+      { run = function() sql.catalog.open('/memory/absent', { storage = disk.backend }) end, says = 'requires tables' },
+      { run = function()
+        sql.catalog.openExisting(Path, { storage = disk.backend,
+          tables = { { tableName = 'handled', columns = { 'id' }, primaryKey = 'id' } } })
+      end, says = 'do not match the database' },
+    } do
+      -- Each of these is refused with an error.
+      local ok, problem = pcall(function(): unknown
+        attempt.run()
+        return nil
+      end)
+      expect(ok).toBe(false)
+      expect(string.find(tostring(problem), attempt.says, 1, true) ~= nil).toBe(true)
+    end
+
+    -- A second handle is refused while the first holds the lock.
+    local first = reopen(disk)
+    -- The lock is held: the open raises.
+    local second = pcall(function() return reopen(disk) end)
+    expect(second).toBe(false)
+    first:close()
+
+    -- One table's generation put in another's place: the cold identity no longer matches.
+    local files = disk.visible()
+    local swapped = memfs.new()
+    for path, body in files do
+      local target = path
+      if path == '/memory/service.t.handled.g00000002.rows' then target = '/memory/service.t.outbox.g00000002.rows' end
+      if path == '/memory/service.t.outbox.g00000002.rows' then target = '/memory/service.t.handled.g00000002.rows' end
+      assert((swapped.backend.createDurable(target, body)))
+    end
+    -- The open raises on the mismatch.
+    local swappedOpen, swappedProblem = pcall(function() return reopen(swapped) end)
+    expect(swappedOpen).toBe(false)
+    expect(string.find(tostring(swappedProblem), 'jessql catalog: open:', 1, true) ~= nil).toBe(true)
+
+    -- A lost manifest is not an empty database: nothing is created over the files that remain.
+    local lost = memfs.new()
+    for path, body in files do
+      if path ~= '/memory/service.jql-manifest' then assert((lost.backend.createDurable(path, body))) end
+    end
+    -- Creation raises over the remains.
+    local begun, begunProblem = pcall(function() return create(lost) end)
+    expect(begun).toBe(false)
+    expect(string.find(tostring(begunProblem), 'manifest missing but database artifacts remain', 1, true) ~= nil).toBe(true)
+
+    -- A lost log is not an empty log.
+    local logless = memfs.new()
+    for path, body in files do
+      if not string.find(path, '%.wal$') then assert((logless.backend.createDurable(path, body))) end
+    end
+    -- The open raises without its log.
+    local replayed, replayProblem = pcall(function() return reopen(logless) end)
+    expect(replayed).toBe(false)
+    expect(string.find(tostring(replayProblem), 'active WAL missing', 1, true) ~= nil).toBe(true)
+  end)
+
+  suite.it('removes at reopen what a stopped publication left, and nothing the manifest names', function()
+    local disk = memfs.new()
+    prepare(disk, Quiet)
+    local before = names(disk)
+    -- What an interrupted flush and an interrupted merge leave behind, and a stranger's file.
+    for _, name in { 'service.g00000003.wal', 'service.g00000003.wal.lock', 'service.t.handled.g00000003.rows',
+      'service.t.handled.g00000003.deleted', 'service.t.outbox.g00000003.hot-rows', 'service.t.unknown.g00000001.rows',
+      'service.t.handled.g00000001.deleted', 'service.notes' } do
+      assert((disk.backend.createDurable('/memory/' .. name, 'left behind')))
+    end
+    local db = reopen(disk)
+    db:close()
+    local after = names(disk)
+    expect(after).toBe((string.gsub(before, 'service.jql%-manifest', 'service.jql-manifest service.notes')))
+    expect(recover(disk)['3']).toBe(3)
+  end)
+end)
+
+return suite
