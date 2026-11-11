@@ -25,6 +25,7 @@ local engine = require('@jessql/engine')
 local hybrid = require('@jessql/hybrid')
 local manifest = require('@jessql/catalog_manifest')
 local policy = require('@jessql/managed_policy')
+local backupKernel = require('@jessql/managed_backup')
 local publicationKernel = require('@jessql/managed_publication')
 local walmark = require('@jessql/walmark')
 
@@ -85,6 +86,11 @@ export type VerifyReport = {
   ok: boolean, epoch: number?, tables: { [string]: VerifyTable }, coldRowsScanned: number, walBytes: number,
   coldPagesChecked: boolean, walFramesChecked: boolean, issues: { VerifyIssue },
 }
+
+-- `storage` is the backend the source lives on, `destinationStorage` the one the copy goes to:
+-- each defaults to the VM default and to the source's backend respectively.
+export type BackupOptions = { storage: vfs.Backend?, destinationStorage: vfs.Backend? }
+export type BackupResult = { epoch: number, files: number, bytes: number }
 
 type Catalog = manifest.Catalog
 type Table = manifest.Table
@@ -947,12 +953,7 @@ end
 -- Offline integrity scan of what the manifest names. It takes the database's lock, so it sees one
 -- published state for the whole scan; it opens no log for writing, repairs nothing and removes
 -- nothing. Damage is an issue in the report, not an error: only a held lock raises.
-function catalog.verify(path: string, options: { storage: vfs.Backend? }?): VerifyReport
-  local fs = vfs.resolve(if options then options.storage else nil)
-  local base = normalize(fs, path)
-  local lock, lockError = fs.lock(base .. '.jql-lock')
-  if not lock then error('jessql catalog: verification locked: ' .. tostring(lockError), 2) end
-
+local function scan(fs: vfs.Backend, base: string): VerifyReport
   local report: VerifyReport = { ok = true, epoch = nil, tables = {}, coldRowsScanned = 0, walBytes = 0,
     coldPagesChecked = false, walFramesChecked = false, issues = {} }
 
@@ -966,7 +967,6 @@ function catalog.verify(path: string, options: { storage: vfs.Backend? }?): Veri
 
   if not decoded then
     issue('manifest', nil, tostring(value))
-    lock:unlock()
     return report
   end
   local found = value :: Catalog
@@ -1024,9 +1024,112 @@ function catalog.verify(path: string, options: { storage: vfs.Backend? }?): Veri
     report.walBytes = journal.size
   end
 
-  lock:unlock()
   return report
 end
+
+function catalog.verify(path: string, options: { storage: vfs.Backend? }?): VerifyReport
+  local fs = vfs.resolve(if options then options.storage else nil)
+  local base = normalize(fs, path)
+  local lock, lockError = fs.lock(base .. '.jql-lock')
+  if not lock then error('jessql catalog: verification locked: ' .. tostring(lockError), 2) end
+  -- The scan reports damage as issues; anything it raises is not damage, and the lock still goes.
+  local ok, report = pcall(scan, fs, base)
+  lock:unlock()
+  if not ok then error('jessql catalog: verification I/O failure: ' .. tostring(report), 2) end
+  return report :: VerifyReport
+end
+
+-- Offline backup, and restore, into an EMPTY destination name only. Both databases are locked
+-- for the whole copy. The source is scanned first and never changed; the destination's manifest
+-- is written last, so an interrupted copy is never a database; and the copy is then opened as a
+-- database would be, which replays its log, before the call returns.
+function catalog.backup(sourcePath: string, destinationPath: string, options: BackupOptions?): BackupResult
+  local from = vfs.resolve(if options then options.storage else nil)
+  local onto = vfs.resolve(if options and options.destinationStorage then options.destinationStorage else from)
+  local source = normalize(from, sourcePath)
+  local destination, parent = normalize(onto, destinationPath)
+  if from == onto and source == destination then error('jessql catalog: backup source and destination must differ', 2) end
+
+  -- One order for both locks, so that two opposite copies cannot wait on each other.
+  local first, second, firstDisk, secondDisk = source, destination, from, onto
+  if second < first then first, second, firstDisk, secondDisk = second, first, onto, from end
+
+  local firstLock, firstError = firstDisk.lock(first .. '.jql-lock')
+  if not firstLock then error('jessql catalog: backup locked: ' .. tostring(firstError), 2) end
+  local secondLock, secondError = secondDisk.lock(second .. '.jql-lock')
+  if not secondLock then
+    firstLock:unlock()
+    error('jessql catalog: backup locked: ' .. tostring(secondError), 2)
+  end
+  local sourceLock, destinationLock = firstLock, secondLock
+  if first ~= source or firstDisk ~= from then sourceLock, destinationLock = secondLock, firstLock end
+
+  local destinationHeld = true
+  -- Scanning and copying can fail at any file; both locks are released whatever happened.
+  local ok, result = pcall(function(): BackupResult
+    local names, listError = onto.list(parent)
+    if not names then error('destination list: ' .. tostring(listError)) end
+    local file = onto.fileName(destination) :: string
+    for _, name in names do
+      if name == file .. '.jql-manifest' or name == file .. '.jql-manifest.tmp'
+        or string.sub(name, 1, #file + 2) == file .. '.g' or string.sub(name, 1, #file + 3) == file .. '.t.' then
+        error('destination contains existing artifacts: ' .. name)
+      end
+    end
+
+    local report = scan(from, source)
+    if not report.ok then
+      local found = report.issues[1]
+      error('source verification failed at ' .. found.stage .. (if found.tableName then ' of ' .. found.tableName else ''))
+    end
+    local raw, manifestError = from.readFileString(source .. '.jql-manifest')
+    if not raw then error('manifest read: ' .. tostring(manifestError)) end
+    local value = manifest.decode(raw)
+    local files, bytes = 0, 0
+
+    local function copy(suffix: string)
+      bytes += backupKernel.copyFile(from, source .. suffix, onto, destination .. suffix)
+      files += 1
+    end
+
+    for _, entry in value.tables do
+      for _, generation in entry.generations do
+        copy(tableFile('', entry.tableName, generation.epoch, 'rows'))
+        if generation.deleted then copy(tableFile('', entry.tableName, generation.epoch, 'deleted')) end
+      end
+    end
+
+    local wal = walPath('', value.epoch)
+    copy(wal)
+    -- The log's committed-length mark travels with the log it describes.
+    if from.exists(walmark.path(source .. wal)) then copy(walmark.path(wal)) end
+
+    -- The manifest LAST: without it nothing here can be mistaken for a database.
+    local created, createError = onto.createDurable(destination .. '.jql-manifest', raw)
+    if created ~= #raw then error('manifest create: ' .. tostring(createError)) end
+    local synced, syncError = onto.syncDirectory(parent)
+    if not synced then error('destination directory sync: ' .. tostring(syncError)) end
+
+    -- Open the copy as a database: this replays its log and checks its binding, which the scan
+    -- does not. It takes the destination's lock itself, so that one is handed over here.
+    destinationLock:unlock()
+    destinationHeld = false
+    local copied = catalog.openExisting(destinationPath, { storage = onto })
+    copied:close()
+    local after = catalog.verify(destinationPath, { storage = onto })
+    if not after.ok then error('destination verification failed') end
+    return { epoch = value.epoch, files = files + 1, bytes = bytes + #raw }
+  end)
+
+  if destinationHeld then destinationLock:unlock() end
+
+  sourceLock:unlock()
+  if not ok then error('jessql catalog: backup: ' .. tostring(result), 2) end
+  return result :: BackupResult
+end
+
+-- A restore is the same copy the other way: it never overwrites a database.
+catalog.restore = catalog.backup
 
 -- Explicit intents, decided inside the database's lock, so that pointing at the wrong name never
 -- creates an empty database by accident.

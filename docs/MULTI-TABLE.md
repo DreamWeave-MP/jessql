@@ -145,7 +145,11 @@ Not built yet, and so limits today:
 - `sql.catalog.verify(path)` reads every page of every generation of every table under the
   database's lock, checks the set against the manifest's identity, and reports damage by stage
   and table without changing a file. It does not check the log's frames (opening the database
-  does) and says so in its report. No offline `backup` or `restore` for a catalog yet, and no
-  secondary indexes.
+  does) and says so in its report.
+- `sql.catalog.backup(source, destination)` (and `restore`, the same copy) copies a database into
+  an empty name under both locks: the source is scanned first and never changed, the
+  destination's manifest is written last, and the copy is opened once as a database, which
+  replays its log, before the call returns. The destination's lock is handed over for that open.
+- No secondary indexes.
 - At most 32 tables and 8 generations a table; the tables are fixed at creation.
 - Verified on the model disk only, like everything the fault laboratory holds.

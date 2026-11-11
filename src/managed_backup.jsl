@@ -70,6 +70,9 @@ local function copyFile(from: vfs.Backend, source: string, fs: vfs.Backend, dest
   return count
 end
 
+-- INTERNAL, for the multi-table store's copy: one file, chunked, synchronized, never overwriting.
+backup.copyFile = copyFile
+
 -- The source and the destination may sit on different backends: each is resolved once, here.
 function backup.copy(source: string, destination: string, parent: string,
   sourceStorage: vfs.Backend?, destinationStorage: vfs.Backend?): Result
