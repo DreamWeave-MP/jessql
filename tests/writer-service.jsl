@@ -5,6 +5,7 @@
 -- many requests behind one synchronization; refusals that are answers; a client that never
 -- waits; and a worker that is slow, full or dead leaving every unanswered request `unknown`,
 -- once, and none of them called committed.
+local ledger = require('@jessql/ledger')
 local memfs = require('@jessql/memfs')
 local meter = require('@jessql/meter')
 local service = require('@jessql/writer_service')
@@ -19,6 +20,7 @@ local Path = '/memory/service'
 local Tables: { sql.CatalogTableSpec } = {
   { tableName = 'events', columns = { 'id', 'body' }, primaryKey = 'id' },
   { tableName = 'counters', columns = { 'id', 'value' }, primaryKey = 'id' },
+  ledger.table('requests'),
 }
 
 local function event(number: number): writer.Request
@@ -33,14 +35,17 @@ type World = {
   disk: Disk, lane: service.Lane, syncs: () -> number, clock: { now: number },
   -- The mailbox's limit, messages the worker has not handled, and switches for misbehaviour.
   capacity: number, mailbox: { unknown }, dead: boolean, silent: boolean, handled: { string },
+  -- The worker handles what is waiting, synchronization and all, and dies before any reply
+  -- of it is delivered.
+  dieAfterHandling: boolean,
   client: service.Client,
 }
 
-local function world(options: service.ClientOptions?): World
-  local disk = memfs.new()
+local function world(options: service.ClientOptions?, existing: Disk?): World
+  local disk = existing or memfs.new()
   local metered = meter.wrap(disk.backend)
   local host = service.host({ storage = metered.backend })
-  local subject = { disk = disk, clock = { now = 0 }, capacity = 1024, mailbox = {}, dead = false, silent = false, handled = {} } :: World
+  local subject = { disk = disk, clock = { now = 0 }, capacity = 1024, mailbox = {}, dead = false, silent = false, handled = {}, dieAfterHandling = false } :: World
   local replies: { unknown } = {}
   subject.syncs = function(): number return metered.counters().classes.wal.syncs end
   subject.lane = {
@@ -62,6 +67,11 @@ local function world(options: service.ClientOptions?): World
         end
 
         table.clear(subject.mailbox)
+        if subject.dieAfterHandling then
+          table.clear(replies)
+          subject.dead = true
+          error('worker failed at handle: invented, after its work was done', 0)
+        end
       end
 
       if #replies == 0 then
@@ -178,6 +188,56 @@ suite.describe('the writer as a service in a worker', function()
     -- and one flush before it died, and the client did not invent an outcome for the rest.
     expect(table.concat(subject.handled, ' ')).toBe('open submit submit submit flush')
     expect(#subject.mailbox).toBe(3)
+  end)
+
+  suite.it('survives a worker that dies after the synchronization and before its reply: unknown, then exactly once', function()
+    local kept: ledger.Options = { table = 'requests', scope = 'client-1' }
+    local options: writer.Options = { ledger = kept }
+    local subject = world()
+    assert(subject.client:open(Path, Tables, options))
+    local function credit(number: number): writer.Request
+      -- One row a request; the ledger, not the row's key, is what is being relied on below.
+      return { id = `c{number}`, operations = { { op = 'insert', table = 'events', row = { id = number, body = 'credit' } } } }
+    end
+
+    for number = 1, 6 do subject.client:submit(credit(number)) end
+
+    -- The worker commits all six behind one synchronization, and dies with the answer unsent.
+    subject.dieAfterHandling = true
+    local acks = subject.client:poll(0)
+    expect(outcomes(acks)).toBe('c1=unknown c2=unknown c3=unknown c4=unknown c5=unknown c6=unknown')
+    expect(subject.client:status().stopped).toBe(true)
+
+    -- The process is gone and so is its lock; what it synchronized is on the disk.
+    subject.disk.crash()
+    expect(rows(subject.disk)).toBe(6)
+
+    -- A new worker over the same database, and every unknown request sent again, blind.
+    local again = world(nil, subject.disk)
+    assert(again.client:open(Path, Tables, options))
+    for number = 1, 6 do expect(again.client:submit(credit(number)).admitted).toBe(true) end
+
+    -- One more that never reached the first worker at all.
+    again.client:submit(credit(7))
+    local second = again.client:poll(0)
+    local already, fresh = 0, 0
+    for _, ack in second do
+      if ack.outcome == 'committed' then
+        fresh += 1
+      elseif ack.outcome == 'rejected' and ledger.wasCommitted(ack.error) then
+        already += 1
+      end
+    end
+
+    expect(`already={already} fresh={fresh} of {#second}`).toBe('already=6 fresh=1 of 7')
+    expect(#again.client:close(5)).toBe(0)
+    -- Each applied once: seven rows, seven ledger entries, though thirteen requests were sent.
+    expect(rows(again.disk)).toBe(7)
+    local db = sql.catalog.openExisting(Path, { storage = again.disk.backend })
+    expect(db:query('SELECT COUNT(*) AS n FROM requests').rows[1].n).toBe(7)
+    local state = ledger.lookup(db, kept, { 'c1', 'c7', 'c8' })
+    expect(`{state.c1} {state.c7} {state.c8}`).toBe('committed committed absent')
+    db:close()
   end)
 
   suite.it('gives up on a worker that does not answer a flush in time, and on one that does not close', function()

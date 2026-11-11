@@ -89,7 +89,11 @@ answers only a refusal), `flush` (which drains once and answers every outcome) a
 second. The application then opens the database itself: 6,673 requests had been acknowledged
 as committed and **all 6,673 were present**, none missing. No row was present that had not been
 acknowledged, in this run: the death here falls just after an acknowledgement, which is the
-easy moment. A death between the synchronization and the reply is not forced by this tool.
+easy moment. A death between the synchronization and the reply is not forced by that tool; it
+is forced in `tests/writer-service.jsl` through a stand-in worker (six requests synchronized,
+the worker gone before its reply): the client reports all six `unknown`, a new worker is opened
+over the same database, all six are sent again blind with the ledger on, and each is refused
+as already committed. Seven rows for thirteen requests sent.
 
 ## As a library: `@jessql/writer_service`
 
