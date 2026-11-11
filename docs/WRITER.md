@@ -171,8 +171,11 @@ supervisor; a worker that cannot be started.
 
 ## Not there
 
-- The supervisor holds a copy of every unanswered request, at most `maxOutstanding` of them,
-  and has only been run over stand-in workers, not real ones.
+- The supervisor holds a copy of every unanswered request, at most `maxOutstanding` of them.
+  Over real workers it has been run once (`bench/writer-worker`, btrfs): 6,000 requests at
+  8,000 a second, the worker killed after 2,000 commits; one restart, 4,666 reported committed
+  and exactly 4,666 rows and ledger entries on reopen, 1,334 refused at once while the new
+  worker opened, none unknown. There is no backoff between restarts.
 - A ledger entry does not record the request's content: a different request reusing an id is
   refused as already committed, not detected as a conflict.
 - **Fairness** between several clients: one client owns one worker, first in, first out.

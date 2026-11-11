@@ -15,6 +15,7 @@
 --     -- /absolute/empty/directory [requests=4000] [bodyBytes=256]
 local application = require('@jess/application')
 local fs = require('@dream/fs')
+local ledger = require('@jessql/ledger')
 local net = require('@jess/net')
 local service = require('@jessql/writer_service')
 local writer = require('@jessql/writer')
@@ -250,6 +251,74 @@ for _, rate in { 2000, 8000, 32000 } do
   local counted = db:query('SELECT COUNT(*) AS n FROM events').rows[1].n
   db:close()
   if counted ~= committed then error(`{committed} were acknowledged and {tostring(counted)} are in the database`, 0) end
+end
+
+-- The supervisor over real workers: a worker is made to fail in the middle of the load, and
+-- the caller must still be told, for every request, that it committed, with each applied once.
+do
+  local name = 'supervised'
+  local kept: ledger.Options = { table = 'requests', scope = 'bench' }
+  local tables: { sql.CatalogTableSpec } = { Tables[1], Tables[2], ledger.table('requests') }
+  -- The library's host, with one message more: `die` fails the worker where it stands.
+  local source = "local host = require('@jessql/writer_service').host()\n"
+    .. "return function(message) if type(message) == 'table' and message.kind == 'die' then error('told to die', 0) end return host(message) end"
+  local lanes: { Worker } = {}
+  local supervised = service.supervisor(function(): service.Lane
+    local lane = workers.spawn { name = `{name}-{#lanes + 1}`, source = source, capabilities = { 'filesystem.read', 'filesystem.write' } }
+    table.insert(lanes, lane)
+    return (lane :: unknown) :: service.Lane
+  end, { path = `{directory}/{name}`, tables = tables, writer = { ledger = kept, maxBatch = 256, maxQueued = 1024 },
+    client = { now = function(): number return net.now() / 1000 end } })
+
+  if supervised:status().stopped then error(`the supervised worker did not start: {tostring(supervised:status().reason)}`, 0) end
+
+  local count = math.min(requests, 12000)
+  local sent, committed, refused, other = 0, 0, 0, 0
+  local killed = false
+  local began = net.now()
+  while sent < count or supervised:status().outstanding > 0 do
+    local due = math.min(count, math.floor((net.now() - began) * 8000 / 1000) + 1)
+    while sent < due do
+      sent += 1
+      local admission = supervised:submit((request(sent) :: unknown) :: writer.Request)
+      if not admission.admitted then
+        if admission.reason ~= 'backpressure' then error(`request r{sent} was refused: {tostring(admission.reason)}`, 0) end
+
+        refused += 1
+      end
+    end
+
+    -- A third of the way in, the worker is told to die, with requests in its mailbox and a
+    -- flush possibly in flight.
+    if not killed and committed >= count / 3 then
+      killed = true
+      -- The worker may already be gone; then the send raises and there is nothing to kill.
+      pcall(function() lanes[#lanes]:send({ kind = 'die' }) end)
+    end
+
+    for _, ack in supervised:poll(0.001) do
+      if ack.outcome == 'committed' then committed += 1 else other += 1 end
+    end
+
+    if supervised:status().stopped then break end
+  end
+
+  local status = supervised:status()
+  for _, ack in supervised:close(60) do
+    if ack.outcome == 'committed' then committed += 1 else other += 1 end
+  end
+
+  -- The last worker closed its database; the earlier ones are dead.
+  for _, lane in lanes do pcall(function() lane:join(10) end) end
+
+  local db = sql.catalog.openExisting(`{directory}/{name}`)
+  local rowsThere = db:query('SELECT COUNT(*) AS n FROM events').rows[1].n :: number
+  local entries = db:query('SELECT COUNT(*) AS n FROM requests').rows[1].n :: number
+  db:close()
+  print(`supervised: {sent} sent at 8000/s, a worker killed after {math.floor(count / 3)} commits: {committed} reported committed, {refused} refused at once, {other} other outcomes; `
+    .. `{status.restarts} restart(s), {#lanes} workers; on reopen {rowsThere} rows and {entries} ledger entries`)
+  if other > 0 or status.restarts < 1 then error('the supervisor did not carry the load across the death', 0) end
+  if rowsThere ~= committed or entries ~= committed or committed + refused ~= sent then error('a request was lost, doubled or misreported', 0) end
 end
 
 -- A worker that dies under load: everything it acknowledged must have survived it.
