@@ -11,7 +11,10 @@ local delta = require('@jessql/delta')
 local vfs = require('@jessql/vfs')
 
 export type Row = { [string]: unknown }
-export type Options = { cachePages: number?, readMode: string?, durability: string?, rowLayout: string?, secondaryIndexPath: string?, secondaryIndexPaths: { string }?, deletePaths: { [number]: string }?, requireIdentity: boolean?, trackPayloadBytes: boolean?, storage: vfs.Backend? }
+export type Options = { cachePages: number?, readMode: string?, durability: string?, rowLayout: string?, secondaryIndexPath: string?, secondaryIndexPaths: { string }?, deletePaths: { [number]: string }?, requireIdentity: boolean?, trackPayloadBytes: boolean?, storage: vfs.Backend?,
+  -- `stream` (the default) reads the hot overlay through a cursor for scans that do not ask for
+  -- primary-key order; `materialize` copies it first, as every scan did before.
+  hotScan: string? }
 export type BatchResult = storage.BatchResult
 export type Transaction = {
   get: (self: Transaction, key: unknown) -> Row?,
@@ -98,7 +101,8 @@ local function keyLess(left: unknown, right: unknown): boolean
 end
 
 local function provider(cold: paged.Snapshot, coldIndex: secondary.Index?, tableName: string, primaryKey: string,
-  hotGet: (string, unknown) -> Row?, hotQuery: (string, { unknown }?) -> engine.Result): engine.Provider
+  hotGet: (string, unknown) -> Row?, hotQuery: (string, { unknown }?) -> engine.Result,
+  hotIterate: ((string) -> () -> Row?)?): engine.Provider
   local columns = cold.columns
 
   local function get(key: unknown): Row?
@@ -224,6 +228,48 @@ local function provider(cold: paged.Snapshot, coldIndex: secondary.Index?, table
           end
           return { _jessqlIter = 'v1', ordered = true, next = nextMerged }
         end
+      end
+    end
+
+    -- A scan that does not ask for primary-key order needs neither a copy of the hot overlay nor
+    -- a set of every shadowed key: hot rows are streamed from the store, and each cold row is
+    -- checked against the overlay as it is read. Memory is then a page of cold rows, whatever
+    -- the size of the overlay. Key-ordered scans still sort the overlay and take the path below.
+    local streamOrder = request.orderBy
+    local keyOrdered = streamOrder ~= nil and #streamOrder == 1 and streamOrder[1].column == primaryKey
+    if hotIterate and not keyOrdered then
+      -- The store refuses a cursor inside a transaction; such a scan takes the path below.
+      local streaming, nextHot = pcall(hotIterate, tableName)
+      if streaming then
+        local nextStreamedCold = cold:iterateRows(readColumns)
+        local hotDone = false
+        return {
+          _jessqlIter = 'v1',
+          next = function(): Row?
+            if not hotDone then
+              local hotRow = nextHot()
+              if hotRow then
+                local result: Row = {}
+                for _, column in request.columns do result[column] = hotRow[column] end
+                return result
+              end
+
+              hotDone = true
+            end
+
+            while true do
+              local row = nextStreamedCold()
+              if not row then return nil end
+
+              local key = row[primaryKey]
+              if not hotGet(tableName, key) and not hotGet(Tombstones, encodeKey(key)) then
+                local result: Row = {}
+                for _, column in request.columns do result[column] = row[column] end
+                return result
+              end
+            end
+          end,
+        }
       end
     end
 
@@ -356,6 +402,10 @@ end
 function hybrid.open(walPath: string, snapshotPath: string | { string }, tableName: string, options: Options?): Database
   -- The disk the whole database lives on: WAL, snapshots, sidecars and everything it exports.
   local fs = vfs.resolve(if options then options.storage else nil)
+  local hotScan = if options and options.hotScan ~= nil then options.hotScan else 'stream'
+  if hotScan ~= 'stream' and hotScan ~= 'materialize' then error('jessql hybrid: hotScan must be stream or materialize', 2) end
+
+  local streamHot = hotScan == 'stream'
   local name = validTable(tableName)
   local indexCache = if options then options.cachePages else nil
   local readMode = if options then options.readMode else nil
@@ -493,14 +543,16 @@ function hybrid.open(walPath: string, snapshotPath: string | { string }, tableNa
     store:transaction(callback)
   end
 
-  local function newView(getter: (string, unknown) -> Row?, query: (string, { unknown }?) -> engine.Result): engine.Database
+  local function newView(getter: (string, unknown) -> Row?, query: (string, { unknown }?) -> engine.Result,
+    rows: ((string) -> () -> Row?)?): engine.Database
     local view = engine.new()
-    view:register(name, provider(cold, coldIndex, name, cold.primaryKey, getter, query))
+    view:register(name, provider(cold, coldIndex, name, cold.primaryKey, getter, query, rows))
     return view
   end
 
   local view = newView(function(table, key) return store:get(table, key) end,
-    function(sql, params) return store:query(sql, params) end)
+    function(sql, params) return store:query(sql, params) end,
+    if streamHot then function(table: string) return store:iterateRows(table) end else nil)
   local db = {} :: Database
 
   function db.get(_self: Database, key: unknown): Row?
@@ -537,7 +589,7 @@ function hybrid.open(walPath: string, snapshotPath: string | { string }, tableNa
     return function(tx: storage.Transaction)
       local transaction = {} :: Transaction
       local txView = newView(function(table, key) return tx:get(table, key) end,
-        function(sql, params) return tx:query(sql, params) end)
+        function(sql, params) return tx:query(sql, params) end, nil)
       local plans: { [string]: engine.Plan } = {}
 
       local function get(key: unknown): Row?

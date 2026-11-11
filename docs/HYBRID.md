@@ -114,3 +114,31 @@ The hybrid format wins restart cost and overall RSS, while the resident engine
 is dramatically faster for random reads and ordered hot scans. Full COUNT and
 mixed secondary-key queries still scan cold storage; this is the next obvious
 optimization frontier. Full measurements: `BENCHMARKS.md`.
+
+## Scans that do not copy the hot overlay
+
+A general scan (one that no index path serves) used to copy every hot row into a query result
+and build a set of every hot and deleted key before reading the first cold row. For a scan that
+does not ask for primary-key order this is no longer done: hot rows are read through the store's
+cursor, and each cold row is checked against the overlay as it is read (`hotGet` on the table and
+on the tombstones, as the indexed path already did). The provider then holds a page of cold rows
+and one hot row at a time, whatever the size of the overlay.
+
+- **Precedence is unchanged:** a hot row hides the cold row of the same key, a tombstone hides
+  it, and a key written again after a deletion is read from the overlay.
+- **Key-ordered scans are unchanged:** they sort the overlay, so they still copy it.
+- **Inside a transaction** the store allows no cursor; such a scan takes the copying path.
+- `hotScan = 'materialize'` in `hybrid.open` options restores the old path everywhere. The
+  default is `'stream'`. A managed database uses the default.
+
+Checked by `tests/hybrid-streaming.jsl`: 12 queries (filters, ORDER BY on a non-key and on the
+key, LIMIT, key ranges, COUNT, GROUP BY) over 30 seeded databases give identical results on both
+paths; and the rest of the suite, which now runs on the streamed path, passes unchanged.
+
+Measured, as allocation and not residency: heap growth across one filtered scan of 6,000 hot
+rows was 1,516 KB streamed against about 2,700 KB copied (three runs, `gcinfo()` before and
+after, largest of five queries). What remains is the SQL executor, which still collects the rows
+a provider yields before filtering; that is P1-05, not this.
+
+Not done: a configurable batch budget, 100K/1M/10M experiments with peak RSS and p99, and joins
+in the differential set.
