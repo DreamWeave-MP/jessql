@@ -33,6 +33,7 @@ export type ExplainedJoin = engine.ExplainedJoin
 export type TableInfo = engine.TableInfo
 
 export type Provider = engine.Provider
+export type Cursor = engine.Cursor
 export type Request = engine.Request
 export type Constraint = engine.Constraint
 export type Order = engine.Order

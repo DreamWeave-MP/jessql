@@ -98,7 +98,22 @@ export type Provider = {
 
 --- A query's answer: the result columns in SELECT order, and one row per result, keyed by them.
 --- A cell that is NULL is absent from its row.
-export type Result = { columns: { string }, rows: { Row } }
+export type Result = { columns: { string }, rows: { Row }, streamed: boolean? }
+
+--- A query result read a row or a page at a time. `streaming` says whether rows are produced as
+--- they are asked for (a single source with no aggregate and no sort left to do), or were all
+--- computed when the cursor was opened and are only handed out in pieces. `close` stops the
+--- query where it is; a cursor is also closed by being read to its end. After either, `next`
+--- answers nil and `page` an empty list. A cursor left open across a write to its source may
+--- raise at the next read rather than mix two states.
+export type Cursor = {
+  columns: { string },
+  streaming: () -> boolean,
+  next: () -> Row?,
+  page: (count: number) -> { Row },
+  done: () -> boolean,
+  close: () -> (),
+}
 
 --- One table of a prepared query, and the columns it is scanned for.
 export type ExplainedScan = { table: string, alias: string, columns: { string } }
@@ -128,6 +143,7 @@ export type Explanation = {
 --- any number of times; `run` and `explain` are called with a dot.
 export type Plan = {
   run: (params: { unknown }?) -> Result,
+  open: (params: { unknown }?) -> Cursor,
   explain: () -> Explanation,
   ast: parser.Select,
   columns: { string },
@@ -1909,7 +1925,7 @@ local function prepare(db: Database, sql: string): Plan
 
   local plan: Plan = {} :: Plan
 
-  function plan.run(params: {unknown}?): Result
+  local function execute(params: {unknown}?, sink: ((Row) -> boolean?)?): Result
     local values: {unknown} = params or {}
     if #values < ast.params then error(string.format('jessql: query expects %d parameters, got %d', ast.params, #values), 0) end
 
@@ -2605,6 +2621,35 @@ local function prepare(db: Database, sql: string): Plan
       local stopAfter = if ast.limit ~= nil then ast.offset + ast.limit else nil
 
       if #orderFns == 0 or orderHandled then
+        if sink then
+          -- Nothing left to sort or group: each row is built and handed over as its source
+          -- yields it, and the source is asked for no more once the consumer or the LIMIT stops.
+          local skipped, emitted = 0, 0
+          if stopAfter ~= 0 then
+            eachContext(function(context)
+              if residualWhere and not sqlTruthy(residualWhere(context, nil, values)) then return nil end
+
+              if skipped < ast.offset then
+                skipped += 1
+                return nil
+              end
+
+              local row: Row = {}
+              for index, selector in selectors do
+                local value = selector(context, nil, values)
+                if value ~= nil then row[resultColumns[index]] = value end
+              end
+
+              emitted += 1
+              if sink(row) == false then return false end
+              if ast.limit ~= nil and emitted >= ast.limit then return false end
+              return nil
+            end)
+          end
+
+          return { columns = resultColumns, rows = {}, streamed = true }
+        end
+
         if stopAfter ~= 0 then
           eachContext(function(context)
             if not residualWhere or sqlTruthy(residualWhere(context, nil, values)) then
@@ -2696,6 +2741,91 @@ local function prepare(db: Database, sql: string): Plan
     end
 
     return { columns = resultColumns, rows = resultRows }
+  end
+
+  function plan.run(params: {unknown}?): Result
+    return execute(params, nil)
+  end
+
+  function plan.open(params: {unknown}?): Cursor
+    local values: {unknown} = params or {}
+    if #values < ast.params then error(string.format('jessql: query expects %d parameters, got %d', ast.params, #values), 0) end
+
+    local finished, streaming = false, false
+    local producer: thread? = nil
+    -- The query runs in its own coroutine and pauses each time it has a row to hand over. It is
+    -- resumed with `true` for another row and `false` to stop where it is.
+    local function produce()
+      local result = execute(values, function(row: Row): boolean?
+        streaming = true
+        return coroutine.yield(row) :: boolean
+      end)
+
+      if not result.streamed then
+        for _, row in result.rows do
+          if coroutine.yield(row) == false then break end
+        end
+      end
+
+      return nil
+    end
+
+    local function advance(continue: boolean): Row?
+      if finished then return nil end
+
+      if not producer then producer = coroutine.create(produce) end
+
+      local running = producer :: thread
+      local ok, row = coroutine.resume(running, continue)
+      if not ok then
+        finished = true
+        error(row, 0)
+      end
+
+      if coroutine.status(running) == 'dead' then finished = true end
+
+      return row :: Row?
+    end
+
+    local cursor = {} :: Cursor
+    cursor.columns = resultColumns
+
+    function cursor.streaming(): boolean return streaming end
+
+    function cursor.done(): boolean return finished end
+
+    function cursor.next(): Row?
+      return advance(true)
+    end
+
+    function cursor.page(count: number): { Row }
+      if type(count) ~= 'number' or count < 1 or count % 1 ~= 0 then error('jessql: a page holds a whole number of rows, at least one', 2) end
+
+      local rows: { Row } = {}
+      while #rows < count do
+        local row = advance(true)
+        if not row then break end
+
+        rows[#rows + 1] = row
+      end
+
+      return rows
+    end
+
+    function cursor.close()
+      if finished then return end
+
+      -- A query that never started has nothing to stop. One that is paused is told to stop,
+      -- so its source is released by the query itself rather than abandoned.
+      if producer and coroutine.status(producer) == 'suspended' then
+        -- The stopped query may raise while unwinding; the cursor is closed regardless.
+        pcall(advance, false)
+      end
+
+      finished = true
+    end
+
+    return cursor
   end
 
   plan.ast = ast
