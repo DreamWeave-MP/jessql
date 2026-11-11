@@ -15,6 +15,7 @@ local managed = require('@jessql/managed')
 local catalog = require('@jessql/catalog')
 
 export type Database = engine.Database
+export type Limits = engine.Limits
 export type PersistentDatabase = storage.Store
 export type BatchResult = storage.BatchResult
 export type HybridDatabase = hybrid.Database

@@ -155,8 +155,22 @@ export type TableInfo = { name: string, columns: { string } }
 
 --- A database: named providers, and queries over them. `_tables` is the engine's own registry,
 --- by lower-cased name.
+--- What one query's operators may hold, in rows. Nothing spills yet: an operator that would pass
+--- its budget stops the query with an error that names the budget, before memory decides.
+--- A field left out is not bounded.
+export type Limits = {
+  -- Rows of the table a hash join builds its table from.
+  joinBuildRows: number?,
+  -- Rows a join hands on to the next step.
+  joinRows: number?,
+  -- Groups a GROUP BY or an aggregate holds.
+  groups: number?,
+}
 export type Database = {
   _tables: { [string]: Provider },
+  _limits: Limits?,
+  -- Sets, or with nil removes, the budgets every query of this database runs under.
+  limits: (self: Database, limits: Limits?) -> Database,
   register: (self: Database, name: string, provider: Provider) -> Database,
   table: (self: Database, name: string, rows: SourceRows, columns: { string }?) -> Database,
   prepare: (self: Database, sql: string) -> Plan,
@@ -1929,6 +1943,15 @@ local function prepare(db: Database, sql: string): Plan
     local values: {unknown} = params or {}
     if #values < ast.params then error(string.format('jessql: query expects %d parameters, got %d', ast.params, #values), 0) end
 
+    -- Read when the query runs, so a prepared plan obeys the budgets of the moment.
+    local limits = db._limits
+    local buildLimit = if limits then limits.joinBuildRows else nil
+    local joinLimit = if limits then limits.joinRows else nil
+    local groupLimit = if limits then limits.groups else nil
+    local function overBudget(what: string, rows: number, limit: number)
+      error(string.format('jessql: query exceeds its budget: %s, %d rows (limit %d)', what, rows, limit), 0)
+    end
+
     if directProviderCount then
       local row: Row = {}
       row[resultColumns[1]] = (sources[1].provider.count :: () -> number)()
@@ -2287,6 +2310,8 @@ local function prepare(db: Database, sql: string): Plan
           residualWhere = nil
           if #orderFns > 0 and driverOrdered then orderHandled = true end
         elseif joinIndex == 1 and not directSingle and joinPlan.strategy == 'hash' then
+          if buildLimit and #(rhs :: SourceRows) > buildLimit then overBudget('the build side of a hash join', #(rhs :: SourceRows), buildLimit) end
+
           local buckets: {[unknown]: SourceRow} = {}
           local duplicateBuckets: {[unknown]: {SourceRow}} = {}
 
@@ -2343,6 +2368,8 @@ local function prepare(db: Database, sql: string): Plan
             if not matched and join.kind == 'left' then nextContexts[#nextContexts + 1] = { leftRow } end
           end
         elseif joinPlan.strategy == 'hash' then
+          if buildLimit and #(rhs :: SourceRows) > buildLimit then overBudget('the build side of a hash join', #(rhs :: SourceRows), buildLimit) end
+
           local buckets: {[unknown]: SourceRow} = {}
           local duplicateBuckets: {[unknown]: {SourceRow}} = {}
 
@@ -2416,6 +2443,7 @@ local function prepare(db: Database, sql: string): Plan
         end
 
         contexts = nextContexts :: {unknown}
+        if joinLimit and #contexts > joinLimit then overBudget('the rows a join hands on', #contexts, joinLimit) end
       end
     end
 
@@ -2457,7 +2485,11 @@ local function prepare(db: Database, sql: string): Plan
       local nilKey = {}
       local order: {Group} = {}
 
+      local groupCount = 0
       local function newGroup(first: unknown, groupKey: unknown?): Group
+        groupCount += 1
+        if groupLimit and groupCount > groupLimit then overBudget('the groups of an aggregate', groupCount, groupLimit) end
+
         if not compactGroupColumn and first then first = retainContext(first) end
         local group: Group = table.create(#aggregateSpecs) :: Group
         group.first = if not compactGroupColumn then first else nil
@@ -2859,13 +2891,29 @@ local function prepare(db: Database, sql: string): Plan
 end
 
 function engine.new(): Database
-  local db = { _tables = {} :: { [string]: Provider } }
+  local db = { _tables = {} :: { [string]: Provider }, _limits = nil :: Limits? }
 
   function db.register(self: Database, name: string, provider: Provider): Database
     if type(name) ~= 'string' or name == '' then error('jessql: table name must be a string', 2) end
     if type(provider) ~= 'table' or type(provider.scan) ~= 'function' then error('jessql: provider needs scan(request)', 2) end
     if type(provider.columns) ~= 'table' then error('jessql: provider needs columns', 2) end
     self._tables[lower(name)] = provider
+    return self
+  end
+
+  function db.limits(self: Database, limits: Limits?): Database
+    if limits then
+      if type(limits) ~= 'table' then error('jessql: limits are a table', 2) end
+
+      for _, name in { 'joinBuildRows', 'joinRows', 'groups' } do
+        local value = (limits :: { [string]: unknown })[name]
+        if value ~= nil and (type(value) ~= 'number' or value ~= math.floor(value :: number) or (value :: number) < 1) then
+          error(`jessql: limit {name} is a whole number of rows, at least 1`, 2)
+        end
+      end
+    end
+
+    self._limits = if limits then table.clone(limits) else nil
     return self
   end
 
