@@ -3,7 +3,7 @@
 -- Durable multi-generation lifecycle for one hybrid table.
 -- Flushes retain immutable generations; full checkpoints compact them.
 -- All transitions are synchronous under the managed lock.
-local fs = require('@jessql/vfs')
+local vfs = require('@jessql/vfs')
 local hybrid = require('@jessql/hybrid')
 local paged = require('@jessql/paged')
 local segments = require('@jessql/segments')
@@ -22,9 +22,14 @@ export type Options = {
   cachePages: number?, readMode: string?, rowLayout: string?, pageBytes: number?,
   maxHotRows: number?, maxHotBytes: number?, maxWalBytes: number?, maxGenerations: number?, runRows: number?, mergeFanIn: number?,
   compactionFanIn: number?,
+  -- The backend the database lives on; without it, the VM default at the time it is opened.
+  storage: vfs.Backend?,
   -- Deterministic fault injection for integration tests. Throws at a named stage.
   testHook: ((string) -> ())?,
 }
+-- `storage` is the backend the source lives on, `destinationStorage` the one the copy goes to:
+-- each defaults to the VM default and to the source's backend respectively.
+export type BackupOptions = { storage: vfs.Backend?, destinationStorage: vfs.Backend? }
 export type InspectionGeneration = { epoch: number, deleted: boolean, rowsBytes: number,
   deletedBytes: number? }
 export type Inspection = { version: number, epoch: number, tableName: string,
@@ -71,14 +76,14 @@ local function assertOK(ok: boolean?, message: string?, action: string)
   if not ok then error('jessql managed: ' .. action .. ': ' .. tostring(message), 3) end
 end
 
-local function directory(path: string): string
+local function directory(fs: vfs.Backend, path: string): string
   local parent = fs.parent(path)
 
   if not parent then error('jessql managed: missing parent directory', 3) end
   return parent
 end
 
-local function normalize(path: string): (string, string)
+local function normalize(fs: vfs.Backend, path: string): (string, string)
   if type(path) ~= 'string' or path == '' then error('jessql managed: path required', 3) end
   local absolute, absoluteError = fs.absolute(path)
 
@@ -87,7 +92,7 @@ local function normalize(path: string): (string, string)
 
   if not name or not fs.isFileName(name) then error('jessql managed: invalid path', 3) end
   -- Canonical parent prevents aliases to the same managed DB from bypassing its lock.
-  local parent, parentError = fs.canonicalize(directory(absolute))
+  local parent, parentError = fs.canonicalize(directory(fs, absolute))
 
   if not parent then error('jessql managed: parent: ' .. tostring(parentError), 3) end
   if not fs.isDir(parent) then error('jessql managed: parent is not a directory', 3) end
@@ -100,7 +105,7 @@ local function paths(base: string, epoch: number): Paths
     wal = base .. suffix .. '.wal' }
 end
 
-local function readManifest(path: string): Manifest
+local function readManifest(fs: vfs.Backend, path: string): Manifest
   local raw, failure = fs.readFileString(path)
   if not raw then error('jessql managed: read manifest: ' .. tostring(failure), 3) end
   return manifest.decode(raw)
@@ -108,25 +113,27 @@ end
 
 -- Publication and durable file sealing are deliberately not pluggable.
 -- The coordinator owns the lock, WAL cutover and poison/failure decisions.
-local seal = publicationKernel.seal
-local removeIfPresent = publicationKernel.removeIfPresent
+-- Every helper below takes the database's backend first: none of them may fall back to a default.
+local function seal(fs: vfs.Backend, path: string, parent: string) publicationKernel.seal(path, parent, fs) end
+
+local function removeIfPresent(fs: vfs.Backend, path: string) publicationKernel.removeIfPresent(path, fs) end
 
 local function compactScratch(base: string, epoch: number): (string, string)
   local prefix = base .. string.format('.g%08d.hot-', epoch)
   return prefix .. 'rows', prefix .. 'deleted'
 end
 
-local function clearScratch(base: string, epoch: number)
+local function clearScratch(fs: vfs.Backend, base: string, epoch: number)
   local rows, deletes = compactScratch(base, epoch)
-  removeIfPresent(rows)
-  removeIfPresent(deletes)
+  removeIfPresent(fs, rows)
+  removeIfPresent(fs, deletes)
 end
 
-local function clearCandidate(candidatePaths: Paths)
-  removeIfPresent(candidatePaths.wal)
-  removeIfPresent(candidatePaths.wal .. '.lock')
-  removeIfPresent(candidatePaths.snapshot)
-  removeIfPresent(candidatePaths.deletes)
+local function clearCandidate(fs: vfs.Backend, candidatePaths: Paths)
+  removeIfPresent(fs, candidatePaths.wal)
+  removeIfPresent(fs, candidatePaths.wal .. '.lock')
+  removeIfPresent(fs, candidatePaths.snapshot)
+  removeIfPresent(fs, candidatePaths.deletes)
 end
 
 local function indexedPaths(base: string, value: Manifest): ({ string }, { [number]: string })
@@ -142,17 +149,17 @@ end
 
 -- Open the immutable set independently before starting a WAL: a manifest is
 -- authoritative only if every referenced generation and sidecar validates.
-local function verifyCold(base: string, value: Manifest, options: Options?): string
+local function verifyCold(fs: vfs.Backend, base: string, value: Manifest, options: Options?): string
   local cachePages = 1
   local readMode = if options then options.readMode else nil
   local source: paged.Snapshot
   if value.version == 1 then
     source = paged.open(paths(base, value.epoch).snapshot,
-      { cachePages = cachePages, readMode = readMode })
+      { cachePages = cachePages, readMode = readMode, storage = fs })
   else
     local rows, deletes = indexedPaths(base, value)
     source = segments.open(rows, { cachePages = cachePages, readMode = readMode,
-      deletePaths = deletes })
+      deletePaths = deletes, storage = fs })
   end
   local identity = source.identity
   -- Schema validation can throw; close the candidate reader on failure.
@@ -172,24 +179,24 @@ local function verifyCold(base: string, value: Manifest, options: Options?): str
   return identity
 end
 
-local function coldIdentity(base: string, value: Manifest, options: Options?): string
+local function coldIdentity(fs: vfs.Backend, base: string, value: Manifest, options: Options?): string
   -- On creation the new candidate has no identity in the manifest yet.
   local rows, deletes = indexedPaths(base, value)
   local cold = segments.open(rows, { cachePages = 1,
-    readMode = if options then options.readMode else nil, deletePaths = deletes })
+    readMode = if options then options.readMode else nil, deletePaths = deletes, storage = fs })
   local token = cold.identity
   cold:close()
   return token
 end
 
-local function openHybrid(base: string, value: Manifest, options: Options?,
+local function openHybrid(fs: vfs.Backend, base: string, value: Manifest, options: Options?,
   requiredWal: boolean): hybrid.Database
   local active = paths(base, value.epoch)
   if requiredWal then
     local exists, checkError = fs.exists(active.wal)
     if not exists then error('jessql managed: active WAL missing: ' .. tostring(checkError), 3) end
   end
-  verifyCold(base, value, options)
+  verifyCold(fs, base, value, options)
   local source: string | { string } = active.snapshot
   local deletes: { [number]: string }? = nil
   if value.version == 2 then source, deletes = indexedPaths(base, value) end
@@ -201,22 +208,23 @@ local function openHybrid(base: string, value: Manifest, options: Options?,
     rowLayout = if options then options.rowLayout else 'packed',
     cachePages = if options then options.cachePages else nil,
     readMode = if options then options.readMode else nil,
+    storage = fs,
   })
 end
 
 -- Only retire files that were removed from the manifest's generation list.
 -- A WAL is always owned by exactly one epoch; rows can survive many epochs.
-local function retire(base: string, parent: string, prior: Manifest, nextValue: Manifest)
+local function retire(fs: vfs.Backend, base: string, parent: string, prior: Manifest, nextValue: Manifest)
   local retained: { [number]: boolean } = {}
   for _, generation in manifest.generations(nextValue) do retained[generation.epoch] = true end
 
   for _, generation in manifest.generations(prior) do
     if not retained[generation.epoch] then
-      clearCandidate(paths(base, generation.epoch))
+      clearCandidate(fs, paths(base, generation.epoch))
     end
   end
-  removeIfPresent(paths(base, prior.epoch).wal)
-  removeIfPresent(paths(base, prior.epoch).wal .. '.lock')
+  removeIfPresent(fs, paths(base, prior.epoch).wal)
+  removeIfPresent(fs, paths(base, prior.epoch).wal .. '.lock')
   local ok, err = fs.syncDirectory(parent)
   assertOK(ok, err, 'retirement directory')
 end
@@ -224,7 +232,7 @@ end
 -- Restart-only orphan collection. The manifest is the sole authority;
 -- no valid generation may be retired merely because its epoch is old.
 -- This runs under the managed lock and after the recovery directory barrier.
-local function collectOrphans(base: string, parent: string, value: Manifest)
+local function collectOrphans(fs: vfs.Backend, base: string, parent: string, value: Manifest)
   local names, listError = fs.list(parent)
   if not names then error('jessql managed: directory list: ' .. tostring(listError), 3) end
   local referenced: { [number]: Generation } = {}
@@ -249,7 +257,7 @@ local function collectOrphans(base: string, parent: string, value: Manifest)
       continue
     end
     -- The known managed filename was not referenced by the verified manifest.
-    removeIfPresent(fs.join(parent, name))
+    removeIfPresent(fs, fs.join(parent, name))
     removed = true
   end
 
@@ -262,7 +270,7 @@ end
 -- An absent manifest is not proof this namespace has never held a database.
 -- In particular, replacing or losing CURRENT during recovery must never allow
 -- startup to erase its existing WAL and silently bootstrap empty storage.
-local function requireFreshNamespace(base: string, parent: string)
+local function requireFreshNamespace(fs: vfs.Backend, base: string, parent: string)
   local names, listError = fs.list(parent)
   if not names then error('jessql managed: initialization directory: ' .. tostring(listError), 3) end
   local name = fs.fileName(base) :: string
@@ -282,15 +290,16 @@ end
 -- This opens no writable hybrid handle, replays no WAL, and retires no files.
 -- It validates cold metadata/identity, but DOES NOT validate WAL frames,
 -- WAL binding, or every payload page. Full recovery still requires open().
-function managed.inspect(path: string): Inspection
-  local base = normalize(path)
+function managed.inspect(path: string, storage: vfs.Backend?): Inspection
+  local fs = vfs.resolve(storage)
+  local base = normalize(fs, path)
   local lock, lockError = fs.lock(base .. '.jql-lock')
   if not lock then error('jessql managed: inspection locked: ' .. tostring(lockError), 2) end
 
   -- Metadata opens can throw on corruption; release the advisory lock before reporting.
   local ok, result = pcall(function(): Inspection
-    local value = readManifest(base .. '.jql-manifest')
-    local identity = verifyCold(base, value, nil)
+    local value = readManifest(fs, base .. '.jql-manifest')
+    local identity = verifyCold(fs, base, value, nil)
     local files: { InspectionGeneration } = {}
 
     for _, generation in manifest.generations(value) do
@@ -333,11 +342,12 @@ end
 -- Offline integrity scan: no WAL writer, tail truncation, retirement or repair.
 -- The namespace lock guarantees a stable published view for the full scan.
 function managed.verify(path: string, options: verification.Options?): verification.Report
-  local base = normalize(path)
+  local fs = vfs.resolve(if options then options.storage else nil)
+  local base = normalize(fs, path)
   local lock, lockError = fs.lock(base .. '.jql-lock')
   if not lock then error('jessql managed: verification locked: ' .. tostring(lockError), 2) end
   -- Offline scan can report I/O failures; always release the exclusive namespace lock.
-  local ok, result = pcall(function() return verification.scan(base, options) end)
+  local ok, result = pcall(function() return verification.scan(base, { semantic = if options then options.semantic else nil, storage = fs }) end)
   lock:unlock()
   if not ok then error('jessql managed: verification I/O failure: ' .. tostring(result), 2) end
   return result :: verification.Report
@@ -349,23 +359,26 @@ managed.diagnose = managed.verify
 
 -- Offline backup and restore into an EMPTY destination namespace only. This
 -- is an exclusive, fully verified copy, not online snapshotting or repair.
-function managed.backup(sourcePath: string, destinationPath: string): backupKernel.Result
-  local source = normalize(sourcePath)
-  local destination, parent = normalize(destinationPath)
-  if source == destination then error('jessql backup: source and destination must differ', 2) end
+function managed.backup(sourcePath: string, destinationPath: string, options: BackupOptions?): backupKernel.Result
+  -- Each side has its own backend, resolved once. A backup may cross from one disk to another.
+  local from = vfs.resolve(if options then options.storage else nil)
+  local onto = vfs.resolve(if options and options.destinationStorage then options.destinationStorage else from)
+  local source = normalize(from, sourcePath)
+  local destination, parent = normalize(onto, destinationPath)
+  if from == onto and source == destination then error('jessql backup: source and destination must differ', 2) end
 
   -- Deterministic acquisition order avoids deadlocking two opposite copies.
-  local first, second = source, destination
-  if second < first then first, second = second, first end
-  local firstLock, firstError = fs.lock(first .. '.jql-lock')
+  local first, second, firstDisk, secondDisk = source, destination, from, onto
+  if second < first then first, second, firstDisk, secondDisk = second, first, onto, from end
+  local firstLock, firstError = firstDisk.lock(first .. '.jql-lock')
   if not firstLock then error('jessql backup: namespace locked: ' .. tostring(firstError), 2) end
-  local secondLock, secondError = fs.lock(second .. '.jql-lock')
+  local secondLock, secondError = secondDisk.lock(second .. '.jql-lock')
   if not secondLock then
     firstLock:unlock()
     error('jessql backup: namespace locked: ' .. tostring(secondError), 2)
   end
   -- Copy/verification can throw; both namespace locks must always be released.
-  local ok, result = pcall(function() return backupKernel.copy(source, destination, parent) end)
+  local ok, result = pcall(function() return backupKernel.copy(source, destination, parent, from, onto) end)
   secondLock:unlock()
   firstLock:unlock()
   if not ok then error(result, 2) end
@@ -378,7 +391,10 @@ managed.restore = managed.backup
 -- Managed synchronous generation lifecycle. No background workers or group
 -- commits: each cutover happens while holding this database's exclusive lock.
 local function openManaged(path: string, options: Options?, intent: string): Database
-  local base, parent = normalize(path)
+  -- Resolved once. Everything this database does from here on, for as long as it is open, goes to
+  -- this backend: the VM default may change underneath without moving it.
+  local fs = vfs.resolve(if options then options.storage else nil)
+  local base, parent = normalize(fs, path)
   local limits = policy.limits(options)
   local maxHotRows, maxHotBytes, maxWalBytes = limits.maxHotRows, limits.maxHotBytes, limits.maxWalBytes
   local maxGenerations, compactionFanIn = limits.maxGenerations, limits.compactionFanIn
@@ -396,7 +412,7 @@ local function openManaged(path: string, options: Options?, intent: string): Dat
 
     if exists then
       if intent == 'create' then error('database already exists; use openExisting to reopen it') end
-      value = readManifest(manifestPath)
+      value = readManifest(fs, manifestPath)
       manifest.sameSchema(value :: Manifest, options)
     else
       if intent == 'existing' then error('database does not exist; use create to initialize it') end
@@ -409,25 +425,25 @@ local function openManaged(path: string, options: Options?, intent: string): Dat
       if name ~= options.tableName then error('tableName must be lowercase') end
       -- Never interpret a lost manifest as a fresh database. Interrupted
       -- first-time initialization requires an explicit operator reset.
-      requireFreshNamespace(base, parent)
+      requireFreshNamespace(fs, base, parent)
       local initial = paths(base, 1)
       paged.create(initial.snapshot, options.columns, options.primaryKey,
-        function(): Row? return nil end, { pageBytes = options.pageBytes })
-      seal(initial.snapshot, parent)
-      local snapshot = paged.open(initial.snapshot, { cachePages = 1 })
+        function(): Row? return nil end, { pageBytes = options.pageBytes, storage = fs })
+      seal(fs, initial.snapshot, parent)
+      local snapshot = paged.open(initial.snapshot, { cachePages = 1, storage = fs })
       value = { version = 1, epoch = 1, tableName = name,
         columns = options.columns, primaryKey = options.primaryKey,
         snapshotIdentity = snapshot.identity }
       snapshot:close()
       manifest.validate(value :: Manifest)
-      current = openHybrid(base, value :: Manifest, options, false)
+      current = openHybrid(fs, base, value :: Manifest, options, false)
       local started = { started = false }
       publicationKernel.publish(base, parent, value :: Manifest,
-        if options then options.testHook else nil, started)
+        if options then options.testHook else nil, started, fs)
     end
 
     if not current then
-      current = openHybrid(base, value :: Manifest, options, true)
+      current = openHybrid(fs, base, value :: Manifest, options, true)
       -- After an interrupted publication, the new manifest may be visible
       -- before a parent-directory barrier. Re-fence it before retiring any
       -- previous generation. Failure only leaves unreachable old files.
@@ -437,7 +453,7 @@ local function openManaged(path: string, options: Options?, intent: string): Dat
       -- across another power loss after newly acknowledged WAL commits.
       assertOK(synced, syncError, 'recovery manifest directory')
       -- Failed orphan removal only leaks unused files, never active data.
-      pcall(function() collectOrphans(base, parent, value :: Manifest) end)
+      pcall(function() collectOrphans(fs, base, parent, value :: Manifest) end)
     end
   end)
 
@@ -672,8 +688,8 @@ local function openManaged(path: string, options: Options?, intent: string): Dat
     local mergedCount = 0
     -- Generation export and publication may fail; keep the old WAL authoritative.
     local completed, transitionFailure = pcall(function()
-      clearCandidate(candidatePaths)
-      if mode == 'compact' then clearScratch(base, nextEpoch) end
+      clearCandidate(fs, candidatePaths)
+      if mode == 'compact' then clearScratch(fs, base, nextEpoch) end
 
       if mode == 'delta' then
         live:exportDelta(candidatePaths.snapshot, candidatePaths.deletes, {
@@ -681,7 +697,7 @@ local function openManaged(path: string, options: Options?, intent: string): Dat
           runRows = if options then options.runRows else nil,
           mergeFanIn = if options then options.mergeFanIn else nil,
         })
-        seal(candidatePaths.deletes, parent)
+        seal(fs, candidatePaths.deletes, parent)
       elseif mode == 'compact' then
         local generations = manifest.generations(active)
         mergedCount = math.min(#generations, compactionFanIn)
@@ -710,13 +726,14 @@ local function openManaged(path: string, options: Options?, intent: string): Dat
           cachePages = if options then options.cachePages else 1,
           pageBytes = if options then options.pageBytes else nil,
           deletePaths = inputDeletes,
+          storage = fs,
         })
-        seal(candidatePaths.deletes, parent)
+        seal(fs, candidatePaths.deletes, parent)
       else
         live:exportSnapshot(candidatePaths.snapshot,
           { pageBytes = if options then options.pageBytes else nil })
       end
-      seal(candidatePaths.snapshot, parent)
+      seal(fs, candidatePaths.snapshot, parent)
       local nextValue: Manifest
       if mode ~= 'full' or active.version == 2 then
         local generations: { Generation } = {}
@@ -730,18 +747,18 @@ local function openManaged(path: string, options: Options?, intent: string): Dat
         end
         generations[#generations + 1] = { epoch = nextEpoch, deleted = mode ~= 'full' }
         nextValue = manifest.new(active, nextEpoch, '', generations)
-        nextValue.snapshotIdentity = coldIdentity(base, nextValue, options)
+        nextValue.snapshotIdentity = coldIdentity(fs, base, nextValue, options)
       else
-        local snapshot = paged.open(candidatePaths.snapshot, { cachePages = 1 })
+        local snapshot = paged.open(candidatePaths.snapshot, { cachePages = 1, storage = fs })
         nextValue = manifest.new(active, nextEpoch, snapshot.identity, nil)
         snapshot:close()
       end
       manifest.validate(nextValue)
       if options and options.testHook then options.testHook('candidate-sealed') end
-      candidate = openHybrid(base, nextValue, options, false)
+      candidate = openHybrid(fs, base, nextValue, options, false)
       if options and options.testHook then options.testHook('wal-ready') end
       publicationKernel.publish(base, parent, nextValue,
-        if options then options.testHook else nil, publication)
+        if options then options.testHook else nil, publication, fs)
       local previous, prior = live, active
       live = candidate :: hybrid.Database
       candidate = nil
@@ -749,10 +766,10 @@ local function openManaged(path: string, options: Options?, intent: string): Dat
       previous:close()
       if options and options.testHook then options.testHook('before-retire') end
       -- Retirement can fail; old unreferenced files are safe to leave behind.
-      pcall(function() retire(base, parent, prior, nextValue) end)
+      pcall(function() retire(fs, base, parent, prior, nextValue) end)
       if mode == 'compact' then
         -- Scratch files are unpublished and safe to leave for restart if cleanup fails.
-        pcall(function() clearScratch(base, nextEpoch) end)
+        pcall(function() clearScratch(fs, base, nextEpoch) end)
       end
     end)
     busy = false
@@ -766,13 +783,13 @@ local function openManaged(path: string, options: Options?, intent: string): Dat
       else
         journal:record('publication-aborted', active.epoch, mode)
         -- Failed cleanup after a safe pre-publication fault must not hide that fault.
-        pcall(function() clearCandidate(candidatePaths) end)
+        pcall(function() clearCandidate(fs, candidatePaths) end)
         if mode == 'compact' then
           -- Reclaim scratch after a caught pre-publication fault.
-          pcall(function() clearScratch(base, nextEpoch) end)
+          pcall(function() clearScratch(fs, base, nextEpoch) end)
         end
         -- Failed manifest temp cleanup must not override the publication error.
-        pcall(function() removeIfPresent(base .. '.jql-manifest.tmp') end)
+        pcall(function() removeIfPresent(fs, base .. '.jql-manifest.tmp') end)
       end
       error('jessql managed: transition failed: ' .. tostring(transitionFailure), 2)
     end

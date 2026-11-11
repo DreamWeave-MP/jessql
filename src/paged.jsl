@@ -2,13 +2,14 @@
 --!native
 -- Immutable, checksummed row pages with a bounded decoded-page cache.
 -- The format is deliberately separate from the transactional WAL.
-local fs = require('@jessql/vfs')
+local vfs = require('@jessql/vfs')
 local bytes = require('@dream/bytes')
 local json = require('@jess/json')
 local engine = require('@jessql/engine')
 
 export type Row = { [string]: unknown }
-export type Options = { pageBytes: number?, cachePages: number?, readMode: string? }
+-- `storage` is the backend the snapshot lives on; without it, the VM default at the time of the call.
+export type Options = { pageBytes: number?, cachePages: number?, readMode: string?, storage: vfs.Backend? }
 export type Metrics = { pages: number, rows: number, cachedPages: number, pageReads: number }
 export type Snapshot = {
   columns: { string }, primaryKey: string, count: number, identity: string, keyKind: string,
@@ -147,6 +148,7 @@ end
 -- streaming: at most one row page and the sparse directory are in memory.
 function paged.create(path: string, columns: { string }, primaryKey: string,
   nextRow: () -> Row?, options: Options?)
+  local fs = vfs.resolve(if options then options.storage else nil)
   validateColumns(columns, primaryKey)
   local pageBytes = if options and options.pageBytes then options.pageBytes else DefaultPageBytes
   if pageBytes < 512 or pageBytes > 1024 * 1024 or pageBytes % 1 ~= 0 then
@@ -238,6 +240,7 @@ function paged.create(path: string, columns: { string }, primaryKey: string,
 end
 
 function paged.open(path: string, options: Options?): Snapshot
+  local fs = vfs.resolve(if options then options.storage else nil)
   local cacheLimit = if options and options.cachePages then options.cachePages else DefaultCachePages
   if cacheLimit < 1 or cacheLimit > 4096 or cacheLimit % 1 ~= 0 then
     error('jessql paged: invalid cachePages', 2)

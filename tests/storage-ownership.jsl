@@ -1,0 +1,217 @@
+--!strict
+-- Storage is owned per database: the backend is fixed when a database is opened and kept for as
+-- long as it is open. These tests run with the VM default set to a backend that raises on any
+-- call, so one storage operation that fell back to the default, anywhere, fails the test by name.
+local memfs = require('@jessql/memfs')
+local sql = require('@jessql')
+local test = require('@jess/test')
+local vfs = require('@jessql/vfs')
+
+local expect = test.expect
+local suite = test.new()
+
+type Row = { [string]: unknown }
+
+-- A backend no database may reach. Every member is a function that raises with its own name.
+local function poison(): vfs.Backend
+  local trap = setmetatable({}, {
+    __index = function(_self: unknown, key: string)
+      return function() error(`the VM default backend was reached: {key}`, 0) end
+    end,
+  })
+  return (trap :: unknown) :: vfs.Backend
+end
+
+-- Runs `body` with the poisoned default installed, and restores the host backend afterwards.
+local function poisoned(body: () -> ())
+  local restore = vfs.use(poison())
+  -- The body can raise on a failed expectation or a reached default; restore either way.
+  local ok, problem = pcall(body)
+  restore()
+  if not ok then error(problem, 0) end
+end
+
+local function managedOptions(disk: memfs.Disk): sql.ManagedOptions
+  return { tableName = 'events', columns = { 'id', 'room', 'body' }, primaryKey = 'id',
+    cachePages = 1, compactionFanIn = 2, storage = disk.backend }
+end
+
+local function count(db: sql.ManagedDatabase): number
+  return db:query('SELECT COUNT(*) AS n FROM events').rows[1].n :: number
+end
+
+local function touched(disk: memfs.Disk): number
+  local files = 0
+  for _ in disk.visible() do files += 1 end
+
+  return files
+end
+
+suite.describe('storage owned per database', function()
+  suite.it('runs a managed database through its whole life without touching the VM default', function()
+    poisoned(function()
+      local disk = memfs.new()
+      local base = '/memory/owned'
+      local db = sql.managed.create(base, managedOptions(disk))
+      for generation = 1, 4 do
+        db:transaction(function(tx)
+          for index = 1, 20 do tx:upsert({ id = generation * 100 + index, room = 'r' .. generation, body = 'b' }) end
+        end)
+
+        if generation == 2 then db:transaction(function(tx) tx:delete(101) end) end
+        db:flush()
+      end
+
+      expect(count(db)).toBe(79)
+      db:compact()
+      expect(count(db)).toBe(79)
+      db:transaction(function(tx) tx:insert({ id = 1, room = 'late', body = 'hot' }) end)
+      db:checkpoint()
+      expect(count(db)).toBe(80)
+      db:close()
+
+      local again = sql.managed.openExisting(base, { storage = disk.backend })
+      expect(count(again)).toBe(80)
+      again:close()
+
+      expect(sql.managed.inspect(base, disk.backend).tableName).toBe('events')
+      local report = sql.managed.verify(base, { semantic = true, storage = disk.backend })
+      expect(report.ok).toBe(true)
+      expect(report.walSemanticReplayChecked).toBe(true)
+    end)
+  end)
+
+  suite.it('backs up from one disk to another, each side on its own backend', function()
+    poisoned(function()
+      local source, target = memfs.new(), memfs.new()
+      local db = sql.managed.create('/memory/live', managedOptions(source))
+      db:transaction(function(tx)
+        for index = 1, 30 do tx:insert({ id = index, room = 'a', body = 'x' }) end
+      end)
+      db:checkpoint()
+      db:transaction(function(tx) tx:insert({ id = 31, room = 'a', body = 'y' }) end)
+      db:close()
+
+      local before = touched(source)
+      local result = sql.managed.backup('/memory/live', '/memory/copy',
+        { storage = source.backend, destinationStorage = target.backend })
+      expect(result.semanticVerified).toBe(true)
+      -- The source gained nothing but the lock file a backup takes on it; the copy is on the other disk only.
+      expect(touched(source) - before <= 1).toBe(true)
+      expect(source.visible()['/memory/copy.jql-manifest']).toBe(nil)
+      expect(target.visible()['/memory/copy.jql-manifest'] ~= nil).toBe(true)
+      expect(target.visible()['/memory/live.jql-manifest']).toBe(nil)
+
+      local copy = sql.managed.openExisting('/memory/copy', { storage = target.backend })
+      expect(count(copy)).toBe(31)
+      copy:close()
+
+      -- The same path on two disks is two namespaces, not one: this is a copy, not a refusal.
+      local third = memfs.new()
+      local same = sql.managed.backup('/memory/live', '/memory/live',
+        { storage = source.backend, destinationStorage = third.backend })
+      expect(same.semanticVerified).toBe(true)
+      -- On one disk, a database is never backed up onto itself.
+      expect((pcall(function()
+        sql.managed.backup('/memory/live', '/memory/live', { storage = source.backend })
+      end))).toBe(false)
+    end)
+  end)
+
+  suite.it('keeps two databases in one VM on two disks, open at once', function()
+    poisoned(function()
+      local left, right = memfs.new(), memfs.new()
+      local first = sql.managed.create('/memory/db', managedOptions(left))
+      local second = sql.managed.create('/memory/db', managedOptions(right))
+      first:transaction(function(tx) tx:insert({ id = 1, room = 'left', body = 'l' }) end)
+      second:transaction(function(tx)
+        tx:insert({ id = 1, room = 'right', body = 'r' })
+        tx:insert({ id = 2, room = 'right', body = 'r' })
+      end)
+      first:checkpoint()
+      second:flush()
+      expect(count(first)).toBe(1)
+      expect(count(second)).toBe(2)
+      expect((first:get(1) :: Row).room).toBe('left')
+      expect((second:get(1) :: Row).room).toBe('right')
+      first:close()
+      second:close()
+
+      -- A crash of one disk is not a crash of the other.
+      local survivor = sql.managed.openExisting('/memory/db', { storage = left.backend })
+      right.crash()
+      expect(count(survivor)).toBe(1)
+      survivor:close()
+    end)
+  end)
+
+  suite.it('does not move an open database when the VM default changes underneath it', function()
+    local home, elsewhere = memfs.new(), memfs.new()
+    local restoreHome = vfs.use(home.backend)
+    -- Opened with no storage option: it takes the default as it is now, and keeps it.
+    local db = sql.open('/memory/kept.wal', { durability = 'sync' })
+    db:createTable('events', { 'id' }, 'id')
+    db:insert('events', { id = 1 })
+
+    local restoreElsewhere = vfs.use(elsewhere.backend)
+    db:insert('events', { id = 2 })
+    local restorePoison = vfs.use(poison())
+    db:insert('events', { id = 3 })
+    expect(db:query('SELECT COUNT(*) AS n FROM events').rows[1].n).toBe(3)
+    db:close()
+    restorePoison()
+    restoreElsewhere()
+
+    expect(elsewhere.visible()['/memory/kept.wal']).toBe(nil)
+    local reopened = sql.open('/memory/kept.wal', { durability = 'sync' })
+    expect(reopened:query('SELECT COUNT(*) AS n FROM events').rows[1].n).toBe(3)
+    reopened:close()
+    restoreHome()
+    expect(vfs.backend() == vfs.native()).toBe(true)
+  end)
+
+  suite.it('keeps a hybrid database, its exports and its sidecars on the disk it was opened on', function()
+    poisoned(function()
+      local disk = memfs.new()
+      local on = disk.backend
+      local cursor = 0
+      sql.paged.create('/memory/cold.rows', { 'id', 'room', 'body' }, 'id', function(): Row?
+        cursor += 1
+        if cursor > 40 then return nil end
+        return { id = cursor, room = if cursor % 2 == 0 then 'even' else 'odd', body = 'cold' }
+      end, { pageBytes = 1024, storage = on })
+
+      local db = sql.hybrid.open('/memory/hot.wal', '/memory/cold.rows', 'events', { cachePages = 2, storage = on })
+      db:transaction(function(tx)
+        tx:insert({ id = 41, room = 'odd', body = 'hot' })
+        tx:delete(2)
+      end)
+
+      -- The options an export is given say nothing about storage: it goes where the database is.
+      db:exportSnapshot('/memory/full.rows', { pageBytes = 1024 })
+      db:exportIndexedDelta('/memory/delta.rows', '/memory/delta.deleted', '/memory/delta.index', 'room', 'body',
+        { runRows = 2, mergeFanIn = 2 }, { runRows = 2, mergeFanIn = 2, format = 'compact' })
+      db:close()
+
+      local files = disk.visible()
+      expect(files['/memory/full.rows'] ~= nil).toBe(true)
+      expect(files['/memory/delta.rows'] ~= nil).toBe(true)
+      expect(files['/memory/delta.deleted'] ~= nil).toBe(true)
+      expect(files['/memory/delta.index'] ~= nil).toBe(true)
+
+      local full = sql.paged.open('/memory/full.rows', { storage = on })
+      local rows = 0
+      for _ in full:iterateRows() do rows += 1 end
+      full:close()
+      expect(rows).toBe(40)
+
+      -- Tiered compaction and its scratch files, on the same disk.
+      sql.tiers.compact('/memory/merged.rows', '/memory/merged.deleted',
+        { '/memory/cold.rows', '/memory/delta.rows' },
+        { fanIn = 2, deletePaths = { [2] = '/memory/delta.deleted' }, storage = on })
+      expect(disk.visible()['/memory/merged.rows'] ~= nil).toBe(true)
+    end)
+  end)
+end)
+
+return suite

@@ -3,7 +3,7 @@
 -- JessQL's native append-only store. No external database or FFI dependency.
 -- Records are length-delimited and CRC-protected; one record contains one transaction.
 -- A torn trailing record is discarded. A corrupt complete record fails closed.
-local fs = require('@jessql/vfs')
+local vfs = require('@jessql/vfs')
 local bytes = require('@dream/bytes')
 local json = require('@jess/json')
 local queryEngine = require('@jessql/engine')
@@ -13,6 +13,8 @@ local mutations = require('@jessql/mutations')
 
 export type Row = { [string]: unknown }
 export type Options = { maxFrameBytes: number?, recoverTail: boolean?, queryCacheEntries: number?, rowLayout: string?, durability: string?, trackPayloadBytes: boolean?,
+  -- The backend the database lives on; without it, the VM default at the time it is opened.
+  storage: vfs.Backend?,
   -- Fault injection for deterministic tests of uncertain batch acknowledgments.
   batchTestHook: ((string) -> ())? }
 export type BatchResult = { ok: boolean, error: string? }
@@ -101,6 +103,8 @@ type Operation = { kind: string, table: string, columns: { string }?, primaryKey
 type Pending = { [string]: { [string]: Row | boolean } }
 type DatabaseState = {
   path: string,
+  -- The disk this database lives on, fixed when it was opened.
+  fs: vfs.Backend,
   lock: dream_fs_Lock,
   engine: queryEngine.Database,
   tables: { [string]: TableState },
@@ -1527,7 +1531,7 @@ local function replay(state: DatabaseState, operations: { Operation })
 end
 
 local function load(state: DatabaseState, recoverTail: boolean)
-  local reader, err = fs.open(state.path)
+  local reader, err = state.fs.open(state.path)
   if not reader then error('jessql storage: ' .. tostring(err), 2) end
   local size = reader:size()
   local magic = reader:readAt(0, #Magic)
@@ -1575,7 +1579,7 @@ local function load(state: DatabaseState, recoverTail: boolean)
   reader:close()
   if offset ~= size then
     if not recoverTail then error('jessql storage: incomplete trailing transaction', 2) end
-    local writer, err = fs.openWrite(state.path, { create = false, truncate = false })
+    local writer, err = state.fs.openWrite(state.path, { create = false, truncate = false })
     if not writer then error('jessql storage: ' .. tostring(err), 2) end
     local ok, truncateError = writer:truncate(offset)
     local synced, syncError = true, nil
@@ -1595,7 +1599,7 @@ local function write(state: DatabaseState, ops: { Operation }, deferSync: boolea
   if state.durability == 'sync' then
     count, err = (state.walWriter :: dream_fs_Writer):write(record)
   else
-    count, err = fs.writeFile(state.path, record, { append = true, create = false })
+    count, err = state.fs.writeFile(state.path, record, { append = true, create = false })
   end
 
   if count ~= #record then
@@ -1623,6 +1627,7 @@ end
 local storage = {}
 
 function storage.open(path: string, options: Options?): Store
+  local fs = vfs.resolve(if options then options.storage else nil)
   if type(path) ~= 'string' or path == '' then error('jessql storage: path is required', 2) end
   local max = if options then options.maxFrameBytes else nil
   if max ~= nil and (max < 1024 or max > 256 * 1024 * 1024 or max % 1 ~= 0) then
@@ -1656,7 +1661,7 @@ function storage.open(path: string, options: Options?): Store
   if not lock then error('jessql storage: database locked: ' .. tostring(err), 2) end
 
   local state: DatabaseState = {
-    path = path, lock = lock, engine = queryEngine.new(), tables = {}, sequence = 0, schemaVersion = 0,
+    path = path, fs = fs, lock = lock, engine = queryEngine.new(), tables = {}, sequence = 0, schemaVersion = 0,
     maxFrameBytes = max or DefaultMaxFrame, closed = false, busy = false, poisoned = false,
     rowLayout = rowLayout or 'row', trackPayloadBytes = options ~= nil and options.trackPayloadBytes == true,
     durability = durability, walWriter = nil,
@@ -2196,14 +2201,15 @@ end
 -- truncating a torn tail, or acknowledging any transaction. The transient
 -- row/index state is discarded after validation; this is intentionally a
 -- memory-intensive audit, not the regular database-open fast path.
-function storage.verifyReplay(path: string): number
+function storage.verifyReplay(path: string, backend: vfs.Backend?): number
+  local fs = vfs.resolve(backend)
   local exists, statError = fs.exists(path)
   if exists ~= true then error('jessql storage: read-only replay requires existing WAL: ' .. tostring(statError), 2) end
   local lock, lockError = fs.lock(path .. '.lock')
   if not lock then error('jessql storage: read-only replay locked: ' .. tostring(lockError), 2) end
 
   local state: DatabaseState = {
-    path = path, lock = lock, engine = queryEngine.new(), tables = {},
+    path = path, fs = fs, lock = lock, engine = queryEngine.new(), tables = {},
     sequence = 0, schemaVersion = 0, maxFrameBytes = DefaultMaxFrame,
     closed = false, busy = false, poisoned = false, rowLayout = 'row',
     trackPayloadBytes = false, durability = 'buffered', walWriter = nil,

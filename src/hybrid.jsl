@@ -8,10 +8,10 @@ local paged = require('@jessql/paged')
 local segments = require('@jessql/segments')
 local secondary = require('@jessql/secondary')
 local delta = require('@jessql/delta')
-local fs = require('@jessql/vfs')
+local vfs = require('@jessql/vfs')
 
 export type Row = { [string]: unknown }
-export type Options = { cachePages: number?, readMode: string?, durability: string?, rowLayout: string?, secondaryIndexPath: string?, secondaryIndexPaths: { string }?, deletePaths: { [number]: string }?, requireIdentity: boolean?, trackPayloadBytes: boolean? }
+export type Options = { cachePages: number?, readMode: string?, durability: string?, rowLayout: string?, secondaryIndexPath: string?, secondaryIndexPaths: { string }?, deletePaths: { [number]: string }?, requireIdentity: boolean?, trackPayloadBytes: boolean?, storage: vfs.Backend? }
 export type BatchResult = storage.BatchResult
 export type Transaction = {
   get: (self: Transaction, key: unknown) -> Row?,
@@ -354,6 +354,8 @@ end
 -- Opens an existing immutable snapshot plus a private mutable WAL.
 -- The snapshot is never modified or deleted by this API.
 function hybrid.open(walPath: string, snapshotPath: string | { string }, tableName: string, options: Options?): Database
+  -- The disk the whole database lives on: WAL, snapshots, sidecars and everything it exports.
+  local fs = vfs.resolve(if options then options.storage else nil)
   local name = validTable(tableName)
   local indexCache = if options then options.cachePages else nil
   local readMode = if options then options.readMode else nil
@@ -376,19 +378,19 @@ function hybrid.open(walPath: string, snapshotPath: string | { string }, tableNa
   local cold = if type(snapshotPath) == 'table'
     then segments.open(snapshotPath :: { string }, { cachePages = if options then options.cachePages else nil,
       readMode = readMode,
-      deletePaths = if options then options.deletePaths else nil })
+      deletePaths = if options then options.deletePaths else nil, storage = fs })
     else paged.open(snapshotPath :: string, { cachePages = if options then options.cachePages else nil,
-      readMode = readMode })
+      readMode = readMode, storage = fs })
   local coldIndex: secondary.Index? = nil
   if options and (options.secondaryIndexPath or options.secondaryIndexPaths) then
     -- A mismatched sidecar must not leave an open cold reader behind.
     local indexOk, indexResult = pcall(function()
       if options.secondaryIndexPaths then
         coldIndex = (cold :: segments.Snapshot):openIndexes(options.secondaryIndexPaths,
-          { cachePages = indexCache, readMode = readMode })
+          { cachePages = indexCache, readMode = readMode, storage = fs })
       else
         coldIndex = secondary.open(options.secondaryIndexPath :: string, cold,
-          { cachePages = indexCache, readMode = readMode })
+          { cachePages = indexCache, readMode = readMode, storage = fs })
       end
     end)
 
@@ -399,7 +401,7 @@ function hybrid.open(walPath: string, snapshotPath: string | { string }, tableNa
   local ok, failure = pcall(function()
     hot = storage.open(walPath, { rowLayout = if options then options.rowLayout else 'packed',
       durability = if options then options.durability else nil,
-      trackPayloadBytes = if options then options.trackPayloadBytes else nil })
+      trackPayloadBytes = if options then options.trackPayloadBytes else nil, storage = fs })
   end)
 
   if not ok then
@@ -716,7 +718,12 @@ function hybrid.open(walPath: string, snapshotPath: string | { string }, tableNa
       nextColdRow = nextCold()
       return row
     end
-    paged.create(path, cold.columns, cold.primaryKey, nextRow, options)
+
+    paged.create(path, cold.columns, cold.primaryKey, nextRow, {
+      pageBytes = if options then options.pageBytes else nil,
+      cachePages = if options then options.cachePages else nil,
+      readMode = if options then options.readMode else nil, storage = fs,
+    })
   end
 
   -- Build an independent immutable candidate from the current hot overlay.
@@ -743,13 +750,19 @@ function hybrid.open(walPath: string, snapshotPath: string | { string }, tableNa
     local rowMetrics: delta.Metrics? = nil
     local deleteMetrics: delta.Metrics? = nil
     local rowsBuilt = false
+    local onDisk: delta.Options = {
+      pageBytes = if options then options.pageBytes else nil, runRows = if options then options.runRows else nil,
+      mergeFanIn = if options then options.mergeFanIn else nil, maxRows = if options then options.maxRows else nil,
+      storage = fs,
+    }
+
     -- Both candidate files form one logical generation. A failed deletion
     -- export must not leave behind an apparently usable rows-only snapshot.
     local built, failure = pcall(function()
       rowMetrics = delta.create(rowsPath, cold.columns, cold.primaryKey,
-        store:iterateRows(name), options)
+        store:iterateRows(name), onDisk)
       rowsBuilt = true
-      local snapshot = paged.open(rowsPath, { cachePages = 1 })
+      local snapshot = paged.open(rowsPath, { cachePages = 1, storage = fs })
       local token = snapshot.identity
       snapshot:close()
       local deleted = store:iterateRows(Tombstones)
@@ -762,7 +775,7 @@ function hybrid.open(walPath: string, snapshotPath: string | { string }, tableNa
         local row = deleted()
         if not row then return nil end
         return { id = row.id, token = '' }
-      end, options)
+      end, onDisk)
     end)
 
     if not built then
@@ -804,11 +817,17 @@ function hybrid.open(walPath: string, snapshotPath: string | { string }, tableNa
     -- Candidate export and indexing can fail; cleanup all three files together.
     local created, failure = pcall(function()
       result = self:exportDelta(rowsPath, deletePath, deltaOptions)
-      indexMetrics = secondary.create(indexPath, rowsPath, partition, orderColumn, indexOptions)
-      local candidate = paged.open(rowsPath, { cachePages = 1 })
+      indexMetrics = secondary.create(indexPath, rowsPath, partition, orderColumn, {
+        pageBytes = if indexOptions then indexOptions.pageBytes else nil,
+        cachePages = if indexOptions then indexOptions.cachePages else nil,
+        runRows = if indexOptions then indexOptions.runRows else nil,
+        mergeFanIn = if indexOptions then indexOptions.mergeFanIn else nil,
+        format = if indexOptions then indexOptions.format else nil, storage = fs,
+      })
+      local candidate = paged.open(rowsPath, { cachePages = 1, storage = fs })
       -- Verify the built sidecar against its exact snapshot before returning.
       local verified, verifyError = pcall(function()
-        local check = secondary.open(indexPath, candidate, { cachePages = 1 })
+        local check = secondary.open(indexPath, candidate, { cachePages = 1, storage = fs })
         check:close()
       end)
       candidate:close()

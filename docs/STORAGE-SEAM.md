@@ -1,35 +1,46 @@
 # The storage seam and the in-memory disk
 
-JessQL reaches the filesystem through one module, `@jessql/vfs`. With nothing installed it is
-`@dream/fs`. A test can install another backend:
+JessQL reaches the filesystem through one module, `@jessql/vfs`, and a database is given its
+backend when it is opened:
 
 ```luau
 local memfs = require('@jessql/memfs')
-local vfs = require('@jessql/vfs')
+local sql = require('@jessql')
 
 local disk = memfs.new()
-local restore = vfs.use(disk.backend)
--- sql.open, sql.managed.create, ... now run entirely in memory, with no filesystem capability
-restore()
+local db = sql.managed.create('/memory/events', { tableName = 'events', columns = { 'id' },
+  primaryKey = 'id', storage = disk.backend })
+-- runs entirely in memory, with no filesystem capability
 ```
+
+Without `storage`, a database gets the VM default, which is `@dream/fs` unless a test installed
+another with `vfs.use(backend)` (it returns the function that restores what was there).
 
 ## Scope, stated plainly
 
-- **Per VM, not per database.** One runtime has one storage backend at a time. A Jess test file
-  runs in its own VM, so this is what offline tests need; it is not a per-handle
-  `Options.storage` adapter, and two databases in one VM cannot use different backends.
-- **A backend is never replaced under an open database.** Every open database holds a lock taken
-  through the seam; the seam counts them (`vfs.busy()`), and `vfs.use` and the restore function
-  it returns both raise while any is held. Installations nest and are undone innermost first;
-  restoring out of order raises, and each restore works once. So the sequence that would let one
-  transaction span two filesystems is an error at the call that would cause it. A simulated crash
-  (`disk.crash()`) abandons its own locks through `vfs.abandon()`, which exists for that alone.
-- **Open question, to settle before this is called finished:** ownership per database. A
-  production in-memory database, or two databases on different storage in one VM, needs the
-  backend fixed at open and kept by every handle of that database (`Options.storage`, threaded
-  through the storage modules instead of a module-level import). The guard above makes the per-VM
-  seam safe; it does not make it per-database.
-- It changes no file format, no durability step and no public database API.
+- **Per database.** The backend is resolved once, when a database is opened, created, verified,
+  inspected or copied, and held by that database for as long as it is open. Two databases in one
+  VM can sit on two backends. Where it goes: `storage` in the options of `sql.open`,
+  `sql.managed.*`, `sql.hybrid.open`, `sql.paged.*`, `sql.segments.*`, `sql.delta.create`,
+  `sql.secondary.*` and `sql.tiers.compact`; the last argument of `sql.managed.inspect`; and
+  `{ storage, destinationStorage }` for `sql.managed.backup`, which may cross from one backend to
+  another.
+- **What a database writes goes where the database is.** Exports, sidecars, compaction scratch,
+  manifests and retirements use the database's backend whatever options the call was given.
+- **The VM default is read at open and never again.** `vfs.use` may be called while databases are
+  open; it changes nothing for them. This replaces the earlier per-VM seam and its lock-count
+  guard (`vfs.busy`, `vfs.abandon`), which refused the swap instead: there is no longer a swap
+  that could move a database. Installations nest and are undone innermost first; restoring out of
+  order raises, and each restore works once.
+- **How this is held:** no storage module calls the default. Their file operations go through a
+  local resolved on entry, internal helpers take the backend as a required argument, and
+  `tests/storage-ownership.jsl` runs a managed database through create, flush, compaction,
+  checkpoint, reopen, inspect, verify and backup, and a hybrid database through its exports, with
+  the VM default set to a backend that raises on any call.
+- **Not covered:** one database spread over two backends (hot on one, cold on another), and a
+  backend chosen by path. Both are possible on this shape; neither is built.
+- It changes no file format and no durability step. Existing calls behave as before; the
+  additions to the public API are the optional parameters above.
 - It does not provide multi-table transactions or off-loop commits.
 
 ## What the in-memory disk models

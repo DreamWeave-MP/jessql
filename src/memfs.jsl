@@ -33,7 +33,7 @@ export type Fault = { message: string, kind: string? }
 export type Injector = (step: string, path: string, occurrence: number) -> Fault?
 
 export type Disk = {
-  -- Install with `vfs.use(disk.backend)`.
+  -- Pass as `storage` when opening a database, or install as the VM default with `vfs.use`.
   backend: vfs.Backend,
   -- Discards everything not synchronized, releases every lock and invalidates every open handle.
   crash: () -> (),
@@ -594,8 +594,7 @@ function memfs.new(options: Options?): Disk
     crash = function()
       generation += 1
       table.clear(locks)
-      -- The process that held them is gone: the seam must not go on counting its locks.
-      if vfs.backend() == exposed then vfs.abandon() end
+
       -- Names go back to what the directories last had synchronized, and every file to the bytes
       -- it last had synchronized.
       table.clear(names)

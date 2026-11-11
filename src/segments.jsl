@@ -5,10 +5,11 @@
 -- replaced, retired, or published by opening or compacting this view.
 local paged = require('@jessql/paged')
 local secondary = require('@jessql/secondary')
+local vfs = require('@jessql/vfs')
 local engine = require('@jessql/engine')
 
 export type Row = { [string]: unknown }
-export type Options = { cachePages: number?, pageBytes: number?, readMode: string?, deletePaths: { [number]: string }? }
+export type Options = { cachePages: number?, pageBytes: number?, readMode: string?, deletePaths: { [number]: string }?, storage: vfs.Backend? }
 export type Snapshot = paged.Snapshot & {
   openIndexes: (self: Snapshot, paths: { string }, options: paged.Options?) -> secondary.Index,
 }
@@ -71,6 +72,7 @@ end
 -- part of the hybrid WAL identity; a changed generation list cannot silently
 -- reuse an old overlay. No lossy hash is used to combine identity tokens.
 function segments.open(paths: { string }, options: Options?): Snapshot
+  local fs = vfs.resolve(if options then options.storage else nil)
   if type(paths) ~= 'table' or #paths < 1 or #paths > MaxSources then
     error('jessql segments: expected 1 to 8 snapshot paths', 2)
   end
@@ -96,7 +98,7 @@ function segments.open(paths: { string }, options: Options?): Snapshot
         error('jessql segments: invalid or duplicate snapshot path')
       end
       seen[path] = true
-      local reader = paged.open(path, { cachePages = cachePages or 1, readMode = readMode })
+      local reader = paged.open(path, { cachePages = cachePages or 1, readMode = readMode, storage = fs })
       if #readers > 0 then
         if reader.primaryKey ~= readers[1].primaryKey
           or not identical(reader.columns, readers[1].columns) then
@@ -112,7 +114,7 @@ function segments.open(paths: { string }, options: Options?): Snapshot
       if deletePath then
         if seen[deletePath] then error('jessql segments: duplicate deletion path') end
         seen[deletePath] = true
-        local deleteReader = paged.open(deletePath, { cachePages = cachePages or 1, readMode = readMode })
+        local deleteReader = paged.open(deletePath, { cachePages = cachePages or 1, readMode = readMode, storage = fs })
         deletions[#readers] = deleteReader
         if deleteReader.primaryKey ~= 'id' or #deleteReader.columns ~= 2
           or deleteReader.columns[1] ~= 'id' or deleteReader.columns[2] ~= 'token'
@@ -301,6 +303,9 @@ function segments.open(paths: { string }, options: Options?): Snapshot
   function snapshot.openIndexes(_self: Snapshot, paths: { string }, indexOptions: paged.Options?): secondary.Index
     ready()
     if activeIndex then error('jessql segments: secondary indexes already open', 2) end
+    -- A sidecar lives on the snapshot's disk, whatever the caller's options say.
+    local sidecar: paged.Options = { storage = fs }
+    if indexOptions then sidecar.pageBytes, sidecar.cachePages, sidecar.readMode = indexOptions.pageBytes, indexOptions.cachePages, indexOptions.readMode end
 
     if type(paths) ~= 'table' or #paths ~= #readers then
       error('jessql segments: expected one sidecar per generation', 2)
@@ -313,7 +318,7 @@ function segments.open(paths: { string }, options: Options?): Snapshot
         if type(path) ~= 'string' or path == '' then
           error('jessql segments: invalid secondary index path')
         end
-        local item = secondary.open(path, readers[number], indexOptions)
+        local item = secondary.open(path, readers[number], sidecar)
         if #indexes > 0 then
           local original = indexes[1]
           if item.partitionColumn ~= original.partitionColumn
@@ -474,7 +479,8 @@ end
 -- and supplied by a streaming iterator. The first record binds this sidecar
 -- to its own data snapshot. This operation does not rotate or retire a WAL.
 function segments.createTombstones(path: string, source: string, nextKey: () -> string?, options: Options?)
-  local reader = paged.open(source, { cachePages = if options then options.cachePages else 1 })
+  local fs = vfs.resolve(if options then options.storage else nil)
+  local reader = paged.open(source, { cachePages = if options then options.cachePages else 1, storage = fs })
   local identity = reader.identity
   reader:close()
   local previous = ''
@@ -492,19 +498,20 @@ function segments.createTombstones(path: string, source: string, nextKey: () -> 
     end
     previous = key
     return { id = key, token = '' }
-  end, { pageBytes = if options then options.pageBytes else nil })
+  end, { pageBytes = if options then options.pageBytes else nil, storage = fs })
 end
 
 -- Bounded-memory explicit compaction. Inputs remain untouched. Caller must
 -- separately publish the resulting generation and rotate its WAL safely.
 function segments.compact(path: string, sources: { string }, options: Options?)
+  local fs = vfs.resolve(if options then options.storage else nil)
   local snapshot = segments.open(sources, { cachePages = if options then options.cachePages else 1,
-    deletePaths = if options then options.deletePaths else nil })
+    deletePaths = if options then options.deletePaths else nil, storage = fs })
 
   -- Snapshot publication can fail during file creation or source streaming.
   local succeeded, failure = pcall(function()
     paged.create(path, snapshot.columns, snapshot.primaryKey,
-      snapshot:iterateRows(), { pageBytes = if options then options.pageBytes else nil })
+      snapshot:iterateRows(), { pageBytes = if options then options.pageBytes else nil, storage = fs })
   end)
   snapshot:close()
   if not succeeded then error(failure, 2) end

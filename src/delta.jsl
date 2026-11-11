@@ -4,10 +4,10 @@
 -- Scratch runs are never published as database generations.
 local paged = require('@jessql/paged')
 local segments = require('@jessql/segments')
-local fs = require('@jessql/vfs')
+local vfs = require('@jessql/vfs')
 
 export type Row = { [string]: unknown }
-export type Options = { pageBytes: number?, runRows: number?, mergeFanIn: number?, maxRows: number? }
+export type Options = { pageBytes: number?, runRows: number?, mergeFanIn: number?, maxRows: number?, storage: vfs.Backend? }
 export type Metrics = { rows: number, spilledRuns: number, mergePasses: number, maxBufferedRows: number }
 
 local DefaultRunRows = 8192
@@ -36,6 +36,7 @@ end
 -- There is no automatic publication, WAL truncation or file retirement.
 function delta.create(path: string, columns: { string }, primaryKey: string,
   nextRow: () -> Row?, options: Options?): Metrics
+  local fs = vfs.resolve(if options then options.storage else nil)
   local runRows = if options and options.runRows then options.runRows else DefaultRunRows
   local fanIn = if options and options.mergeFanIn then options.mergeFanIn else DefaultFanIn
   local pageBytes = if options then options.pageBytes else nil
@@ -73,7 +74,7 @@ function delta.create(path: string, columns: { string }, primaryKey: string,
   local function spill()
     if #bufferRows == 0 then return end
     local destination = scratchPath()
-    paged.create(destination, columns, primaryKey, fromBuffer(), { pageBytes = pageBytes })
+    paged.create(destination, columns, primaryKey, fromBuffer(), { pageBytes = pageBytes, storage = fs })
     scratch[#scratch + 1] = destination
     runs[#runs + 1] = destination
     metrics.spilledRuns += 1
@@ -81,7 +82,7 @@ function delta.create(path: string, columns: { string }, primaryKey: string,
   end
 
   local function merge(destination: string, paths: { string })
-    segments.compact(destination, paths, { cachePages = 1, pageBytes = pageBytes })
+    segments.compact(destination, paths, { cachePages = 1, pageBytes = pageBytes, storage = fs })
   end
 
   -- Row sources and page writes can fail; remove every completed scratch run before propagating.
@@ -98,7 +99,7 @@ function delta.create(path: string, columns: { string }, primaryKey: string,
 
     if #runs == 0 then
       -- Small deltas avoid scratch files and extra disk writes altogether.
-      paged.create(path, columns, primaryKey, fromBuffer(), { pageBytes = pageBytes })
+      paged.create(path, columns, primaryKey, fromBuffer(), { pageBytes = pageBytes, storage = fs })
       return
     end
 

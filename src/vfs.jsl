@@ -4,17 +4,18 @@
 -- `@jessql/memfs` for tests that run with no filesystem capability, or by a wrapper that injects
 -- a fault at a chosen durability step.
 --
--- The seam is per VM, not per database: one runtime has one storage backend at a time. That is
--- what an application's offline tests need (a Jess test file runs in its own VM), and it keeps
--- every existing call site, signature and type exactly as it was. A per-database adapter is a
--- separate, larger change and is not claimed here.
+-- Storage is owned per database. Every function that opens, creates, verifies or copies a
+-- database takes a `storage` backend (in its options, or as its last argument) and resolves it
+-- once, on entry, with `vfs.resolve`. Everything that database does afterwards goes to that
+-- backend, held in the database's own closure: two databases in one VM can sit on two disks, and
+-- nothing done to the VM later can move an open database onto another.
 --
--- Because it is per VM, the backend must never change under an open database: one transaction
--- would then span two filesystems. Every open database holds a lock taken through this module, so
--- the seam counts the locks held and refuses to install or restore a backend while any is held.
--- That makes the unsafe sequence an error at the call that would cause it, not corruption later.
+-- `vfs.use` sets the VM's default: the backend a database gets when it is opened without one.
+-- It is read at open and never again, so changing it under an open database changes nothing for
+-- that database. With nothing installed and nothing passed, the backend is `@dream/fs`.
 --
--- With nothing installed this is `@dream/fs`: each function forwards its arguments unchanged.
+-- The forwarding functions below (`vfs.exists` and the rest) act on the VM default. They are for
+-- tests and tools; the storage modules do not call them.
 
 local native = require('@dream/fs')
 
@@ -27,26 +28,18 @@ type RecursiveOptions = { recursive: boolean? }
 type LockOptions = { shared: boolean?, createParents: boolean? }
 
 local current: Backend = native
--- Locks taken through the seam and not yet released, per backend: the databases that are open.
-local held: { [Backend]: number } = {}
 local vfs = {}
 
--- How many locks are held on the backend in use: zero when no database is open on it.
-function vfs.busy(): number
-  return held[current] or 0
+-- The backend a database will use: the one it was given, else the VM default as it is now.
+-- Call it once per entry point and keep the result; never per operation.
+function vfs.resolve(storage: Backend?): Backend
+  return storage or current
 end
 
--- Installs `backend` for this VM and returns a function that puts back what was there.
---
--- Raises if a database is open on the backend in use: a backend is never replaced under one.
--- The returned function raises the same way while a database is open on `backend`; once that
--- is closed it restores the previous backend, exactly once (calling it again does nothing).
--- Installations nest, and must be undone innermost first: restoring out of order raises.
+-- Installs `backend` as this VM's default and returns a function that puts back what was there,
+-- exactly once (calling it again does nothing). Installations nest, and must be undone innermost
+-- first: restoring out of order raises. Databases already open are unaffected either way.
 function vfs.use(backend: Backend): () -> ()
-  if vfs.busy() > 0 then
-    error(`jessql vfs: cannot replace the storage backend while {vfs.busy()} lock(s) are held on it: close every database first`, 2)
-  end
-
   local previous = current
   current = backend
   local restored = false
@@ -54,23 +47,12 @@ function vfs.use(backend: Backend): () -> ()
     if restored then return end
     if current ~= backend then error('jessql vfs: storage backends must be restored innermost first', 2) end
 
-    if vfs.busy() > 0 then
-      error(`jessql vfs: cannot restore the storage backend while {vfs.busy()} lock(s) are held on it: close every database first`, 2)
-    end
-
     restored = true
     current = previous
   end
 end
 
--- Forgets the locks held on the backend in use. For a simulated crash only: the process that
--- held them is gone and will never release them. `@jessql/memfs` calls this from `crash()`.
--- It releases nothing on a real filesystem and must not be used to get round `use`.
-function vfs.abandon()
-  held[current] = nil
-end
-
--- The backend in use, and the host filesystem whatever is in use.
+-- The VM default, and the host filesystem whatever the default is.
 function vfs.backend(): Backend return current end
 function vfs.native(): Backend return native end
 
@@ -106,33 +88,6 @@ function vfs.replace(source: string, destination: string) return current.replace
 function vfs.rename(from: string, to: string) return current.rename(from, to) end
 function vfs.mkdir(path: string, options: RecursiveOptions?) return current.mkdir(path, options) end
 function vfs.remove(path: string, options: RecursiveOptions?) return current.remove(path, options) end
-
--- Ownership. The lock handed back counts itself against the backend it was taken on until it
--- is released, which is how the seam knows a database is open.
-function vfs.lock(path: string, options: LockOptions?): (dream_fs_Lock?, string?, dream_fs_ErrorKind?)
-  local owner = current
-  local taken, message, kind = owner.lock(path, options)
-  if not taken then return nil, message, kind end
-
-  held[owner] = (held[owner] or 0) + 1
-  local counted = true
-  local proxy = {}
-  function proxy.unlock(_self: unknown)
-    if counted then
-      counted = false
-      local remaining = (held[owner] or 0) - 1
-      held[owner] = if remaining > 0 then remaining else nil
-    end
-
-    return taken:unlock()
-  end
-
-  function proxy.held(_self: unknown) return taken:held() end
-
-  function proxy.shared(_self: unknown) return taken:shared() end
-
-  -- The same methods as the host's lock; a table rather than its userdata, which a type cannot say.
-  return (proxy :: unknown) :: dream_fs_Lock, nil, nil
-end
+function vfs.lock(path: string, options: LockOptions?) return current.lock(path, options) end
 
 return vfs

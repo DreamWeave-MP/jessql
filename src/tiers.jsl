@@ -4,10 +4,10 @@
 -- Older input files are never replaced, renamed, retired or deleted.
 local segments = require('@jessql/segments')
 local paged = require('@jessql/paged')
-local fs = require('@jessql/vfs')
+local vfs = require('@jessql/vfs')
 
 export type Options = { fanIn: number?, cachePages: number?, pageBytes: number?,
-  deletePaths: { [number]: string }? }
+  deletePaths: { [number]: string }?, storage: vfs.Backend? }
 export type Metrics = { groups: number, passes: number, maxOpenGenerations: number }
 type Source = { rows: string, deletes: string?, temporary: boolean }
 
@@ -30,16 +30,17 @@ end
 -- A newly inserted row supersedes an older deletion; a remaining deletion
 -- must propagate or rows outside the group could be resurrected later.
 local function mergeDeletions(path: string, rowPath: string, group: { Source }, options: Options?)
+  local fs = vfs.resolve(if options then options.storage else nil)
   local readers: { paged.Snapshot } = {}
   local advances: { () -> paged.Row? } = {}
   local heads: { string? } = {}
-  local snapshot = paged.open(rowPath, { cachePages = 1 })
+  local snapshot = paged.open(rowPath, { cachePages = 1, storage = fs })
   -- Opening or reading a damaged source can fail; release all open readers.
   local ok, failure = pcall(function()
     for index, source in group do
       local deletionPath = source.deletes
       if not deletionPath then continue end
-      local reader = paged.open(deletionPath, { cachePages = 1 })
+      local reader = paged.open(deletionPath, { cachePages = 1, storage = fs })
       readers[#readers + 1] = reader
       local advance = reader:iterateRows({ 'id' })
       advances[index] = advance
@@ -73,7 +74,7 @@ local function mergeDeletions(path: string, rowPath: string, group: { Source }, 
     end
 
     segments.createTombstones(path, rowPath, nextKey,
-      { pageBytes = if options then options.pageBytes else nil })
+      { pageBytes = if options then options.pageBytes else nil, storage = fs })
   end)
 
   for _, reader in readers do reader:close() end
@@ -84,6 +85,7 @@ end
 -- A candidate snapshot and optional deletion sidecar are constructed from a
 -- complete ordered generation list. No durable manifest adoption is implied.
 function tiers.compact(rowsPath: string, deletePath: string?, sources: { string }, options: Options?): Metrics
+  local fs = vfs.resolve(if options then options.storage else nil)
   local fanIn = if options and options.fanIn then options.fanIn else 8
   if type(fanIn) ~= 'number' or fanIn % 1 ~= 0 or fanIn < 2 or fanIn > 8 then
     error('jessql tiers: invalid fanIn', 2)
@@ -175,12 +177,12 @@ function tiers.compact(rowsPath: string, deletePath: string?, sources: { string 
       metrics.maxOpenGenerations = math.max(metrics.maxOpenGenerations, #group)
       segments.compact(destination, paths, { cachePages = if options then options.cachePages else 1,
         pageBytes = if options then options.pageBytes else nil,
-        deletePaths = if hasDeletes then deletePaths else nil })
+        deletePaths = if hasDeletes then deletePaths else nil, storage = fs })
 
       if destination ~= rowsPath then owned[destination] = true else createdRows = true end
 
       if deletions then
-        mergeDeletions(deletions, destination, group, options)
+        mergeDeletions(deletions, destination, group, { pageBytes = if options then options.pageBytes else nil, storage = fs })
         if deletions ~= deletePath then owned[deletions] = true else createdDeletes = true end
       end
     end

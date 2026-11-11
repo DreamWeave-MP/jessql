@@ -274,68 +274,36 @@ suite.describe('storage seam: a backend is never replaced under an open database
     expect(vfs.backend() == vfs.native()).toBe(true)
   end)
 
-  suite.it('refuses to install or restore a backend while a database is open, and allows it once closed', function()
+  suite.it('lets the default be replaced and restored while a database is open, without moving it', function()
     local first, second = memfs.new(), memfs.new()
     local restore = vfs.use(first.backend)
-    expect(vfs.busy()).toBe(0)
     local db = sql.open('/memory/open.wal', { durability = 'sync' })
     db:createTable('events', { 'id' }, 'id')
     db:insert('events', { id = 1 })
-    expect(vfs.busy() > 0).toBe(true)
 
-    -- Either call would leave this database writing to a disk it was not opened on.
-    -- vfs.use raises while the database holds its lock; that refusal is the assertion.
-    local swapped, swapMessage = pcall(vfs.use, second.backend)
-    expect(swapped).toBe(false)
-    expect((string.find(tostring(swapMessage), 'close every database first', 1, true)) ~= nil).toBe(true)
-    -- restore raises for the same reason.
-    expect((pcall(restore))).toBe(false)
-    expect(vfs.backend() == first.backend).toBe(true)
-
-    -- The database is untouched by the refused attempts and still commits to its own disk.
+    -- The database resolved its backend when it was opened. Replacing the default now is allowed,
+    -- and this database goes on committing to the disk it was opened on.
+    local swap = vfs.use(second.backend)
     db:insert('events', { id = 2 })
     db:close()
-    expect(vfs.busy()).toBe(0)
     expect(second.visible()['/memory/open.wal']).toBe(nil)
+    swap()
 
-    restore()
-    expect(vfs.backend() == vfs.native()).toBe(true)
-    local again = vfs.use(first.backend)
     local reopened = sql.open('/memory/open.wal', { durability = 'sync' })
     expect(reopened:query('SELECT COUNT(*) AS n FROM events').rows[1].n).toBe(2)
     reopened:close()
-    again()
-  end)
-
-  suite.it('counts each lock once however often it is released, and per backend', function()
-    local disk = memfs.new()
-    local restore = vfs.use(disk.backend)
-    local one = assert((vfs.lock('/memory/a.lock')))
-    local two = assert((vfs.lock('/memory/b.lock')))
-    expect(vfs.busy()).toBe(2)
-    one:unlock()
-    one:unlock()
-    expect(vfs.busy()).toBe(1)
-    -- A lock that could not be taken is not counted.
-    expect((vfs.lock('/memory/b.lock'))).toBe(nil)
-    expect(vfs.busy()).toBe(1)
-    two:unlock()
-    expect(vfs.busy()).toBe(0)
-    restore()
-    expect(vfs.busy()).toBe(0)
-  end)
-
-  suite.it('lets a simulated crash abandon its locks, and only that', function()
-    local disk = memfs.new()
-    local restore = vfs.use(disk.backend)
-    local db = sql.open('/memory/crashed.wal', { durability = 'sync' })
-    db:createTable('events', { 'id' }, 'id')
-    expect(vfs.busy() > 0).toBe(true)
-    -- The process is gone; nothing will ever close this database.
-    disk.crash()
-    expect(vfs.busy()).toBe(0)
     restore()
     expect(vfs.backend() == vfs.native()).toBe(true)
+  end)
+
+  suite.it('releases a crashed disk\'s locks, so the database on it can be opened again', function()
+    local disk = memfs.new()
+    local db = sql.open('/memory/crashed.wal', { durability = 'sync', storage = disk.backend })
+    db:createTable('events', { 'id' }, 'id')
+    -- The process is gone; nothing will ever close this database.
+    disk.crash()
+    local after = sql.open('/memory/crashed.wal', { durability = 'sync', storage = disk.backend })
+    after:close()
   end)
 end)
 
