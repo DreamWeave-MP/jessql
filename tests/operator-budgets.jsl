@@ -2,6 +2,7 @@
 -- #16, first part: budgets on what a query's operators hold. Nothing spills yet; a query that
 -- would pass a budget stops with an error naming it, and one within its budgets answers exactly
 -- as it does with none.
+local memfs = require('@jessql/memfs')
 local sql = require('@jessql')
 local test = require('@jess/test')
 
@@ -70,6 +71,57 @@ suite.describe('per-operator budgets', function()
     -- One group for an aggregate without GROUP BY.
     db:limits({ groups = 1 })
     expect(db:query('SELECT COUNT(*) AS n FROM orders').rows[1].n).toBe(200)
+  end)
+
+  suite.it('holds for a multi-table managed database, in and out of a transaction and across a flush', function()
+    local disk = memfs.new()
+    local tables: { sql.CatalogTableSpec } = {
+      { tableName = 'orders', columns = { 'id', 'customer' }, primaryKey = 'id' },
+      { tableName = 'lines', columns = { 'id', 'order_id', 'amount' }, primaryKey = 'id' },
+    }
+    local db = sql.catalog.create('/memory/budgeted', { tables = tables, storage = disk.backend, queryLimits = { groups = 5, joinRows = 20 } })
+    db:transaction(function(tx)
+      for order = 1, 12 do
+        tx:insert('orders', { id = order, customer = order % 6 })
+        for line = 1, 2 do tx:insert('lines', { id = order * 10 + line, order_id = order, amount = line }) end
+      end
+    end)
+
+    local grouped = 'SELECT customer, COUNT(*) AS n FROM orders GROUP BY customer'
+    local joined = 'SELECT o.customer, l.amount FROM orders o JOIN lines l ON l.order_id = o.id'
+    -- Six customers against a budget of five groups.
+    expect(refusal((db :: unknown) :: sql.Database, grouped)).toBe('jessql: query exceeds its budget: the groups of an aggregate, 6 rows (limit 5)')
+    -- Twenty-four joined rows against a budget of twenty are answered all the same: a managed
+    -- table is joined by its primary key one row at a time, and a join that holds no rows has
+    -- nothing for the budget to count. What it returns is the caller's, and is not budgeted.
+    expect(#db:query(joined).rows).toBe(24)
+    -- Within budget: answered.
+    expect(#db:query('SELECT customer, COUNT(*) AS n FROM orders WHERE customer < 3 GROUP BY customer').rows).toBe(3)
+
+    -- The same inside a transaction, which reads through a view of its own.
+    local inside = ''
+    db:transaction(function(tx)
+      -- The query raises under the budget; the transaction itself changes nothing and commits.
+      local ok, problem = pcall(function() return tx:query(grouped) end)
+      inside = if ok then 'answered' else tostring(problem)
+    end)
+    expect(inside).toBe('jessql: query exceeds its budget: the groups of an aggregate, 6 rows (limit 5)')
+
+    -- A flush publishes a new generation and a new view: the budget is still there.
+    db:flush()
+    expect(refusal((db :: unknown) :: sql.Database, grouped)).toBe('jessql: query exceeds its budget: the groups of an aggregate, 6 rows (limit 5)')
+    db:close()
+
+    -- Reopened without budgets, the same queries answer; a malformed budget is refused at open.
+    local free = sql.catalog.openExisting('/memory/budgeted', { storage = disk.backend })
+    expect(#free:query(grouped).rows).toBe(6)
+    expect(#free:query(joined).rows).toBe(24)
+    free:close()
+    local malformed: sql.CatalogOptions = { storage = disk.backend, queryLimits = { groups = 0 } }
+    -- Opening with a budget that is not a whole number of rows raises.
+    expect((pcall(sql.catalog.openExisting, '/memory/budgeted', malformed))).toBe(false)
+    -- And the refused open left nothing locked behind it.
+    sql.catalog.openExisting('/memory/budgeted', { storage = disk.backend }):close()
   end)
 
   suite.it('applies to a plan prepared before the budget was set, and refuses budgets that are not', function()

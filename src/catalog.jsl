@@ -42,6 +42,9 @@ export type Options = {
   maxHotRows: number?, maxHotBytes: number?, maxWalBytes: number?, maxGenerations: number?,
   -- The backend the database lives on; without it, the VM default at the time it is opened.
   storage: vfs.Backend?,
+  -- Budgets on what a query's joins and aggregates hold, in rows (`engine.Limits`). They apply
+  -- to every query of the database and of its transactions, across flushes and compactions.
+  queryLimits: engine.Limits?,
   -- Deterministic fault injection for integration tests. Throws at a named stage.
   testHook: ((string) -> ())?,
 }
@@ -215,8 +218,10 @@ end
 -- The read path of every table over one hot reader: the store itself, or a transaction on it.
 local function newView(value: Catalog, colds: { [string]: segments.Snapshot },
   getter: (string, unknown) -> Row?, query: (string, { unknown }?) -> engine.Result,
-  rows: ((string) -> () -> Row?)?): engine.Database
+  rows: ((string) -> () -> Row?)?, limits: engine.Limits?): engine.Database
   local view = engine.new()
+  -- A malformed budget raises here, when the database is opened, and not at the first query.
+  view:limits(limits)
   for _, entry in value.tables do
     local name = entry.tableName
     view:register(name, hybrid.provider(colds[name], nil, name, entry.primaryKey, getter, query, rows, tombstones(name)))
@@ -298,10 +303,19 @@ local function openOverlay(fs: vfs.Backend, base: string, value: Catalog, option
     error('jessql catalog: ' .. tostring(failure), 3)
   end
   local store = hot :: storage.Store
-  local view = newView(value, colds, function(name, key) return store:get(name, key) end,
+  -- A budget that is not one raises as the view is made. The log and the cold readers are open
+  -- by now and are closed before that is reported, so a refused open leaves nothing locked.
+  local viewed, view = pcall(newView, value, colds, function(name, key) return store:get(name, key) end,
     function(sql, params) return store:query(sql, params) end,
-    function(name: string) return store:iterateRows(name) end)
-  return { store = store, colds = colds, view = view, wal = wal }
+    function(name: string) return store:iterateRows(name) end, if options then options.queryLimits else nil)
+  if not viewed then
+    -- Closing can raise as well; the refusal already being reported is the one that matters.
+    pcall(function() store:close() end)
+    closeAll(colds)
+    error('jessql catalog: ' .. tostring(view), 3)
+  end
+
+  return { store = store, colds = colds, view = view :: engine.Database, wal = wal }
 end
 
 local function closeOverlay(overlay: Overlay)
@@ -630,7 +644,7 @@ local function openCatalog(path: string, options: Options?, intent: string): Dat
         local view = txView
         if not view then
           view = newView(active, overlay.colds, function(name, key) return tx:get(name, key) end,
-            function(text, values) return tx:query(text, values) end, nil)
+            function(text, values) return tx:query(text, values) end, nil, if options then options.queryLimits else nil)
           txView = view
         end
         local plan = plans[sql]
