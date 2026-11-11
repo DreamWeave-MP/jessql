@@ -330,6 +330,10 @@ export type SupervisorOptions = {
   -- unknown (default 3, at most 100).
   maxRestarts: number?,
   openSeconds: number?,
+  -- The least time between one replacement and the next: this many seconds after the first,
+  -- doubling each time, up to 30 (default 1; 0 for none). The first replacement is immediate.
+  -- A worker that dies as soon as it is started is then not started in a tight loop.
+  restartBackoffSeconds: number?,
 }
 export type Supervisor = {
   submit: (self: Supervisor, request: writer.Request) -> Admission,
@@ -364,6 +368,14 @@ function service.supervisor(spawn: () -> Lane, options: SupervisorOptions): Supe
   local stopped, reason = false, nil :: string?
   local client: Client? = nil
   local self = {} :: Supervisor
+  local backoff = if options.restartBackoffSeconds ~= nil then options.restartBackoffSeconds else 1
+  if typeof(backoff) ~= 'number' or backoff ~= backoff or backoff < 0 or backoff > 3600 then
+    error('jessql writer service: invalid restartBackoffSeconds', 2)
+  end
+
+  local clock = (options.client and options.client.now) or os.clock
+  -- No replacement before this time.
+  local notBefore = 0
 
   local function start(): (boolean, string?)
     -- Starting a worker can raise (no capability, no domain); that is an answer.
@@ -404,6 +416,7 @@ function service.supervisor(spawn: () -> Lane, options: SupervisorOptions): Supe
     if restarts >= maxRestarts then return 'the worker was replaced as often as allowed' end
 
     restarts += 1
+    notBefore = clock() + math.min(30, backoff * 2 ^ (restarts - 1))
     local started, problem = start()
     if not started then return problem end
 
@@ -461,6 +474,10 @@ function service.supervisor(spawn: () -> Lane, options: SupervisorOptions): Supe
         settle(ack.id)
       end
     end
+
+    -- Too soon after the last replacement: the requests stay held, and this is looked at
+    -- again at the next poll. Nothing is admitted meanwhile.
+    if (lost or current:status().stopped) and restarts < maxRestarts and clock() < notBefore then return acks end
 
     if lost or current:status().stopped then
       local problem = replace()
