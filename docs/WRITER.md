@@ -57,10 +57,45 @@ What it shows:
 
 One run; the max column is the device's outliers. No uncertainty is claimed.
 
+## In a worker, under real concurrency
+
+`bench/writer-worker` is a small application package (a worker needs a script domain, which
+`jess run` and a package's tests do not have). The database and the writer live in a worker;
+the application sends requests by the clock at a set rate, whatever the worker is doing, and
+keeps one `flush` outstanding at a time. The protocol is four messages: `open`, `submit` (which
+answers only a refusal), `flush` (which drains once and answers every outcome) and `close`.
+
+20,000 requests at each rate, 256-byte body, btrfs, one machine, one run, 2026-11-11:
+
+| Arrivals/s | Committed | Refused | Log syncs | Syncs a commit | p50 ms | p99 ms | max ms | Commits/s |
+|---|---|---|---|---|---|---|---|---|
+| 500 | 20,000 | 0 | 19,830 | 0.9915 | 0.90 | 3.28 | 22.4 | 500 |
+| 2,000 | 20,000 | 0 | 10,468 | 0.5234 | 0.92 | 9.22 | 39.7 | 2,000 |
+| 8,000 | 20,000 | 0 | 1,301 | 0.0650 | 1.87 | 17.58 | 22.4 | 7,979 |
+| 32,000 | 12,592 | 7,408 | 53 | 0.0042 | 35.00 | 43.49 | 44.9 | 19,329 |
+
+- **Coalescing is real and nobody asks for it**: what arrives while the log is being
+  synchronized is committed behind the next synchronization. At 8,000 arrivals a second that is
+  15 requests a synchronization; p50 stays under 2 ms.
+- **Past what the disk takes** (about 19,000 commits a second here) the sender's bound refuses
+  the rest at once and latency stays bounded by that bound: p99 43 ms. The worker's mailbox
+  holds 1,024 messages and raises on one more, so the application bounds what is unanswered at
+  768 and refuses beyond it; the writer's own `queue-full` is never reached in this arrangement.
+- **p99 at light load is worse than a plain commit's** (3.3 ms against 1.4 ms): a request waits
+  for the application's next look at the worker, up to a millisecond, and for a flush already
+  in flight.
+
+**A worker that dies.** In a last run the worker is made to fail under load at 8,000 arrivals a
+second. The application then opens the database itself: 6,673 requests had been acknowledged
+as committed and **all 6,673 were present**, none missing. No row was present that had not been
+acknowledged, in this run: the death here falls just after an acknowledgement, which is the
+easy moment. A death between the synchronization and the reply is not forced by this tool.
+
 ## Not there
 
-- **A worker.** Nothing here runs concurrently; admission while a synchronization is in flight
-  is modelled, not measured.
+- A worker **as a library**: the worker's source and its protocol are in the benchmark
+  application, not in `@jessql`. Shutdown is `close`; there is no timeout on an unanswered
+  flush, and no restart of a worker that died.
 - Death of a worker between the synchronization and its reply: the caller reconciles by id (a
   row keyed by the request's id in the same request makes a retry a duplicate-key rejection).
   A durable idempotency ledger is #33.

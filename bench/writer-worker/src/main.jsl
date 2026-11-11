@@ -1,0 +1,213 @@
+--!strict
+-- #32: the bounded writer inside a real worker. The database and `@jessql/writer` live in a
+-- second Luau state; this one only sends requests and reads answers. Requests arrive by the
+-- clock at a set rate whatever the worker is doing, so what piles up while the log is being
+-- synchronized is real, and so is what one synchronization then covers.
+--
+-- The protocol is the loop the writer's own comment describes: `submit` admits one request and
+-- answers only if it is refused; `flush` drains once and answers every outcome. This side keeps
+-- one flush outstanding at a time. `die` makes the worker fail where it stands, for the last
+-- part: the database is then opened here and every request that was acknowledged as committed
+-- must be in it.
+--
+--   jess package run --package /absolute/path/to/jessql --capability worker.spawn \
+--     --capability filesystem.read --capability filesystem.write bench/writer-worker \
+--     -- /absolute/empty/directory [requests=4000] [bodyBytes=256]
+local application = require('@jess/application')
+local fs = require('@dream/fs')
+local net = require('@jess/net')
+local sql = require('@jessql')
+local workers = require('@jess/worker')
+
+local directory, requestsText, bodyText = ...
+local requests = math.clamp(math.floor(tonumber(requestsText) or 4000), 200, 200000)
+local bodyBytes = math.clamp(math.floor(tonumber(bodyText) or 256), 1, 65536)
+if type(directory) ~= 'string' or string.sub(directory, 1, 1) ~= '/' then
+  print('usage: writer-worker -- <absolute empty directory> [requests] [bodyBytes]')
+  application.exit(2)
+  return
+end
+
+local listed = fs.list(directory)
+if not listed or #listed ~= 0 then
+  print('the directory must exist and be empty')
+  application.exit(2)
+  return
+end
+
+local WorkerSource = [==[
+local meter = require('@jessql/meter')
+local sql = require('@jessql')
+local vfs = require('@jessql/vfs')
+local writer = require('@jessql/writer')
+
+local db, actor, metered
+
+return function(message)
+  if message.kind == 'submit' then
+    local admission = actor:submit(message.request)
+    if admission.admitted then return nil end
+    return { kind = 'refused', id = message.request.id, reason = admission.reason }
+  elseif message.kind == 'flush' then
+    return { kind = 'acks', acks = actor:drain(), queued = actor:status().queued }
+  elseif message.kind == 'open' then
+    metered = meter.wrap(vfs.native())
+    db = sql.catalog.create(message.path, { storage = metered.backend, tables = {
+      { tableName = 'events', columns = { 'id', 'body' }, primaryKey = 'id' },
+      { tableName = 'counters', columns = { 'id', 'value' }, primaryKey = 'id' },
+    } })
+    actor = writer.new(db, { maxBatch = 256, maxQueued = 1024 })
+    metered.reset()
+    return { kind = 'opened' }
+  elseif message.kind == 'close' then
+    local rest = actor:stop('closing')
+    local status = actor:status()
+    local syncs = metered.counters().classes.wal.syncs
+    db:close()
+    return { kind = 'closed', rest = rest, syncs = syncs, batches = status.batches, committed = status.committed }
+  elseif message.kind == 'die' then
+    error('the worker was told to die', 0)
+  end
+
+  return { kind = 'unknown-message' }
+end
+]==]
+
+local body = string.rep('x', bodyBytes)
+local MaxOutstanding = 768
+
+local function percentile(sorted: { number }, fraction: number): number
+  return sorted[math.max(1, math.ceil(#sorted * fraction))]
+end
+
+type Reply = { kind: string, id: string?, reason: string?, acks: { { id: string, outcome: string, error: string? } }?, queued: number?,
+  rest: { { id: string, outcome: string } }?, syncs: number?, batches: number?, committed: number? }
+type Run = { committed: { [string]: boolean }, count: number, refused: number, latencies: { number }, wallMs: number, sent: number }
+
+local function request(number: number): { [string]: unknown }
+  return { id = `r{number}`, operations = {
+    { op = 'insert', table = 'events', row = { id = number, body = body } },
+    { op = 'upsert', table = 'counters', row = { id = 'total', value = number } },
+  } }
+end
+
+local function open(name: string): Worker
+  local lane = workers.spawn { name = name, source = WorkerSource, capabilities = { 'filesystem.read', 'filesystem.write' } }
+  lane:send({ kind = 'open', path = `{directory}/{name}` })
+  local opened = lane:receive(30) :: Reply?
+  if not opened or opened.kind ~= 'opened' then error(`the worker did not open its database: {if opened then opened.kind else 'no answer'}`, 0) end
+  return lane
+end
+
+-- Sends `count` requests at `rate` a second by the clock, one flush outstanding at a time, until
+-- every request sent is answered or, with `dieAfter`, until that many are committed and the
+-- worker has been told to die.
+local function load(lane: Worker, count: number, rate: number, dieAfter: number?): Run
+  local run: Run = { committed = {}, count = 0, refused = 0, latencies = {}, wallMs = 0, sent = 0 }
+  local submitted: { [string]: number } = {}
+  local outstanding, flushing = 0, false
+  local began = net.now()
+  while run.sent < count or outstanding > 0 do
+    local now = net.now()
+    local due = math.min(count, math.floor((now - began) * rate / 1000) + 1)
+    while run.sent < due do
+      run.sent += 1
+      -- The worker's mailbox holds 1,024 messages and refuses one more by raising. What is
+      -- unanswered is bounded here, below that, and a request past the bound is refused at
+      -- once: the same backpressure the writer's own queue gives, one step earlier.
+      if outstanding >= MaxOutstanding then
+        run.refused += 1
+        continue
+      end
+
+      local message = request(run.sent)
+      submitted[`r{run.sent}`] = net.now()
+      lane:send({ kind = 'submit', request = message })
+      outstanding += 1
+    end
+
+    if not flushing and outstanding > 0 then
+      lane:send({ kind = 'flush' })
+      flushing = true
+    end
+
+    local reply = lane:receive(0.001) :: Reply?
+    if not reply then continue end
+
+    if reply.kind == 'refused' then
+      run.refused += 1
+      outstanding -= 1
+      submitted[reply.id :: string] = nil
+    elseif reply.kind == 'acks' then
+      flushing = false
+      local at = net.now()
+      for _, ack in reply.acks or {} do
+        if ack.outcome ~= 'committed' then error(`request {ack.id} was {ack.outcome}: {tostring(ack.error)}`, 0) end
+
+        table.insert(run.latencies, at - submitted[ack.id])
+        submitted[ack.id] = nil
+        run.committed[ack.id] = true
+        run.count += 1
+        outstanding -= 1
+      end
+
+      if dieAfter and run.count >= dieAfter then
+        lane:send({ kind = 'die' })
+        break
+      end
+    end
+  end
+
+  run.wallMs = net.now() - began
+  return run
+end
+
+print(`requests={requests} bodyBytes={bodyBytes} clock=monotonic-ms durability=sync; the writer runs in a worker`)
+print('arrivals_per_second,sent,committed,refused,log_syncs,syncs_per_commit,batches,p50_ms,p99_ms,max_ms,commits_per_second')
+for _, rate in { 500, 2000, 8000, 32000 } do
+  local name = `rate-{rate}`
+  local lane = open(name)
+  local run = load(lane, requests, rate, nil)
+  lane:send({ kind = 'close' })
+  local closed = lane:receive(60) :: Reply?
+  lane:join(60)
+  if not closed or closed.kind ~= 'closed' then error('the worker did not close its database', 0) end
+
+  table.sort(run.latencies)
+  local samples = run.latencies
+  print(string.format('%d,%d,%d,%d,%d,%.4f,%d,%.3f,%.3f,%.3f,%.0f', rate, run.sent, run.count, run.refused, closed.syncs or 0,
+    if run.count > 0 then (closed.syncs or 0) / run.count else 0, closed.batches or 0,
+    if #samples > 0 then percentile(samples, 0.5) else 0, if #samples > 0 then percentile(samples, 0.99) else 0,
+    if #samples > 0 then samples[#samples] else 0, run.count / (run.wallMs / 1000)))
+  if run.count + run.refused ~= run.sent then error('a request was neither committed nor refused', 0) end
+
+  -- Opened here, after the worker is gone: what it acknowledged is what is there.
+  local db = sql.catalog.openExisting(`{directory}/{name}`)
+  local counted = db:query('SELECT COUNT(*) AS n FROM events').rows[1].n
+  db:close()
+  if counted ~= run.count then error(`{run.count} were acknowledged and {tostring(counted)} are in the database`, 0) end
+end
+
+-- A worker that dies under load: everything it acknowledged must have survived it.
+do
+  local name = 'died'
+  local lane = open(name)
+  local run = load(lane, requests, 8000, math.floor(requests / 3))
+  -- The worker has failed; nothing more is read from it. Its lock goes with its state.
+  pcall(function() lane:join(10) end)
+  local db = sql.catalog.openExisting(`{directory}/{name}`)
+  local present = 0
+  local missing = 0
+  for id in run.committed do
+    local number = tonumber(string.sub(id, 2))
+    local found = db:query(`SELECT id FROM events WHERE id = {number}`).rows
+    if #found == 1 then present += 1 else missing += 1 end
+  end
+
+  local counted = db:query('SELECT COUNT(*) AS n FROM events').rows[1].n :: number
+  db:close()
+  print(`worker died after {run.count} acknowledgements of {run.sent} sent: {present} of them present on reopen, {missing} missing; {counted - present} more rows are there that were never acknowledged`)
+  if missing > 0 then error('an acknowledged request did not survive the worker', 0) end
+end
+
+application.exit(0)
