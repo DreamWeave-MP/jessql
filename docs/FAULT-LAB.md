@@ -74,3 +74,27 @@ acknowledgment before a sync (`acknowledged-lost`), a commit made durable in two
 - **Commits are inserts of distinct rows.** Updates and deletions are in the prepared state of
   other suites, not in the oracle.
 - Compaction scratch names are random, so two runs of that scenario are equivalent, not identical.
+
+## A disk that fills and stays full
+
+The laboratory above fails one step. A full disk fails every write until space comes back, which
+is a different thing to survive. `memfs` models it: `disk.capacity(bytes)` bounds what the files
+hold in all, a write that would pass it fails with `no space left on device` and writes nothing,
+and removing a file gives its bytes back. `tests/disk-full.jsl` then checks, on the managed store:
+
+- a commit that did not fit is not acknowledged, the next one is refused too, what was
+  acknowledged before survives a crash with the disk still full, and commits work again with room;
+- a flush, a checkpoint and a selective compaction that run out of room publish no generation
+  (the epoch is unchanged), leave no scratch or temporary file behind after reopening, lose
+  nothing, and go through once there is room;
+- with a hot-row budget and no room to flush, later commits are refused and
+  `maintenanceStatus().lastError` says why;
+- a backup onto a disk without room publishes no manifest and leaves the source byte for byte
+  as it was;
+- **a sweep of capacities** from 400 bytes to past what the whole workload needs, in steps of
+  257: after a crash and with the limit lifted, every acknowledged commit is whole, every
+  unacknowledged one is whole or absent, and the offline scan passes.
+
+Limits of the model: capacity counts file bytes only (no directory or metadata overhead, no
+reserved blocks), bytes a writer has buffered are counted for that writer but not across
+writers, and nothing here measures resident memory.

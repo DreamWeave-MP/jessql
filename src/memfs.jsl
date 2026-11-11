@@ -43,6 +43,11 @@ export type Disk = {
   -- The bytes visible now, and the bytes a crash would leave, by path. For assertions.
   visible: () -> { [string]: string },
   surviving: () -> { [string]: string },
+  -- A full disk. `capacity(bytes)` sets how many bytes the files may hold in all (nil: no limit);
+  -- a write that would pass it fails with "no space left on device" and writes nothing. Removing
+  -- a file gives its bytes back. `used()` is what the files hold now.
+  capacity: (bytes: number?) -> (),
+  used: () -> number,
 }
 
 export type Options = { cwd: string? }
@@ -80,6 +85,21 @@ function memfs.new(options: Options?): Disk
   local injector: Injector? = nil
   -- Bumped by a crash: a handle opened before it belongs to a process that is gone.
   local generation = 0
+  local limit: number? = nil
+
+  local function used(): number
+    local total = 0
+    for _, node in names do
+      if node.kind == 'file' then total += #node.data end
+    end
+
+    return total
+  end
+
+  -- Whether `more` bytes on top of what the files hold would pass the limit.
+  local function full(more: number): boolean
+    return limit ~= nil and used() + more > limit
+  end
 
   local function resolve(path: string): string
     local absolute = if string.sub(path, 1, 1) == '/' then path else `{cwd}/{path}`
@@ -355,6 +375,10 @@ function memfs.new(options: Options?): Disk
     if settings.createParents then makeParents(resolved) end
     if parentMissing(resolved) then return nil, `{path}: parent not found`, 'notFound' end
 
+    -- A replaced file gives its own bytes back first; an append or a write at an offset adds.
+    local returned = if node and not settings.append and not settings.offset then #node.data else 0
+    if full(#text - returned) then return nil, 'no space left on device', 'other' end
+
     local file: Inode = if node then node else { kind = 'file', data = '', durable = '' }
     if settings.append then
       file.data ..= text
@@ -380,6 +404,8 @@ function memfs.new(options: Options?): Disk
     if parentMissing(resolved) then return nil, `{path}: parent not found`, 'notFound' end
 
     local text = bytesOf(data)
+    if full(#text) then return nil, 'no space left on device', 'other' end
+
     local file: Inode = { kind = 'file', data = text, durable = text }
     -- The one call that makes both the bytes and the name survive.
     names[resolved] = file
@@ -450,6 +476,12 @@ function memfs.new(options: Options?): Disk
       local refused, refusedKind = refuse('write')
       if refused then return nil, refused, refusedKind end
       local text = bytesOf(data, offset, length)
+      -- Counted when accepted, with what this writer already holds unwritten.
+      local waiting = 0
+      for _, write in pending do waiting += #write.text end
+
+      if full(waiting + #text) then return nil, 'no space left on device', 'other' end
+
       table.insert(pending, { at = if append then nil else position, text = text })
       position += #text
       return #text, nil, nil
@@ -607,6 +639,8 @@ function memfs.new(options: Options?): Disk
     steps = function(): { string } return table.clone(log) end,
     visible = function(): { [string]: string } return contents(names, false) end,
     surviving = function(): { [string]: string } return contents(durableNames, true) end,
+    capacity = function(bytes: number?) limit = bytes end,
+    used = used,
   }
 end
 
