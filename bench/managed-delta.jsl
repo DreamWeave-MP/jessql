@@ -21,7 +21,7 @@ local function clear()
 
   for epoch = 1, 9 do
     local stem = base .. string.format('.g%08d', epoch)
-    for _, suffix in { '.rows', '.deleted', '.wal', '.wal.lock' } do
+    for _, suffix in { '.rows', '.deleted', '.wal', '.wal.lock', '.wal.committed' } do
       fs.remove(stem .. suffix)
     end
   end

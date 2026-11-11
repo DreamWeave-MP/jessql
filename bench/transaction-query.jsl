@@ -7,6 +7,7 @@ local fs = require('@dream/fs')
 local path = fs.join(assert((fs.cwd())), '.jessql-transaction-query-bench.wal')
 fs.remove(path)
 fs.remove(path .. '.lock')
+fs.remove(path .. '.committed')
 
 local db = sql.open(path)
 db:createTable('records', { 'id', 'bucket', 'payload' }, 'id')
@@ -48,3 +49,4 @@ print(string.format('rows=%d queries=%d cached=%.6f s unique_sql=%.6f s ratio=%.
 db:close()
 fs.remove(path)
 fs.remove(path .. '.lock')
+fs.remove(path .. '.committed')

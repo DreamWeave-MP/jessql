@@ -23,6 +23,7 @@ if mode == 'prepare' then
   fs.remove(sidecar)
   fs.remove(wal)
   fs.remove(wal .. '.lock')
+  fs.remove(wal .. '.committed')
   local cursor = 0
   local start = os.clock()
   sql.paged.create(cold, { 'id', 'room', 'stream', 'body' }, 'id', function()

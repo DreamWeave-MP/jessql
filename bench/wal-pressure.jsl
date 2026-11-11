@@ -13,7 +13,7 @@ for _, extension in { '.jql-manifest', '.jql-manifest.tmp', '.jql-lock' } do fs.
 
 for epoch = 1, 6 do
   local prefix = base .. string.format('.g%08d', epoch)
-  for _, extension in { '.rows', '.deleted', '.wal', '.wal.lock' } do fs.remove(prefix .. extension) end
+  for _, extension in { '.rows', '.deleted', '.wal', '.wal.lock', '.wal.committed' } do fs.remove(prefix .. extension) end
 end
 
 local db = sql.managed.open(base, {
@@ -34,5 +34,5 @@ for _, extension in { '.jql-manifest', '.jql-manifest.tmp', '.jql-lock' } do fs.
 
 for epoch = 1, 6 do
   local prefix = base .. string.format('.g%08d', epoch)
-  for _, extension in { '.rows', '.deleted', '.wal', '.wal.lock' } do fs.remove(prefix .. extension) end
+  for _, extension in { '.rows', '.deleted', '.wal', '.wal.lock', '.wal.committed' } do fs.remove(prefix .. extension) end
 end

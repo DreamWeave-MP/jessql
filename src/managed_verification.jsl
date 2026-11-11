@@ -9,6 +9,7 @@ local paged = require('@jessql/paged')
 local segments = require('@jessql/segments')
 local manifest = require('@jessql/managed_manifest')
 local storage = require('@jessql/storage')
+local walmark = require('@jessql/walmark')
 
 export type Issue = { code: string, stage: string, message: string, recovery: string }
 type Failure = { code: string, message: string }
@@ -173,6 +174,13 @@ local function wal(fs: vfs.Backend, base: string, value: manifest.Manifest, iden
       offset += HeaderBytes + length
       report.walFrames += 1
     end
+    -- A log that ends cleanly on a frame can still be short: cut at a boundary, or an older copy.
+    -- Its committed-length mark is the witness.
+    local committed = walmark.read(fs, path)
+    if committed and (committed.length > offset or committed.sequence > sequence) then
+      defect('WAL_SHORTER_THAN_COMMITTED', `WAL holds {sequence} transactions in {offset} bytes; {committed.sequence} in {committed.length} were committed`)
+    end
+
     report.walFramesChecked = true
     if not bound then defect('WAL_IDENTITY_MISSING', 'WAL snapshot binding absent') end
     report.walIdentityChecked = true

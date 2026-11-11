@@ -26,8 +26,10 @@ if mode == 'prepare' then
   fs.remove(snapshotPath)
   fs.remove(hotPath)
   fs.remove(hotPath .. '.lock')
+  fs.remove(hotPath .. '.committed')
   fs.remove(residentPath)
   fs.remove(residentPath .. '.lock')
+  fs.remove(residentPath .. '.committed')
   local cursor = 0
   local start = os.clock()
   sql.paged.create(snapshotPath, { 'id', 'room', 'body' }, 'id', function()

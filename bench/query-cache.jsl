@@ -7,6 +7,7 @@ local probes = tonumber((...)) or 3000
 local path = fs.join(assert((fs.cwd())), '.jessql-query-cache-bench.wal')
 fs.remove(path)
 fs.remove(path .. '.lock')
+fs.remove(path .. '.committed')
 local db = sql.open(path)
 db:createTable('records', { 'id', 'value' }, 'id')
 db:transaction(function(tx)
@@ -35,3 +36,4 @@ print(string.format('probes=%d checksum=%d uncached_s=%.5f cached_s=%.5f speedup
   probes, optimized, uncached, cached, uncached / cached))
 fs.remove(path)
 fs.remove(path .. '.lock')
+fs.remove(path .. '.committed')

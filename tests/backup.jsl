@@ -13,7 +13,7 @@ end
 local function cleanup(base: string)
   for epoch = 1, 16 do
     local prefix = base .. string.format('.g%08d', epoch)
-    for _, suffix in { '.rows', '.deleted', '.wal', '.wal.lock', '.hot-rows', '.hot-deleted' } do
+    for _, suffix in { '.rows', '.deleted', '.wal', '.wal.lock', '.wal.committed', '.hot-rows', '.hot-deleted' } do
       fs.remove(prefix .. suffix)
     end
   end

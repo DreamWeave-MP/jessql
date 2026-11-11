@@ -4,6 +4,7 @@
 -- Records are length-delimited and CRC-protected; one record contains one transaction.
 -- A torn trailing record is discarded. A corrupt complete record fails closed.
 local vfs = require('@jessql/vfs')
+local walmark = require('@jessql/walmark')
 local bytes = require('@dream/bytes')
 local json = require('@jess/json')
 local queryEngine = require('@jessql/engine')
@@ -118,6 +119,9 @@ type DatabaseState = {
   trackPayloadBytes: boolean,
   durability: string,
   walWriter: dream_fs_Writer?,
+  -- The log's committed-length mark, and how long the log is now. See `@jessql/walmark`.
+  mark: walmark.Writer?,
+  walLength: number,
 }
 
 local Magic = 'JQLW1\n'
@@ -1577,6 +1581,14 @@ local function load(state: DatabaseState, recoverTail: boolean)
     offset += HeaderBytes + length
   end
   reader:close()
+  -- The other witness to where the log ends. A log shorter than its mark did not get that way
+  -- by a crash: it was damaged or replaced, and is refused before anything is truncated.
+  local committed = walmark.read(state.fs, state.path)
+  if committed and (committed.length > offset or committed.sequence > state.sequence) then
+    error(`jessql storage: the log holds {state.sequence} transactions in {offset} bytes, fewer than the {committed.sequence} in {committed.length} bytes it was recorded to hold: it was damaged or replaced by an older copy (remove {walmark.path(state.path)} only to accept that loss)`, 2)
+  end
+
+  state.walLength = offset
   if offset ~= size then
     if not recoverTail then error('jessql storage: incomplete trailing transaction', 2) end
     local writer, err = state.fs.openWrite(state.path, { create = false, truncate = false })
@@ -1607,6 +1619,8 @@ local function write(state: DatabaseState, ops: { Operation }, deferSync: boolea
     error('jessql storage: append failed (reopen required): ' .. tostring(err), 2)
   end
 
+  state.walLength += #record
+
   if state.durability == 'sync' and deferSync ~= true then
     local synced, syncError = (state.walWriter :: dream_fs_Writer):syncData()
     if not synced then
@@ -1622,6 +1636,8 @@ local function write(state: DatabaseState, ops: { Operation }, deferSync: boolea
     error('jessql storage: post-append apply failed (reopen required): ' .. tostring(applyError), 2)
   end
   state.sequence += 1
+  -- Only once this transaction is synchronized is it recorded as committed.
+  if state.mark and deferSync ~= true then state.mark.record(state.sequence, state.walLength) end
 end
 
 local storage = {}
@@ -1664,7 +1680,7 @@ function storage.open(path: string, options: Options?): Store
     path = path, fs = fs, lock = lock, engine = queryEngine.new(), tables = {}, sequence = 0, schemaVersion = 0,
     maxFrameBytes = max or DefaultMaxFrame, closed = false, busy = false, poisoned = false,
     rowLayout = rowLayout or 'row', trackPayloadBytes = options ~= nil and options.trackPayloadBytes == true,
-    durability = durability, walWriter = nil,
+    durability = durability, walWriter = nil, mark = nil, walLength = 0,
   }
 
   -- Opening can fail on invalid frames; release the advisory lock on failure.
@@ -1678,6 +1694,8 @@ function storage.open(path: string, options: Options?): Store
       end
 
       if count ~= #Magic then error('jessql storage: ' .. tostring(writeError)) end
+      -- A new log: a mark left by an earlier log of this name says nothing about it.
+      walmark.forget(fs, path)
     end
 
     if durability == 'sync' then
@@ -1699,6 +1717,14 @@ function storage.open(path: string, options: Options?): Store
       local writer, openError = fs.openWrite(path, { append = true, create = false })
       if not writer then error('jessql storage: sync writer: ' .. tostring(openError)) end
       state.walWriter = writer
+      state.mark = walmark.open(fs, path)
+      -- A mark that is there and cannot be written would go stale the moment the log is
+      -- shortened, and a stale mark makes a sound log look damaged. Better not to open at all.
+      if not state.mark and fs.exists(walmark.path(path)) then
+        writer:close()
+        state.walWriter = nil
+        error('jessql storage: the committed-length mark could not be opened for writing')
+      end
     end
   end)
 
@@ -1808,6 +1834,8 @@ function storage.open(path: string, options: Options?): Store
         end
 
         if batchTestHook then batchTestHook('after-sync') end
+        -- The whole batch is synchronized: it is recorded as committed in one mark.
+        if state.mark then state.mark.record(state.sequence, state.walLength) end
       end
       return results
     end)
@@ -2081,9 +2109,13 @@ function storage.open(path: string, options: Options?): Store
     local estimate = 0
     local maximum = state.maxFrameBytes
 
+    local compacted = 0
+
     local function writeBytes(contents: string)
       local count, err = writer:write(contents)
       if count ~= #contents then error('jessql storage: checkpoint write: ' .. tostring(err), 2) end
+
+      compacted += #contents
     end
 
     local function flushBatch()
@@ -2154,6 +2186,13 @@ function storage.open(path: string, options: Options?): Store
       -- not known. Both hold exactly the committed rows, so either is correct; but a commit
       -- appended now could be lost with the name. Any failure in this window therefore poisons
       -- the store: it must be closed and opened again, and opening re-fences the name.
+      -- The mark still describes the longer log. It is withdrawn, durably, before the shorter
+      -- log can take the name: a crash must never find a sound log shorter than its mark.
+      if state.mark and not state.mark.reset() then
+        fs.remove(temp)
+        error('jessql storage: checkpoint could not withdraw the committed-length mark', 2)
+      end
+
       local replaced, replaceError = fs.replace(temp, state.path)
       if not replaced then
         state.poisoned = true
@@ -2179,6 +2218,9 @@ function storage.open(path: string, options: Options?): Store
 
       state.walWriter = appender
     else
+      -- An unsynchronized store keeps no mark, but one left by a synchronized use of this log
+      -- would describe the longer log that is about to be replaced.
+      walmark.forget(fs, state.path)
       local renamed, renameError = fs.rename(temp, state.path)
       if not renamed then
         state.poisoned = true
@@ -2186,6 +2228,10 @@ function storage.open(path: string, options: Options?): Store
       end
     end
     state.sequence = sequence
+    if durable then
+      state.walLength = compacted
+      if state.mark then state.mark.record(state.sequence, state.walLength) end
+    end
 
     -- Discard dead key slots and stale secondary postings after compaction.
     for _, current in state.tables do
@@ -2242,6 +2288,14 @@ function storage.open(path: string, options: Options?): Store
       closed, closeError = state.walWriter:close()
       state.walWriter = nil
     end
+
+    if state.mark then
+      -- Closing makes durable what the commits of this session recorded, and records nothing of
+      -- its own: a log that was only opened and closed has not been vouched for by anyone.
+      state.mark.close()
+      state.mark = nil
+    end
+
     state.lock:unlock()
     if not closed then error('jessql storage: close: ' .. tostring(closeError), 2) end
   end
@@ -2265,7 +2319,7 @@ function storage.verifyReplay(path: string, backend: vfs.Backend?): number
     path = path, fs = fs, lock = lock, engine = queryEngine.new(), tables = {},
     sequence = 0, schemaVersion = 0, maxFrameBytes = DefaultMaxFrame,
     closed = false, busy = false, poisoned = false, rowLayout = 'row',
-    trackPayloadBytes = false, durability = 'buffered', walWriter = nil,
+    trackPayloadBytes = false, durability = 'buffered', walWriter = nil, mark = nil, walLength = 0,
   }
   -- recoverTail=false prohibits the only write-capable branch in load().
   local ok, failure = pcall(function() load(state, false) end)

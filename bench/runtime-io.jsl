@@ -49,6 +49,7 @@ if task == 'wal' then
   local wal = path .. '.wal'
   fs.remove(wal)
   fs.remove(wal .. '.lock')
+  fs.remove(wal .. '.committed')
   local db = sql.open(wal, { durability = option })
   db:createTable('t', { 'id', 'payload' }, 'id')
   local batch = repetitions
@@ -72,6 +73,7 @@ if task == 'wal' then
     'rss_kib', rss())
   fs.remove(wal)
   fs.remove(wal .. '.lock')
+  fs.remove(wal .. '.committed')
   return
 end
 

@@ -10,6 +10,7 @@ local function fixture(name: string): (string, string)
   fs.remove(base .. '.cold')
   fs.remove(base .. '.wal')
   fs.remove(base .. '.wal.lock')
+  fs.remove(base .. '.wal.committed')
   return base .. '.cold', base .. '.wal'
 end
 
@@ -17,6 +18,7 @@ local function clear(cold: string, wal: string)
   fs.remove(cold)
   fs.remove(wal)
   fs.remove(wal .. '.lock')
+  fs.remove(wal .. '.committed')
 end
 
 local function snapshot(path: string, count: number)
@@ -169,12 +171,14 @@ suite.describe('hybrid WAL overlay with immutable cold pages', function()
     local freshWal = wal .. '.new'
     fs.remove(freshWal)
     fs.remove(freshWal .. '.lock')
+    fs.remove(freshWal .. '.committed')
     local fresh = sql.hybrid.open(freshWal, exported, 'events')
     expect(fresh:query('SELECT COUNT(*) AS n FROM events').rows[1].n).toBe(50)
     expect(assert(fresh:get(9)).body).toBe('changed')
     fresh:close()
     fs.remove(freshWal)
     fs.remove(freshWal .. '.lock')
+    fs.remove(freshWal .. '.committed')
     fs.remove(exported)
     clear(cold, wal)
   end)

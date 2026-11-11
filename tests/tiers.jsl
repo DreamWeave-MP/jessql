@@ -14,7 +14,7 @@ local function cleanup(base: string, count: number)
     fs.remove(base .. '.' .. tostring(index) .. '.deleted')
   end
 
-  for _, ending in { '.out', '.out.deleted', '.old', '.bad', '.new.wal', '.new.wal.lock' } do
+  for _, ending in { '.out', '.out.deleted', '.old', '.bad', '.new.wal', '.new.wal.lock', '.new.wal.committed' } do
     fs.remove(base .. ending)
   end
 end

@@ -6,6 +6,7 @@ local build = require('./fixtures/formats-build')
 local bytes = require('@dream/bytes')
 local formats = require('@jessql/formats')
 local golden = require('./fixtures/formats-v1')
+local marks = require('./fixtures/formats-mark-v1')
 local memfs = require('@jessql/memfs')
 local sql = require('@jessql')
 local test = require('@jess/test')
@@ -14,6 +15,12 @@ local expect = test.expect
 local suite = test.new()
 
 type Row = { [string]: unknown }
+
+-- Every pinned file: what 0.2.0 wrote, and the committed-length mark this code adds beside a log.
+local every: { [string]: string } = {}
+for path, encoded in golden do every[path] = encoded end
+
+for path, encoded in marks do every[path] = encoded end
 
 -- A disk holding the golden files, each made durable as the store would have left it.
 local function restored(change: ((path: string, body: string) -> string)?): memfs.Disk
@@ -40,7 +47,7 @@ end
 suite.describe('the format registry', function()
   suite.it('identifies every golden file, and by the name the store wrote it under', function()
     local seen: { [string]: number } = {}
-    for path, encoded in golden do
+    for path, encoded in every do
       local body = buffer.tostring(assert((bytes.fromBase64(encoded))))
       local format = formats.identify(body)
       expect(`{path} identified={format ~= nil}`).toBe(`{path} identified=true`)
@@ -116,13 +123,13 @@ suite.describe('files written by 0.2.0', function()
 
   suite.it('are what today\'s writers still produce, byte for byte', function()
     local today = build()
-    for path, encoded in golden do
+    for path, encoded in every do
       local body = buffer.tostring(assert((bytes.fromBase64(encoded))))
       -- A difference here is a format change: register a new version and add a fixture for it.
       expect(`{path} {today[path] == body}`).toBe(`{path} true`)
     end
 
-    for path in today do expect(`{path} {golden[path] ~= nil}`).toBe(`{path} true`) end
+    for path in today do expect(`{path} {every[path] ~= nil}`).toBe(`{path} true`) end
   end)
 end)
 

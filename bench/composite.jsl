@@ -11,6 +11,7 @@ local BatchSize = 128
 local path = fs.join(assert((fs.cwd())), '.jessql-composite-bench.wal')
 fs.remove(path)
 fs.remove(path .. '.lock')
+fs.remove(path .. '.committed')
 
 local db = sql.open(path)
 db:createTable('events', { 'id', 'room_id', 'stream_id', 'payload' }, 'id')
@@ -85,3 +86,4 @@ print(string.format('composite_build_s=%.5f', buildTime))
 db:close()
 fs.remove(path)
 fs.remove(path .. '.lock')
+fs.remove(path .. '.committed')

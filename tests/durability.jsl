@@ -9,12 +9,14 @@ local function fixture(name: string): string
   local path = fs.join(fs.cwd() :: string, '.jessql-new-runtime-' .. name .. '.wal')
   fs.remove(path)
   fs.remove(path .. '.lock')
+  fs.remove(path .. '.committed')
   return path
 end
 
 local function clean(path: string)
   fs.remove(path)
   fs.remove(path .. '.lock')
+  fs.remove(path .. '.committed')
 end
 
 suite.describe('synchronized journal', function()

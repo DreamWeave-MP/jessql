@@ -9,6 +9,7 @@ can consult is `@jessql/formats`; this page is the same list with its rules.
 | `rows` | `JQLP2\n` | `.rows`, `.deleted`, legacy secondary indexes, exports | 2 | 2 | `@jessql/paged` |
 | `compact-index` | `JQLS1\n` | a caller-named sidecar (`format = 'compact'`) | 1 | 1 | `@jessql/compactsecondary` |
 | `manifest` | `JQLM1\n` | `<base>.jql-manifest` | record versions 1 and 2 | 1 (one generation), 2 (a list) | `@jessql/managed_manifest` |
+| `log-mark` | `JQLC1\n` | `<log>.committed`, beside a synchronized log | 1 | 1 | `@jessql/walmark` |
 
 Lock files (`.jql-lock`, `.wal.lock`) are empty and carry no format.
 
@@ -63,13 +64,25 @@ with the scan. 400 mutations per file:
 **The immutable formats and the manifest refuse every mutation tried.** No mutation of any file
 produced rows that were never committed.
 
-**The write-ahead log is different, by design, and it is a limit worth knowing.** Nothing else
-commits to where the log ends, so a log that stops short, or whose last frame fails its checksum,
-is what a crash during the last write leaves, and is read as that: the last transaction is
-dropped without a refusal. In 19 of 400 mutations, damage to the tail of the log cost a
-transaction that had been acknowledged. It never produced anything but a state that was once
-committed. Telling a torn last write from later damage would need the log's committed length
-recorded somewhere else; that is not done, and is not proposed here.
+**The write-ahead log, without a mark, is different.** A log that stops short, or whose last frame
+fails its checksum, is what a crash during the last write leaves, and is read as that: in 19 of 400
+mutations of a log with no mark beside it (as 0.2.0 wrote it), damage to the tail cost a
+transaction that had been acknowledged, without a refusal.
+
+**With its committed-length mark, it no longer is.** A synchronized store now records beside the
+log (`<log>.committed`, format `JQLC1`, module `@jessql/walmark`) how long the log was and how many
+transactions it held, after each commit is synchronized. A log found shorter than its mark is
+refused at open, and the offline scan reports `WAL_SHORTER_THAN_COMMITTED`. Over 400 mutations of
+the same log with its mark present, every one is read as the written rows or refused; none is
+read as an earlier state (`tests/wal-committed-length.jsl`).
+
+What the mark promises exactly: it is written only after the log's own synchronization, so a
+crash can never make a sound log look damaged; it is made durable when the store is closed and
+before a checkpoint shortens the log, not with every commit (that would double a commit's cost).
+So after a clean close every commit is covered, and after a crash every commit up to the mark
+that had reached storage. A log restored from an older copy is refused too; removing the mark is
+how that loss is knowingly accepted. A log written before marks existed has none until its next
+commit. A store that is not synchronized keeps none.
 
 Not covered: more than one mutation at a time, mutations chosen by knowledge of the format
 (a valid checksum over changed content), endianness, and candidate formats that do not exist

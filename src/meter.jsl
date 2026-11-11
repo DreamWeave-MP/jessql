@@ -63,6 +63,9 @@ function meter.classify(path: string): Class
   end
 
   if ends(path, '.lock') or ends(path, '.jql-lock') or ends(path, '.owner') then return 'lock' end
+  -- The committed-length mark beside a log: two small slots rewritten in place, so what was
+  -- written to it is not what it holds. Counted with the locks, as bookkeeping and not data.
+  if ends(path, '.committed') then return 'lock' end
   if ends(path, '.wal') then return 'wal' end
   if ends(path, '.rows') then return 'rows' end
   if ends(path, '.deleted') then return 'deleted' end

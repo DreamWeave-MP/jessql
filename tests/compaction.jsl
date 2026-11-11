@@ -14,7 +14,7 @@ local function fixture(name: string): string
 
   for epoch = 1, 32 do
     local suffix = string.format('.g%08d', epoch)
-    for _, ending in { '.rows', '.deleted', '.wal', '.wal.lock', '.hot-rows', '.hot-deleted' } do
+    for _, ending in { '.rows', '.deleted', '.wal', '.wal.lock', '.wal.committed', '.hot-rows', '.hot-deleted' } do
       fs.remove(base .. suffix .. ending)
     end
   end
@@ -26,7 +26,7 @@ local function removeFixture(base: string)
 
   for epoch = 1, 32 do
     local suffix = string.format('.g%08d', epoch)
-    for _, ending in { '.rows', '.deleted', '.wal', '.wal.lock', '.hot-rows', '.hot-deleted' } do
+    for _, ending in { '.rows', '.deleted', '.wal', '.wal.lock', '.wal.committed', '.hot-rows', '.hot-deleted' } do
       fs.remove(base .. suffix .. ending)
     end
   end

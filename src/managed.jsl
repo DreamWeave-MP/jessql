@@ -13,6 +13,7 @@ local manifest = require('@jessql/managed_manifest')
 local policy = require('@jessql/managed_policy')
 local publicationKernel = require('@jessql/managed_publication')
 local verification = require('@jessql/managed_verification')
+local walmark = require('@jessql/walmark')
 local backupKernel = require('@jessql/managed_backup')
 local compactionPlan = require('@jessql/compaction_plan')
 local observability = require('@jessql/managed_observability')
@@ -136,6 +137,7 @@ end
 local function clearCandidate(fs: vfs.Backend, candidatePaths: Paths)
   removeIfPresent(fs, candidatePaths.wal)
   removeIfPresent(fs, candidatePaths.wal .. '.lock')
+  removeIfPresent(fs, walmark.path(candidatePaths.wal))
   removeIfPresent(fs, candidatePaths.snapshot)
   removeIfPresent(fs, candidatePaths.deletes)
 end
@@ -229,6 +231,7 @@ local function retire(fs: vfs.Backend, base: string, parent: string, prior: Mani
   end
   removeIfPresent(fs, paths(base, prior.epoch).wal)
   removeIfPresent(fs, paths(base, prior.epoch).wal .. '.lock')
+  removeIfPresent(fs, walmark.path(paths(base, prior.epoch).wal))
   local ok, err = fs.syncDirectory(parent)
   assertOK(ok, err, 'retirement directory')
 end
@@ -249,7 +252,7 @@ local function collectOrphans(fs: vfs.Backend, base: string, parent: string, val
     local number, extension = string.match(string.sub(name, #prefix + 1),
       '^(%d%d%d%d%d%d%d%d)%.([%a%.%-]+)$')
     if not number or (extension ~= 'rows' and extension ~= 'deleted'
-      and extension ~= 'wal' and extension ~= 'wal.lock'
+      and extension ~= 'wal' and extension ~= 'wal.lock' and extension ~= 'wal.committed'
       and extension ~= 'hot-rows' and extension ~= 'hot-deleted') then continue end
 
     local epoch = tonumber(number) :: number
@@ -257,7 +260,7 @@ local function collectOrphans(fs: vfs.Backend, base: string, parent: string, val
     local generation = referenced[epoch]
     if (extension == 'rows' and generation ~= nil)
       or (extension == 'deleted' and generation ~= nil and generation.deleted)
-      or ((extension == 'wal' or extension == 'wal.lock') and epoch == value.epoch) then
+      or ((extension == 'wal' or extension == 'wal.lock' or extension == 'wal.committed') and epoch == value.epoch) then
       continue
     end
     -- The known managed filename was not referenced by the verified manifest.
@@ -281,6 +284,10 @@ local function requireFreshNamespace(fs: vfs.Backend, base: string, parent: stri
   local manifestCandidate = name .. '.jql-manifest.tmp'
   local generationPrefix = name .. '.g'
   for _, entry in names do
+    -- A committed-length mark beside no log says nothing: the log it described is gone, and a
+    -- new log of that name discards it. It is not evidence of a database.
+    if string.sub(entry, -#walmark.Suffix) == walmark.Suffix then continue end
+
     if entry == manifestCandidate or
       (string.sub(entry, 1, #generationPrefix) == generationPrefix
         and string.match(string.sub(entry, #generationPrefix + 1), '^%d%d%d%d%d%d%d%d')) then

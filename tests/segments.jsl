@@ -9,14 +9,14 @@ local function files(label: string): (string, string, string, string)
   local current = fs.cwd()
   local cwd: string = assert(current)
   local base = fs.join(cwd, '.jessql-segments-' .. label)
-  for _, suffix in { '.a', '.b', '.c', '.out', '.wal', '.wal.lock' } do
+  for _, suffix in { '.a', '.b', '.c', '.out', '.wal', '.wal.lock', '.wal.committed' } do
     fs.remove(base .. suffix)
   end
   return base .. '.a', base .. '.b', base .. '.c', base
 end
 
 local function cleanup(base: string)
-  for _, suffix in { '.a', '.b', '.c', '.out', '.wal', '.wal.lock' } do
+  for _, suffix in { '.a', '.b', '.c', '.out', '.wal', '.wal.lock', '.wal.committed' } do
     fs.remove(base .. suffix)
   end
 end
@@ -257,6 +257,7 @@ suite.describe('immutable generation merging', function()
     cleanup(base)
     fs.remove(base .. '.ref.wal')
     fs.remove(base .. '.ref.wal.lock')
+    fs.remove(base .. '.ref.wal.committed')
   end)
 
   suite.it('rejects mismatched generation sidecars without leaking the WAL lock', function()

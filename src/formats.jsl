@@ -44,6 +44,11 @@ formats.list = table.freeze({
     module = '@jessql/managed_manifest',
     purpose = 'The authoritative generation list of a managed database. Record version 1 names one generation, 2 a list.',
   }),
+  table.freeze({
+    id = 'log-mark', magic = 'JQLC1\n', suffixes = { '.wal.committed' }, version = 1, reads = { 1 }, writes = { 1 },
+    module = '@jessql/walmark',
+    purpose = 'The committed length of the log beside it: two checksummed slots written alternately after each synchronized commit.',
+  }),
 } :: { Format })
 
 -- The format a file with these leading bytes is, or nil: unknown, including a later version.

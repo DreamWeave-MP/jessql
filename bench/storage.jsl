@@ -8,6 +8,7 @@ local batchSize = tonumber(select(2, ...)) or 64
 local path = fs.join(assert((fs.cwd())), '.jessql-benchmark.wal')
 fs.remove(path)
 fs.remove(path .. '.lock')
+fs.remove(path .. '.committed')
 local start = os.clock()
 local db = sql.open(path)
 db:createTable('events', { 'id', 'room', 'payload' }, 'id')
@@ -50,3 +51,4 @@ print(string.format('setup=%.3fs append=%.3fs %.0f rows/s', initialized-start, w
 print(string.format('indexed_1000=%.3fs checkpoint=%.3fs reopen=%.3fs', queried-written, checkpointed-queried, recovered-checkpointed))
 fs.remove(path)
 fs.remove(path .. '.lock')
+fs.remove(path .. '.committed')

@@ -1,0 +1,157 @@
+--!strict
+-- The committed length of a write-ahead log, recorded beside it.
+--
+-- A log's own end says nothing about where it should end: a log that stops short is exactly what
+-- a crash during the last write leaves, so a reader drops the incomplete tail. Damage that cuts
+-- the tail off later looks the same, and used to cost acknowledged transactions without a word.
+-- This file is the other witness. After a commit is synchronized, the store writes here how long
+-- the log then was and how many transactions it held. A log found shorter than its mark was
+-- damaged (or replaced by an older copy), and is refused instead of quietly shortened.
+--
+-- What the mark promises, exactly: it is written only after the log's own synchronization, so
+-- it never claims more than is durable; a crash can therefore never make a sound log look
+-- damaged. It is not synchronized with every commit (that would double the cost of one): it is
+-- synchronized when the store is closed, and before a checkpoint shortens the log. So after a
+-- clean close every commit is covered, and after a crash every commit up to whatever mark had
+-- reached storage. The newest commits before a crash are protected as they were before: not.
+--
+-- The file is `<log>.committed`: a magic and two slots written alternately, each with its own
+-- checksum, so a write torn by a crash leaves the other slot standing. A missing or unreadable
+-- mark is no mark: the log is read as it always was.
+
+local bytes = require('@dream/bytes')
+local vfs = require('@jessql/vfs')
+
+export type Mark = { sequence: number, length: number }
+export type Writer = {
+  -- Records that the log holds `sequence` transactions in `length` bytes, all synchronized.
+  record: (sequence: number, length: number) -> (),
+  -- Makes "nothing is committed" durable, before the log is replaced by a shorter one. Returns
+  -- whether it is durable; the caller must not shorten the log if it is not.
+  reset: () -> boolean,
+  -- Makes the latest record durable. Best effort: a mark that is behind is still true.
+  sync: () -> (),
+  close: () -> (),
+}
+
+local Magic = 'JQLC1\n'
+local SlotBytes = 24
+local walmark = {}
+
+walmark.Magic = Magic
+walmark.Suffix = '.committed'
+
+function walmark.path(log: string): string
+  return log .. walmark.Suffix
+end
+
+-- One slot: sequence and length as 64-bit floats (whole numbers below 2^53), then a CRC-32 of
+-- those sixteen bytes and four bytes of zero.
+local function slot(sequence: number, length: number): string
+  local raw = buffer.create(SlotBytes)
+  buffer.writef64(raw, 0, sequence)
+  buffer.writef64(raw, 8, length)
+  buffer.writeu32(raw, 16, bytes.crc32(buffer.readstring(raw, 0, 16)))
+  return buffer.tostring(raw)
+end
+
+local function whole(value: number): boolean
+  return value == value and value >= 0 and value < 2 ^ 53 and value % 1 == 0
+end
+
+local function parse(body: string, at: number): Mark?
+  if #body < at + SlotBytes then return nil end
+
+  local raw = buffer.fromstring(string.sub(body, at + 1, at + SlotBytes))
+  if buffer.readu32(raw, 16) ~= bytes.crc32(buffer.readstring(raw, 0, 16)) or buffer.readu32(raw, 20) ~= 0 then return nil end
+
+  local sequence, length = buffer.readf64(raw, 0), buffer.readf64(raw, 8)
+  if not whole(sequence) or not whole(length) then return nil end
+
+  return { sequence = sequence, length = length }
+end
+
+-- The mark a file's bytes hold: the valid slot with the most transactions, or nil.
+function walmark.decode(body: string): Mark?
+  if string.sub(body, 1, #Magic) ~= Magic then return nil end
+
+  local first, second = parse(body, #Magic), parse(body, #Magic + SlotBytes)
+  if first and second then return if second.sequence > first.sequence then second else first end
+
+  return first or second
+end
+
+-- The mark recorded beside `log`, or nil when there is none that can be read.
+function walmark.read(fs: vfs.Backend, log: string): Mark?
+  local path = walmark.path(log)
+  if not fs.exists(path) then return nil end
+
+  local body = fs.readFileString(path)
+  return if body then walmark.decode(body) else nil
+end
+
+-- Removes the mark beside `log`: for a log that is being created, whose predecessor of the same
+-- name left one behind.
+function walmark.forget(fs: vfs.Backend, log: string)
+  local path = walmark.path(log)
+  if fs.exists(path) then fs.remove(path) end
+end
+
+-- Opens the mark beside `log` for writing, creating it empty of claims if it is not there. Nil
+-- when it cannot be opened: the store then runs without one.
+function walmark.open(fs: vfs.Backend, log: string): Writer?
+  local path = walmark.path(log)
+  local existing = walmark.read(fs, log)
+  local body = if fs.exists(path) then fs.readFileString(path) else nil
+  if not body or #body ~= #Magic + 2 * SlotBytes or string.sub(body, 1, #Magic) ~= Magic then
+    -- A fresh file: the magic and two slots that claim nothing.
+    local empty = Magic .. slot(0, 0) .. slot(0, 0)
+    if fs.writeFile(path, empty) ~= #empty then return nil end
+  end
+
+  local writer = fs.openWrite(path, { create = false, truncate = false })
+  if not writer then return nil end
+
+  local handle: dream_fs_Writer = writer
+  -- Which slot the next record goes to: the one that does not hold the current mark.
+  local turn = 0
+  local latest: Mark = existing or { sequence = 0, length = 0 }
+  local closed = false
+
+  local function put(sequence: number, length: number): boolean
+    local record = slot(sequence, length)
+    if not handle:seek(#Magic + turn * SlotBytes) then return false end
+    if handle:write(record) ~= #record then return false end
+
+    turn = 1 - turn
+    latest = { sequence = sequence, length = length }
+    return true
+  end
+
+  return {
+    record = function(sequence: number, length: number)
+      if closed or (sequence == latest.sequence and length == latest.length) then return end
+
+      put(sequence, length)
+    end,
+    reset = function(): boolean
+      if closed then return false end
+      -- Both slots, so that neither still claims the longer log, and durably.
+      if not put(0, 0) or not put(0, 0) then return false end
+
+      return handle:syncData() == true
+    end,
+    sync = function()
+      if not closed then handle:syncData() end
+    end,
+    close = function()
+      if closed then return end
+
+      closed = true
+      handle:syncData()
+      handle:close()
+    end,
+  }
+end
+
+return walmark
