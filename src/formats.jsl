@@ -1,0 +1,69 @@
+--!strict
+-- The registry of what JessQL persists: every on-disk format, the magic that opens it, and which
+-- versions this build reads and writes. It is the list a compatibility decision is made against.
+-- `tests/formats.jsl` holds it to the code: every file a database writes must identify here, and
+-- the golden files of each registered version must still open.
+--
+-- Adding or changing a format: add the new version here, keep the old one readable or say in
+-- `reads` that it is not, add a golden fixture for the new version, and never edit an old one.
+
+export type Format = {
+  id: string,
+  -- The first bytes of the file.
+  magic: string,
+  -- File name endings this format is written under by the managed store (others are caller-named).
+  suffixes: { string },
+  -- The version in the magic, and the record versions inside it that this build reads and writes.
+  version: number,
+  reads: { number },
+  writes: { number },
+  module: string,
+  purpose: string,
+}
+
+local formats = {}
+
+formats.list = table.freeze({
+  table.freeze({
+    id = 'wal', magic = 'JQLW1\n', suffixes = { '.wal' }, version = 1, reads = { 1 }, writes = { 1 },
+    module = '@jessql/storage',
+    purpose = 'Write-ahead log: length- and CRC-framed JSON transactions with sequential numbers.',
+  }),
+  table.freeze({
+    id = 'rows', magic = 'JQLP2\n', suffixes = { '.rows', '.deleted' }, version = 2, reads = { 2 }, writes = { 2 },
+    module = '@jessql/paged',
+    purpose = 'Immutable paged snapshot: sorted rows by primary key with a sparse page directory. Also deletion sidecars and legacy secondary indexes.',
+  }),
+  table.freeze({
+    id = 'compact-index', magic = 'JQLS1\n', suffixes = {}, version = 1, reads = { 1 }, writes = { 1 },
+    module = '@jessql/compactsecondary',
+    purpose = 'Compact secondary-index sidecar bound to one snapshot.',
+  }),
+  table.freeze({
+    id = 'manifest', magic = 'JQLM1\n', suffixes = { '.jql-manifest' }, version = 1, reads = { 1, 2 }, writes = { 1, 2 },
+    module = '@jessql/managed_manifest',
+    purpose = 'The authoritative generation list of a managed database. Record version 1 names one generation, 2 a list.',
+  }),
+} :: { Format })
+
+-- The format a file with these leading bytes is, or nil: unknown, including a later version.
+function formats.identify(head: string): Format?
+  for _, format in formats.list do
+    if string.sub(head, 1, #format.magic) == format.magic then return format end
+  end
+
+  return nil
+end
+
+-- The format the managed store writes under this file name, by its ending, or nil.
+function formats.expected(path: string): Format?
+  for _, format in formats.list do
+    for _, suffix in format.suffixes do
+      if string.sub(path, -#suffix) == suffix then return format end
+    end
+  end
+
+  return nil
+end
+
+return formats
