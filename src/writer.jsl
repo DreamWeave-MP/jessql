@@ -13,6 +13,11 @@
 --   unknown    the batch failed at or after the append. The request may or may not be durable;
 --              the writer accepts nothing more and the database must be reopened to find out.
 --
+-- An admitted request is the writer's own: `submit` copies it, operations and rows and all,
+-- and what is queued, committed and acknowledged is that copy. A caller that changes or reuses
+-- its table afterwards changes nothing here. The copy is taken without running anything of the
+-- caller's (no metamethod is consulted), validated as the copy, and frozen.
+--
 -- This module has no worker in it and starts none: a worker's loop is receive, `submit`, `drain`,
 -- send. That keeps it testable without a script domain, and keeps the policy here: the order is
 -- first in, first out; one request cannot hold another's outcome hostage; and nothing is
@@ -23,6 +28,7 @@
 -- the same request (an `insert` refuses a duplicate), and a retry of a request that did commit is
 -- `rejected` with a duplicate key instead of being applied twice.
 local catalog = require('@jessql/catalog')
+local mutations = require('@jessql/mutations')
 
 export type Row = { [string]: unknown }
 export type Operation = {
@@ -76,6 +82,7 @@ local function invalid(request: unknown, maxOperations: number): string?
 
   for index, operation in value.operations do
     if type(operation) ~= 'table' or type(operation.table) ~= 'string' then return `operation {index} names no table` end
+    if type(operation.op) ~= 'string' then return `operation {index} is not insert, upsert, update or delete` end
 
     if operation.op == 'insert' or operation.op == 'upsert' then
       if type(operation.row) ~= 'table' then return `operation {index} has no row` end
@@ -89,6 +96,69 @@ local function invalid(request: unknown, maxOperations: number): string?
   end
 
   return nil
+end
+
+-- Freezes a table in place. Typed loosely on purpose: the checker's own signature for
+-- `table.freeze` does not fit a table that is then used under its declared type.
+local freeze = table.freeze :: (value: unknown) -> unknown
+
+-- A row or a set of changes, copied: string keys to scalars. A value that is itself a table could
+-- be changed under the writer after admission, so none is taken, but for the NULL sentinel.
+local function copyRow(value: unknown): (Row?, string?)
+  if type(value) ~= 'table' then return nil, nil end
+  local copy: Row = {}
+  for name, held in next, value :: { [unknown]: unknown } do
+    if type(name) ~= 'string' then return nil, 'a column name is a string' end
+    local kind = type(held)
+    if kind ~= 'string' and kind ~= 'number' and kind ~= 'boolean' and held ~= mutations.NULL then
+      return nil, 'a value is a string, a number, a boolean or NULL'
+    end
+
+    copy[name :: string] = held
+  end
+
+  freeze(copy)
+  return copy, nil
+end
+
+-- The writer's own copy of what a caller submitted, with only the fields a request has, or why it
+-- is not a request. Read with `rawget` and `next`: nothing of the caller's runs here.
+local function snapshot(request: unknown, maxOperations: number): (Request?, string?)
+  if type(request) ~= 'table' then return nil, 'a request is a table' end
+  local given = request :: { [unknown]: unknown }
+  local listed = rawget(given, 'operations')
+  if type(listed) ~= 'table' then return nil, `1 to {maxOperations} operations` end
+  local count = rawlen(listed :: { unknown })
+  if count == 0 or count > maxOperations then return nil, `1 to {maxOperations} operations` end
+
+  local operations: { Operation } = {}
+  for index = 1, count do
+    local operation = rawget(listed :: { unknown }, index)
+    if type(operation) ~= 'table' then return nil, `operation {index} names no table` end
+    local fields = operation :: { [unknown]: unknown }
+    local key = rawget(fields, 'key')
+    if key ~= nil and type(key) ~= 'string' and type(key) ~= 'number' and type(key) ~= 'boolean' then
+      return nil, `operation {index}: a key is a string, a number or a boolean`
+    end
+
+    local row, rowProblem = copyRow(rawget(fields, 'row'))
+    if rowProblem then return nil, `operation {index}: {rowProblem}` end
+    local changes, changesProblem = copyRow(rawget(fields, 'changes'))
+    if changesProblem then return nil, `operation {index}: {changesProblem}` end
+
+    local copied: Operation = { op = rawget(fields, 'op') :: string, table = rawget(fields, 'table') :: string,
+      row = row, key = key, changes = changes }
+    freeze(copied)
+    operations[index] = copied
+  end
+
+  freeze(operations)
+  local taken: Request = { id = rawget(given, 'id') :: string, operations = operations }
+  local problem = invalid(taken, maxOperations)
+  if problem then return nil, problem end
+
+  freeze(taken)
+  return taken, nil
 end
 
 -- One request as one transaction: every operation, or an error that leaves none of them.
@@ -139,14 +209,15 @@ function writer.new(db: catalog.Database, options: Options?): Writer
 
   function self.submit(_self: Writer, request: Request): Admission
     if status.stopped then return { admitted = false, reason = 'stopped', queued = status.queued } end
-    local problem = invalid(request, maxOperations)
-    if problem then return { admitted = false, reason = 'invalid: ' .. problem, queued = status.queued } end
-    if waiting[request.id] then return { admitted = false, reason = 'duplicate-id', queued = status.queued } end
+    -- From here on only the copy is looked at: the caller's table is not read again, now or later.
+    local taken, problem = snapshot(request, maxOperations)
+    if not taken then return { admitted = false, reason = 'invalid: ' .. (problem or 'malformed'), queued = status.queued } end
+    if waiting[taken.id] then return { admitted = false, reason = 'duplicate-id', queued = status.queued } end
     if status.queued >= maxQueued then return { admitted = false, reason = 'queue-full', queued = status.queued } end
 
     tail += 1
-    queue[tail] = request
-    waiting[request.id] = true
+    queue[tail] = taken
+    waiting[taken.id] = true
     status.queued += 1
     return { admitted = true, reason = nil, queued = status.queued }
   end

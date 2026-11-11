@@ -167,6 +167,67 @@ suite.describe('the bounded writer', function()
     end
   end)
 
+  suite.it('owns what it admitted: nothing a caller does to its tables afterwards reaches the queue', function()
+    local disk = memfs.new()
+    local db = sql.catalog.create(Path, { tables = Tables, storage = disk.backend })
+    local queue = writer.new(db)
+
+    -- The reported defect: the id changed between admission and the drain.
+    local request = event(1)
+    expect(queue:submit(request).admitted).toBe(true)
+    request.id = 'mutated'
+    -- And everything else a caller could reach: an operation's kind, table, row and key; the list.
+    request.operations[1].op = 'delete'
+    request.operations[1].table = 'counters'
+    request.operations[1].key = 'last';
+    (request.operations[2].row :: Row).body = 'rewritten'
+    request.operations[2].row = { id = 99, body = 'replaced' }
+    request.operations[4] = { op = 'insert', table = 'handled', row = { id = 500 } }
+    table.remove(request.operations, 3)
+
+    local acks = queue:drain()
+    expect(outcomes(acks)).toBe('event-1=committed')
+    expect((db:get('conversation', 1) :: Row).body).toBe('event 1')
+    expect((db:get('counters', 'last') :: Row).value).toBe(1)
+    expect(db:get('handled', 500)).toBe(nil)
+    expect(db:get('conversation', 99)).toBe(nil)
+    -- The original id is free again once drained, and the id it was changed to was never held.
+    expect(queue:submit(event(1)).admitted).toBe(true)
+    expect(queue:submit({ id = 'mutated', operations = event(2).operations }).admitted).toBe(true)
+    expect(outcomes(queue:drain())).toBe('event-1=rejected mutated=committed')
+
+    -- While it waits, the original id is a duplicate whatever the caller's table now says, and the
+    -- changed id is not.
+    local waiting = event(3)
+    queue:submit(waiting)
+    waiting.id = 'other'
+    expect(queue:submit(event(3)).reason).toBe('duplicate-id')
+    expect(queue:submit({ id = 'other', operations = event(4).operations }).admitted).toBe(true)
+    expect(outcomes(queue:drain())).toBe('event-3=committed other=committed')
+
+    -- A table whose fields are computed when read is copied without running anything of the
+    -- caller's: what its raw fields hold is what is judged, and here they hold nothing.
+    local reads = 0
+    local shifting = setmetatable({}, { __index = function(_self: unknown, name: string): unknown
+      reads += 1
+      if name == 'id' then return `shifting-{reads}` end
+      return event(5).operations
+    end })
+    local refused = queue:submit((shifting :: unknown) :: writer.Request)
+    expect(refused.admitted).toBe(false)
+    expect(reads).toBe(0)
+
+    -- A value that is itself a table could be changed after admission, so it is not admitted;
+    -- the NULL sentinel is a value like any other.
+    local nested = queue:submit({ id = 'nested', operations = { { op = 'insert', table = 'conversation', row = { id = 7, body = { 'x' } } } } })
+    expect(nested.reason).toBe('invalid: operation 1: a value is a string, a number, a boolean or NULL')
+    expect(queue:submit({ id = 'keyed', operations = { { op = 'delete', table = 'handled', key = { 1 } } } }).admitted).toBe(false)
+    expect(queue:submit({ id = 'named', operations = { { op = 'insert', table = 'handled', row = ({ 'x' } :: unknown) :: Row } } }).admitted).toBe(false)
+    expect(queue:submit({ id = 'null', operations = { { op = 'upsert', table = 'conversation', row = { id = 8, body = sql.NULL } } } }).admitted).toBe(true)
+    expect(queue:status().queued).toBe(1)
+    db:close()
+  end)
+
   suite.it('calls a batch whose synchronization failed unknown, stops, and lets the retry find out by id', function()
     local disk = memfs.new()
     local db = sql.catalog.create(Path, { tables = Tables, storage = disk.backend })
