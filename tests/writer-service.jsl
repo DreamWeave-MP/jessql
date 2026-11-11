@@ -340,7 +340,9 @@ suite.describe('the writer as a service in a worker', function()
     -- Without a ledger a retry could apply a request twice, so there is no supervisor.
     local bare: service.SupervisorOptions = { path = Path, tables = Tables, writer = {} }
     local negative: service.SupervisorOptions = { path = Path, tables = Tables, writer = { ledger = kept }, maxRestarts = -1 }
+    -- Making a supervisor with no ledger raises: that refusal is what is being tested.
     expect((pcall(service.supervisor, spawn, bare))).toBe(false)
+    -- And so does a number of restarts that is not one.
     expect((pcall(service.supervisor, spawn, negative))).toBe(false)
     -- A worker that cannot be started is a supervisor that is stopped, not an error.
     local none = service.supervisor(function(): service.Lane error('no script domain', 0) end, { path = Path, tables = Tables, writer = { ledger = kept } })
