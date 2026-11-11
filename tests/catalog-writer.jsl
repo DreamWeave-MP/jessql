@@ -1,0 +1,220 @@
+--!strict
+-- #32 / #40.3: the bounded writer over a multi-table managed database. Requests are data; many
+-- are committed behind one synchronization, each with an outcome of its own; the queue is bounded
+-- and says so; and an uncertain batch is called unknown, never committed and never absent.
+local memfs = require('@jessql/memfs')
+local meter = require('@jessql/meter')
+local sql = require('@jessql')
+local test = require('@jess/test')
+local writer = require('@jessql/writer')
+
+local expect = test.expect
+local suite = test.new()
+
+type Row = { [string]: unknown }
+
+local Path = '/memory/service'
+local Tables: { sql.CatalogTableSpec } = {
+  { tableName = 'handled', columns = { 'id' }, primaryKey = 'id' },
+  { tableName = 'conversation', columns = { 'id', 'body' }, primaryKey = 'id' },
+  { tableName = 'counters', columns = { 'id', 'value' }, primaryKey = 'id' },
+}
+
+-- One handled event as data: the handled-mark is keyed by the event, so the same event twice is
+-- refused by the database and not applied twice.
+local function event(number: number): writer.Request
+  return { id = `event-{number}`, operations = {
+    { op = 'insert', table = 'handled', row = { id = number } },
+    { op = 'insert', table = 'conversation', row = { id = number, body = `event {number}` } },
+    { op = 'upsert', table = 'counters', row = { id = 'last', value = number } },
+  } }
+end
+
+local function outcomes(acks: { writer.Ack }): string
+  local parts: { string } = {}
+  for _, ack in acks do table.insert(parts, `{ack.id}={ack.outcome}`) end
+
+  return table.concat(parts, ' ')
+end
+
+local function count(db: sql.CatalogDatabase, name: string): number
+  return db:query(`SELECT COUNT(*) AS n FROM {name}`).rows[1].n :: number
+end
+
+suite.describe('the bounded writer', function()
+  suite.it('commits many requests behind one synchronization, in order, each with its own outcome', function()
+    local disk = memfs.new()
+    local metered = meter.wrap(disk.backend)
+    local db = sql.catalog.create(Path, { tables = Tables, storage = metered.backend })
+    local queue = writer.new(db, { maxBatch = 64 })
+    for number = 1, 50 do expect(queue:submit(event(number)).admitted).toBe(true) end
+
+    -- Among them: the same event again, and an update of a row that is not there.
+    expect(queue:submit({ id = 'again', operations = event(7).operations }).admitted).toBe(true)
+    expect(queue:submit({ id = 'missing', operations = {
+      { op = 'insert', table = 'handled', row = { id = 900 } },
+      { op = 'update', table = 'conversation', key = 900, changes = { body = 'x' } },
+    } }).admitted).toBe(true)
+    expect(queue:submit(event(51)).admitted).toBe(true)
+
+    metered.reset()
+    local acks = queue:drain()
+    expect(#acks).toBe(53)
+    -- One synchronization of the log for all of them.
+    expect(metered.counters().classes.wal.syncs).toBe(1)
+    for index = 1, 50 do
+      expect(acks[index].id).toBe(`event-{index}`)
+      expect(acks[index].outcome).toBe('committed')
+    end
+
+    expect(acks[51].outcome).toBe('rejected')
+    expect(string.find(tostring(acks[51].error), 'duplicate primary key', 1, true) ~= nil).toBe(true)
+    expect(acks[52].outcome).toBe('rejected')
+    expect(string.find(tostring(acks[52].error), 'no row to update in conversation', 1, true) ~= nil).toBe(true)
+    expect(acks[53].outcome).toBe('committed')
+
+    -- A rejected request left nothing, not even the operations before the one that failed.
+    expect(db:get('handled', 900)).toBe(nil)
+    expect(count(db, 'handled')).toBe(51)
+    expect(count(db, 'conversation')).toBe(51)
+    expect((db:get('counters', 'last') :: Row).value).toBe(51)
+
+    local status = queue:status()
+    expect(status.committed).toBe(51)
+    expect(status.rejected).toBe(2)
+    expect(status.batches).toBe(1)
+    expect(status.queued).toBe(0)
+    expect(#queue:drain()).toBe(0)
+    db:close()
+
+    -- Everything acknowledged as committed is there after a crash.
+    disk.crash()
+    local reopened = sql.catalog.openExisting(Path, { storage = disk.backend })
+    expect(count(reopened, 'handled')).toBe(51)
+    reopened:close()
+  end)
+
+  suite.it('covers no more than its batch with one synchronization, oldest first', function()
+    local disk = memfs.new()
+    local metered = meter.wrap(disk.backend)
+    local db = sql.catalog.create(Path, { tables = Tables, storage = metered.backend })
+    local queue = writer.new(db, { maxBatch = 4 })
+    for number = 1, 10 do queue:submit(event(number)) end
+
+    metered.reset()
+    expect(outcomes(queue:drain())).toBe('event-1=committed event-2=committed event-3=committed event-4=committed')
+    expect(queue:status().queued).toBe(6)
+    expect(#queue:drain()).toBe(4)
+    expect(outcomes(queue:drain())).toBe('event-9=committed event-10=committed')
+    expect(metered.counters().classes.wal.syncs).toBe(3)
+
+    -- Against one synchronization a commit without it.
+    metered.reset()
+    for number = 11, 20 do db:transaction(function(tx) tx:insert('handled', { id = number }) end) end
+
+    expect(metered.counters().classes.wal.syncs).toBe(10)
+    db:close()
+  end)
+
+  suite.it('refuses what it cannot queue, at once and with the reason', function()
+    local disk = memfs.new()
+    local db = sql.catalog.create(Path, { tables = Tables, storage = disk.backend })
+    local queue = writer.new(db, { maxQueued = 3, maxOperations = 2 })
+    local small = function(id: string): writer.Request
+      return { id = id, operations = { { op = 'insert', table = 'handled', row = { id = id } } } }
+    end
+    expect(queue:submit(small('a')).queued).toBe(1)
+    expect(queue:submit(small('b')).admitted).toBe(true)
+    expect(queue:submit(small('a')).reason).toBe('duplicate-id')
+    expect(queue:submit(small('c')).admitted).toBe(true)
+    local full = queue:submit(small('d'))
+    expect(full.admitted).toBe(false)
+    expect(full.reason).toBe('queue-full')
+    expect(full.queued).toBe(3)
+
+    local shapes: { unknown } = {
+      'text', { id = '', operations = {} }, { id = 'x', operations = {} }, { id = string.rep('x', 129), operations = small('x').operations },
+      { id = 'x', operations = { { op = 'insert', table = 'handled' } } },
+      { id = 'x', operations = { { op = 'update', table = 'handled', key = 1 } } },
+      { id = 'x', operations = { { op = 'delete', table = 'handled' } } },
+      { id = 'x', operations = { { op = 'drop', table = 'handled' } } },
+      { id = 'x', operations = { { op = 'insert', row = {} } } },
+      { id = 'x', operations = { small('x').operations[1], small('y').operations[1], small('z').operations[1] } },
+    }
+
+    for _, shape in shapes do
+      local refused = queue:submit(shape :: writer.Request)
+      expect(refused.admitted).toBe(false)
+      expect(string.sub(tostring(refused.reason), 1, 8)).toBe('invalid:')
+    end
+
+    -- Draining makes room, and an id that was drained may be used again.
+    expect(#queue:drain()).toBe(3)
+    expect(queue:submit(small('d')).admitted).toBe(true)
+    expect(queue:submit(small('a')).admitted).toBe(true)
+    -- Stopping answers for what was waiting, and nothing is admitted afterwards.
+    expect(outcomes(queue:stop('shutting down'))).toBe('d=rejected a=rejected')
+    expect(queue:submit(small('e')).reason).toBe('stopped')
+    expect(#queue:drain()).toBe(0)
+    expect(queue:status().reason).toBe('shutting down')
+    expect(db:get('handled', 'd')).toBe(nil)
+    db:close()
+
+    for _, options in { { maxQueued = 0 }, { maxBatch = 257 }, { maxOperations = 1.5 } } :: { writer.Options } do
+      -- Limits out of range raise.
+      local made = pcall(function() return writer.new(db, options) end)
+      expect(made).toBe(false)
+    end
+  end)
+
+  suite.it('calls a batch whose synchronization failed unknown, stops, and lets the retry find out by id', function()
+    local disk = memfs.new()
+    local db = sql.catalog.create(Path, { tables = Tables, storage = disk.backend })
+    local queue = writer.new(db, { maxBatch = 3 })
+    for number = 1, 5 do queue:submit(event(number)) end
+
+    local failing = true
+    disk.inject(function(step: string, path: string, _occurrence: number): memfs.Fault?
+      if failing and step == 'syncData' and string.sub(path, -4) == '.wal' then return { message = 'injected sync failure' } end
+      return nil
+    end)
+    local acks = queue:drain()
+    expect(outcomes(acks)).toBe('event-1=unknown event-2=unknown event-3=unknown')
+    local status = queue:status()
+    expect(status.stopped).toBe(true)
+    expect(status.unknown).toBe(3)
+    -- Nothing more is attempted: what was waiting is refused untouched, and nothing is admitted.
+    expect(outcomes(queue:drain())).toBe('event-4=rejected event-5=rejected')
+    expect(queue:submit(event(6)).reason).toBe('stopped')
+    failing = false
+    disk.inject(nil)
+    -- The handle may be poisoned by the failed synchronization; it is closed as far as it can be.
+    pcall(function() db:close() end)
+
+    -- After a crash and a reopen, the caller retries the unknown requests under the same ids.
+    disk.crash()
+    local reopened = sql.catalog.openExisting(Path, { storage = disk.backend })
+    local survived = count(reopened, 'handled')
+    local retry = writer.new(reopened)
+    for number = 1, 5 do retry:submit(event(number)) end
+
+    local second = retry:drain()
+    local committed, duplicates = 0, 0
+    for _, ack in second do
+      if ack.outcome == 'committed' then
+        committed += 1
+      elseif string.find(tostring(ack.error), 'duplicate primary key', 1, true) then
+        duplicates += 1
+      end
+    end
+
+    -- Whatever survived is refused as a duplicate and the rest commits: each event exactly once.
+    expect(duplicates).toBe(survived)
+    expect(committed).toBe(5 - survived)
+    expect(count(reopened, 'handled')).toBe(5)
+    expect(count(reopened, 'conversation')).toBe(5)
+    reopened:close()
+  end)
+end)
+
+return suite

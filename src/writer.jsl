@@ -1,0 +1,221 @@
+--!strict
+-- A bounded writer for a multi-table managed database (#32, #40.3): the core of a writer actor.
+--
+-- Requests are plain data, a list of operations with an id, so that they can cross a worker
+-- boundary; nothing here is a closure a caller supplies. A request is admitted into a bounded
+-- queue or refused at once with the reason, which is the backpressure a caller can observe.
+-- `drain` takes the oldest requests, commits each as its own frame behind ONE synchronization
+-- (`transactionBatch`), and answers one acknowledgement for each:
+--
+--   committed  the request's frame is synchronized, whole.
+--   rejected   the request changed nothing: an operation of it failed (a duplicate key, a row
+--              that is not there), or the writer stopped before attempting it.
+--   unknown    the batch failed at or after the append. The request may or may not be durable;
+--              the writer accepts nothing more and the database must be reopened to find out.
+--
+-- This module has no worker in it and starts none: a worker's loop is receive, `submit`, `drain`,
+-- send. That keeps it testable without a script domain, and keeps the policy here: the order is
+-- first in, first out; one request cannot hold another's outcome hostage; and nothing is
+-- acknowledged before the synchronization that covers it.
+--
+-- What a caller does about `unknown`, or about a worker that died after the synchronization and
+-- before its reply, is reconciliation by id: put a row keyed by the request's id in a table of
+-- the same request (an `insert` refuses a duplicate), and a retry of a request that did commit is
+-- `rejected` with a duplicate key instead of being applied twice.
+local catalog = require('@jessql/catalog')
+
+export type Row = { [string]: unknown }
+export type Operation = {
+  op: string,
+  table: string,
+  -- `insert` and `upsert`.
+  row: Row?,
+  -- `update` and `delete`.
+  key: unknown?,
+  -- `update`.
+  changes: Row?,
+}
+export type Request = { id: string, operations: { Operation } }
+export type Outcome = 'committed' | 'rejected' | 'unknown'
+export type Ack = { id: string, outcome: Outcome, error: string? }
+export type Admission = { admitted: boolean, reason: string?, queued: number }
+export type Options = {
+  -- The most requests waiting at once (default 1024, at most 65536). One more is refused.
+  maxQueued: number?,
+  -- The most requests one synchronization covers (default 64, at most 256).
+  maxBatch: number?,
+  -- The most operations in one request (default 256, at most 4096).
+  maxOperations: number?,
+}
+export type Status = { queued: number, committed: number, rejected: number, unknown: number, batches: number, stopped: boolean, reason: string? }
+export type Writer = {
+  -- Admits a request or refuses it with `queue-full`, `duplicate-id`, `invalid: ...` or `stopped`.
+  submit: (self: Writer, request: Request) -> Admission,
+  -- Commits up to `maxBatch` of the oldest requests behind one synchronization.
+  drain: (self: Writer) -> { Ack },
+  -- Refuses everything from now on and answers `rejected` for what was still waiting.
+  stop: (self: Writer, reason: string?) -> { Ack },
+  status: (self: Writer) -> Status,
+}
+
+local writer = {}
+
+local function whole(value: unknown, least: number, most: number): boolean
+  return type(value) == 'number' and (value :: number) % 1 == 0 and (value :: number) >= least and (value :: number) <= most
+end
+
+-- Why a request is not one this writer will queue, or nil.
+local function invalid(request: unknown, maxOperations: number): string?
+  if type(request) ~= 'table' then return 'a request is a table' end
+  local value = request :: Request
+  if type(value.id) ~= 'string' or #value.id == 0 or #value.id > 128 then return 'id is a string of 1 to 128 bytes' end
+
+  if type(value.operations) ~= 'table' or #value.operations == 0 or #value.operations > maxOperations then
+    return `1 to {maxOperations} operations`
+  end
+
+  for index, operation in value.operations do
+    if type(operation) ~= 'table' or type(operation.table) ~= 'string' then return `operation {index} names no table` end
+
+    if operation.op == 'insert' or operation.op == 'upsert' then
+      if type(operation.row) ~= 'table' then return `operation {index} has no row` end
+    elseif operation.op == 'update' then
+      if operation.key == nil or type(operation.changes) ~= 'table' then return `operation {index} needs a key and changes` end
+    elseif operation.op == 'delete' then
+      if operation.key == nil then return `operation {index} needs a key` end
+    else
+      return `operation {index} is not insert, upsert, update or delete`
+    end
+  end
+
+  return nil
+end
+
+-- One request as one transaction: every operation, or an error that leaves none of them.
+local function apply(tx: catalog.Transaction, request: Request)
+  for index, operation in request.operations do
+    if operation.op == 'insert' then
+      tx:insert(operation.table, operation.row :: Row)
+    elseif operation.op == 'upsert' then
+      tx:upsert(operation.table, operation.row :: Row)
+    elseif operation.op == 'update' then
+      if not tx:update(operation.table, operation.key, operation.changes :: Row) then
+        error(`operation {index}: no row to update in {operation.table}`, 0)
+      end
+    elseif not tx:delete(operation.table, operation.key) then
+      error(`operation {index}: no row to delete in {operation.table}`, 0)
+    end
+  end
+end
+
+function writer.new(db: catalog.Database, options: Options?): Writer
+  local maxQueued = if options and options.maxQueued ~= nil then options.maxQueued else 1024
+  local maxBatch = if options and options.maxBatch ~= nil then options.maxBatch else 64
+  local maxOperations = if options and options.maxOperations ~= nil then options.maxOperations else 256
+  if not whole(maxQueued, 1, 65536) then error('jessql writer: invalid maxQueued', 2) end
+  if not whole(maxBatch, 1, 256) then error('jessql writer: invalid maxBatch', 2) end
+  if not whole(maxOperations, 1, 4096) then error('jessql writer: invalid maxOperations', 2) end
+
+  -- A queue that never moves its entries: `head` is the oldest, `tail` the newest.
+  local queue: { [number]: Request } = {}
+  local head, tail = 1, 0
+  local waiting: { [string]: boolean } = {}
+  local status: Status = { queued = 0, committed = 0, rejected = 0, unknown = 0, batches = 0, stopped = false, reason = nil }
+  local self = {} :: Writer
+
+  local function take(count: number): { Request }
+    local taken: { Request } = {}
+    for _ = 1, math.min(count, status.queued) do
+      local request = queue[head]
+      queue[head] = nil
+      head += 1
+      waiting[request.id] = nil
+      taken[#taken + 1] = request
+    end
+
+    status.queued -= #taken
+    return taken
+  end
+
+  function self.submit(_self: Writer, request: Request): Admission
+    if status.stopped then return { admitted = false, reason = 'stopped', queued = status.queued } end
+    local problem = invalid(request, maxOperations)
+    if problem then return { admitted = false, reason = 'invalid: ' .. problem, queued = status.queued } end
+    if waiting[request.id] then return { admitted = false, reason = 'duplicate-id', queued = status.queued } end
+    if status.queued >= maxQueued then return { admitted = false, reason = 'queue-full', queued = status.queued } end
+
+    tail += 1
+    queue[tail] = request
+    waiting[request.id] = true
+    status.queued += 1
+    return { admitted = true, reason = nil, queued = status.queued }
+  end
+
+  local function refuseRest(reason: string): { Ack }
+    local acks: { Ack } = {}
+    for _, request in take(status.queued) do
+      acks[#acks + 1] = { id = request.id, outcome = 'rejected', error = reason }
+      status.rejected += 1
+    end
+
+    return acks
+  end
+
+  function self.drain(_self: Writer): { Ack }
+    if status.stopped then return refuseRest('writer stopped: not attempted') end
+
+    local batch = take(maxBatch)
+    if #batch == 0 then return {} end
+
+    local callbacks: { (catalog.Transaction) -> () } = {}
+    for index, request in batch do
+      callbacks[index] = function(tx: catalog.Transaction) apply(tx, request) end
+    end
+
+    status.batches += 1
+    -- The batch raises when the append or its synchronization is uncertain: nothing in it may be
+    -- called committed, and nothing in it may be called absent.
+    local ran, results = pcall(function() return db:transactionBatch(callbacks) end)
+    local acks: { Ack } = {}
+    if not ran then
+      status.stopped = true
+      status.reason = 'batch outcome unknown: ' .. tostring(results)
+      for _, request in batch do
+        acks[#acks + 1] = { id = request.id, outcome = 'unknown', error = tostring(results) }
+        status.unknown += 1
+      end
+
+      return acks
+    end
+
+    for index, request in batch do
+      local result = (results :: { catalog.BatchResult })[index]
+      if result.ok then
+        acks[#acks + 1] = { id = request.id, outcome = 'committed', error = nil }
+        status.committed += 1
+      else
+        acks[#acks + 1] = { id = request.id, outcome = 'rejected', error = result.error }
+        status.rejected += 1
+      end
+    end
+
+    return acks
+  end
+
+  function self.stop(_self: Writer, reason: string?): { Ack }
+    if not status.stopped then
+      status.stopped = true
+      status.reason = reason or 'stopped'
+    end
+
+    return refuseRest('writer stopped: not attempted')
+  end
+
+  function self.status(_self: Writer): Status
+    return table.clone(status)
+  end
+
+  return self
+end
+
+return writer
