@@ -172,7 +172,7 @@ local function stopped(disk: memfs.Disk, stop: number?, mode: Mode, body: () -> 
     if dead then return { message = 'faultlab: the process is gone', kind = 'other' } end
 
     table.insert(taken, `{step} {path}`)
-    if stop == nil or #taken ~= stop then return nil end
+    if not stop or #taken ~= stop then return nil end
 
     reached = true
     if mode == 'crash' then
@@ -202,8 +202,7 @@ function lab.run(scenario: Scenario, options: Options?): Report
 
   local function record(violation: Violation, detail: string, mode: Mode | 'baseline', step: number, book: Book,
     observed: Observed, disk: memfs.Disk, recoveryStep: number?, recoveryAt: string?)
-    local acknowledged: { string } = {}
-    local uncertain: { string } = {}
+    local acknowledged: { string }, uncertain: { string } = {}, {}
     for _, id in book.order do table.insert(if book.commits[id].acknowledged then acknowledged else uncertain, id) end
 
     table.insert(report.violations, {
