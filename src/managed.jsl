@@ -14,6 +14,7 @@ local policy = require('@jessql/managed_policy')
 local publicationKernel = require('@jessql/managed_publication')
 local verification = require('@jessql/managed_verification')
 local backupKernel = require('@jessql/managed_backup')
+local compactionPlan = require('@jessql/compaction_plan')
 local observability = require('@jessql/managed_observability')
 
 export type Row = { [string]: unknown }
@@ -22,6 +23,9 @@ export type Options = {
   cachePages: number?, readMode: string?, rowLayout: string?, pageBytes: number?,
   maxHotRows: number?, maxHotBytes: number?, maxWalBytes: number?, maxGenerations: number?, runRows: number?, mergeFanIn: number?,
   compactionFanIn: number?,
+  -- `widest` (the default: as many generations as the fan-in allows) or `cheapest` (the fewest
+  -- bytes rewritten per generation removed). Selection only; publication is the same.
+  compactionPolicy: string?,
   -- The backend the database lives on; without it, the VM default at the time it is opened.
   storage: vfs.Backend?,
   -- Deterministic fault injection for integration tests. Throws at a named stage.
@@ -700,10 +704,30 @@ local function openManaged(path: string, options: Options?, intent: string): Dat
         seal(fs, candidatePaths.deletes, parent)
       elseif mode == 'compact' then
         local generations = manifest.generations(active)
-        mergedCount = math.min(#generations, compactionFanIn)
+        local sources, deletions = indexedPaths(base, active)
+        -- Sizes of what is published, for the selection. A generation that cannot be measured is
+        -- an error: nothing is merged on a guess.
+        local measured: { compactionPlan.Generation } = {}
+        for index, generation in generations do
+          local rows, rowsError = fs.stat(sources[index])
+          if not rows or not rows.isFile then error('generation rows missing: ' .. tostring(rowsError)) end
+
+          local bytes = rows.size
+          if deletions[index] then
+            local deletes, deletesError = fs.stat(deletions[index])
+            if not deletes or not deletes.isFile then error('generation tombstones missing: ' .. tostring(deletesError)) end
+
+            bytes += deletes.size
+          end
+
+          measured[index] = { epoch = generation.epoch, bytes = bytes }
+        end
+
+        local decision = compactionPlan.select(measured, compactionFanIn, limits.compactionPolicy)
+        mergedCount = decision.count
+        journal:record('compaction-selected', active.epoch, decision.reason)
         local inputRows: { string } = {}
         local inputDeletes: { [number]: string } = {}
-        local sources, deletions = indexedPaths(base, active)
         for index = #generations - mergedCount + 1, #generations do
           local slot = #inputRows + 1
           inputRows[slot] = sources[index]

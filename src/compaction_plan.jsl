@@ -1,0 +1,78 @@
+--!strict
+-- Which generations a selective compaction merges. Pure: it is given the published generations'
+-- sizes and answers with a count and its reasons. It performs no I/O, publishes nothing and
+-- changes no durability step; the managed store still seals, publishes and retires exactly as
+-- it did, on whatever this selects.
+--
+-- The choice is narrow by construction. A manifest is an ordered list, oldest first, and a merge
+-- replaces a run of it with one generation at the end. Only the newest run can be replaced that
+-- way without moving rows across generations they must stay newer or older than, so a candidate
+-- is "the newest k generations", for k from 2 to the fan-in. That also keeps deletion markers
+-- safe: whatever is merged, every older generation is still below the output (TOMBSTONE-SAFETY.md).
+--
+-- Policies:
+--   widest    the most generations the fan-in allows. Fewest generations afterwards, so the
+--             least read fan-out; it may rewrite a large old generation to absorb a small one.
+--             This is what the store has always done, and the default.
+--   cheapest  the candidate that rewrites the fewest bytes per generation it removes. It leaves
+--             a large old generation alone until the newer ones have grown to be worth merging
+--             with it. Ties go to the wider candidate.
+
+export type Policy = 'widest' | 'cheapest'
+-- A published generation: its epoch and the bytes of its rows and deletion sidecar together.
+export type Generation = { epoch: number, bytes: number }
+export type Candidate = {
+  -- How many of the newest generations, the bytes they hold, and bytes per generation removed.
+  count: number, bytes: number, cost: number,
+}
+export type Decision = {
+  policy: Policy, count: number,
+  -- Every candidate considered, narrowest first.
+  candidates: { Candidate },
+  -- One line, for the maintenance journal: what was chosen and against what.
+  reason: string,
+}
+
+local plan = {}
+
+plan.Policies = table.freeze({ 'widest', 'cheapest' } :: { Policy })
+
+function plan.valid(policy: unknown): boolean
+  return policy == 'widest' or policy == 'cheapest'
+end
+
+-- `generations` is the manifest's list, oldest first. Raises on fewer than two, a fan-in outside
+-- 2..8, or a size that is not a whole number of bytes: a caller's error, never a guess.
+function plan.select(generations: { Generation }, fanIn: number, policy: Policy): Decision
+  if #generations < 2 then error('jessql compaction: selection needs two generations', 2) end
+  if type(fanIn) ~= 'number' or fanIn % 1 ~= 0 or fanIn < 2 or fanIn > 8 then error('jessql compaction: invalid fan-in', 2) end
+  if not plan.valid(policy) then error('jessql compaction: unknown policy', 2) end
+
+  local candidates: { Candidate } = {}
+  local bytes = 0
+  for count = 1, math.min(#generations, fanIn) do
+    local size = generations[#generations - count + 1].bytes
+    if type(size) ~= 'number' or size < 0 or size % 1 ~= 0 then error('jessql compaction: invalid generation size', 2) end
+
+    bytes += size
+    if count >= 2 then table.insert(candidates, { count = count, bytes = bytes, cost = bytes / (count - 1) }) end
+  end
+
+  local chosen = candidates[#candidates]
+  if policy == 'cheapest' then
+    for _, candidate in candidates do
+      -- Wider wins a tie: the same cost buys one generation fewer.
+      if candidate.cost < chosen.cost or (candidate.cost == chosen.cost and candidate.count > chosen.count) then chosen = candidate end
+    end
+  end
+
+  local widest = candidates[#candidates]
+  local reason = `{policy}: newest {chosen.count} of {#generations} generations, {chosen.bytes} bytes`
+  if chosen.count ~= widest.count then
+    reason ..= ` ({string.format('%.0f', chosen.cost)} per generation removed, against {string.format('%.0f', widest.cost)} for the newest {widest.count})`
+  end
+
+  return { policy = policy, count = chosen.count, candidates = candidates, reason = reason }
+end
+
+return plan

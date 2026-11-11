@@ -3,13 +3,17 @@
 -- Pure, deterministic maintenance policy. Never performs filesystem I/O,
 -- advances an epoch, or acknowledges a transaction. The managed durability
 -- state machine retains exclusive control of these operations.
+local compactionPlan = require('@jessql/compaction_plan')
+
 export type Options = {
   maxHotRows: number?, maxHotBytes: number?, maxWalBytes: number?,
   maxGenerations: number?, compactionFanIn: number?,
+  -- Which generations a selective compaction merges: see `@jessql/compaction_plan`.
+  compactionPolicy: string?,
 }
 export type Limits = {
   maxHotRows: number?, maxHotBytes: number?, maxWalBytes: number?,
-  maxGenerations: number, compactionFanIn: number,
+  maxGenerations: number, compactionFanIn: number, compactionPolicy: compactionPlan.Policy,
 }
 local policy = {}
 
@@ -49,9 +53,13 @@ function policy.limits(options: Options?): Limits
     error('jessql managed: invalid compactionFanIn', 2)
   end
 
+  local compactionPolicy = if options and options.compactionPolicy ~= nil then options.compactionPolicy else 'widest'
+  if not compactionPlan.valid(compactionPolicy) then error('jessql managed: invalid compactionPolicy', 2) end
+
   return { maxHotRows = maxHotRows, maxHotBytes = maxHotBytes,
     maxWalBytes = maxWalBytes, maxGenerations = maxGenerations,
-    compactionFanIn = compactionFanIn }
+    compactionFanIn = compactionFanIn,
+    compactionPolicy = compactionPolicy :: compactionPlan.Policy }
 end
 
 -- Return only an intent, never perform the transition. A single operation

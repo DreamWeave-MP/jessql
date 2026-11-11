@@ -33,7 +33,7 @@ type History = {
   problem: string?,
 }
 
-local function run(seed: number, steps: number): History
+local function run(seed: number, steps: number, policy: string?): History
   local pick = generator(seed)
   local disk = memfs.new()
   local model: { [number]: string } = {}
@@ -43,7 +43,7 @@ local function run(seed: number, steps: number): History
 
   local function options(): sql.ManagedOptions
     return { tableName = 'events', columns = { 'id', 'body' }, primaryKey = 'id', cachePages = 1,
-      compactionFanIn = 2, maxGenerations = 4, storage = disk.backend,
+      compactionFanIn = if policy then 3 else 2, maxGenerations = 4, compactionPolicy = policy, storage = disk.backend,
       testHook = function(stage: string)
         if failAt == stage then
           failAt = nil
@@ -187,6 +187,19 @@ suite.describe('tombstone safety across generations', function()
     expect(totals.failed > 100).toBe(true)
     expect(totals.crashes > 100).toBe(true)
     expect(totals.generations >= 3).toBe(true)
+  end)
+
+  suite.it('never resurrects a deleted key when compaction picks the cheapest run instead of the widest', function()
+    local deletions, transitions = 0, 0
+    for seed = 101, 125 do
+      local history = run(seed, 160, 'cheapest')
+      expect(history.problem).toBe(nil)
+      deletions += history.deletions
+      transitions += history.transitions
+    end
+
+    expect(deletions > 500).toBe(true)
+    expect(transitions > 500).toBe(true)
   end)
 
   suite.it('gives the same history for the same seed', function()
