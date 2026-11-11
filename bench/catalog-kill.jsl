@@ -1,0 +1,170 @@
+--!strict
+-- #40: the multi-table managed database on a REAL filesystem, killed. A child process commits
+-- five-table service steps under small budgets, so that flushes and compactions run every few
+-- commits; this process kills it with SIGKILL after a random few milliseconds, reopens the
+-- database, and holds it to what the child acknowledged: every acknowledged step whole, at most
+-- one unacknowledged step and that one whole, the tables agreeing with each other, and the offline
+-- scan clean. Then it starts the child again on the same database, round after round.
+--
+-- This is a process crash, not a power loss: the kernel keeps what the dead process wrote. It
+-- shows that no step of a commit or a publication leaves the files in a state recovery cannot
+-- take; it shows nothing about what a device keeps when the power goes.
+--
+-- Needs a jess built on l3i 2.8.0 or newer (process.start), given as the program to run the child.
+--
+--   jess run --package . --capability filesystem.read --capability filesystem.write \
+--     --capability process.spawn bench/catalog-kill.jsl /absolute/empty/directory /absolute/path/to/jess [rounds=40] [seed=1]
+local fs = require('@dream/fs')
+local net = require('@jess/net')
+local process = require('@dream/process')
+local sql = require('@jessql')
+
+type Row = { [string]: unknown }
+type Child = {
+  readStdout: (self: Child, maxBytes: number) -> ((buffer | string)?, string?, string?),
+  wait: (self: Child, timeoutMs: number?) -> ({ success: boolean }?, string?, string?),
+  kill: (self: Child) -> boolean,
+  close: (self: Child) -> (),
+}
+type Starter = { start: (program: string, arguments: { string }?, options: { [string]: unknown }?) -> (Child?, string?, string?) }
+
+local directory, jess, roundsText, seedText = ...
+local rounds = tonumber(roundsText) or 40
+local seed = tonumber(seedText) or 1
+if type(directory) ~= 'string' or string.sub(directory, 1, 1) ~= '/' or type(jess) ~= 'string' or string.sub(jess, 1, 1) ~= '/' then
+  print('usage: catalog-kill <absolute empty directory> <absolute jess> [rounds] [seed]')
+  return 2
+end
+
+local listed = fs.list(directory)
+if not listed or #listed ~= 0 then
+  print('the directory must exist and be empty')
+  return 2
+end
+
+local base = `{directory}/service`
+local starter = (process :: unknown) :: Starter
+
+-- A small generator of its own, so that a seed names a run.
+local state = seed % 2147483647
+local function random(least: number, most: number): number
+  state = (state * 48271) % 2147483647
+  return least + state % (most - least + 1)
+end
+
+-- What a restart finds: the newest step, or an error naming what no sequence of whole commits
+-- could have left.
+local function recover(): (number, number)
+  local db = sql.catalog.openExisting(base)
+  local highest = 0
+  local present: { [number]: number } = {}
+  for _, name in { 'reservations', 'handled', 'conversation' } do
+    for _, row in db:query(`SELECT id FROM {name}`).rows do
+      local number = (row :: Row).id :: number
+      present[number] = (present[number] or 0) + 1
+      highest = math.max(highest, number)
+    end
+  end
+
+  local counter = db:get('counters', 'total')
+  local total = if counter then counter.value :: number else 0
+  local outbox = db:query('SELECT id FROM outbox').rows
+  local epoch = db:stats().epoch
+  db:close()
+  if total ~= highest then error(`the counter says {total} and the newest step present is {highest}`, 0) end
+
+  if highest > 0 and (#outbox ~= 1 or (outbox[1] :: Row).id ~= highest) then
+    error(`the outbox holds {#outbox} row(s), not exactly the newest step {highest}`, 0)
+  end
+
+  for number = 1, highest do
+    if present[number] ~= 3 then error(`step {number} is in {present[number] or 0} of 3 tables`, 0) end
+  end
+
+  local report = sql.catalog.verify(base)
+  if not report.ok then error(`the offline scan found {report.issues[1].stage}: {report.issues[1].message}`, 0) end
+  return highest, epoch
+end
+
+-- Created here, whole, before anything is killed: a creation that is interrupted leaves files an
+-- operator must remove, by design, and that is not what this measures.
+sql.catalog.create(base, { tables = {
+  { tableName = 'reservations', columns = { 'id', 'effect' }, primaryKey = 'id' },
+  { tableName = 'handled', columns = { 'id' }, primaryKey = 'id' },
+  { tableName = 'conversation', columns = { 'id', 'body' }, primaryKey = 'id' },
+  { tableName = 'outbox', columns = { 'id' }, primaryKey = 'id' },
+  { tableName = 'counters', columns = { 'id', 'value' }, primaryKey = 'id' },
+} }):close()
+
+local problems = 0
+local previous, previousEpoch = 0, 0
+local publications, unacknowledged = 0, 0
+print('round,lived_ms_after_first_ack,acknowledged,recovered,epoch,outcome')
+for round = 1, rounds do
+  -- How long the child lives after its first acknowledgement (it has ten seconds to make one).
+  local lifetime = random(0, 150)
+  local child, startProblem = starter.start(jess, { 'run', '--package', '.', '--capability', 'filesystem.read', '--capability', 'filesystem.write',
+    'bench/catalog-kill-writer.jsl', base }, { stdout = 'pipe', stderr = 'null', timeoutMs = 60000 })
+
+  if not child then
+    print(`could not start the child: {startProblem or 'unknown'}`)
+    return 1
+  end
+
+  local began = net.now()
+  local text = ''
+  local ended = false
+  local first: number? = nil
+  while net.now() - (first or began) < (if first then lifetime else 10000) do
+    local chunk, _, kind = child:readStdout(65536)
+    if chunk then
+      text ..= if typeof(chunk) == 'buffer' then buffer.tostring(chunk) else chunk :: string
+      first = first or net.now()
+    elseif kind ~= 'wouldBlock' then
+      ended = true
+      break
+    else
+      process.sleep(0.001)
+    end
+  end
+
+  child:kill()
+  -- Whatever it had acknowledged before it died is still in the pipe.
+  while true do
+    local chunk = child:readStdout(65536)
+    if not chunk then break end
+    text ..= if typeof(chunk) == 'buffer' then buffer.tostring(chunk) else chunk :: string
+  end
+
+  child:close()
+  local acknowledged = previous
+  for line in string.gmatch(text, '(%d+)\n') do acknowledged = math.max(acknowledged, tonumber(line) :: number) end
+
+  -- A restart that cannot open the database, or finds it inconsistent, raises.
+  local opened, highest, epoch = pcall(recover)
+  local outcome = 'ok'
+  if not opened then
+    outcome = `VIOLATION: {tostring(highest)}`
+  elseif ended then
+    outcome = 'VIOLATION: the child stopped by itself'
+  elseif highest < acknowledged then
+    outcome = `VIOLATION: step {acknowledged} was acknowledged and step {highest} is the newest present`
+  elseif highest > acknowledged + 1 then
+    outcome = `VIOLATION: steps past {acknowledged + 1} are present though only {acknowledged} were acknowledged`
+  elseif epoch < previousEpoch then
+    outcome = `VIOLATION: the epoch went back from {previousEpoch} to {epoch}`
+  end
+
+  if outcome ~= 'ok' then problems += 1 end
+
+  print(`{round},{lifetime},{acknowledged},{if opened then tostring(highest) else '-'},{if opened then tostring(epoch) else '-'},{outcome}`)
+  if not opened then break end
+
+  if highest > acknowledged then unacknowledged += 1 end
+
+  publications += epoch - previousEpoch
+  previous, previousEpoch = highest, epoch
+end
+
+print(`rounds={rounds} seed={seed} steps={previous} publications={publications} killed_with_an_unacknowledged_step_present={unacknowledged} violations={problems}`)
+return if problems == 0 then 0 else 1
