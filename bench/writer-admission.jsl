@@ -1,0 +1,185 @@
+--!strict
+-- #32: what the bounded writer buys on a real disk, and what it costs. The same requests (one
+-- row inserted and a counter raised, in one frame) go through three paths with synchronized
+-- durability: one commit a request; explicit batches (`transactionBatch`); and `@jessql/writer`
+-- under a steady load. Counted for each: synchronizations of the log per committed request, by
+-- `@jessql/meter` (not inferred from timing), and the time from handing a request over to
+-- knowing it is durable.
+--
+-- The load is a model, since nothing here runs concurrently: each cycle `arrivals` requests are
+-- submitted and the writer drains once, which is what a worker does when that many requests
+-- arrive during one synchronization. With more arrivals than a batch holds the queue grows to
+-- its limit and the rest are refused: those are counted, not hidden.
+--
+-- Wall time from the monotonic clock; mostly the device's fsync. Run it on the disk a service
+-- would use. Numbers are that machine's.
+--
+--   jess run --package . --capability filesystem.read --capability filesystem.write \
+--     bench/writer-admission.jsl /absolute/empty/directory [requests=2000] [bodyBytes=256]
+local fs = require('@dream/fs')
+local meter = require('@jessql/meter')
+local net = require('@jess/net')
+local sql = require('@jessql')
+local vfs = require('@jessql/vfs')
+local writer = require('@jessql/writer')
+
+local directory, requestsText, bodyText = ...
+local requests = math.clamp(math.floor(tonumber(requestsText) or 2000), 256, 200000)
+local bodyBytes = math.clamp(math.floor(tonumber(bodyText) or 256), 1, 65536)
+if type(directory) ~= 'string' or string.sub(directory, 1, 1) ~= '/' then
+  print('usage: writer-admission <absolute empty directory> [requests] [bodyBytes]')
+  return 2
+end
+
+local listed = fs.list(directory)
+if not listed or #listed ~= 0 then
+  print('the directory must exist and be empty')
+  return 2
+end
+
+local body = string.rep('x', bodyBytes)
+local Tables: { sql.CatalogTableSpec } = {
+  { tableName = 'events', columns = { 'id', 'body' }, primaryKey = 'id' },
+  { tableName = 'counters', columns = { 'id', 'value' }, primaryKey = 'id' },
+}
+
+type Tx = { insert: (self: Tx, name: string, row: { [string]: unknown }) -> (), upsert: (self: Tx, name: string, row: { [string]: unknown }) -> () }
+
+local function percentile(sorted: { number }, fraction: number): number
+  return sorted[math.max(1, math.ceil(#sorted * fraction))]
+end
+
+type Result = { latencies: { number }, committed: number, refused: number, wallMs: number, syncs: number, batches: number }
+
+local function report(name: string, result: Result)
+  table.sort(result.latencies)
+  local samples = result.latencies
+  print(string.format('%s,%d,%d,%d,%.4f,%.3f,%.3f,%.3f,%.0f', name, result.committed, result.refused, result.syncs,
+    if result.committed > 0 then result.syncs / result.committed else 0,
+    if #samples > 0 then percentile(samples, 0.5) else 0, if #samples > 0 then percentile(samples, 0.99) else 0,
+    if #samples > 0 then samples[#samples] else 0, if result.wallMs > 0 then result.committed / (result.wallMs / 1000) else 0))
+end
+
+-- A fresh database under `name`, metered, and what to call for the log's synchronizations.
+local function database(name: string): (sql.CatalogDatabase, () -> number)
+  local metered = meter.wrap(vfs.native())
+  local db = sql.catalog.create(`{directory}/{name}`, { tables = Tables, storage = metered.backend })
+  metered.reset()
+  return db, function(): number return metered.counters().classes.wal.syncs end
+end
+
+local function verify(db: sql.CatalogDatabase, expected: number)
+  local counted = db:query('SELECT COUNT(*) AS n FROM events').rows[1].n
+  db:close()
+  if counted ~= expected then error(`expected {expected} rows, found {tostring(counted)}`, 0) end
+end
+
+print(`requests={requests} bodyBytes={bodyBytes} clock=monotonic-ms durability=sync`)
+print('path,committed,refused,log_syncs,syncs_per_commit,p50_ms,p99_ms,max_ms,commits_per_second')
+
+-- One commit a request.
+do
+  local db, syncs = database('unbatched')
+  local result: Result = { latencies = {}, committed = 0, refused = 0, wallMs = 0, syncs = 0, batches = 0 }
+  local began = net.now()
+  for number = 1, requests do
+    local before = net.now()
+    db:transaction(function(tx)
+      local writing = (tx :: unknown) :: Tx
+      writing:insert('events', { id = number, body = body })
+      writing:upsert('counters', { id = 'total', value = number })
+    end)
+    table.insert(result.latencies, net.now() - before)
+    result.committed += 1
+  end
+
+  result.wallMs, result.syncs = net.now() - began, syncs()
+  report('one commit a request', result)
+  verify(db, result.committed)
+end
+
+-- Explicit batches: every request of a batch waits for the whole batch.
+for _, size in { 16, 64, 256 } do
+  local db, syncs = database(`batch-{size}`)
+  local result: Result = { latencies = {}, committed = 0, refused = 0, wallMs = 0, syncs = 0, batches = 0 }
+  local began = net.now()
+  local number = 0
+  while number < requests do
+    local callbacks: { (sql.CatalogTransaction) -> () } = {}
+    for _ = 1, math.min(size, requests - number) do
+      number += 1
+      local mine = number
+      table.insert(callbacks, function(tx: sql.CatalogTransaction)
+        local writing = (tx :: unknown) :: Tx
+        writing:insert('events', { id = mine, body = body })
+        writing:upsert('counters', { id = 'total', value = mine })
+      end)
+    end
+
+    local before = net.now()
+    local results = db:transactionBatch(callbacks)
+    local took = net.now() - before
+    for _, outcome in results do
+      if not outcome.ok then error(`a batched request failed: {tostring(outcome.error)}`, 0) end
+
+      table.insert(result.latencies, took)
+      result.committed += 1
+    end
+  end
+
+  result.wallMs, result.syncs = net.now() - began, syncs()
+  report(`explicit batches of {size}`, result)
+  verify(db, result.committed)
+end
+
+-- The writer under a steady load of `arrivals` requests a synchronization.
+for _, arrivals in { 1, 8, 64, 256, 320 } do
+  local db, syncs = database(`writer-{arrivals}`)
+  local actor = writer.new(db, { maxBatch = 256, maxQueued = 1024 })
+  local result: Result = { latencies = {}, committed = 0, refused = 0, wallMs = 0, syncs = 0, batches = 0 }
+  local submitted: { [string]: number } = {}
+  local began = net.now()
+  local number = 0
+  local function settle(acks: { writer.Ack })
+    local now = net.now()
+    for _, ack in acks do
+      if ack.outcome ~= 'committed' then error(`request {ack.id} was {ack.outcome}: {tostring(ack.error)}`, 0) end
+
+      table.insert(result.latencies, now - submitted[ack.id])
+      submitted[ack.id] = nil
+      result.committed += 1
+    end
+  end
+
+  while number < requests do
+    for _ = 1, math.min(arrivals, requests - number) do
+      number += 1
+      local id = `r{number}`
+      local admission = actor:submit({ id = id, operations = {
+        { op = 'insert', table = 'events', row = { id = number, body = body } },
+        { op = 'upsert', table = 'counters', row = { id = 'total', value = number } },
+      } })
+
+      if admission.admitted then
+        submitted[id] = net.now()
+      elseif admission.reason == 'queue-full' then
+        result.refused += 1
+      else
+        error(`request {id} was refused: {tostring(admission.reason)}`, 0)
+      end
+    end
+
+    settle(actor:drain())
+  end
+
+  -- What is still queued when arrivals stop is drained: nothing admitted is left unanswered.
+  while actor:status().queued > 0 do settle(actor:drain()) end
+
+  result.wallMs, result.syncs, result.batches = net.now() - began, syncs(), actor:status().batches
+  report(`writer, {arrivals} arrivals a synchronization`, result)
+  if result.committed + result.refused ~= requests then error('a request was neither committed nor refused', 0) end
+
+  verify(db, result.committed)
+end
+
+return 0
