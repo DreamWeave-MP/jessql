@@ -91,11 +91,40 @@ as committed and **all 6,673 were present**, none missing. No row was present th
 acknowledged, in this run: the death here falls just after an acknowledgement, which is the
 easy moment. A death between the synchronization and the reply is not forced by this tool.
 
+## As a library: `@jessql/writer_service`
+
+The protocol and both of its ends, without the spawning: `service.host()` is the worker's
+message handler, `service.source` is what an application gives `jess.worker.spawn`, and
+`service.client(lane, options)` talks to a worker's handle, or to anything with `send` and
+`receive`, which is how it is tested without a script domain.
+
+- `submit` answers at once: admitted to the wire, or refused with `backpressure` (more than
+  `maxOutstanding` unanswered, default 768, at most 960, under the mailbox's 1,024),
+  `duplicate-id`, `closed`, `stopped` or `transport`.
+- `poll(seconds)` keeps one flush outstanding and returns every outcome learnt: `committed`,
+  `rejected` (a refusal by the writer arrives as this, with its reason) or `unknown`.
+- A worker that fails, or a flush unanswered for `flushTimeoutSeconds` (default 30), **stops the
+  client**: every unanswered request is `unknown`, exactly once, and nothing more is admitted.
+  The client never calls such a request rejected: it may be in the worker's mailbox and commit
+  later, and a test shows exactly that.
+- `close(seconds)` flushes, closes the database in the worker and returns the last outcomes;
+  what a worker never answered for is `unknown`.
+- The host answers every malformed or untimely message and never raises for one. A failed
+  `open` leaves no database open behind it (a test found that it did, and it was fixed).
+
+On a real worker (`bench/writer-worker`, three runs of 20,000 requests a rate, btrfs): the
+library client commits as fast as the hand-written protocol at 8,000 and 32,000 arrivals a
+second (7,992 and 19,438 commits a second in the first run; p99 17.5 and 40.5 ms). **At 2,000
+arrivals a second its p99 was 271, 75 and 18 ms across the three runs** against 13 to 15 ms for
+the hand-written protocol, with the same median (1.1 ms). Each library run follows the heaviest
+run of the other protocol on the same disk, which may be all there is to it; it is not
+explained, and it is recorded.
+
 ## Not there
 
-- A worker **as a library**: the worker's source and its protocol are in the benchmark
-  application, not in `@jessql`. Shutdown is `close`; there is no timeout on an unanswered
-  flush, and no restart of a worker that died.
+- **Restart** of a worker that died, and **fairness** between several clients: one client owns
+  one worker, first in, first out.
+- The spawning itself is the application's: a worker needs a script domain.
 - Death of a worker between the synchronization and its reply: the caller reconciles by id (a
   row keyed by the request's id in the same request makes a retry a duplicate-key rejection).
   A durable idempotency ledger is #33.

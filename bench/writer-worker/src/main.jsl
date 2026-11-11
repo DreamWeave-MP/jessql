@@ -16,6 +16,8 @@
 local application = require('@jess/application')
 local fs = require('@dream/fs')
 local net = require('@jess/net')
+local service = require('@jessql/writer_service')
+local writer = require('@jessql/writer')
 local sql = require('@jessql')
 local workers = require('@jess/worker')
 
@@ -74,6 +76,10 @@ end
 ]==]
 
 local body = string.rep('x', bodyBytes)
+local Tables: { sql.CatalogTableSpec } = {
+  { tableName = 'events', columns = { 'id', 'body' }, primaryKey = 'id' },
+  { tableName = 'counters', columns = { 'id', 'value' }, primaryKey = 'id' },
+}
 local MaxOutstanding = 768
 
 local function percentile(sorted: { number }, fraction: number): number
@@ -186,6 +192,64 @@ for _, rate in { 500, 2000, 8000, 32000 } do
   local counted = db:query('SELECT COUNT(*) AS n FROM events').rows[1].n
   db:close()
   if counted ~= run.count then error(`{run.count} were acknowledged and {tostring(counted)} are in the database`, 0) end
+end
+
+-- The same load through the library: `@jessql/writer_service`'s host in the worker and its
+-- client here. No meter is in that host, so flushes are counted instead: each is at most one
+-- synchronization.
+print('library client: arrivals_per_second,sent,committed,refused,flushes,p50_ms,p99_ms,max_ms,commits_per_second')
+for _, rate in { 2000, 8000, 32000 } do
+  local name = `library-{rate}`
+  local lane = workers.spawn { name = name, source = service.source, capabilities = { 'filesystem.read', 'filesystem.write' } }
+  local client = service.client((lane :: unknown) :: service.Lane, { now = function(): number return net.now() / 1000 end })
+  local opened, problem = client:open(`{directory}/{name}`, Tables, { maxBatch = 256, maxQueued = 1024 })
+  if not opened then error(`the library worker did not open: {tostring(problem)}`, 0) end
+
+  local submitted: { [string]: number } = {}
+  local latencies: { number } = {}
+  local sent, committed, refused = 0, 0, 0
+  local function learn(acks: { service.Ack })
+    local at = net.now()
+    for _, ack in acks do
+      if ack.outcome ~= 'committed' then error(`request {ack.id} was {ack.outcome}: {tostring(ack.error)}`, 0) end
+
+      table.insert(latencies, at - submitted[ack.id])
+      submitted[ack.id] = nil
+      committed += 1
+    end
+  end
+
+  local began = net.now()
+  while sent < requests or client:status().outstanding > 0 do
+    local due = math.min(requests, math.floor((net.now() - began) * rate / 1000) + 1)
+    while sent < due do
+      sent += 1
+      local admission = client:submit((request(sent) :: unknown) :: writer.Request)
+      if admission.admitted then
+        submitted[`r{sent}`] = net.now()
+      elseif admission.reason == 'backpressure' then
+        refused += 1
+      else
+        error(`request r{sent} was refused: {tostring(admission.reason)}`, 0)
+      end
+    end
+
+    learn(client:poll(0.001))
+  end
+
+  local wallMs = net.now() - began
+  local flushes = client:status().flushes
+  learn(client:close(60))
+  lane:join(60)
+  table.sort(latencies)
+  print(string.format('%d,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.0f', rate, sent, committed, refused, flushes,
+    percentile(latencies, 0.5), percentile(latencies, 0.99), latencies[#latencies], committed / (wallMs / 1000)))
+  if committed + refused ~= sent then error('a request was neither committed nor refused', 0) end
+
+  local db = sql.catalog.openExisting(`{directory}/{name}`)
+  local counted = db:query('SELECT COUNT(*) AS n FROM events').rows[1].n
+  db:close()
+  if counted ~= committed then error(`{committed} were acknowledged and {tostring(counted)} are in the database`, 0) end
 end
 
 -- A worker that dies under load: everything it acknowledged must have survived it.

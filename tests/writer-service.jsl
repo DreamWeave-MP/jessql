@@ -1,0 +1,235 @@
+--!strict
+-- #32: the writer as a service in a worker. The host and the client are driven here through a
+-- lane that stands in for a worker's handle: messages wait in a mailbox and are handled when
+-- the client next reads, which is the order a real worker would give them. What is held to:
+-- many requests behind one synchronization; refusals that are answers; a client that never
+-- waits; and a worker that is slow, full or dead leaving every unanswered request `unknown`,
+-- once, and none of them called committed.
+local memfs = require('@jessql/memfs')
+local meter = require('@jessql/meter')
+local service = require('@jessql/writer_service')
+local sql = require('@jessql')
+local test = require('@jess/test')
+local writer = require('@jessql/writer')
+
+local expect = test.expect
+local suite = test.new()
+
+local Path = '/memory/service'
+local Tables: { sql.CatalogTableSpec } = {
+  { tableName = 'events', columns = { 'id', 'body' }, primaryKey = 'id' },
+  { tableName = 'counters', columns = { 'id', 'value' }, primaryKey = 'id' },
+}
+
+local function event(number: number): writer.Request
+  return { id = `e{number}`, operations = {
+    { op = 'insert', table = 'events', row = { id = number, body = `event {number}` } },
+    { op = 'upsert', table = 'counters', row = { id = 'last', value = number } },
+  } }
+end
+
+type Disk = typeof(memfs.new())
+type World = {
+  disk: Disk, lane: service.Lane, syncs: () -> number, clock: { now: number },
+  -- The mailbox's limit, messages the worker has not handled, and switches for misbehaviour.
+  capacity: number, mailbox: { unknown }, dead: boolean, silent: boolean, handled: { string },
+  client: service.Client,
+}
+
+local function world(options: service.ClientOptions?): World
+  local disk = memfs.new()
+  local metered = meter.wrap(disk.backend)
+  local host = service.host({ storage = metered.backend })
+  local subject = { disk = disk, clock = { now = 0 }, capacity = 1024, mailbox = {}, dead = false, silent = false, handled = {} } :: World
+  local replies: { unknown } = {}
+  subject.syncs = function(): number return metered.counters().classes.wal.syncs end
+  subject.lane = {
+    send = function(_self: service.Lane, message: unknown)
+      if subject.dead then error('the worker is stopped; it takes no more messages', 0) end
+      if #subject.mailbox >= subject.capacity then error('the worker\'s queue is full', 0) end
+
+      table.insert(subject.mailbox, message)
+    end,
+    receive = function(_self: service.Lane, seconds: number?): unknown
+      if subject.dead then error('worker failed at handle: invented', 0) end
+
+      -- The worker runs when the application looks: every waiting message, in order.
+      if not subject.silent then
+        for _, message in subject.mailbox do
+          table.insert(subject.handled, tostring((message :: { kind: string }).kind))
+          local reply = host(message)
+          if reply ~= nil then table.insert(replies, reply) end
+        end
+
+        table.clear(subject.mailbox)
+      end
+
+      if #replies == 0 then
+        -- Waiting is what moves the clock.
+        subject.clock.now += seconds or 0
+        return nil
+      end
+
+      return table.remove(replies, 1)
+    end,
+  }
+
+  local given = table.clone(options or {} :: service.ClientOptions)
+  given.now = function(): number return subject.clock.now end
+  subject.client = service.client(subject.lane, given)
+  return subject
+end
+
+local function outcomes(acks: { service.Ack }): string
+  local parts: { string } = {}
+  for _, ack in acks do table.insert(parts, `{ack.id}={ack.outcome}`) end
+
+  return table.concat(parts, ' ')
+end
+
+local function rows(disk: Disk): number
+  local db = sql.catalog.openExisting(Path, { storage = disk.backend })
+  local counted = db:query('SELECT COUNT(*) AS n FROM events').rows[1].n :: number
+  db:close()
+  return counted
+end
+
+suite.describe('the writer as a service in a worker', function()
+  suite.it('commits what was sent between two looks behind one synchronization, and answers each request', function()
+    local subject = world()
+    expect((subject.client:open(Path, Tables))).toBe(true)
+    local before = subject.syncs()
+    for number = 1, 40 do expect(subject.client:submit(event(number)).admitted).toBe(true) end
+
+    -- The same event again under another id, and a request the writer will not take.
+    expect(subject.client:submit({ id = 'again', operations = event(7).operations }).admitted).toBe(true)
+    expect(subject.client:submit({ id = 'empty', operations = {} }).admitted).toBe(true)
+    expect(subject.client:status().outstanding).toBe(42)
+    local acks = subject.client:poll(0)
+    expect(#acks).toBe(42)
+    expect(subject.syncs() - before).toBe(1)
+    local byId: { [string]: service.Ack } = {}
+    for _, ack in acks do byId[ack.id] = ack end
+
+    expect(byId.e1.outcome).toBe('committed')
+    expect(byId.e40.outcome).toBe('committed')
+    expect(byId.again.outcome).toBe('rejected')
+    expect(byId.empty.outcome).toBe('rejected')
+    expect(string.find(byId.empty.error or '', 'refused: invalid', 1, true) ~= nil).toBe(true)
+    expect(subject.client:status().outstanding).toBe(0)
+    -- Nothing to flush: nothing is sent, nothing is synchronized.
+    expect(#subject.client:poll(0)).toBe(0)
+    expect(subject.client:status().flushes).toBe(1)
+
+    expect(subject.client:submit(event(41)).admitted).toBe(true)
+    expect(outcomes(subject.client:close(5))).toBe('e41=committed')
+    expect(subject.client:status().reason).toBe('closed')
+    expect(subject.client:submit(event(42)).reason).toBe('closed')
+    expect(rows(subject.disk)).toBe(41)
+  end)
+
+  suite.it('refuses at once what it cannot take, and never waits to do it', function()
+    local subject = world({ maxOutstanding = 5 })
+    expect(subject.client:submit(event(1)).reason).toBe('closed')
+    assert(subject.client:open(Path, Tables))
+    for number = 1, 5 do expect(subject.client:submit(event(number)).admitted).toBe(true) end
+
+    local full = subject.client:submit(event(6))
+    expect(`{tostring(full.admitted)} {tostring(full.reason)} {full.outstanding}`).toBe('false backpressure 5')
+    expect(subject.client:submit(event(3)).reason).toBe('duplicate-id')
+    expect(subject.client:submit({ id = '', operations = {} }).reason).toBe('invalid: a request has an id')
+    -- Refused here means never sent: the worker saw five submits and no more.
+    expect(#subject.mailbox).toBe(5)
+    expect(#subject.client:poll(0)).toBe(5)
+    expect(subject.client:submit(event(6)).admitted).toBe(true)
+
+    -- A mailbox that will not take a message is an answer too, and the request is not counted.
+    subject.capacity = 0
+    local refused = subject.client:submit(event(7))
+    expect(`{tostring(refused.reason)} {refused.outstanding}`).toBe('transport 1')
+    subject.capacity = 1024
+    expect(outcomes(subject.client:poll(0))).toBe('e6=committed')
+
+    -- Options that are not bounds are refused when the client is made.
+    for _, bad in { { maxOutstanding = 0 }, { maxOutstanding = 961 }, { maxOutstanding = 1.5 }, { flushTimeoutSeconds = 0 }, { flushTimeoutSeconds = 0 / 0 } } :: { service.ClientOptions } do
+      expect((pcall(service.client, subject.lane, bad))).toBe(false)
+    end
+  end)
+
+  suite.it('calls every unanswered request unknown, once, when the worker dies, and commits none of them itself', function()
+    local subject = world()
+    assert(subject.client:open(Path, Tables))
+    for number = 1, 3 do subject.client:submit(event(number)) end
+
+    expect(outcomes(subject.client:poll(0))).toBe('e1=committed e2=committed e3=committed')
+    for number = 4, 6 do subject.client:submit(event(number)) end
+
+    subject.dead = true
+    local acks = subject.client:poll(0)
+    expect(outcomes(acks)).toBe('e4=unknown e5=unknown e6=unknown')
+    expect(acks[1].error).toBe('the worker failed')
+    local status = subject.client:status()
+    expect(`{tostring(status.stopped)} {tostring(status.reason)} {status.outstanding}`).toBe('true the worker failed 0')
+    -- Once: nothing is reported twice, and nothing more is taken.
+    expect(#subject.client:poll(0)).toBe(0)
+    expect(subject.client:submit(event(7)).reason).toBe('stopped')
+    expect(#subject.client:close(1)).toBe(0)
+    -- The three unknown ones never left the mailbox here: the worker handled three submits
+    -- and one flush before it died, and the client did not invent an outcome for the rest.
+    expect(table.concat(subject.handled, ' ')).toBe('open submit submit submit flush')
+    expect(#subject.mailbox).toBe(3)
+  end)
+
+  suite.it('gives up on a worker that does not answer a flush in time, and on one that does not close', function()
+    local subject = world({ flushTimeoutSeconds = 10 })
+    assert(subject.client:open(Path, Tables))
+    subject.client:submit(event(1))
+    subject.silent = true
+    -- Looked at for nine seconds: still waiting, nothing claimed.
+    expect(#subject.client:poll(9)).toBe(0)
+    expect(subject.client:status().stopped).toBe(false)
+    -- One flush is outstanding, and no second one is sent on top of it.
+    expect(#subject.client:poll(0)).toBe(0)
+    expect(subject.client:status().flushes).toBe(1)
+    local acks = subject.client:poll(2)
+    expect(outcomes(acks)).toBe('e1=unknown')
+    expect(acks[1].error).toBe('the worker did not answer a flush in time')
+    expect(subject.client:status().stopped).toBe(true)
+
+    -- The request was in the worker's mailbox all along. A worker that then wakes may commit
+    -- it: that is exactly what unknown means, and why the client never said rejected.
+    local late = world()
+    assert(late.client:open(Path, Tables))
+    late.client:submit(event(1))
+    late.silent = true
+    local unanswered = late.client:close(3)
+    expect(outcomes(unanswered)).toBe('e1=unknown')
+    expect(unanswered[1].error).toBe('the worker did not close in time')
+    late.silent = false
+    late.lane:receive(0)
+    expect(rows(late.disk)).toBe(1)
+  end)
+
+  suite.it('answers every malformed or untimely message at the host without raising', function()
+    local host = service.host({ storage = memfs.new().backend })
+    local function kindOf(reply: unknown): string
+      local fields = reply :: { kind: string, reason: string? }
+      return `{fields.kind}:{tostring(fields.reason)}`
+    end
+
+    expect(kindOf(host({ kind = 'submit', request = event(1) }))).toBe('failed:not open')
+    expect(kindOf(host({ kind = 'flush', serial = 1 }))).toBe('failed:not open')
+    expect(kindOf(host('not a table'))).toBe('failed:not open')
+    expect(kindOf(host({ kind = 'open' }))).toBe('failed:open needs a path and tables')
+    expect(string.find(kindOf(host({ kind = 'open', path = Path, tables = Tables, options = { maxBatch = 100000 } })), 'jessql writer: invalid maxBatch', 1, true) ~= nil).toBe(true)
+    -- A failed open leaves the host able to open: the database it had opened was closed again.
+    expect(kindOf(host({ kind = 'open', path = Path, tables = Tables }))).toBe('opened:nil')
+    expect(kindOf(host({ kind = 'open', path = Path, tables = Tables }))).toBe('failed:already open')
+    expect(kindOf(host({ kind = 'nonsense' }))).toBe('failed:unknown message')
+    expect(kindOf(host({ kind = 'submit', request = 'not a request' }))).toBe('refused:invalid: a request is a table')
+    expect(kindOf(host({ kind = 'close' }))).toBe('closed:nil')
+    expect(kindOf(host({ kind = 'flush', serial = 2 }))).toBe('failed:not open')
+  end)
+end)
+
+return suite
