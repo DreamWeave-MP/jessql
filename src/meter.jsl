@@ -1,0 +1,332 @@
+--!strict
+-- A storage backend that counts. `meter.wrap(backend)` returns a backend to open a database on
+-- (`storage = metered.backend`) and the counters it keeps: bytes written and read, files made and
+-- removed and the bytes that went with them, and synchronizations, each by what kind of file it
+-- was. From those: write, space and read amplification.
+--
+-- It is opt-in and outside the store: a database opened without it pays nothing, because no
+-- storage module knows it exists. It counts what the store asked the backend to do, not what a
+-- device did; a write the backend refused is not counted.
+
+local vfs = require('@jessql/vfs')
+
+-- What kind of file a path is, from the names the managed store gives its files.
+export type Class = 'wal' | 'rows' | 'deleted' | 'manifest' | 'scratch' | 'lock' | 'other'
+
+export type Counter = {
+  -- Bytes the backend accepted, and bytes it returned.
+  written: number, read: number,
+  -- Files removed, and the bytes they held when they went: what was written and is now obsolete.
+  removed: number, removedBytes: number,
+  -- syncData and syncAll calls on files of this class.
+  syncs: number,
+}
+
+export type Counters = {
+  classes: { [Class]: Counter },
+  -- Bytes written to each path that has been written through this meter and not removed or
+  -- renamed away: what its physical size should be if it was only ever appended to.
+  files: { [string]: number },
+  directorySyncs: number, replaces: number,
+}
+
+export type Metered = {
+  backend: vfs.Backend,
+  counters: () -> Counters,
+  reset: () -> (),
+}
+
+export type Amplification = {
+  -- Bytes written to storage per byte the user supplied.
+  write: number,
+  -- Bytes on storage per byte of live user data.
+  space: number,
+  -- Bytes read from storage per byte returned to the user; nil when nothing was returned.
+  read: number?,
+}
+
+type WriteOptions = { offset: number?, append: boolean?, create: boolean?, exclusive: boolean?, atomic: boolean?, createParents: boolean? }
+type OpenWriteOptions = { append: boolean?, truncate: boolean?, create: boolean?, exclusive: boolean?, writeThrough: boolean? }
+type RecursiveOptions = { recursive: boolean? }
+
+local Classes: { Class } = { 'wal', 'rows', 'deleted', 'manifest', 'scratch', 'lock', 'other' }
+local meter = {}
+
+local function ends(path: string, suffix: string): boolean
+  return string.sub(path, -#suffix) == suffix
+end
+
+-- Scratch first: a compaction's scratch files end in `.rows` and `.deleted` too.
+function meter.classify(path: string): Class
+  if string.find(path, '.jql-tiers-', 1, true) or string.find(path, '.hot-', 1, true) or ends(path, '.jql-manifest.tmp') then
+    return 'scratch'
+  end
+
+  if ends(path, '.lock') or ends(path, '.jql-lock') or ends(path, '.owner') then return 'lock' end
+  if ends(path, '.wal') then return 'wal' end
+  if ends(path, '.rows') then return 'rows' end
+  if ends(path, '.deleted') then return 'deleted' end
+  if ends(path, '.jql-manifest') then return 'manifest' end
+  return 'other'
+end
+
+local function size(data: buffer | string, length: number?): number
+  if length then return length end
+  return if type(data) == 'string' then #data else buffer.len(data)
+end
+
+function meter.wrap(inner: vfs.Backend): Metered
+  local classes: { [Class]: Counter } = {}
+  local files: { [string]: number } = {}
+  local directorySyncs, replaces = 0, 0
+  local function clear()
+    for _, class in Classes do classes[class] = { written = 0, read = 0, removed = 0, removedBytes = 0, syncs = 0 } end
+
+    table.clear(files)
+    directorySyncs, replaces = 0, 0
+  end
+
+  clear()
+  local function wrote(path: string, count: number?)
+    if not count or count <= 0 then return end
+    local counter = classes[meter.classify(path)]
+    counter.written += count
+    files[path] = (files[path] or 0) + count
+  end
+
+  local function readBytes(path: string, count: number)
+    classes[meter.classify(path)].read += count
+  end
+
+  local backend = table.clone(inner)
+
+  backend.writeFile = function(path: string, data: buffer | string, options: WriteOptions?): (number?, string?, dream_fs_ErrorKind?)
+    local count, message, kind = inner.writeFile(path, data, options)
+    -- Without `append` or an offset the file is replaced: what it held is no longer its size.
+    if count and not (options and (options.append or options.offset)) then files[path] = nil end
+    wrote(path, count)
+    return count, message, kind
+  end
+
+  backend.createDurable = function(path: string, data: buffer | string)
+    local count, message, kind = inner.createDurable(path, data)
+    wrote(path, count)
+    return count, message, kind
+  end
+
+  backend.readFile = function(path: string)
+    local data, message, kind = inner.readFile(path)
+    if data then readBytes(path, buffer.len(data)) end
+    return data, message, kind
+  end
+
+  backend.readFileString = function(path: string)
+    local data, message, kind = inner.readFileString(path)
+    if data then readBytes(path, #data) end
+    return data, message, kind
+  end
+
+  backend.readAt = function(path: string, offset: number, length: number)
+    local data, message, kind = inner.readAt(path, offset, length)
+    if data then readBytes(path, buffer.len(data)) end
+    return data, message, kind
+  end
+
+  backend.open = function(path: string): (dream_fs_Reader?, string?, dream_fs_ErrorKind?)
+    local reader, message, kind = inner.open(path)
+    if not reader then return nil, message, kind end
+
+    local opened: dream_fs_Reader = reader
+    local proxy = {}
+    function proxy.size(_self: unknown) return opened:size() end
+
+    function proxy.tell(_self: unknown) return opened:tell() end
+
+    function proxy.seek(_self: unknown, to: number) return opened:seek(to) end
+
+    function proxy.skip(_self: unknown, count: number) return opened:skip(count) end
+
+    function proxy.close(_self: unknown) return opened:close() end
+
+    function proxy.readAt(_self: unknown, at: number, length: number)
+      local data, readMessage, readKind = opened:readAt(at, length)
+      if data then readBytes(path, buffer.len(data)) end
+      return data, readMessage, readKind
+    end
+
+    function proxy.read(_self: unknown, length: number)
+      local data, readMessage, readKind = opened:read(length)
+      if data then readBytes(path, buffer.len(data)) end
+      return data, readMessage, readKind
+    end
+
+    -- The same methods as the host's reader; a table rather than its userdata, which a type cannot say.
+    return (proxy :: unknown) :: dream_fs_Reader, nil, nil
+  end
+
+  backend.openPositional = function(path: string): (dream_fs_PositionalReader?, string?, dream_fs_ErrorKind?)
+    local reader, message, kind = inner.openPositional(path)
+    if not reader then return nil, message, kind end
+
+    local opened: dream_fs_PositionalReader = reader
+    local proxy = {}
+    function proxy.size(_self: unknown) return opened:size() end
+
+    function proxy.close(_self: unknown) return opened:close() end
+
+    function proxy.readAt(_self: unknown, at: number, length: number)
+      local data, readMessage, readKind = opened:readAt(at, length)
+      if data then readBytes(path, buffer.len(data)) end
+      return data, readMessage, readKind
+    end
+
+    return (proxy :: unknown) :: dream_fs_PositionalReader, nil, nil
+  end
+
+  backend.openWrite = function(path: string, options: OpenWriteOptions?): (dream_fs_Writer?, string?, dream_fs_ErrorKind?)
+    local writer, message, kind = inner.openWrite(path, options)
+    if not writer then return nil, message, kind end
+
+    if options and options.truncate then files[path] = nil end
+
+    local opened: dream_fs_Writer = writer
+    local proxy = {}
+    function proxy.tell(_self: unknown) return opened:tell() end
+
+    function proxy.seek(_self: unknown, to: number) return opened:seek(to) end
+
+    function proxy.flush(_self: unknown) return opened:flush() end
+
+    function proxy.close(_self: unknown) return opened:close() end
+
+    function proxy.truncate(_self: unknown, length: number)
+      local ok, truncateMessage, truncateKind = opened:truncate(length)
+      -- A file cut short is no longer the sum of what was written to it.
+      if ok then files[path] = math.min(files[path] or 0, length) end
+      return ok, truncateMessage, truncateKind
+    end
+
+    function proxy.write(_self: unknown, data: buffer | string, offset: number?, length: number?)
+      local count, writeMessage, writeKind = opened:write(data, offset, length)
+      wrote(path, if count then count else nil)
+      return count, writeMessage, writeKind
+    end
+
+    function proxy.syncData(_self: unknown)
+      classes[meter.classify(path)].syncs += 1
+      return opened:syncData()
+    end
+
+    function proxy.syncAll(_self: unknown)
+      classes[meter.classify(path)].syncs += 1
+      return opened:syncAll()
+    end
+
+    return (proxy :: unknown) :: dream_fs_Writer, nil, nil
+  end
+
+  backend.remove = function(path: string, options: RecursiveOptions?)
+    local stat = inner.stat(path)
+    local held = if stat and stat.isFile then stat.size else nil
+    local ok, message, kind = inner.remove(path, options)
+    if ok and held then
+      local counter = classes[meter.classify(path)]
+      counter.removed += 1
+      counter.removedBytes += held
+      files[path] = nil
+    end
+
+    return ok, message, kind
+  end
+
+  backend.replace = function(source: string, destination: string)
+    local ok, message, kind = inner.replace(source, destination)
+    if ok then
+      replaces += 1
+      files[destination], files[source] = files[source], nil
+    end
+
+    return ok, message, kind
+  end
+
+  backend.rename = function(from: string, to: string)
+    local ok, message, kind = inner.rename(from, to)
+    if ok then files[to], files[from] = files[from], nil end
+    return ok, message, kind
+  end
+
+  backend.syncDirectory = function(path: string)
+    directorySyncs += 1
+    return inner.syncDirectory(path)
+  end
+
+  return {
+    backend = backend,
+    counters = function(): Counters
+      local copy: { [Class]: Counter } = {}
+      for class, counter in classes do copy[class] = table.clone(counter) end
+
+      return { classes = copy, files = table.clone(files), directorySyncs = directorySyncs, replaces = replaces }
+    end,
+    reset = clear,
+  }
+end
+
+-- Every class added up, scratch and locks included.
+function meter.total(counters: Counters): Counter
+  local sum: Counter = { written = 0, read = 0, removed = 0, removedBytes = 0, syncs = 0 }
+  for _, counter in counters.classes do
+    sum.written += counter.written
+    sum.read += counter.read
+    sum.removed += counter.removed
+    sum.removedBytes += counter.removedBytes
+    sum.syncs += counter.syncs
+  end
+
+  return sum
+end
+
+-- The three ratios. `userBytes` is what the user supplied over the run, `liveBytes` what is
+-- still live of it, `physicalBytes` what the files hold now, `returnedBytes` what queries gave
+-- back. The caller says how it measured them; this only divides.
+function meter.amplification(counters: Counters, userBytes: number, liveBytes: number, physicalBytes: number,
+  returnedBytes: number?): Amplification
+  if userBytes <= 0 or liveBytes <= 0 then error('jessql meter: amplification needs user and live bytes above zero', 2) end
+
+  local total = meter.total(counters)
+  return {
+    write = total.written / userBytes,
+    space = physicalBytes / liveBytes,
+    read = if returnedBytes and returnedBytes > 0 then total.read / returnedBytes else nil,
+  }
+end
+
+-- One line of comma-separated values for a sample, and the header that goes above such lines.
+function meter.header(): string
+  local columns = { 'label' }
+  for _, class in Classes do
+    for _, field in { 'written', 'read', 'removed', 'removedBytes', 'syncs' } do table.insert(columns, `{class}_{field}`) end
+  end
+
+  table.insert(columns, 'directory_syncs')
+  table.insert(columns, 'replaces')
+  return table.concat(columns, ',')
+end
+
+function meter.row(label: string, counters: Counters): string
+  if string.find(label, '[,\n"]') then error('jessql meter: a label has no comma, quote or newline', 2) end
+
+  local cells = { label }
+  for _, class in Classes do
+    local counter = counters.classes[class]
+    for _, value in { counter.written, counter.read, counter.removed, counter.removedBytes, counter.syncs } do
+      table.insert(cells, string.format('%d', value))
+    end
+  end
+
+  table.insert(cells, string.format('%d', counters.directorySyncs))
+  table.insert(cells, string.format('%d', counters.replaces))
+  return table.concat(cells, ',')
+end
+
+return meter
