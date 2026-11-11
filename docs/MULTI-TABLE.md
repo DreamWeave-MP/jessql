@@ -122,11 +122,26 @@ and hot rows, a flush between commits and a compaction between commits, each sto
 storage step (42, 204 and 294 of them) in three modes, the first two with every crashed recovery
 crashed again: 10,411 stopped runs, no violation.
 
+Budgets are over the whole database, because the log is: `maxHotRows` (rows and tombstones of
+every table together), `maxHotBytes` (their payload), `maxWalBytes` (the log's size) and
+`maxGenerations` (2 to 8 for any one table, default 8). A commit that crosses one publishes a
+flush after it has been acknowledged, or a compaction when some table is at its limit of
+generations. A log that churn filled while leaving nothing hot is replaced on its own: the epoch
+moves and no table gains a generation. Maintenance that fails never fails the commit before it;
+it is kept in `maintenanceStatus().lastError` and the next write is refused until a flush or a
+compaction succeeds. A budget already crossed when the database is opened is remembered the same
+way, and nothing is published during an open.
+
+Checked by the same file: 120 service steps under `maxHotRows = 12, maxGenerations = 3` never held
+12 hot rows, more than 3 generations or a log of 16 KiB; 200 rounds of churn under
+`maxWalBytes = 4096` never held a log of 8 KiB; and nine commits that set off three publications,
+a compaction among them, were stopped at each of 649 storage steps in three modes (1,948 stopped
+runs, no violation).
+
 Not built yet, and so limits today:
 
-- No budgets and no automatic maintenance: the caller flushes and compacts. The hot rows of every
-  table are resident until a flush, as in the single-table store.
-- A log that grew by churn that left nothing hot is not rotated by `flush`.
+- The hot rows of every table are resident until a flush, as in the single-table store. Budgets
+  bound them (below); without one the caller flushes and compacts.
 - No offline `inspect`, `verify`, `backup` or `restore` for a catalog, and no secondary indexes.
 - At most 32 tables and 8 generations a table; the tables are fixed at creation.
 - Verified on the model disk only, like everything the fault laboratory holds.

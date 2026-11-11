@@ -83,8 +83,6 @@ suite.describe('catalog manifest (record version 3)', function()
     -- Generations out of order or past the publication epoch.
     expect(string.find(refused(function(value) value.tables[2].generations[2].epoch = 1 end), 'invalid generation entry', 1, true) ~= nil).toBe(true)
     expect(string.find(refused(function(value) value.tables[2].generations[3].epoch = 5 end), 'invalid generation entry', 1, true) ~= nil).toBe(true)
-    -- No table has a generation at the publication epoch: nothing was published at it.
-    expect(string.find(refused(function(value) value.tables[2].generations[3].epoch = 3 end), 'no generation at the publication epoch', 1, true) ~= nil).toBe(true)
     local many: { catalog.Generation } = {}
     for epoch = 1, 9 do many[epoch] = { epoch = epoch, deleted = false } end
 
@@ -174,11 +172,16 @@ suite.describe('catalog manifest (record version 3)', function()
     expect(#first.tables[2].generations).toBe(1)
     expect(catalog.table(second, 'absent')).toBe(nil)
 
-    -- Not two epochs at once, not an unknown table, and not a publication that changed nothing.
+    -- A publication that names no table moves the epoch alone: a new log over the same cold set.
+    local rotated = catalog.next(second, 3, other, {})
+    expect(rotated.epoch).toBe(3)
+    expect(#(catalog.table(rotated, 'events') :: catalog.Table).generations).toBe(2)
+    expect(catalog.decode(catalog.encode(rotated)).epoch).toBe(3)
+
+    -- Not two epochs at once, and not an unknown table.
     for _, attempt in {
       function() catalog.next(first, 3, other, { events = { { epoch = 1, deleted = false }, { epoch = 3, deleted = false } } }) end,
       function() catalog.next(first, 2, other, { absent = { { epoch = 2, deleted = false } } }) end,
-      function() catalog.next(first, 2, other, {}) end,
     } do
       -- A refusal is an error.
       local ok = pcall(attempt)

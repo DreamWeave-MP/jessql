@@ -52,7 +52,7 @@ local function sequence(value: unknown, most: number): boolean
   return seen == count
 end
 
-local function validateTable(entry: unknown, epoch: number): number
+local function validateTable(entry: unknown, epoch: number)
   if type(entry) ~= 'table' then error('jessql catalog: invalid table entry', 4) end
   local value = entry :: Table
   if not catalog.validName(value.tableName) then error('jessql catalog: invalid table name', 4) end
@@ -80,8 +80,6 @@ local function validateTable(entry: unknown, epoch: number): number
     end
     previous = generation.epoch
   end
-
-  return previous
 end
 
 local function validate(value: unknown)
@@ -99,17 +97,14 @@ local function validate(value: unknown)
   end
 
   if not sequence(manifest.tables, MaxTables) then error('jessql catalog: invalid table list', 3) end
-  local newest, previousName = 0, ''
+  local previousName = ''
 
   for _, entry in manifest.tables do
-    newest = math.max(newest, validateTable(entry, manifest.epoch))
+    validateTable(entry, manifest.epoch)
     -- One order only, so that one catalog has one encoding and no name appears twice.
     if entry.tableName <= previousName then error('jessql catalog: tables must be in name order, once each', 3) end
     previousName = entry.tableName
   end
-
-  -- A publication exists because some table gained a generation at its epoch.
-  if newest ~= manifest.epoch then error('jessql catalog: no generation at the publication epoch', 3) end
 end
 
 function catalog.validate(value: Catalog)
@@ -202,7 +197,8 @@ function catalog.initial(schemas: { TableSchema }, identity: string): Catalog
 end
 
 -- The manifest after a publication at `epoch`: each table named in `generations` takes that list,
--- every other table keeps its own.
+-- every other table keeps its own. With none named the epoch alone moves: a new log over the
+-- same cold set.
 function catalog.next(active: Catalog, epoch: number, identity: string,
   generations: { [string]: { Generation } }): Catalog
   local value = catalog.copy(active)

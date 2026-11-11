@@ -24,6 +24,7 @@ local tiers = require('@jessql/tiers')
 local engine = require('@jessql/engine')
 local hybrid = require('@jessql/hybrid')
 local manifest = require('@jessql/catalog_manifest')
+local policy = require('@jessql/managed_policy')
 local publicationKernel = require('@jessql/managed_publication')
 local walmark = require('@jessql/walmark')
 
@@ -34,6 +35,10 @@ export type Options = {
   tables: { TableSpec }?,
   cachePages: number?, readMode: string?, rowLayout: string?, pageBytes: number?,
   runRows: number?, mergeFanIn: number?, compactionFanIn: number?,
+  -- Budgets over the whole database: hot rows and tombstones of every table together, their
+  -- payload bytes, and the log's size. Crossing one after a commit publishes a flush, or a
+  -- compaction when some table already has `maxGenerations` (2 to 8, default 8).
+  maxHotRows: number?, maxHotBytes: number?, maxWalBytes: number?, maxGenerations: number?,
   -- The backend the database lives on; without it, the VM default at the time it is opened.
   storage: vfs.Backend?,
   -- Deterministic fault injection for integration tests. Throws at a named stage.
@@ -49,7 +54,8 @@ export type Transaction = {
   query: (self: Transaction, sql: string, params: { unknown }?) -> engine.Result,
 }
 export type TableStats = { generations: number, coldRows: number, hotRows: number, tombstones: number }
-export type Stats = { epoch: number, walBytes: number, cachedPages: number, tables: { [string]: TableStats } }
+export type Stats = { epoch: number, walBytes: number, cachedPages: number, hotPayloadBytes: number?,
+  tables: { [string]: TableStats } }
 export type Database = {
   get: (self: Database, tableName: string, key: unknown) -> Row?,
   insert: (self: Database, tableName: string, row: Row) -> (),
@@ -61,8 +67,10 @@ export type Database = {
   query: (self: Database, sql: string, params: { unknown }?) -> engine.Result,
   prepare: (self: Database, sql: string) -> engine.Plan,
   stats: (self: Database) -> Stats,
-  maintenanceStatus: (self: Database) -> { poisoned: boolean },
+  maintenanceStatus: (self: Database) -> { lastError: string?, poisoned: boolean },
   -- A new generation for every table with anything hot, and a new log. The epoch afterwards.
+  -- With nothing hot it does nothing, unless the log has reached `maxWalBytes`: then the log
+  -- alone is replaced by an empty one.
   flush: (self: Database) -> number,
   -- The same, and every table with more than one generation is merged into one.
   compact: (self: Database) -> number,
@@ -220,7 +228,7 @@ local function openOverlay(fs: vfs.Backend, base: string, value: Catalog, option
   -- A locked or damaged log raises; the cold readers are closed before that is reported.
   local opened, failure = pcall(function()
     local store = storage.open(wal, { rowLayout = if options then options.rowLayout else 'packed',
-      durability = 'sync', storage = fs })
+      durability = 'sync', trackPayloadBytes = options ~= nil and options.maxHotBytes ~= nil, storage = fs })
     hot = store
     local existing: { [string]: { string } } = {}
     local count = 0
@@ -422,6 +430,9 @@ local function openCatalog(path: string, options: Options?, intent: string): Dat
   local pageBytes = if options then options.pageBytes else nil
   local mergeCachePages = if options and options.cachePages then options.cachePages else 1
   local specs = if options then options.tables else nil
+  local limits = policy.limits(if options then { maxHotRows = options.maxHotRows, maxHotBytes = options.maxHotBytes,
+    maxWalBytes = options.maxWalBytes, maxGenerations = options.maxGenerations } else nil)
+  local budgeted = limits.maxHotRows ~= nil or limits.maxHotBytes ~= nil or limits.maxWalBytes ~= nil
   local lock, lockError = fs.lock(base .. '.jql-lock')
   if not lock then error('jessql catalog: database locked: ' .. tostring(lockError), 2) end
   local manifestPath = base .. '.jql-manifest'
@@ -481,6 +492,7 @@ local function openCatalog(path: string, options: Options?, intent: string): Dat
   local live = current :: Overlay
   local active = value :: Catalog
   local closed, poisoned, busy, batchActive, activeTransaction = false, false, false, false, false
+  local lastMaintenanceError: string? = nil
   local db = {} :: Database
 
   local function ready()
@@ -619,19 +631,31 @@ local function openCatalog(path: string, options: Options?, intent: string): Dat
     end
   end
 
-  function db.transaction(_self: Database, callback: (Transaction) -> ())
+  -- With a budget configured, a write is refused while the last maintenance stands failed:
+  -- otherwise an error there would let the log and the hot rows grow without bound.
+  local function readyToWrite()
     ready()
+    if budgeted and lastMaintenanceError then
+      error('jessql catalog: maintenance failed under configured budget; flush or compact', 3)
+    end
+  end
+
+  local autoMaintain: () -> () = function() end
+
+  function db.transaction(_self: Database, callback: (Transaction) -> ())
+    readyToWrite()
     if activeTransaction then error('jessql catalog: nested transaction', 2) end
     activeTransaction = true
     -- A callback or the commit can raise; the guard is released either way.
     local succeeded, problem = pcall(function() live.store:transaction(wrap(callback)) end)
     activeTransaction = false
     if not succeeded then error(problem, 2) end
+    autoMaintain()
   end
 
   -- Independent frames behind one synchronization: each callback is whole or absent on its own.
   function db.transactionBatch(_self: Database, callbacks: { (Transaction) -> () }): { BatchResult }
-    ready()
+    readyToWrite()
     if activeTransaction then error('jessql catalog: nested transaction', 2) end
 
     if type(callbacks) ~= 'table' or #callbacks == 0 or #callbacks > 256 then
@@ -653,6 +677,8 @@ local function openCatalog(path: string, options: Options?, intent: string): Dat
     batchActive = false
     activeTransaction = false
     if not succeeded then error(result, 2) end
+    -- Only once the whole batch is durable, and never as a failure of it.
+    autoMaintain()
     return result :: { BatchResult }
   end
 
@@ -681,6 +707,27 @@ local function openCatalog(path: string, options: Options?, intent: string): Dat
     return live.store:tableFootprint(name).rows, live.store:tableFootprint(tombstones(name)).rows
   end
 
+  local function walBytes(): number
+    local journal, journalError = fs.stat(live.wal)
+    if not journal or not journal.isFile then error('jessql catalog: active WAL stat failed: ' .. tostring(journalError), 2) end
+    return journal.size
+  end
+
+  -- Everything the log holds, over every table: rows and tombstones, their payload bytes when
+  -- those are tracked, and the most generations any one table has.
+  local function pressure(): (number, number?, number)
+    local held, payload, generations = 0, 0, 0
+    for _, entry in active.tables do
+      local rows = live.store:tableFootprint(entry.tableName)
+      local removed = live.store:tableFootprint(tombstones(entry.tableName))
+      held += rows.rows + removed.rows
+      payload += (rows.payloadBytes or 0) + (removed.payloadBytes or 0)
+      generations = math.max(generations, #entry.generations)
+    end
+
+    return held, if limits.maxHotBytes then payload else nil, generations
+  end
+
   function db.stats(_self: Database): Stats
     ready()
     local tables: { [string]: TableStats } = {}
@@ -691,20 +738,20 @@ local function openCatalog(path: string, options: Options?, intent: string): Dat
       cachedPages += cold:stats().cachedPages
       tables[entry.tableName] = { generations = #entry.generations, coldRows = cold.count, hotRows = hotRows, tombstones = removed }
     end
-    local journal, journalError = fs.stat(live.wal)
-    if not journal or not journal.isFile then error('jessql catalog: active WAL stat failed: ' .. tostring(journalError), 2) end
-    return { epoch = active.epoch, walBytes = journal.size, cachedPages = cachedPages, tables = tables }
+    local _, payload = pressure()
+    return { epoch = active.epoch, walBytes = walBytes(), cachedPages = cachedPages, hotPayloadBytes = payload, tables = tables }
   end
 
-  function db.maintenanceStatus(_self: Database): { poisoned: boolean }
+  function db.maintenanceStatus(_self: Database): { lastError: string?, poisoned: boolean }
+    if batchActive then error('jessql catalog: batched commit in progress', 2) end
     if closed then error('jessql catalog: closed', 2) end
-    return { poisoned = poisoned }
+    return { lastError = lastMaintenanceError, poisoned = poisoned }
   end
 
   -- Publishes the next epoch. `merge` also folds every table that has more than one generation
   -- (counting what it has hot) into a single one. Either way every table with anything hot gets
   -- a generation, because the log that held it is replaced by an empty one.
-  local function transition(merge: boolean): number
+  local function transition(merge: boolean, rotate: boolean): number
     ready()
     if activeTransaction then error('jessql catalog: cannot publish inside a transaction', 2) end
     if active.epoch >= MaxEpoch then error('jessql catalog: generation limit', 2) end
@@ -717,7 +764,7 @@ local function openCatalog(path: string, options: Options?, intent: string): Dat
         planned[entry.tableName] = if hot then 'merge-hot' else 'merge'
         any = true
       elseif hot then
-        if #entry.generations >= manifest.MaxGenerations then
+        if #entry.generations >= limits.maxGenerations then
           error('jessql catalog: generation budget reached for ' .. entry.tableName .. '; compact first', 2)
         end
         planned[entry.tableName] = 'delta'
@@ -725,7 +772,9 @@ local function openCatalog(path: string, options: Options?, intent: string): Dat
       end
     end
 
-    if not any then
+    -- With nothing to write, the epoch still moves when the log itself is what must go: the next
+    -- manifest names the same generations and a new, empty log is bound to the same cold set.
+    if not any and not rotate then
       if merge then error('jessql catalog: nothing to compact', 2) end
       return active.epoch
     end
@@ -818,15 +867,57 @@ local function openCatalog(path: string, options: Options?, intent: string): Dat
       error('jessql catalog: transition failed: ' .. tostring(transitionFailure), 2)
     end
 
+    lastMaintenanceError = nil
     return active.epoch
   end
 
   function db.flush(_self: Database): number
-    return transition(false)
+    ready()
+    return transition(false, limits.maxWalBytes ~= nil and walBytes() >= limits.maxWalBytes)
   end
 
   function db.compact(_self: Database): number
-    return transition(true)
+    return transition(true, false)
+  end
+
+  -- A commit that returned is synchronized. Maintenance after it must never turn that into an
+  -- apparent failure: what goes wrong here is kept, and refuses the next write instead.
+  autoMaintain = function()
+    if not budgeted then return end
+
+    -- Accounting and publication can both raise after the commit was acknowledged.
+    local ok, problem = pcall(function()
+      local held, payload, generations = 0, nil :: number?, 0
+      if limits.maxHotRows or limits.maxHotBytes then held, payload, generations = pressure() end
+
+      local mode = policy.plan(limits, generations, held, 0, payload, if limits.maxWalBytes then walBytes() else nil)
+      if mode == 'compact' then
+        transition(true, true)
+      elseif mode == 'flush' then
+        -- A table can be at its limit of generations without the log having said so.
+        local _, _, most = pressure()
+        transition(most >= limits.maxGenerations, true)
+      end
+    end)
+    lastMaintenanceError = if ok then nil else tostring(problem)
+  end
+
+  -- A restart must not forget a budget the last process had already crossed: it may have died
+  -- after an acknowledged commit and before the flush that commit called for. Nothing is
+  -- published during open; writes wait for the caller to flush or compact.
+  if budgeted then
+    -- Accounting over a recovered log can raise; the database then accepts nothing.
+    local counted, problem = pcall(function()
+      local held, payload, generations = pressure()
+      if policy.plan(limits, generations, held, 0, payload, if limits.maxWalBytes then walBytes() else nil) then
+        lastMaintenanceError = 'recovered state exceeds a configured budget; flush or compact'
+      end
+    end)
+
+    if not counted then
+      poisoned = true
+      lastMaintenanceError = 'recovered accounting failed: ' .. tostring(problem)
+    end
   end
 
   function db.close(_self: Database)

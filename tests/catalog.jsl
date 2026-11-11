@@ -456,4 +456,158 @@ suite.describe('a managed database of several tables', function()
   end)
 end)
 
+local function budgeted(disk: memfs.Disk, hook: ((string) -> ())?): sql.CatalogDatabase
+  return sql.catalog.open(Path, { tables = Tables, storage = disk.backend, cachePages = 2, pageBytes = 512,
+    maxHotRows = 12, maxGenerations = 3, testHook = hook })
+end
+
+suite.describe('a managed database of several tables under budgets', function()
+  suite.it('flushes and compacts by itself, keeping the hot rows, the generations and the log bounded', function()
+    local disk = memfs.new()
+    local db = budgeted(disk, nil)
+    local mostHot, mostGenerations, mostLog = 0, 0, 0
+    for number = 1, 120 do
+      db:transaction(function(tx) step(tx, number) end)
+      local stats = db:stats()
+      local hot = 0
+      for _, entry in Tables do
+        local held = stats.tables[entry.tableName]
+        hot += held.hotRows + held.tombstones
+        mostGenerations = math.max(mostGenerations, held.generations)
+      end
+
+      mostHot = math.max(mostHot, hot)
+      mostLog = math.max(mostLog, stats.walBytes)
+    end
+
+    -- A step adds four rows and a tombstone at most; the budget is twelve.
+    expect(mostHot < 12).toBe(true)
+    expect(mostGenerations <= 3).toBe(true)
+    expect(mostLog < 16384).toBe(true)
+    expect(db:stats().epoch > 20).toBe(true)
+    expect(db:maintenanceStatus().lastError).toBe(nil)
+    db:close()
+    expect(recover(disk)['120']).toBe(3)
+    print(`catalog budgets: most hot {mostHot}, most generations {mostGenerations}, largest log {mostLog} bytes over 120 steps`)
+  end)
+
+  suite.it('replaces a log that churn filled though nothing in it is hot', function()
+    local disk = memfs.new()
+    local db = sql.catalog.create(Path, { tables = Tables, storage = disk.backend, maxWalBytes = 4096 })
+    local largest = 0
+    for number = 1, 200 do
+      -- A row that comes and goes in the log leaves nothing hot behind.
+      db:insert('outbox', { id = number })
+      db:delete('outbox', number)
+      largest = math.max(largest, db:stats().walBytes)
+    end
+
+    local stats = db:stats()
+    expect(largest < 8192).toBe(true)
+    expect(stats.epoch > 5).toBe(true)
+    -- The epoch moved and no table gained a generation.
+    for _, entry in Tables do expect(stats.tables[entry.tableName].generations).toBe(1) end
+
+    expect(db:query('SELECT COUNT(*) AS n FROM outbox').rows[1].n).toBe(0)
+    db:close()
+    local second = reopen(disk)
+    expect(second:stats().epoch).toBe(stats.epoch)
+    second:close()
+  end)
+
+  suite.it('keeps a commit acknowledged when the maintenance after it fails, then refuses writes until a flush', function()
+    local disk = memfs.new()
+    local failing = true
+    local db = budgeted(disk, function(reached: string)
+      if failing and reached == 'candidate-sealed' then error('injected at ' .. reached, 0) end
+    end)
+
+    -- Four steps cross the budget; the fourth commit returns although its flush failed.
+    for number = 1, 4 do db:transaction(function(tx) step(tx, number) end) end
+
+    local status = db:maintenanceStatus()
+    expect(status.poisoned).toBe(false)
+    expect(string.find(tostring(status.lastError), 'injected at candidate-sealed', 1, true) ~= nil).toBe(true)
+    expect((db:get('counters', 'total') :: Row).value).toBe(4)
+    -- The next write is refused, and nothing of it is there.
+    local written, problem = pcall(function() db:transaction(function(tx) step(tx, 5) end) end)
+    expect(written).toBe(false)
+    expect(string.find(tostring(problem), 'maintenance failed under configured budget', 1, true) ~= nil).toBe(true)
+    expect(db:get('handled', 5)).toBe(nil)
+
+    failing = false
+    expect(db:flush()).toBe(2)
+    expect(db:maintenanceStatus().lastError).toBe(nil)
+    db:transaction(function(tx) step(tx, 5) end)
+    db:close()
+    expect(recover(disk)['5']).toBe(3)
+  end)
+
+  suite.it('remembers at reopen a budget the last process had crossed', function()
+    local disk = memfs.new()
+    local db = create(disk)
+    for number = 1, 6 do db:transaction(function(tx) step(tx, number) end) end
+
+    db:close()
+    local second = budgeted(disk, nil)
+    expect(string.find(tostring(second:maintenanceStatus().lastError), 'recovered state exceeds', 1, true) ~= nil).toBe(true)
+    -- Nothing was published during the open, and a write waits for the caller's flush.
+    expect(second:stats().epoch).toBe(1)
+    -- The write is refused with an error.
+    local written = pcall(function() second:transaction(function(tx) step(tx, 7) end) end)
+    expect(written).toBe(false)
+    expect(second:flush()).toBe(2)
+    second:transaction(function(tx) step(tx, 7) end)
+    second:close()
+    expect(recover(disk)['7']).toBe(3)
+
+    -- Limits out of range are refused before anything is opened.
+    for _, options in {
+      { tables = Tables, storage = disk.backend, maxHotRows = 0 },
+      { tables = Tables, storage = disk.backend, maxWalBytes = 100 },
+      { tables = Tables, storage = disk.backend, maxGenerations = 9 },
+      { tables = Tables, storage = disk.backend, maxHotBytes = 1.5 },
+    } do
+      -- Each of these raises.
+      local ok = pcall(function() sql.catalog.open('/memory/other', options :: sql.CatalogOptions) end)
+      expect(ok).toBe(false)
+    end
+
+    expect(names(disk) == string.gsub(names(disk), 'other', '')).toBe(true)
+  end)
+
+  suite.it('is whole at every storage step of the flushes and compactions its commits set off', function()
+    local report = lab.run({
+      name = 'catalog commits under budgets',
+      prepare = function(disk: memfs.Disk, ledger: lab.Ledger)
+        local db = budgeted(disk, nil)
+        for number = 1, 3 do commit(db, ledger, number) end
+
+        db:close()
+      end,
+      exercise = function(disk: memfs.Disk, ledger: lab.Ledger)
+        local db = budgeted(disk, nil)
+        -- A step may raise at the fault; the database is closed either way.
+        local ok, problem = pcall(function()
+          for number = 4, 12 do commit(db, ledger, number) end
+        end)
+        -- close can raise on a handle the fault has poisoned; it is closed as far as it can be.
+        pcall(function() db:close() end)
+        if not ok then error(problem, 0) end
+      end,
+      recover = recover,
+    })
+    expect(findings(report)).toBe('')
+    expect(report.truncated).toBe(false)
+    local replacements = 0
+    for _, taken in report.schedule do
+      if string.match(taken, '^replace ') then replacements += 1 end
+    end
+
+    -- Several publications happened inside the commits, a compaction among them.
+    expect(replacements >= 3).toBe(true)
+    print(`catalog budgets: {#report.schedule} storage steps, {report.runs} stopped runs, {replacements} publications, {#report.violations} violations`)
+  end)
+end)
+
 return suite
