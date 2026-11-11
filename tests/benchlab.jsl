@@ -1,0 +1,261 @@
+--!strict
+-- P0-01: the benchmark laboratory itself. Datasets must be the same for the same specification
+-- and say so by fingerprint; samplers must have the shape they claim; the harness must keep its
+-- phases apart, rotate its order, keep every raw trial and refuse a wrong answer. A fake clock
+-- makes the timings exact.
+local lab = require('@jessql/benchlab')
+local test = require('@jess/test')
+
+local expect = test.expect
+local suite = test.new()
+
+local Spec: lab.DatasetSpec = { seed = 7, rows = 500, minBodyBytes = 1024, maxBodyBytes = 4096, categories = 12, blobEvery = 50, blobBytes = 20000 }
+
+suite.describe('seeded datasets', function()
+  suite.it('gives the same rows and the same fingerprint for the same specification, twice', function()
+    local first, second = lab.dataset(Spec), lab.dataset(table.clone(Spec))
+    expect(first.fingerprint()).toBe(second.fingerprint())
+    expect(#first.fingerprint()).toBe(64)
+    expect(first.userBytes()).toBe(second.userBytes())
+    local left, right = first.iterate(), second.iterate()
+    for _ = 1, Spec.rows do
+      local one, other = left() :: lab.Row, right() :: lab.Row
+      expect(`{one.id}|{one.category}|{one.body}`).toBe(`{other.id}|{other.category}|{other.body}`)
+    end
+
+    expect(left()).toBe(nil)
+    -- A second pass over one dataset is the same pass.
+    expect((first.iterate()() :: lab.Row).body).toBe((second.iterate()() :: lab.Row).body)
+  end)
+
+  suite.it('changes its fingerprint when anything in the specification changes', function()
+    local base = lab.dataset(Spec).fingerprint()
+    local changes: { [string]: number } = { seed = 8, rows = 501, minBodyBytes = 1025, maxBodyBytes = 4095, categories = 13, blobEvery = 49, blobBytes = 20001 }
+    for field, value in changes do
+      local changed = table.clone(Spec);
+      (changed :: { [string]: number })[field] = value
+      expect(`{field} {lab.dataset(changed).fingerprint() ~= base}`).toBe(`{field} true`)
+    end
+  end)
+
+  suite.it('keeps to the sizes, keys, categories and blobs it was asked for', function()
+    local data = lab.dataset(Spec)
+    local categories: { [string]: boolean } = {}
+    local count, blobs, bodies, kinds = 0, 0, 0, 0
+    for row in data.iterate() do
+      count += 1
+      expect(row.id).toBe(count)
+      local body = row.body :: string
+      expect(#body >= 1024 and #body <= 4096).toBe(true)
+      bodies += #body
+      if not categories[row.category :: string] then
+        categories[row.category :: string] = true
+        kinds += 1
+      end
+
+      if row.blob then
+        blobs += 1
+        expect(#(row.blob :: string)).toBe(20000)
+        expect(count % 50).toBe(0)
+      end
+    end
+
+    expect(count).toBe(500)
+    expect(blobs).toBe(10)
+    expect(kinds).toBe(12)
+    -- Bodies are spread over the range, not all at one end.
+    expect(bodies / count > 2000 and bodies / count < 3100).toBe(true)
+    expect(data.userBytes() > bodies + blobs * 20000).toBe(true)
+  end)
+
+  suite.it('refuses a specification that is not one', function()
+    for _, bad in { { rows = 0 }, { minBodyBytes = -1 }, { maxBodyBytes = 10 }, { categories = 0 }, { seed = 1.5 }, { blobEvery = 3, blobBytes = 0 } } do
+      local spec = table.clone(Spec)
+      for field, value in bad :: { [string]: number } do (spec :: { [string]: number })[field] = value end
+
+      -- An invalid specification raises; the refusal is the assertion.
+      expect((pcall(lab.dataset, spec))).toBe(false)
+    end
+  end)
+end)
+
+suite.describe('key samplers', function()
+  local function histogram(sampler: lab.Sampler, draws: number): { [number]: number }
+    local counts: { [number]: number } = {}
+    for _ = 1, draws do
+      local key = sampler()
+      counts[key] = (counts[key] or 0) + 1
+    end
+
+    return counts
+  end
+
+  suite.it('draws the same keys for the same seed, and stays in range', function()
+    for _, distribution in { 'uniform', 'zipf' } :: { lab.Distribution } do
+      local first, second = lab.sampler(distribution, 1000, 3), lab.sampler(distribution, 1000, 3)
+      for _ = 1, 2000 do
+        local key = first()
+        expect(key).toBe(second())
+        expect(key >= 1 and key <= 1000 and key % 1 == 0).toBe(true)
+      end
+    end
+  end)
+
+  suite.it('spreads uniform draws evenly and piles Zipfian draws on the first keys', function()
+    local uniform = histogram(lab.sampler('uniform', 100, 11), 100000)
+    local least: number, most: number = math.huge, 0
+    for key = 1, 100 do
+      local drawn: number = uniform[key] or 0
+      least, most = math.min(least, drawn), math.max(most, drawn)
+    end
+
+    -- A thousand expected per key.
+    expect(least > 800 and most < 1200).toBe(true)
+
+    local zipf = histogram(lab.sampler('zipf', 1000, 11, 1), 100000)
+    -- With skew 1 over 1000 keys the first key takes about 13% and the first ten about 39%.
+    local firstTen = 0
+    for key = 1, 10 do firstTen += zipf[key] or 0 end
+
+    expect((zipf[1] or 0) > 12000 and (zipf[1] or 0) < 14500).toBe(true)
+    expect(firstTen > 37000 and firstTen < 41500).toBe(true)
+    expect((zipf[1] or 0) > (zipf[2] or 0) and (zipf[2] or 0) > (zipf[10] or 0)).toBe(true)
+    -- A higher skew is more concentrated.
+    local steep = histogram(lab.sampler('zipf', 1000, 11, 1.5), 100000)
+    expect((steep[1] or 0) > (zipf[1] or 0)).toBe(true)
+  end)
+
+  suite.it('refuses a distribution, key count or skew it cannot use', function()
+    -- Each of these raises; the refusal is the assertion.
+    expect((pcall(function() lab.sampler('uniform', 0, 1) end))).toBe(false)
+    expect((pcall(function() lab.sampler('zipf', 10, 1, 0) end))).toBe(false)
+    expect((pcall(function() lab.sampler(('normal' :: unknown) :: lab.Distribution, 10, 1) end))).toBe(false)
+  end)
+end)
+
+suite.describe('the harness', function()
+  -- A clock that advances only when told to, so every figure can be checked exactly.
+  local function fakeClock(): (() -> number, (seconds: number) -> ())
+    local now = 0
+    return function(): number return now end, function(seconds: number) now += seconds end
+  end
+
+  local function workload(name: string, cost: number, advance: (number) -> (), log: { string }, wrongAfter: number?): lab.Workload
+    local calls = 0
+    return {
+      name = name,
+      setup = function()
+        table.insert(log, `setup {name}`)
+        advance(5)
+      end,
+      load = function()
+        table.insert(log, `load {name}`)
+        advance(7)
+      end,
+      operation = function(index: number): number
+        calls += 1
+        -- One operation in ten is ten times slower: a tail to find.
+        advance(if index % 10 == 0 then cost * 10 else cost)
+        return if wrongAfter and calls > wrongAfter then index + 1 else index
+      end,
+      expected = function(operations: number): number return operations * (operations + 1) / 2 end,
+      between = function() table.insert(log, `between {name}`) end,
+      teardown = function() table.insert(log, `teardown {name}`) end,
+    }
+  end
+
+  suite.it('times setup, load and work apart, and gets the percentiles of what was measured', function()
+    local clock, advance = fakeClock()
+    local log: { string } = {}
+    local report = lab.run({ workloads = { workload('a', 0.001, advance, log) }, trials = 2, operations = 1000, clock = clock,
+      environment = { jess = 'test' }, fingerprint = 'f' })
+    expect(report.setupSeconds.a).toBe(5)
+    expect(report.loadSeconds.a).toBe(7)
+    expect(#report.trials).toBe(2)
+    local trial = report.trials[1]
+    -- 900 operations at 1 ms and 100 at 10 ms.
+    expect(math.abs(trial.seconds - 1.9) < 1e-9).toBe(true)
+    expect(math.abs(trial.p50 - 0.001) < 1e-9).toBe(true)
+    expect(math.abs(trial.p95 - 0.01) < 1e-9).toBe(true)
+    expect(math.abs(trial.p999 - 0.01) < 1e-9).toBe(true)
+    expect(math.abs(trial.slowest - 0.01) < 1e-9).toBe(true)
+    expect(trial.checksum).toBe(500500)
+    expect(report.environment.jess).toBe('test')
+  end)
+
+  suite.it('rotates which workload goes first, and runs between and teardown outside the trials', function()
+    local clock, advance = fakeClock()
+    local log: { string } = {}
+    local report = lab.run({ workloads = { workload('a', 0.001, advance, log), workload('b', 0.002, advance, log), workload('c', 0.003, advance, log) },
+      trials = 3, operations = 10, clock = clock })
+    local order: { string } = {}
+    for _, trial in report.trials do table.insert(order, `{trial.trial}:{trial.order}:{trial.workload}`) end
+
+    expect(table.concat(order, ' ')).toBe('1:1:a 1:2:b 1:3:c 2:1:b 2:2:c 2:3:a 3:1:c 3:2:a 3:3:b')
+    expect(log[1]).toBe('setup a')
+    expect(log[#log]).toBe('teardown c')
+    local between = 0
+    for _, line in log do
+      if string.sub(line, 1, 7) == 'between' then between += 1 end
+    end
+
+    -- One after each untimed check and one after each of nine trials.
+    expect(between).toBe(12)
+  end)
+
+  suite.it('refuses to report a workload whose answer is wrong, before timing and during it', function()
+    local clock, advance = fakeClock()
+    -- Wrong from the start: stopped by the untimed pass. Wrong later: stopped in a timed trial.
+    for _, wrongAfter in { 0, 25 } do
+      local config: lab.Config = { workloads = { workload('bad', 0.001, advance, {}, wrongAfter) }, trials = 3, operations = 10, clock = clock }
+      -- The run raises on the wrong answer; that it does is the assertion.
+      local ok, problem = pcall(lab.run, config)
+      expect(ok).toBe(false)
+      expect((string.find(tostring(problem), 'nothing is reported for a wrong result', 1, true)) ~= nil).toBe(true)
+    end
+  end)
+
+  suite.it('compares only reports of the same data, writes every raw trial, and takes real percentiles', function()
+    local clock, advance = fakeClock()
+    local function report(fingerprint: string?): lab.Report
+      return lab.run({ workloads = { workload('a', 0.001, advance, {}) }, trials = 2, operations = 10, clock = clock, fingerprint = fingerprint })
+    end
+
+    expect(lab.comparable(report('x'), report('x'))).toBe(true)
+    expect(lab.comparable(report('x'), report('y'))).toBe(false)
+    expect(lab.comparable(report(nil), report(nil))).toBe(false)
+
+    local lines = string.split(lab.csv(report('x')), '\n')
+    expect(#lines).toBe(3)
+    expect(#string.split(lines[1], ',')).toBe(#string.split(lines[2], ','))
+    expect(string.sub(lines[2], 1, 6)).toBe('x,a,1,')
+
+    expect(lab.percentile({ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 }, 50)).toBe(5)
+    expect(lab.percentile({ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 }, 99)).toBe(10)
+    expect(lab.percentile({ 4 }, 99.9)).toBe(4)
+    -- No samples, or a percentile out of range, raises.
+    expect((pcall(lab.percentile, {}, 50))).toBe(false)
+    expect((pcall(lab.percentile, { 1 }, 0))).toBe(false)
+  end)
+
+  suite.it('refuses two workloads of one name, a name that would break a line of values, no workloads, and no trials', function()
+    local clock, advance = fakeClock()
+    -- Each of these raises; the refusal is the assertion.
+    local twice: lab.Config = { workloads = { workload('a', 1, advance, {}), workload('a', 1, advance, {}) }, trials = 1, operations = 1, clock = clock }
+    local none: lab.Config = { workloads = {}, trials = 1, operations = 1, clock = clock }
+    local zero: lab.Config = { workloads = { workload('a', 1, advance, {}) }, trials = 0, operations = 1, clock = clock }
+    -- Two workloads of one name raises.
+    expect((pcall(lab.run, twice))).toBe(false)
+    -- No workloads raises.
+    expect((pcall(lab.run, none))).toBe(false)
+    -- No trials raises.
+    expect((pcall(lab.run, zero))).toBe(false)
+    for _, name in { 'a,b', 'a"b', 'a\nb', '' } do
+      local named: lab.Config = { workloads = { workload(name, 1, advance, {}) }, trials = 1, operations = 1, clock = clock }
+      -- A name that would break a line of values raises.
+      expect((pcall(lab.run, named))).toBe(false)
+    end
+  end)
+end)
+
+return suite

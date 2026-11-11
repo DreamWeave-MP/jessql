@@ -1,0 +1,131 @@
+--!strict
+-- The benchmark laboratory on a managed database, in memory: point reads with uniform and with
+-- Zipfian keys, a filtered scan and upserts, each checked against an oracle built from the
+-- dataset alone. It prints the environment it was told, the dataset fingerprint and every raw
+-- trial as CSV. The disk is in memory, so this measures the engine and not a device; the clock
+-- is `os.clock`, processor time.
+--
+--   jess run --package . bench/lab.jsl [rows=20000] [minBody=256] [maxBody=1024] [trials=5] [operations=20000]
+local lab = require('@jessql/benchlab')
+local memfs = require('@jessql/memfs')
+local meter = require('@jessql/meter')
+local sql = require('@jessql')
+
+type Row = { [string]: unknown }
+
+local arguments = { ... }
+local rows = tonumber(arguments[1]) or 20000
+local minBody = tonumber(arguments[2]) or 256
+local maxBody = tonumber(arguments[3]) or 1024
+local trials = tonumber(arguments[4]) or 5
+local operations = tonumber(arguments[5]) or 20000
+
+local data = lab.dataset({ seed = 20261110, rows = rows, minBodyBytes = minBody, maxBodyBytes = maxBody, categories = 16 })
+-- The oracle's own copy of what each row holds, made from the dataset and nothing else.
+local lengths: { number } = table.create(rows) :: { number }
+local inCategory = 0
+for row in data.iterate() do
+  lengths[row.id :: number] = #(row.body :: string)
+  if row.category == 'c3' then inCategory += 1 end
+end
+
+local disk = memfs.new()
+local metered = meter.wrap(disk.backend)
+local db: sql.ManagedDatabase? = nil
+local function database(): sql.ManagedDatabase return db :: sql.ManagedDatabase end
+
+local function load()
+  local opened = sql.managed.create('/memory/lab', { tableName = 'events', columns = { 'id', 'category', 'body' },
+    primaryKey = 'id', storage = metered.backend })
+  local nextRow = data.iterate()
+  local pending = true
+  while pending do
+    opened:transaction(function(tx)
+      for _ = 1, 2000 do
+        local row = nextRow()
+        if not row then
+          pending = false
+          break
+        end
+
+        tx:insert({ id = row.id, category = row.category, body = row.body })
+      end
+    end)
+    opened:flush()
+    -- Stay under the generation budget while loading.
+    if opened:stats().generations >= 6 then opened:compact() end
+  end
+
+  if opened:stats().generations >= 2 then opened:compact() end
+
+  db = opened
+end
+
+-- A point read answers the length of the body it found; the oracle adds the same lengths.
+local function reads(name: string, distribution: lab.Distribution, first: boolean): lab.Workload
+  local function keys(): lab.Sampler return lab.sampler(distribution, rows, 42, 1.1) end
+
+  local sampler = keys()
+  return {
+    name = name,
+    load = if first then load else nil,
+    operation = function(_index: number): number
+      local found = database():get(sampler())
+      return if found then #(found.body :: string) else -1
+    end,
+    expected = function(count: number): number
+      local oracle, sum = keys(), 0
+      for _ = 1, count do sum += lengths[oracle()] end
+
+      return sum
+    end,
+    -- Every trial draws the same keys, so trials are the same work.
+    between = function() sampler = keys() end,
+  }
+end
+
+local scan: lab.Workload = {
+  name = 'filtered scan',
+  operation = function(_index: number): number
+    return database():query('SELECT COUNT(*) AS n FROM events WHERE category = ?', { 'c3' }).rows[1].n :: number
+  end,
+  expected = function(count: number): number return inCategory * count end,
+}
+
+local upserts: lab.Workload = {
+  name = 'upsert',
+  operation = function(index: number): number
+    local key = rows + index
+    database():upsert({ id = key, category = 'new', body = 'u' })
+    return 1
+  end,
+  expected = function(count: number): number return count end,
+  between = function()
+    -- Take the rows back out so every trial starts from the same database.
+    database():transaction(function(tx)
+      for index = 1, operations do tx:delete(rows + index) end
+    end)
+    database():checkpoint()
+  end,
+}
+
+local environment = { clock = 'os.clock (processor seconds)', disk = 'memfs', rows = tostring(rows),
+  body_bytes = `{minBody}..{maxBody}`, durability = 'sync on a model disk' }
+
+local fast = lab.run({ workloads = { reads('point read uniform keys', 'uniform', true), reads('point read zipf 1.1 keys', 'zipf', false), upserts },
+  trials = trials, operations = operations, clock = os.clock, environment = environment, fingerprint = data.fingerprint() })
+
+print(`dataset: {rows} rows, {data.userBytes()} user bytes, fingerprint {data.fingerprint()}`)
+for key, value in environment do print(`environment: {key} = {value}`) end
+
+print(`load: {string.format('%.3f', fast.loadSeconds['point read uniform keys'])} s (insert, flush every 2000 rows, one selective compaction)`)
+local written = meter.total(metered.counters()).written
+print(`bytes written through the store so far: {written} ({string.format('%.2f', written / data.userBytes())} per user byte)`)
+print(lab.csv(fast))
+
+-- A scan reads every row, so it gets far fewer operations: a second run over the same data,
+-- rather than a loop hidden inside one operation of the first.
+local slow = lab.run({ workloads = { scan }, trials = trials, operations = 20, clock = os.clock, environment = environment,
+  fingerprint = data.fingerprint() })
+print(lab.csv(slow))
+database():close()
