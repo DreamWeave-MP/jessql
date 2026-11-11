@@ -51,16 +51,19 @@ suite.describe('synchronized journal', function()
     clean(path)
   end)
 
-  suite.it('rejects unsafe checkpoint publication without poisoning the journal', function()
+  -- This test used to assert that a synchronized checkpoint was refused "until generation
+  -- publication is safe". It now is: the compacted log is synchronized, takes the name by an
+  -- atomic replacement, and the name is made durable before another commit is accepted.
+  suite.it('publishes a synchronized checkpoint durably and goes on committing', function()
     local path = fixture('checkpoint')
     local db = sql.open(path, { durability = 'sync' })
     db:createTable('events', { 'id' }, 'id')
-    -- The sync-mode checkpoint must throw until generation publication is safe.
-    local accepted = pcall(function() db:checkpoint() end)
-    expect(accepted).toBe(false)
+    db:insert('events', { id = 'before' })
+    db:checkpoint()
     db:insert('events', { id = 'safe' })
     db:close()
     local reopened = sql.open(path, { durability = 'sync' })
+    expect((assert(reopened:get('events', 'before'))).id).toBe('before')
     expect((assert(reopened:get('events', 'safe'))).id).toBe('safe')
     reopened:close()
     clean(path)

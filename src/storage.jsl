@@ -1679,6 +1679,21 @@ function storage.open(path: string, options: Options?): Store
 
       if count ~= #Magic then error('jessql storage: ' .. tostring(writeError)) end
     end
+
+    if durability == 'sync' then
+      -- A checkpoint may have been interrupted between replacing the log and making its name
+      -- durable. Whichever log is here now is whole; make this name durable before anything is
+      -- appended to it, and drop a compacted log that never took the name.
+      local stale = path .. '.checkpoint.tmp'
+      if fs.exists(stale) then fs.remove(stale) end
+
+      local parent = fs.parent(path)
+      if parent then
+        local fenced, fenceError = fs.syncDirectory(parent)
+        if not fenced then error('jessql storage: log directory synchronization: ' .. tostring(fenceError)) end
+      end
+    end
+
     load(state, options == nil or options.recoverTail ~= false)
     if durability == 'sync' then
       local writer, openError = fs.openWrite(path, { append = true, create = false })
@@ -2047,11 +2062,13 @@ function storage.open(path: string, options: Options?): Store
 
   function db.checkpoint(_self: Store)
     ready()
-    -- The legacy checkpoint replaces the active WAL without a generation
-    -- manifest. Refuse to claim a durable commit contract for that operation.
-    if state.durability == 'sync' then
-      error('jessql storage: synced checkpoint requires durable generation publication', 2)
-    end
+    -- A synchronized store publishes its compacted log durably: the new log is synchronized
+    -- before it takes the name, the name is made durable by a directory synchronization, and
+    -- the store accepts no commit until both have happened. An unsynchronized store keeps the
+    -- plain rename it always had and promises nothing about it.
+    local durable = state.durability == 'sync'
+    local directory = if durable then fs.parent(state.path) else nil
+    if durable and not directory then error('jessql storage: checkpoint needs the log\'s directory', 2) end
 
     if state.busy then error('jessql storage: checkpoint inside transaction', 2) end
     -- Write a new compact log beside the live log; rename only after a complete close.
@@ -2120,6 +2137,11 @@ function storage.open(path: string, options: Options?): Store
         end
       end
       flushBatch()
+      if durable then
+        -- Every byte of the new log is on storage before it can become the log.
+        local synced, syncError = writer:syncAll()
+        if not synced then error('checkpoint sync: ' .. tostring(syncError)) end
+      end
     end)
     local closed, closeError = writer:close()
     if not ok or not closed then
@@ -2127,10 +2149,41 @@ function storage.open(path: string, options: Options?): Store
       error('jessql storage: checkpoint failed: ' .. tostring(failure or closeError), 2)
     end
 
-    local renamed, renameError = fs.rename(temp, state.path)
-    if not renamed then
-      state.poisoned = true
-      error('jessql storage: checkpoint rename uncertain: ' .. tostring(renameError), 2)
+    if durable then
+      -- From the replacement until the directory is synchronized, which log a crash leaves is
+      -- not known. Both hold exactly the committed rows, so either is correct; but a commit
+      -- appended now could be lost with the name. Any failure in this window therefore poisons
+      -- the store: it must be closed and opened again, and opening re-fences the name.
+      local replaced, replaceError = fs.replace(temp, state.path)
+      if not replaced then
+        state.poisoned = true
+        error('jessql storage: checkpoint replacement uncertain: ' .. tostring(replaceError), 2)
+      end
+
+      local fenced, fenceError = fs.syncDirectory(directory :: string)
+      if not fenced then
+        state.poisoned = true
+        error('jessql storage: checkpoint directory synchronization uncertain: ' .. tostring(fenceError), 2)
+      end
+
+      -- The append handle still refers to the log that was replaced.
+      local previous = state.walWriter
+      state.walWriter = nil
+      if previous then previous:close() end
+
+      local appender, appendError = fs.openWrite(state.path, { append = true, create = false })
+      if not appender then
+        state.poisoned = true
+        error('jessql storage: checkpoint could not reopen the log: ' .. tostring(appendError), 2)
+      end
+
+      state.walWriter = appender
+    else
+      local renamed, renameError = fs.rename(temp, state.path)
+      if not renamed then
+        state.poisoned = true
+        error('jessql storage: checkpoint rename uncertain: ' .. tostring(renameError), 2)
+      end
     end
     state.sequence = sequence
 

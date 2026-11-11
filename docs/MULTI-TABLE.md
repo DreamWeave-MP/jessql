@@ -20,16 +20,14 @@ Two facts, both pinned by the same test file, are why this is not yet what #40 a
 
 1. **A managed database is one table.** Generations, manifests, flush, compaction, verification
    and backup are all built around `Options.tableName`.
-2. **A synchronized persistent store cannot shorten its log.** `checkpoint()` is refused under
-   `durability = 'sync'` (`synced checkpoint requires durable generation publication`): the
-   legacy checkpoint replaces the log with a rename and no manifest, which is not a durability
-   contract anyone should rely on, so the store declines to offer it. The log therefore grows
-   with every commit, including rewrites of the same row, and every open replays all of it.
+2. **A synchronized persistent store could not shorten its log.** `checkpoint()` was refused
+   under `durability = 'sync'`, because the legacy checkpoint replaced the log with a bare
+   rename. Option A below removes this one (see "Option A, as prototyped").
 
-So today a service can have several tables in one atomic commit, or bounded storage with
-durable generation publication, and not both.
+With only the first fact left, a service can have several tables in one atomic commit with a
+bounded log, as long as every row of those tables fits in memory.
 
-## Two ways to close it (for the maintainer to choose; neither is built)
+## Two ways to close it (for the maintainer to choose)
 
 **A. A durable checkpoint for the multi-table store.** Give `sql.open` the publication protocol
 the managed store already has for its log: write the compacted log as a new epoch, seal it,
@@ -50,8 +48,32 @@ epoch covering all of them, flush and compaction per table under a single public
 
 They are not exclusive: A is a subset of the publication B needs, and could come first.
 
-## What a service can do meanwhile
+## Option A, as prototyped
 
-Nothing safe that is also bounded. Keeping small bookkeeping tables in a synchronized
-`sql.open` store is atomic and crash-safe as shown above, at the cost of a log that grows until
-the store is rebuilt offline. That is a statement of the present limit, not a recommendation.
+A synchronized `checkpoint()` now publishes the compacted log instead of refusing:
+
+1. the compacted log is written beside the live one and synchronized (`syncAll`);
+2. it takes the log's name by an atomic replacement;
+3. the directory is synchronized, which makes the name durable;
+4. the append handle is reopened on the new log.
+
+No manifest is needed, and none was added: the log has one fixed name, both logs hold exactly
+the committed rows (no commit can interleave), so whichever a crash leaves is correct. What is
+not safe is a commit appended to a log whose name is not yet durable. So any failure between
+steps 2 and 4 poisons the store, which then accepts no commit; and opening a synchronized store
+now synchronizes the log's directory before anything is appended, and removes a compacted log
+that never took the name.
+
+Checked by `tests/multi-table-atomicity.jsl`: the five-table service step with a checkpoint
+between commits, stopped at each of 20 storage steps in three modes, with crashed recoveries
+crashed again (161 stopped runs, no violation); the log really is shorter and a crash finds the
+shorter one; a checkpoint whose directory synchronization fails refuses the next commit until the
+store is reopened; a stale compacted log is dropped at open.
+
+Costs and limits: every open of a synchronized store, managed databases included, now makes one
+more directory synchronization. A checkpoint rewrites every row and holds the store for that
+long. All rows are resident. The unsynchronized checkpoint is unchanged and still promises
+nothing. This was verified on the model disk only.
+
+Whether this ships, and whether option B follows, is the maintainer's decision; the prototype is
+a draft so the choice can be made on something that runs.

@@ -3,8 +3,8 @@
 -- several tables in one WAL frame. A service step that reserves a side effect, marks an event
 -- handled, appends to a conversation, moves an outbox row and charges a counter is stopped at
 -- every storage step and must be there whole or not at all. This is `sql.open`, the WAL-only
--- store. A *managed* database is still single-table, and this store cannot shorten its log
--- while it is synchronized: both are pinned below, because together they are the gap.
+-- store. Its log is shortened by a checkpoint that is published durably and swept the same way.
+-- A *managed* database is still single-table.
 local lab = require('@jessql/faultlab')
 local memfs = require('@jessql/memfs')
 local sql = require('@jessql')
@@ -149,24 +149,109 @@ suite.describe('one commit over several tables of the persistent store', functio
     expect(report.truncated).toBe(false)
   end)
 
-  suite.it('cannot shorten its log while synchronized: a checkpoint is refused, and the log only grows', function()
+  suite.it('shortens its log by a checkpoint that is whole at every storage step, with commits before and after', function()
+    local report = lab.run({
+      name = 'checkpoint between service steps',
+      prepare = prepare,
+      exercise = function(disk: memfs.Disk, ledger: lab.Ledger)
+        local db = open(disk)
+        -- A step or the checkpoint may raise at the fault; the store is closed either way.
+        local ok, problem = pcall(function()
+          for number = 3, 4 do
+            ledger.begin(tostring(number), 3)
+            db:transaction(function(tx) step(tx, number) end)
+            ledger.acknowledge(tostring(number))
+          end
+
+          db:checkpoint()
+          ledger.begin('5', 3)
+          db:transaction(function(tx) step(tx, 5) end)
+          ledger.acknowledge('5')
+        end)
+        -- close can raise on a store the fault has poisoned; it is closed as far as it can be.
+        pcall(function() db:close() end)
+        if not ok then error(problem, 0) end
+      end,
+      recover = recover,
+    }, { crashRecovery = true })
+    expect(findings(report)).toBe('')
+    expect(report.truncated).toBe(false)
+    -- The schedule holds the publication: the new log synchronized, the replacement, the directory.
+    local seen: { [string]: number } = {}
+    for _, taken in report.schedule do
+      local kind = string.match(taken, '^(%S+)') :: string
+      seen[kind] = (seen[kind] or 0) + 1
+    end
+
+    expect(seen.syncAll).toBe(1)
+    expect(seen.replace).toBe(1)
+    expect((seen.syncDirectory or 0) >= 2).toBe(true)
+    print(`checkpoint: {#report.schedule} storage steps, {report.runs} stopped runs, {#report.violations} violations`)
+  end)
+
+  suite.it('really shortens the log, keeps every row, and leaves no compacted log behind', function()
     local disk = memfs.new()
     local ledger: lab.Ledger = { begin = function(_id: string, _rows: number) end, acknowledge = function(_id: string) end }
     prepare(disk, ledger)
     local db = open(disk)
-    local before = #disk.visible()[Path]
-    -- A synchronized store raises on checkpoint by design; the refusal is the assertion.
-    local done, problem = pcall(function() db:checkpoint() end)
-    expect(done).toBe(false)
-    expect((string.find(tostring(problem), 'synced checkpoint requires durable generation publication', 1, true)) ~= nil).toBe(true)
-    -- Rewriting the same counter and moving the same outbox row still lengthens the log.
-    for number = 3, 12 do db:transaction(function(tx) step(tx, number) end) end
+    for number = 3, 40 do db:transaction(function(tx) step(tx, number) end) end
 
+    local before = #disk.visible()[Path]
+    db:checkpoint()
     local after = #disk.visible()[Path]
-    expect(after > before * 3).toBe(true)
-    -- Still usable, and still whole, after the refused checkpoint.
+    -- Forty rewrites of one counter and forty outbox moves collapse to their last state.
+    expect(after < before).toBe(true)
+    expect(disk.visible()[Path .. '.checkpoint.tmp']).toBe(nil)
+    -- What a crash would find is the shortened log, not the old one.
+    expect(#disk.surviving()[Path]).toBe(after)
+    db:transaction(function(tx) step(tx, 41) end)
     db:close()
-    expect(recover(disk)['12']).toBe(3)
+    disk.crash()
+    local observed = recover(disk)
+    for number = 1, 41 do expect(`{number} {observed[tostring(number)]}`).toBe(`{number} 3`) end
+  end)
+
+  suite.it('accepts no commit after a checkpoint whose name could not be made durable, until it is reopened', function()
+    local disk = memfs.new()
+    local ledger: lab.Ledger = { begin = function(_id: string, _rows: number) end, acknowledge = function(_id: string) end }
+    prepare(disk, ledger)
+    local db = open(disk)
+    db:transaction(function(tx) step(tx, 3) end)
+    local directorySyncs = 0
+    disk.inject(function(taken: string, _path: string, _occurrence: number): memfs.Fault?
+      if taken ~= 'syncDirectory' then return nil end
+      directorySyncs += 1
+      return { message = 'injected: directory could not be synchronized' }
+    end)
+    -- The checkpoint raises when the directory cannot be synchronized; the refusal is the assertion.
+    local done, problem = pcall(function() db:checkpoint() end)
+    disk.inject(nil)
+    expect(done).toBe(false)
+    expect(directorySyncs).toBe(1)
+    expect((string.find(tostring(problem), 'directory synchronization uncertain', 1, true)) ~= nil).toBe(true)
+    -- A commit now could be lost with the name: it is refused, not acknowledged.
+    expect((pcall(function() db:transaction(function(tx) step(tx, 4) end) end))).toBe(false)
+    -- close can raise on the poisoned store; it is closed as far as it can be.
+    pcall(function() db:close() end)
+
+    -- Opening again makes the name durable before anything is appended.
+    local reopened = open(disk)
+    reopened:transaction(function(tx) step(tx, 4) end)
+    reopened:close()
+    disk.crash()
+    local observed = recover(disk)
+    expect(`{observed['3']} {observed['4']}`).toBe('3 3')
+  end)
+
+  suite.it('drops a compacted log that never took the name when the store is next opened', function()
+    local disk = memfs.new()
+    local ledger: lab.Ledger = { begin = function(_id: string, _rows: number) end, acknowledge = function(_id: string) end }
+    prepare(disk, ledger)
+    assert((disk.backend.createDurable(Path .. '.checkpoint.tmp', 'half a compacted log')))
+    local db = open(disk)
+    expect(disk.visible()[Path .. '.checkpoint.tmp']).toBe(nil)
+    db:close()
+    expect(recover(disk)['2']).toBe(3)
   end)
 
   suite.it('rolls every table back when the callback raises after touching all of them', function()
