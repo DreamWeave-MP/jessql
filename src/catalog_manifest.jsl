@@ -1,0 +1,254 @@
+--!strict
+--!native
+-- Internal, pure codec and invariants for the manifest of a multi-table managed database (a
+-- "catalog"): record version 3 of the JQLM1 manifest. No filesystem calls: callers own locking
+-- and publication, as with the single-table manifest.
+--
+-- One manifest names every table of the database, each with its own list of cold generations,
+-- under ONE publication epoch. A publication either moves the whole database to the next epoch
+-- or does not happen: there is no per-table manifest and so no moment at which two tables
+-- disagree about which generations are current. The log is one file per epoch, shared by every
+-- table, which is what makes a transaction over several tables one frame.
+--
+-- A single-table reader refuses this record (its version is not 1 or 2), and this codec refuses
+-- theirs: neither can open the other's database by mistake.
+local bytes = require('@dream/bytes')
+local json = require('@jess/json')
+
+export type Generation = { epoch: number, deleted: boolean }
+export type Table = { tableName: string, columns: { string }, primaryKey: string, generations: { Generation } }
+export type Catalog = { version: number, epoch: number, snapshotIdentity: string, tables: { Table } }
+export type TableSchema = { tableName: string, columns: { string }, primaryKey: string }
+
+local Magic = 'JQLM1\n'
+local MaxManifest = 65536
+local MaxEpoch = 99999999
+local MaxTables = 32
+local MaxGenerations = 8
+local MaxColumns = 256
+local IdentityPrefix = 'JQLC3|'
+local catalog = { Version = 3, MaxEpoch = MaxEpoch, MaxTables = MaxTables, MaxGenerations = MaxGenerations }
+
+local function whole(value: unknown, least: number, most: number): boolean
+  return type(value) == 'number' and (value :: number) % 1 == 0 and (value :: number) >= least and (value :: number) <= most
+end
+
+-- A table name the hot store, the engine and a file name can all carry: lowercase, and none of
+-- the names the overlay keeps for itself.
+function catalog.validName(name: unknown): boolean
+  return type(name) == 'string' and #(name :: string) <= 48 and string.match(name :: string, '^[%l_][%l%d_]*$') ~= nil
+    and string.sub(name :: string, 1, 9) ~= '__jessql_'
+end
+
+-- A sequence of exactly `count` entries and no other key.
+local function sequence(value: unknown, most: number): boolean
+  if type(value) ~= 'table' then return false end
+  local list = value :: { unknown }
+  local count = #list
+  if count == 0 or count > most then return false end
+  local seen = 0
+  for _ in pairs(list) do seen += 1 end
+
+  return seen == count
+end
+
+local function validateTable(entry: unknown, epoch: number): number
+  if type(entry) ~= 'table' then error('jessql catalog: invalid table entry', 4) end
+  local value = entry :: Table
+  if not catalog.validName(value.tableName) then error('jessql catalog: invalid table name', 4) end
+
+  if type(value.primaryKey) ~= 'string' or not sequence(value.columns, MaxColumns) then
+    error('jessql catalog: invalid table schema', 4)
+  end
+  local unique: { [string]: boolean } = {}
+
+  for _, name in value.columns do
+    if type(name) ~= 'string' or not string.match(name, '^[%a_][%w_]*$') or unique[name] then
+      error('jessql catalog: invalid table columns', 4)
+    end
+    unique[name] = true
+  end
+
+  if not unique[value.primaryKey] then error('jessql catalog: missing primary key', 4) end
+  if not sequence(value.generations, MaxGenerations) then error('jessql catalog: invalid generations', 4) end
+  local previous = 0
+
+  for _, generation in value.generations do
+    if type(generation) ~= 'table' or not whole(generation.epoch, previous + 1, epoch)
+      or type(generation.deleted) ~= 'boolean' then
+      error('jessql catalog: invalid generation entry', 4)
+    end
+    previous = generation.epoch
+  end
+
+  -- The oldest generation of a table has nothing beneath it to delete from.
+  if value.generations[1].deleted then error('jessql catalog: the first generation cannot carry deletions', 4) end
+  return previous
+end
+
+local function validate(value: unknown)
+  if type(value) ~= 'table' then error('jessql catalog: invalid manifest', 3) end
+  local manifest = value :: Catalog
+  if manifest.version ~= catalog.Version then
+    error('jessql catalog: not a multi-table manifest (record version ' .. tostring(manifest.version) .. ')', 3)
+  end
+
+  if not whole(manifest.epoch, 1, MaxEpoch) then error('jessql catalog: invalid epoch', 3) end
+
+  if type(manifest.snapshotIdentity) ~= 'string'
+    or not string.match(manifest.snapshotIdentity, '^JQLC3|%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x$') then
+    error('jessql catalog: invalid cold identity', 3)
+  end
+
+  if not sequence(manifest.tables, MaxTables) then error('jessql catalog: invalid table list', 3) end
+  local newest, previousName = 0, ''
+
+  for _, entry in manifest.tables do
+    newest = math.max(newest, validateTable(entry, manifest.epoch))
+    -- One order only, so that one catalog has one encoding and no name appears twice.
+    if entry.tableName <= previousName then error('jessql catalog: tables must be in name order, once each', 3) end
+    previousName = entry.tableName
+  end
+
+  -- A publication exists because some table gained a generation at its epoch.
+  if newest ~= manifest.epoch then error('jessql catalog: no generation at the publication epoch', 3) end
+end
+
+function catalog.validate(value: Catalog)
+  validate(value)
+end
+
+-- The identity of a whole cold set: every table's name with the identity of its generations, in
+-- name order. The log is bound to this, so a log cannot be replayed over another table set, or
+-- over this one with a generation swapped.
+function catalog.identity(identities: { [string]: string }): string
+  local names: { string } = {}
+  for name in identities do names[#names + 1] = name end
+  table.sort(names)
+  local parts: { string } = {}
+
+  for _, name in names do
+    local token = identities[name]
+    parts[#parts + 1] = name .. '\0' .. tostring(#token) .. '\0' .. token .. '\n'
+  end
+
+  return IdentityPrefix .. bytes.sha256(table.concat(parts))
+end
+
+function catalog.encode(value: Catalog): string
+  validate(value)
+  local body = json.encodeTable(value)
+  if #body > MaxManifest - 64 then error('jessql catalog: manifest too large', 2) end
+  return Magic .. body .. '\n' .. tostring(bytes.crc32(body)) .. '\n'
+end
+
+-- The record version of a manifest's bytes, without accepting it: 1 and 2 are a single-table
+-- database, 3 a catalog. Nil for anything that is not a whole, checksummed manifest.
+function catalog.versionOf(raw: string): number?
+  if type(raw) ~= 'string' or #raw > MaxManifest or string.sub(raw, 1, #Magic) ~= Magic then return nil end
+  local body, checksum = string.match(string.sub(raw, #Magic + 1), '^(.*)\n(%d+)\n$')
+  if not body or not checksum or tonumber(checksum) ~= bytes.crc32(body) then return nil end
+  -- A checksummed body can still be text that is not JSON.
+  local parsed, decoded = pcall(function(): unknown return json.decode(body) end)
+  if not parsed or type(decoded) ~= 'table' then return nil end
+  local version = (decoded :: { version: unknown }).version
+  return if type(version) == 'number' then version else nil
+end
+
+function catalog.decode(raw: string): Catalog
+  if type(raw) ~= 'string' or #raw > MaxManifest or string.sub(raw, 1, #Magic) ~= Magic then
+    error('jessql catalog: invalid manifest header', 2)
+  end
+  local body, checksum = string.match(string.sub(raw, #Magic + 1), '^(.*)\n(%d+)\n$')
+  if not body or not checksum or tonumber(checksum) ~= bytes.crc32(body) then
+    error('jessql catalog: manifest checksum mismatch', 2)
+  end
+  -- A checksummed body can still be text that is not JSON.
+  local parsed, decoded = pcall(function(): unknown return json.decode(body) end)
+  if not parsed then error('jessql catalog: invalid manifest', 2) end
+  validate(decoded)
+  local value = decoded :: Catalog
+  -- What was read is exactly what this build would have written: no key it does not know.
+  if catalog.encode(catalog.copy(value)) ~= raw then error('jessql catalog: manifest is not in canonical form', 2) end
+  return value
+end
+
+-- A catalog with only the fields this record version has, in tables of its own.
+function catalog.copy(value: Catalog): Catalog
+  local tables: { Table } = {}
+  for index, entry in value.tables do
+    local generations: { Generation } = {}
+    for position, generation in entry.generations do
+      generations[position] = { epoch = generation.epoch, deleted = generation.deleted }
+    end
+
+    tables[index] = { tableName = entry.tableName, columns = table.clone(entry.columns),
+      primaryKey = entry.primaryKey, generations = generations }
+  end
+
+  return { version = value.version, epoch = value.epoch, snapshotIdentity = value.snapshotIdentity, tables = tables }
+end
+
+-- The first manifest of a new database: every table with one empty generation at epoch 1.
+function catalog.initial(schemas: { TableSchema }, identity: string): Catalog
+  local tables: { Table } = {}
+  for index, schema in schemas do
+    tables[index] = { tableName = schema.tableName, columns = table.clone(schema.columns),
+      primaryKey = schema.primaryKey, generations = { { epoch = 1, deleted = false } } }
+  end
+
+  table.sort(tables, function(left: Table, right: Table): boolean return left.tableName < right.tableName end)
+  local value: Catalog = { version = catalog.Version, epoch = 1, snapshotIdentity = identity, tables = tables }
+  validate(value)
+  return value
+end
+
+-- The manifest after a publication at `epoch`: each table named in `generations` takes that list,
+-- every other table keeps its own.
+function catalog.next(active: Catalog, epoch: number, identity: string,
+  generations: { [string]: { Generation } }): Catalog
+  local value = catalog.copy(active)
+  value.epoch = epoch
+  value.snapshotIdentity = identity
+  local known: { [string]: boolean } = {}
+  for _, entry in value.tables do
+    known[entry.tableName] = true
+    if generations[entry.tableName] then entry.generations = generations[entry.tableName] end
+  end
+
+  for name in generations do
+    if not known[name] then error('jessql catalog: publication names an unknown table', 2) end
+  end
+
+  if epoch ~= active.epoch + 1 then error('jessql catalog: a publication moves one epoch', 2) end
+  validate(value)
+  return value
+end
+
+function catalog.table(value: Catalog, name: string): Table?
+  for _, entry in value.tables do
+    if entry.tableName == name then return entry end
+  end
+
+  return nil
+end
+
+-- Raises unless `schemas` is exactly the tables this catalog holds, with these columns and keys.
+function catalog.sameSchema(value: Catalog, schemas: { TableSchema })
+  if #schemas ~= #value.tables then error('jessql catalog: requested tables do not match the database', 2) end
+
+  for _, schema in schemas do
+    local entry = catalog.table(value, schema.tableName)
+    if not entry or entry.primaryKey ~= schema.primaryKey or #entry.columns ~= #schema.columns then
+      error('jessql catalog: requested schema of ' .. tostring(schema.tableName) .. ' does not match the database', 2)
+    end
+
+    for index, column in schema.columns do
+      if entry.columns[index] ~= column then
+        error('jessql catalog: requested schema of ' .. schema.tableName .. ' does not match the database', 2)
+      end
+    end
+  end
+end
+
+return catalog

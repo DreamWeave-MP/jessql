@@ -40,9 +40,9 @@ formats.list = table.freeze({
     purpose = 'Compact secondary-index sidecar bound to one snapshot.',
   }),
   table.freeze({
-    id = 'manifest', magic = 'JQLM1\n', suffixes = { '.jql-manifest' }, version = 1, reads = { 1, 2 }, writes = { 1, 2 },
+    id = 'manifest', magic = 'JQLM1\n', suffixes = { '.jql-manifest' }, version = 1, reads = { 1, 2, 3 }, writes = { 1, 2, 3 },
     module = '@jessql/managed_manifest',
-    purpose = 'The authoritative generation list of a managed database. Record version 1 names one generation, 2 a list.',
+    purpose = 'The authoritative generation list of a managed database. Record version 1 names one generation, 2 a list; 3 (@jessql/catalog_manifest) names several tables, each with its list, under one epoch.',
   }),
   table.freeze({
     id = 'log-mark', magic = 'JQLC1\n', suffixes = { '.wal.committed' }, version = 1, reads = { 1 }, writes = { 1 },
