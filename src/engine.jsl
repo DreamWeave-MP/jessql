@@ -165,6 +165,10 @@ export type Limits = {
   joinRows: number?,
   -- Groups a GROUP BY or an aggregate holds.
   groups: number?,
+  -- Rows a query without aggregates holds at once, to sort them or to return them all. A
+  -- query read through a cursor, or one whose ORDER BY and LIMIT let it keep only the best,
+  -- holds fewer or none and is counted for what it holds.
+  heldRows: number?,
 }
 export type Database = {
   _tables: { [string]: Provider },
@@ -1948,6 +1952,7 @@ local function prepare(db: Database, sql: string): Plan
     local buildLimit = if limits then limits.joinBuildRows else nil
     local joinLimit = if limits then limits.joinRows else nil
     local groupLimit = if limits then limits.groups else nil
+    local heldLimit = if limits then limits.heldRows else nil
     local function overBudget(what: string, rows: number, limit: number)
       error(string.format('jessql: query exceeds its budget: %s, %d rows (limit %d)', what, rows, limit), 0)
     end
@@ -2686,6 +2691,7 @@ local function prepare(db: Database, sql: string): Plan
           eachContext(function(context)
             if not residualWhere or sqlTruthy(residualWhere(context, nil, values)) then
               units[#units + 1] = { context = retainContext(context), group = nil }
+              if heldLimit and #units > heldLimit then overBudget('the rows a query holds to sort or return', #units, heldLimit) end
               if stopAfter ~= nil and #units >= stopAfter then return false end
             end
             return nil
@@ -2714,6 +2720,7 @@ local function prepare(db: Database, sql: string): Plan
         eachContext(function(context)
           if not residualWhere or sqlTruthy(residualWhere(context, nil, values)) then
             units[#units + 1] = { context = retainContext(context), group = nil }
+            if heldLimit and #units > heldLimit then overBudget('the rows a query holds to sort or return', #units, heldLimit) end
           end
           return nil
         end)
@@ -2905,7 +2912,7 @@ function engine.new(): Database
     if limits then
       if type(limits) ~= 'table' then error('jessql: limits are a table', 2) end
 
-      for _, name in { 'joinBuildRows', 'joinRows', 'groups' } do
+      for _, name in { 'joinBuildRows', 'joinRows', 'groups', 'heldRows' } do
         local value = (limits :: { [string]: unknown })[name]
         if value ~= nil and (type(value) ~= 'number' or value ~= math.floor(value :: number) or (value :: number) < 1) then
           error(`jessql: limit {name} is a whole number of rows, at least 1`, 2)
