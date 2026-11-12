@@ -1,0 +1,296 @@
+--!strict
+-- A two-level directory of cold pages (#19): prototype.
+--
+-- A cold file's directory says, for each page, the first key it holds and where it is. Held
+-- flat, it is one allocation as large as the table has pages, made when the file is opened.
+-- Here it is two levels: leaves of a fixed number of page entries, written as the pages are,
+-- and a root with one entry a leaf. Opening reads the root and nothing else. A lookup finds the
+-- leaf in the root, loads that one leaf (checked against its CRC-32) and finds the page in it.
+-- Leaves are kept in a cache bounded by count, least recently used out first. So what is held
+-- is the root (pages / leafEntries entries) and at most `maxLeaves` leaves, whatever the table.
+--
+-- The file: the leaves one after another, then the root, then a 24-byte footer.
+--
+--   leaf    u32 count, then count times: u16 key length, key, u32 segment, u32 offset, u32 length
+--   root    u32 count, then count times: u16 key length, first key of the leaf,
+--           u32 leaf offset, u32 leaf length, u32 leaf CRC-32, u32 entries in the leaf
+--   footer  'JQD2', u32 version (1), u32 root offset, u32 root length, u32 root CRC-32, u32 pages
+--
+-- Integers are low byte first. Offsets in the directory file are 32-bit: a directory of more
+-- than 4 GiB is outside this prototype. A page is named as `@jessql/coldaddress` names it.
+local bytes = require('@dream/bytes')
+local vfs = require('@jessql/vfs')
+
+export type Page = { first: string, segment: number, offset: number, length: number }
+export type Writer = {
+  -- Pages in strictly ascending order of their first key. Nil, or why it was refused.
+  add: (page: Page) -> string?,
+  -- Writes the root and the footer. The number of pages, or nil and why.
+  finish: () -> (number?, string?),
+}
+export type Stats = { pages: number, leaves: number, rootBytes: number, cached: number, leafReads: number, hits: number }
+export type Reader = {
+  -- The page whose range holds `key`: the last page whose first key is not after it. Nil with
+  -- no reason when `key` is before every page; nil and a reason when the directory is damaged.
+  find: (key: string) -> (Page?, string?),
+  stats: () -> Stats,
+}
+export type Options = { leafEntries: number?, maxLeaves: number? }
+
+local directory = {}
+
+directory.Magic = 'JQD2'
+directory.Version = 1
+directory.FooterBytes = 24
+directory.MaxKeyBytes = 4096
+directory.MaxRootBytes = 64 * 1024 * 1024
+directory.MaxLeafBytes = 8 * 1024 * 1024
+
+local function whole(value: unknown, least: number, most: number): boolean
+  return type(value) == 'number' and value == value and value == math.floor(value :: number)
+    and (value :: number) >= least and (value :: number) <= most
+end
+
+local function u32(value: number): string
+  local out = buffer.create(4)
+  buffer.writeu32(out, 0, value)
+  return buffer.tostring(out)
+end
+
+local function u16(value: number): string
+  local out = buffer.create(2)
+  buffer.writeu16(out, 0, value)
+  return buffer.tostring(out)
+end
+
+-- A writer of a new directory file at `path`. Leaves go to the file as they fill.
+function directory.writer(storage: vfs.Backend, path: string, options: Options?): (Writer?, string?)
+  local leafEntries = if options and options.leafEntries then options.leafEntries else 256
+  if not whole(leafEntries, 2, 65536) then return nil, 'not a leaf size' end
+
+  local created, problem = storage.writeFile(path, '', { exclusive = true })
+  if not created then return nil, problem or 'not created' end
+
+  local leaf: { string } = {}
+  local leafCount, leafFirst = 0, ''
+  local root: { string } = {}
+  local leaves, pages, written, rootBytes = 0, 0, 0, 4
+  local previous: string? = nil
+  local finished, failed = false, false
+
+  local function flush(): string?
+    if leafCount == 0 then return nil end
+
+    local body = u32(leafCount) .. table.concat(leaf)
+    if #body > directory.MaxLeafBytes then return 'a leaf larger than a leaf may be' end
+    if written + #body > 2 ^ 32 - 1 then return 'a directory file past 4 GiB' end
+
+    local appended, why = storage.writeFile(path, body, { append = true })
+    if not appended then return why or 'not written' end
+
+    local entry = u16(#leafFirst) .. leafFirst .. u32(written) .. u32(#body) .. u32(bytes.crc32(body)) .. u32(leafCount)
+    rootBytes += #entry
+    if rootBytes > directory.MaxRootBytes then return 'a root larger than a root may be' end
+
+    table.insert(root, entry)
+    written += #body
+    leaves += 1
+    leaf, leafCount = {}, 0
+    return nil
+  end
+
+  local self = {} :: Writer
+
+  function self.add(page: Page): string?
+    if finished or failed then return 'finished' end
+    if type(page) ~= 'table' or type(page.first) ~= 'string' or #page.first > directory.MaxKeyBytes then return 'not a page with a key a directory holds' end
+    if not whole(page.segment, 0, 2 ^ 32 - 1) or not whole(page.offset, 0, 2 ^ 32 - 1) or not whole(page.length, 1, 2 ^ 32 - 1) then return 'not a page address' end
+    if previous and not (previous < page.first) then return 'pages out of order' end
+
+    previous = page.first
+    if leafCount == 0 then leafFirst = page.first end
+
+    table.insert(leaf, u16(#page.first) .. page.first .. u32(page.segment) .. u32(page.offset) .. u32(page.length))
+    leafCount += 1
+    pages += 1
+    if leafCount >= leafEntries then
+      local why = flush()
+      if why then
+        failed = true
+        return why
+      end
+    end
+
+    return nil
+  end
+
+  function self.finish(): (number?, string?)
+    if finished or failed then return nil, 'finished' end
+
+    local why = flush()
+    if why then return nil, why end
+
+    local body = u32(leaves) .. table.concat(root)
+    if written + #body + directory.FooterBytes > 2 ^ 32 - 1 then return nil, 'a directory file past 4 GiB' end
+
+    local footer = directory.Magic .. u32(directory.Version) .. u32(written) .. u32(#body) .. u32(bytes.crc32(body)) .. u32(pages)
+    local appended, problem = storage.writeFile(path, body .. footer, { append = true })
+    if not appended then return nil, problem or 'not written' end
+
+    finished = true
+    return pages, nil
+  end
+
+  return self, nil
+end
+
+type Leaf = { firsts: { string }, pages: { Page }, stamp: number }
+type RootEntry = { first: string, offset: number, length: number, crc: number, entries: number }
+
+-- Opens a directory file of `size` bytes: the footer and the root are read, checked, and held.
+function directory.reader(storage: vfs.Backend, path: string, size: number, options: Options?): (Reader?, string?)
+  local maxLeaves = if options and options.maxLeaves then options.maxLeaves else 64
+  if not whole(maxLeaves, 1, 1000000) then return nil, 'not a cache size' end
+  if not whole(size, directory.FooterBytes + 4, 2 ^ 32 - 1) then return nil, 'not a directory file' end
+
+  local function read(offset: number, length: number): string?
+    local got = storage.readAt(path, offset, length)
+    if not got or buffer.len(got) ~= length then return nil end
+
+    return buffer.tostring(got)
+  end
+
+  local footer = read(size - directory.FooterBytes, directory.FooterBytes)
+  if not footer or string.sub(footer, 1, 4) ~= directory.Magic then return nil, 'not a directory file' end
+
+  local tail = buffer.fromstring(footer)
+  if buffer.readu32(tail, 4) ~= directory.Version then return nil, 'a directory of another version' end
+
+  local rootOffset, rootLength, rootCrc, pages = buffer.readu32(tail, 8), buffer.readu32(tail, 12), buffer.readu32(tail, 16), buffer.readu32(tail, 20)
+  if rootLength < 4 or rootLength > directory.MaxRootBytes or rootOffset + rootLength + directory.FooterBytes ~= size then return nil, 'a root that is not where the footer says' end
+
+  local rootBody = read(rootOffset, rootLength)
+  if not rootBody or bytes.crc32(rootBody) ~= rootCrc then return nil, 'the root does not match its checksum' end
+
+  -- The root, decoded once: one entry a leaf.
+  local raw = buffer.fromstring(rootBody)
+  local count = buffer.readu32(raw, 0)
+  local entries: { RootEntry } = {}
+  local at, described, expected = 4, 0, 0
+  for _ = 1, count do
+    if at + 2 > rootLength then return nil, 'a root cut short' end
+
+    local keyLength = buffer.readu16(raw, at)
+    if at + 2 + keyLength + 16 > rootLength then return nil, 'a root cut short' end
+
+    local first = buffer.readstring(raw, at + 2, keyLength)
+    at += 2 + keyLength
+    local entry: RootEntry = { first = first, offset = buffer.readu32(raw, at), length = buffer.readu32(raw, at + 4),
+      crc = buffer.readu32(raw, at + 8), entries = buffer.readu32(raw, at + 12) }
+    at += 16
+    -- Leaves are laid end to end from the start of the file, in key order.
+    if entry.offset ~= expected or entry.length < 4 or entry.length > directory.MaxLeafBytes or entry.entries < 1
+      or (#entries > 0 and not (entries[#entries].first < first)) then return nil, 'a root whose leaves are not in order' end
+
+    expected += entry.length
+    described += entry.entries
+    table.insert(entries, entry)
+  end
+
+  if at ~= rootLength or expected ~= rootOffset or described ~= pages then return nil, 'a root that does not describe the file' end
+
+  local cache: { [number]: Leaf } = {}
+  local cached, clock, leafReads, hits = 0, 0, 0, 0
+
+  local function load(index: number): (Leaf?, string?)
+    clock += 1
+    local held = cache[index]
+    if held then
+      held.stamp = clock
+      hits += 1
+      return held, nil
+    end
+
+    local entry = entries[index]
+    local body = read(entry.offset, entry.length)
+    leafReads += 1
+    if not body or bytes.crc32(body) ~= entry.crc then return nil, `leaf {index} does not match its checksum` end
+
+    local data = buffer.fromstring(body)
+    if buffer.readu32(data, 0) ~= entry.entries then return nil, `leaf {index} is not the leaf the root describes` end
+
+    local firsts: { string } = {}
+    local listed: { Page } = {}
+    local cursor = 4
+    for position = 1, entry.entries do
+      if cursor + 2 > entry.length then return nil, `leaf {index} is cut short` end
+
+      local keyLength = buffer.readu16(data, cursor)
+      if cursor + 2 + keyLength + 12 > entry.length then return nil, `leaf {index} is cut short` end
+
+      local first = buffer.readstring(data, cursor + 2, keyLength)
+      cursor += 2 + keyLength
+      firsts[position] = first
+      listed[position] = { first = first, segment = buffer.readu32(data, cursor), offset = buffer.readu32(data, cursor + 4), length = buffer.readu32(data, cursor + 8) }
+      cursor += 12
+    end
+
+    if cursor ~= entry.length or firsts[1] ~= entry.first then return nil, `leaf {index} is not the leaf the root describes` end
+
+    -- Room is made before the leaf is kept: the least recently used goes.
+    if cached >= maxLeaves then
+      local oldest, oldestStamp = 0, math.huge
+      for candidate, leaf in cache do
+        if leaf.stamp < oldestStamp then oldest, oldestStamp = candidate, leaf.stamp end
+      end
+
+      cache[oldest] = nil
+      cached -= 1
+    end
+
+    local leaf: Leaf = { firsts = firsts, pages = listed, stamp = clock }
+    cache[index] = leaf
+    cached += 1
+    return leaf, nil
+  end
+
+  -- The last position whose key is not after `key`, or 0.
+  local function floor(keys: number, keyAt: (position: number) -> string, key: string): number
+    local low, high = 1, keys
+    local found = 0
+    while low <= high do
+      local middle = (low + high) // 2
+      if keyAt(middle) <= key then
+        found = middle
+        low = middle + 1
+      else
+        high = middle - 1
+      end
+    end
+
+    return found
+  end
+
+  local self = {} :: Reader
+
+  function self.find(key: string): (Page?, string?)
+    if type(key) ~= 'string' then return nil, 'not a key' end
+
+    local index = floor(#entries, function(position: number): string return entries[position].first end, key)
+    if index == 0 then return nil, nil end
+
+    local leaf, problem = load(index)
+    if not leaf then return nil, problem end
+
+    local position = floor(#leaf.firsts, function(at: number): string return leaf.firsts[at] end, key)
+    return leaf.pages[position], nil
+  end
+
+  function self.stats(): Stats
+    return { pages = pages, leaves = #entries, rootBytes = rootLength, cached = cached, leafReads = leafReads, hits = hits }
+  end
+
+  return self, nil
+end
+
+return directory
