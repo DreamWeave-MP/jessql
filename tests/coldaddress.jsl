@@ -1,0 +1,219 @@
+--!strict
+-- #20: addresses into cold data kept as segment files. The arithmetic at its boundaries, the
+-- eight bytes on disk, names that are safe everywhere, and a prototype reader over real files
+-- on a disk in memory, including logical offsets far past 4 GiB.
+local address = require('@jessql/coldaddress')
+local bytes = require('@dream/bytes')
+local memfs = require('@jessql/memfs')
+local test = require('@jess/test')
+
+local expect = test.expect
+local suite = test.new()
+
+local GiB = 2 ^ 30
+local Directory = '/memory/cold'
+
+-- The reason a call gave beside its nil.
+local function reason(_value: unknown, why: string?): string?
+  return why
+end
+
+suite.describe('segment addresses', function()
+  suite.it('splits and joins logical offsets exactly, up to the last one a number holds', function()
+    local cases: { { logical: number, segment: number, offset: number } } = {
+      { logical = 0, segment = 0, offset = 0 },
+      { logical = GiB - 1, segment = 0, offset = GiB - 1 },
+      { logical = GiB, segment = 1, offset = 0 },
+      { logical = 4 * GiB, segment = 4, offset = 0 },
+      { logical = 4 * GiB + 1, segment = 4, offset = 1 },
+      { logical = 2 ^ 40 + 12345, segment = 1024, offset = 12345 },
+      { logical = 2 ^ 53 - 1, segment = 2 ^ 23 - 1, offset = GiB - 1 },
+    }
+
+    for _, case in cases do
+      local pair = assert(address.split(case.logical, GiB))
+      expect(`{case.logical}: {pair.segment} {pair.offset}`).toBe(`{case.logical}: {case.segment} {case.offset}`)
+      expect((address.join(pair, GiB))).toBe(case.logical)
+    end
+
+    -- One past the last exact number is not a logical offset, and its pair has none.
+    expect(reason(address.split(2 ^ 53, GiB))).toBe('not a whole logical offset an exact number holds')
+    expect(reason(address.join({ segment = 2 ^ 23, offset = 0 }, GiB))).toBe('no exact logical offset: carry the pair')
+    -- The pair itself is still an address: it goes on to the last segment.
+    expect(address.valid({ segment = 2 ^ 32 - 1, offset = GiB - 1 }, GiB)).toBe(true)
+    expect(address.valid({ segment = 2 ^ 32, offset = 0 }, GiB)).toBe(false)
+
+    for _, bad in { -1, 0.5, 0 / 0, 1 / 0, 2 ^ 60 } do
+      expect((address.split(bad, GiB))).toBe(nil)
+    end
+
+    expect((address.split('12' :: any, GiB))).toBe(nil)
+  end)
+
+  suite.it('takes only a power of two for a segment size, and only pairs that fit it', function()
+    for _, size in { 4096, 65536, GiB, 2 ^ 31 } do expect(address.validSegmentBytes(size)).toBe(true) end
+    for _, size in { 0, 1, 2048, 4097, 6000, 2 ^ 31 + 1, 2 ^ 32, 1.5 * GiB, -GiB } do expect(address.validSegmentBytes(size)).toBe(false) end
+
+    expect(address.valid({ segment = 0, offset = 4095 }, 4096)).toBe(true)
+    expect(address.valid({ segment = 0, offset = 4096 }, 4096)).toBe(false)
+    expect(address.valid({ segment = -1, offset = 0 }, 4096)).toBe(false)
+    expect(address.valid({ segment = 1.5, offset = 0 }, 4096)).toBe(false)
+    expect((address.split(10, 5000))).toBe(nil)
+    expect((address.join({ segment = 0, offset = 4096 }, 4096))).toBe(nil)
+  end)
+
+  suite.it('writes a pair as eight fixed bytes and refuses bytes that are not one', function()
+    local encoded = assert(address.encode({ segment = 0x01020304, offset = 0x0A0B0C0D }, GiB))
+    -- Low byte first, the segment and then the offset.
+    expect(bytes.toHex(encoded)).toBe('040302010d0c0b0a')
+    local back = assert(address.decode(encoded, nil, GiB))
+    expect(back.segment).toBe(0x01020304)
+    expect(back.offset).toBe(0x0A0B0C0D)
+
+    local last = assert(address.encode({ segment = 2 ^ 32 - 1, offset = GiB - 1 }, GiB))
+    expect(bytes.toHex(last)).toBe('ffffffffffffff3f')
+    expect(assert(address.decode(last, nil, GiB)).segment).toBe(2 ^ 32 - 1)
+    -- Inside a longer record.
+    expect(assert(address.decode('xx' .. encoded .. 'yy', 3, GiB)).offset).toBe(0x0A0B0C0D)
+
+    -- An offset no segment of the set can hold is damage.
+    expect(reason(address.decode(string.rep('\255', 8), nil, GiB))).toBe('offset past the end of a segment')
+    expect(reason(address.decode('short', nil, GiB))).toBe('not eight bytes')
+    expect(reason(address.decode(encoded, 2, GiB))).toBe('not eight bytes')
+    expect((address.encode({ segment = 2 ^ 32, offset = 0 }, GiB))).toBe(nil)
+    expect((address.encode({ segment = 0, offset = GiB }, GiB))).toBe(nil)
+  end)
+
+  suite.it('names segment files so that they sort by id and are safe on every platform', function()
+    expect((address.fileName('events', 0))).toBe('events.s00000000.cold')
+    expect((address.fileName('events', 255))).toBe('events.s000000ff.cold')
+    expect((address.fileName('events', 2 ^ 32 - 1))).toBe('events.sffffffff.cold')
+    expect((address.fileName('events', 2 ^ 32))).toBe(nil)
+    expect((address.fileName('events', -1))).toBe(nil)
+
+    for _, base in { 'events', 'Orders_2026-11', 'a', string.rep('b', 48) } do expect(address.validBase(base)).toBe(true) end
+
+    for _, base in { '', 'con', 'CON', 'Nul', 'aux', 'prn', 'COM1', 'lpt9', 'a.b', 'a/b', 'a\\b', '..', 'a b', '-a', '_a', 'a\0', string.rep('b', 49), 'ünï' } do
+      expect(`{base}: {tostring(address.validBase(base))}`).toBe(`{base}: false`)
+    end
+
+    -- Names that only look like devices are names.
+    for _, base in { 'console', 'COM10', 'nulls', 'com' } do expect(address.validBase(base)).toBe(true) end
+  end)
+
+  suite.it('cuts a read into one piece a segment, and refuses one that runs off the end', function()
+    local spans = assert(address.spans({ segment = 2, offset = 4000 }, 8300, 4096))
+    expect(#spans).toBe(4)
+    expect(`{spans[1].segment}:{spans[1].offset}+{spans[1].length}`).toBe('2:4000+96')
+    expect(`{spans[2].segment}:{spans[2].offset}+{spans[2].length}`).toBe('3:0+4096')
+    expect(`{spans[3].segment}:{spans[3].offset}+{spans[3].length}`).toBe('4:0+4096')
+    expect(`{spans[4].segment}:{spans[4].offset}+{spans[4].length}`).toBe('5:0+12')
+    expect(#assert(address.spans({ segment = 0, offset = 0 }, 0, 4096))).toBe(0)
+    expect(reason(address.spans({ segment = 2 ^ 32 - 1, offset = 0 }, 4097, 4096))).toBe('past the last segment')
+    expect(reason(address.spans({ segment = 0, offset = 0 }, 4096 * 4097, 4096))).toBe('too many segments for one read')
+    expect((address.spans({ segment = 0, offset = 0 }, -1, 4096))).toBe(nil)
+  end)
+end)
+
+suite.describe('the prototype reader over segment files', function()
+  local function written(segmentBytes: number, total: number): (typeof(memfs.new()), address.Set, string)
+    local disk = memfs.new()
+    disk.backend.mkdir(Directory, { recursive = true })
+    local writer = assert(address.writer(disk.backend, Directory, 'events', segmentBytes))
+    local all: { string } = {}
+    local produced = 0
+    local record = 0
+    while produced < total do
+      record += 1
+      -- Records of uneven length, so that they fall across the edges of segments.
+      local data = string.format('record %06d:', record) .. string.rep(string.char(65 + record % 26), record % 97)
+      local start = assert(writer.append(data))
+      expect(start).toBe(produced)
+      produced += #data
+      table.insert(all, data)
+    end
+
+    return disk, assert(writer.finish()), table.concat(all)
+  end
+
+  suite.it('reads back every byte it was given, across the edges of real segment files', function()
+    local disk, set, all = written(4096, 30000)
+    expect(#set.segments).toBe(math.ceil(#all / 4096))
+    expect((disk.backend.exists(`{Directory}/events.s00000007.cold`))).toBe(true)
+    local reader = assert(address.reader(disk.backend, Directory, 'events', set))
+
+    expect((reader.read(0, #all))).toBe(all)
+    for _, case in { { 0, 1 }, { 4095, 2 }, { 4096, 4096 }, { 8191, 8194 }, { #all - 5, 5 }, { 12345, 0 } } do
+      expect((reader.read(case[1], case[2])) == string.sub(all, case[1] + 1, case[1] + case[2])).toBe(true)
+    end
+
+    for _, entry in set.segments do expect((reader.verify(entry.id))).toBe(true) end
+
+    -- Past the end, in the last segment and beyond it.
+    expect(reason(reader.read(#all - 5, 6))).toBe(`past the end of segment {#set.segments - 1}`)
+    expect(reason(reader.read(#set.segments * 4096, 1))).toBe(`segment {#set.segments} is not in the set`)
+  end)
+
+  suite.it('reads at logical offsets far past 4 GiB, exactly, and refuses what the set does not hold', function()
+    -- Real files, small; the ids are what make the offsets large. A set need not start at 0.
+    local disk = memfs.new()
+    disk.backend.mkdir(Directory, { recursive = true })
+    local function put(id: number, body: string): address.Segment
+      assert((disk.backend.writeFile(`{Directory}/{assert(address.fileName('events', id))}`, body)))
+      return { id = id, length = #body, crc = bytes.crc32(body) }
+    end
+
+    local set: address.Set = { segmentBytes = GiB, segments = {
+      put(5, 'five gibibytes in'), put(6, 'the next one'), put(2 ^ 23 - 1, 'the last a number can name'), put(2 ^ 23, 'only a pair reaches this'),
+    } }
+    local reader = assert(address.reader(disk.backend, Directory, 'events', set))
+
+    expect((reader.read(5 * GiB, 4))).toBe('five')
+    expect((reader.read(5 * GiB + 5, 9))).toBe('gibibytes')
+    expect((reader.read(6 * GiB + 4, 4))).toBe('next')
+    expect((reader.read((2 ^ 23 - 1) * GiB + 4, 4))).toBe('last')
+    -- 2^53 and beyond: by pair only.
+    expect(reason(reader.read(2 ^ 53, 4))).toBe('not a whole logical offset an exact number holds')
+    expect((reader.readAt({ segment = 2 ^ 23, offset = 5 }, 6))).toBe('a pair')
+
+    -- Fails closed: a segment the set does not name, a read past a segment's recorded length
+    -- even though it is far short of the segment's capacity, and a read across a gap.
+    expect(reason(reader.read(4 * GiB, 1))).toBe('segment 4 is not in the set')
+    expect(reason(reader.read(5 * GiB + 10, 100))).toBe('past the end of segment 5')
+    expect(reason(reader.read(7 * GiB, 1))).toBe('segment 7 is not in the set')
+  end)
+
+  suite.it('refuses a set that is not one, a file that is shorter than the set says, and bytes that changed', function()
+    local disk, set, all = written(4096, 10000)
+    expect(#all > 8192).toBe(true)
+    local backend = disk.backend
+
+    local unordered: address.Set = { segmentBytes = 4096, segments = { set.segments[2], set.segments[1] } }
+    expect(reason(address.reader(backend, Directory, 'events', unordered))).toBe('a segment out of order or out of range')
+    local twice: address.Set = { segmentBytes = 4096, segments = { set.segments[1], set.segments[1] } }
+    expect((address.reader(backend, Directory, 'events', twice))).toBe(nil)
+    local long: address.Set = { segmentBytes = 4096, segments = { { id = 0, length = 4097, crc = 0 } } }
+    expect((address.reader(backend, Directory, 'events', long))).toBe(nil)
+    expect((address.reader(backend, Directory, 'con', set))).toBe(nil)
+    expect((address.reader(backend, Directory, 'events', { segmentBytes = 5000, segments = {} }))).toBe(nil)
+
+    local reader = assert(address.reader(backend, Directory, 'events', set))
+    local path = `{Directory}/events.s00000001.cold`
+    local body = assert((backend.readFileString(path)))
+    -- One byte changed: the read still returns bytes, and verification says they are not the ones.
+    assert((backend.writeFile(path, string.sub(body, 1, 99) .. '~' .. string.sub(body, 101))))
+    expect((reader.verify(0))).toBe(true)
+    expect(reason(reader.verify(1))).toBe('segment 1 does not match its checksum')
+    -- Cut short: every read that needs the missing bytes is refused.
+    assert((backend.writeFile(path, string.sub(body, 1, 2000))))
+    expect(reason(reader.read(4096 + 1990, 20))).toBe('segment 1 is shorter than the set says')
+    expect(reason(reader.verify(1))).toBe('segment 1 is shorter than the set says')
+    expect((reader.read(4096, 100)) == string.sub(body, 1, 100)).toBe(true)
+    -- Gone.
+    assert((backend.remove(path)))
+    expect((reader.read(4096, 10))).toBe(nil)
+    expect((reader.verify(7))).toBe(false)
+  end)
+end)
+
+return suite
