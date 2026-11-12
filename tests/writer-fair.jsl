@@ -153,6 +153,62 @@ suite.describe('fair admission in front of one writer', function()
     expect(got).toBe(0)
   end)
 
+  suite.it('keeps count of its tenants as they change, and ends each wait once, whenever it ends', function()
+    local now = 0
+    local back = behind(100000, 100000)
+    local front = fair.new({ submit = back.submit, poll = back.poll, capacity = 4096, maxTenants = 4096, waitSeconds = 5, now = function(): number return now end })
+    -- Two thousand tenants hold one request each.
+    for index = 1, 2000 do expect(front.submit(`tenant{index}`, request()).admitted).toBe(true) end
+
+    expect(front.status().active).toBe(2000)
+    -- One more submits five thousand times: two are within its share, the rest are refused,
+    -- and nothing is gone through to find that out. A wait is the only thing ever looked at,
+    -- and there has been none.
+    local admitted, refused = 0, 0
+    for _ = 1, 5000 do
+      local admission = front.submit('busy', request())
+      if admission.admitted then admitted += 1 elseif admission.reason == 'fair-share' then refused += 1 end
+    end
+
+    expect(`{admitted} {refused}`).toBe('2 4998')
+    local status = front.status()
+    expect(status.active).toBe(2001)
+    expect(status.share).toBe(2)
+    expect(status.examined).toBe(0)
+
+    -- A full queue of ten, and three hundred who find no room: each waits, and counts.
+    local small = fair.new({ submit = back.submit, poll = back.poll, capacity = 10, maxTenants = 4096, waitSeconds = 5, now = function(): number return now end })
+    for index = 1, 10 do small.submit(`holder{index}`, request()) end
+
+    for index = 1, 300 do
+      now = index / 100
+      expect(small.submit(`late{index}`, request()).reason).toBe('backpressure')
+    end
+
+    expect(small.status().active).toBe(310)
+    expect(small.status().share).toBe(1)
+    -- One of them asks again later: its wait is renewed, and the first is not the one that ends it.
+    now = 4
+    expect(small.submit('late1', request()).reason).toBe('backpressure')
+    -- The first two waits began at 0.01 and 0.02 and last five seconds.
+    now = 5.025
+    expect(small.status().tenants.late1.waiting).toBe(true)
+    expect(small.status().tenants.late2).toBe(nil)
+    expect(small.status().active).toBe(309)
+    -- All the first waits have ended by now but that one's second.
+    now = 8.5
+    local later = small.status()
+    expect(later.active).toBe(11)
+    expect(later.tenants.late1.waiting).toBe(true)
+    now = 9
+    local last = small.status()
+    expect(last.active).toBe(10)
+    expect(last.tenants.late1).toBe(nil)
+    -- Three hundred and one waits were begun, and each was looked at once.
+    expect(last.examined).toBe(301)
+    expect(last.share).toBe(1)
+  end)
+
   suite.it('passes on what the writer behind refuses, counts nothing it did not admit, and refuses what is not a request', function()
     local now = 0
     local back = behind(2, 10)

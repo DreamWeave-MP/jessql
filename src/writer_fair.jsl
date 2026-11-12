@@ -37,14 +37,16 @@ export type Options = {
   now: (() -> number)?,
 }
 export type TenantStatus = { outstanding: number, waiting: boolean, admitted: number, refused: number }
-export type Status = { outstanding: number, capacity: number, share: number, tenants: { [string]: TenantStatus } }
+-- `active` is how many tenants the queue is shared between now; `examined` how many waits have
+-- been looked at to end them since the start, which is at most one a refusal.
+export type Status = { outstanding: number, capacity: number, share: number, tenants: { [string]: TenantStatus }, active: number, examined: number }
 export type Fair = {
   submit: (tenant: string, request: writer.Request) -> Admission,
   poll: (seconds: number?) -> { writer.Ack },
   status: () -> Status,
 }
 
-type Tenant = { outstanding: number, waitingUntil: number, admitted: number, refused: number }
+type Tenant = { outstanding: number, waitingUntil: number, admitted: number, refused: number, counted: boolean }
 
 local fair = {}
 
@@ -74,20 +76,57 @@ function fair.new(options: Options): Fair
   local owner: { [string]: string } = {}
   local outstanding = 0
 
-  -- The tenants that hold requests or are waiting, with those who neither hold nor wait any
-  -- longer forgotten on the way.
-  local function active(at: number): number
-    local count = 0
-    for name, tenant in tenants do
-      if tenant.outstanding > 0 or tenant.waitingUntil > at then
-        count += 1
-      else
-        tenants[name] = nil
-        tenantCount -= 1
+  -- How many tenants hold requests or are waiting, kept as each one changes and never counted
+  -- by going through them: a submission costs the same however many tenants there are.
+  local activeCount = 0
+  -- Waits in the order they will end. Every wait lasts the same, so that is the order they
+  -- began in, and the ones that have ended are at the front.
+  local waits: { { name: string, expires: number } } = {}
+  local waitsHead = 1
+  local looked = 0
+
+  -- Counts or uncounts one tenant after something of it changed; one that neither holds nor
+  -- waits is forgotten.
+  local function settle(name: string, tenant: Tenant, at: number)
+    local active = tenant.outstanding > 0 or tenant.waitingUntil > at
+    if active ~= tenant.counted then
+      tenant.counted = active
+      activeCount += if active then 1 else -1
+    end
+
+    if not active and tenants[name] == tenant then
+      tenants[name] = nil
+      tenantCount -= 1
+    end
+  end
+
+  -- Ends the waits whose time is up. Each wait is looked at once here, whenever it ends.
+  local function expire(at: number)
+    while waitsHead <= #waits and waits[waitsHead].expires <= at do
+      local ended = waits[waitsHead]
+      waitsHead += 1
+      looked += 1
+      local tenant = tenants[ended.name]
+      -- A wait that was renewed, or ended by an admission, is not this one any more.
+      if tenant and tenant.waitingUntil == ended.expires then
+        tenant.waitingUntil = 0
+        settle(ended.name, tenant, at)
       end
     end
 
-    return count
+    -- The ended ones are dropped from the front once they are most of the list.
+    if waitsHead > 1024 and waitsHead * 2 > #waits then
+      waits = table.move(waits, waitsHead, #waits, 1, {})
+      waitsHead = 1
+    end
+  end
+
+  local function wait(name: string, tenant: Tenant, at: number)
+    if waitSeconds <= 0 then return end
+
+    tenant.waitingUntil = at + waitSeconds
+    table.insert(waits, { name = name, expires = tenant.waitingUntil })
+    settle(name, tenant, at)
   end
 
   local function refuse(tenant: Tenant?, reason: string): Admission
@@ -106,32 +145,37 @@ function fair.new(options: Options): Fair
     if owner[id] then return refuse(tenants[name], 'duplicate-id') end
 
     local at = now()
-    local others = active(at)
-    local tenant = tenants[name]
-    if not tenant then
-      if tenantCount >= maxTenants then return refuse(nil, 'too-many-tenants') end
+    expire(at)
+    local known = tenants[name]
+    if not known and tenantCount >= maxTenants then return refuse(nil, 'too-many-tenants') end
 
-      local made: Tenant = { outstanding = 0, waitingUntil = 0, admitted = 0, refused = 0 }
-      tenant = made
-      tenants[name] = made
+    local tenant: Tenant = known or { outstanding = 0, waitingUntil = 0, admitted = 0, refused = 0, counted = false }
+    if not known then
+      tenants[name] = tenant
       tenantCount += 1
-      others += 1
     end
 
-    local share = math.max(1, capacity // math.max(1, others))
-    if tenant.outstanding >= share then return refuse(tenant, 'fair-share') end
+    -- This tenant is one of those the queue is shared between, whether it was already or not.
+    local sharing = activeCount + (if tenant.counted then 0 else 1)
+    local share = math.max(1, capacity // sharing)
+    if tenant.outstanding >= share then
+      settle(name, tenant, at)
+      return refuse(tenant, 'fair-share')
+    end
 
     if outstanding >= capacity then
       -- Under its share and no room: it is owed the next places freed.
-      tenant.waitingUntil = at + waitSeconds
+      wait(name, tenant, at)
+      settle(name, tenant, at)
       return refuse(tenant, 'backpressure')
     end
 
     local admission = options.submit(request)
     if not admission.admitted then
       -- The writer behind is full or gone: its answer, and this tenant is still owed a place.
-      if admission.reason == 'backpressure' then tenant.waitingUntil = at + waitSeconds end
+      if admission.reason == 'backpressure' then wait(name, tenant, at) end
 
+      settle(name, tenant, at)
       return refuse(tenant, admission.reason or 'refused')
     end
 
@@ -140,11 +184,13 @@ function fair.new(options: Options): Fair
     tenant.outstanding += 1
     tenant.admitted += 1
     tenant.waitingUntil = 0
+    settle(name, tenant, at)
     return { admitted = true, reason = nil, outstanding = outstanding }
   end
 
   function self.poll(seconds: number?): { writer.Ack }
     local acks = options.poll(seconds)
+    local at = now()
     for _, ack in acks do
       local name = owner[ack.id]
       if not name then continue end
@@ -152,21 +198,26 @@ function fair.new(options: Options): Fair
       owner[ack.id] = nil
       outstanding -= 1
       local tenant = tenants[name]
-      if tenant then tenant.outstanding -= 1 end
+      if tenant then
+        tenant.outstanding -= 1
+        settle(name, tenant, at)
+      end
     end
 
+    expire(at)
     return acks
   end
 
   function self.status(): Status
     local listed: { [string]: TenantStatus } = {}
     local at = now()
-    local count = active(at)
+    expire(at)
     for name, tenant in tenants do
       listed[name] = { outstanding = tenant.outstanding, waiting = tenant.waitingUntil > at, admitted = tenant.admitted, refused = tenant.refused }
     end
 
-    return { outstanding = outstanding, capacity = capacity, share = math.max(1, capacity // math.max(1, count)), tenants = listed }
+    return { outstanding = outstanding, capacity = capacity, share = math.max(1, capacity // math.max(1, activeCount)), tenants = listed,
+      active = activeCount, examined = looked }
   end
 
   return self
