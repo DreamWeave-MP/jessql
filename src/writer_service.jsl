@@ -50,12 +50,18 @@ export type ClientOptions = {
   maxOutstanding: number?,
   -- How long a flush may go unanswered before the worker is given up on (default 30).
   flushTimeoutSeconds: number?,
+  -- The most bytes in one request, and in everything sent and not yet answered (defaults and
+  -- limits as the writer's own `maxRequestBytes` and `maxQueuedBytes`). They are held here,
+  -- before a message enters the worker's mailbox: a count of messages does not bound what a
+  -- mailbox holds. Over the first is `too-large`; what would pass the second, `backpressure`.
+  maxRequestBytes: number?,
+  maxOutstandingBytes: number?,
   -- Seconds, monotonic. Injected in tests.
   now: (() -> number)?,
 }
 export type Ack = writer.Ack
 export type Admission = { admitted: boolean, reason: string?, outstanding: number }
-export type ClientStatus = { outstanding: number, stopped: boolean, reason: string?, flushes: number }
+export type ClientStatus = { outstanding: number, outstandingBytes: number, stopped: boolean, reason: string?, flushes: number }
 export type Client = {
   open: (self: Client, path: string, tables: { catalog.TableSpec }, options: writer.Options?, seconds: number?) -> (boolean, string?),
   submit: (self: Client, request: writer.Request) -> Admission,
@@ -175,8 +181,22 @@ function service.client(lane: Lane, options: ClientOptions?): Client
     error('jessql writer service: invalid flushTimeoutSeconds', 2)
   end
 
+  local maxRequestBytes = if options and options.maxRequestBytes ~= nil then options.maxRequestBytes else writer.DefaultRequestBytes
+  local maxOutstandingBytes = if options and options.maxOutstandingBytes ~= nil then options.maxOutstandingBytes else writer.DefaultQueuedBytes
+  if typeof(maxRequestBytes) ~= 'number' or maxRequestBytes ~= math.floor(maxRequestBytes) or maxRequestBytes < 1 or maxRequestBytes > writer.MaxRequestBytes then
+    error('jessql writer service: invalid maxRequestBytes', 2)
+  end
+
+  if typeof(maxOutstandingBytes) ~= 'number' or maxOutstandingBytes ~= math.floor(maxOutstandingBytes) or maxOutstandingBytes < maxRequestBytes
+    or maxOutstandingBytes > writer.MaxQueuedBytes then
+    error('jessql writer service: invalid maxOutstandingBytes', 2)
+  end
+
   local now = (options and options.now) or os.clock
-  -- In the order they were sent: an unknown outcome is reported in that order too.
+  -- In the order they were sent: an unknown outcome is reported in that order too. What each
+  -- weighs is kept until it is answered.
+  local weights: { [string]: number } = {}
+  local outstandingBytes = 0
   local pending: { [string]: boolean } = {}
   local order: { string } = {}
   local outstanding = 0
@@ -190,6 +210,8 @@ function service.client(lane: Lane, options: ClientOptions?): Client
 
     pending[id] = nil
     outstanding -= 1
+    outstandingBytes -= weights[id] or 0
+    weights[id] = nil
     return true
   end
 
@@ -266,11 +288,20 @@ function service.client(lane: Lane, options: ClientOptions?): Client
 
     local id = field(request, 'id')
     if typeof(id) ~= 'string' or #id == 0 then return refused('invalid: a request has an id') end
+
+    -- Weighed before it goes anywhere, whatever it is. What is a request is sent as the
+    -- writer's own frozen copy, so a lane that does not copy what it is handed cannot be
+    -- changed under; what is not one is sent as it is, small, for the writer to refuse.
+    local taken, _, weighed = writer.snapshot(request)
+    local size = if taken then weighed else writer.weigh(request)
+    if size > maxRequestBytes then return refused('too-large') end
     if pending[id] then return refused('duplicate-id') end
-    if outstanding >= maxOutstanding then return refused('backpressure') end
-    if not send({ kind = 'submit', request = request }) then return refused('transport') end
+    if outstanding >= maxOutstanding or outstandingBytes + size > maxOutstandingBytes then return refused('backpressure') end
+    if not send({ kind = 'submit', request = taken or request }) then return refused('transport') end
 
     pending[id] = true
+    weights[id] = size
+    outstandingBytes += size
     table.insert(order, id)
     outstanding += 1
     return { admitted = true, reason = nil, outstanding = outstanding }
@@ -351,7 +382,7 @@ function service.client(lane: Lane, options: ClientOptions?): Client
   end
 
   function self.status(_self: Client): ClientStatus
-    return { outstanding = outstanding, stopped = stopped or closed, reason = reason, flushes = flushes }
+    return { outstanding = outstanding, outstandingBytes = outstandingBytes, stopped = stopped or closed, reason = reason, flushes = flushes }
   end
 
   return self

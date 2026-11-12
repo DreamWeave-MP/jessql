@@ -95,6 +95,25 @@ the worker gone before its reply): the client reports all six `unknown`, a new w
 over the same database, all six are sent again blind with the ledger on, and each is refused
 as already committed. Seven rows for thirteen requests sent.
 
+## Bounded in bytes, not only in count
+
+A queue of at most N requests is not a queue of bounded memory: one request may carry
+megabytes. So a request has a **weight** (the bytes of its id and of every table name, column
+name, key and value in it; a number is eight, a boolean or NULL one) and there are two limits
+on it at each place requests are held:
+
+| Where | One request | All held together | Refusals |
+|---|---|---|---|
+| the writer's queue | `maxRequestBytes` (1 MiB; at most 64 MiB) | `maxQueuedBytes` (64 MiB; at most 1 GiB) | `too-large`, `queue-full` |
+| a client, before the worker's mailbox | `maxRequestBytes` | `maxOutstandingBytes` | `too-large`, `backpressure` |
+
+The client weighs whatever it is handed, a request or not, before it sends anything, so the
+limit holds for what the writer would only have refused. Something small that is not a request
+is still sent on for the writer to refuse, as before. `status()` reports `queuedBytes` and
+`outstandingBytes`. **A default changed with this**: a request over 1 MiB, which used to be
+admitted, is refused unless `maxRequestBytes` is raised. What is *not* bounded by these: the
+rows a transaction touches in the database, and replies coming back from the worker.
+
 ## A service that owns its paths
 
 `service.host({ root = '/absolute/dir' })`, or `service.sourceFor(root)` for a worker, confines

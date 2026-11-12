@@ -57,13 +57,21 @@ export type Options = {
   maxBatch: number?,
   -- The most operations in one request (default 256, at most 4096).
   maxOperations: number?,
+  -- The most bytes in one request (default 1 MiB, at most 64 MiB), and in all the requests
+  -- waiting together (default 64 MiB, at most 1 GiB). A count of requests bounds how many
+  -- there are and says nothing of how large: these bound what the queue holds. A request's
+  -- bytes are those of its id and of every table name, column name, key and value in it, a
+  -- number counted as eight and a boolean or NULL as one. One over the first is refused with
+  -- `too-large`; one that would pass the second, with `queue-full`.
+  maxRequestBytes: number?,
+  maxQueuedBytes: number?,
   -- A durable ledger of request ids in the same database (`@jessql/ledger`): every request's id
   -- is written in the request's own frame, and a request whose id is already there is rejected
   -- with `ledger: already committed`, having changed nothing. Without it, a caller that retries
   -- must carry its own duplicate guard in the request.
   ledger: ledger.Options?,
 }
-export type Status = { queued: number, committed: number, rejected: number, unknown: number, batches: number, stopped: boolean, reason: string? }
+export type Status = { queued: number, queuedBytes: number, committed: number, rejected: number, unknown: number, batches: number, stopped: boolean, reason: string? }
 export type Writer = {
   -- Admits a request or refuses it with `queue-full`, `duplicate-id`, `invalid: ...` or `stopped`.
   submit: (self: Writer, request: Request) -> Admission,
@@ -75,6 +83,11 @@ export type Writer = {
 }
 
 local writer = {}
+
+writer.DefaultRequestBytes = 1024 * 1024
+writer.MaxRequestBytes = 64 * 1024 * 1024
+writer.DefaultQueuedBytes = 64 * 1024 * 1024
+writer.MaxQueuedBytes = 1024 * 1024 * 1024
 
 local function whole(value: unknown, least: number, most: number): boolean
   return type(value) == 'number' and (value :: number) % 1 == 0 and (value :: number) >= least and (value :: number) <= most
@@ -114,50 +127,62 @@ local freeze = table.freeze :: (value: unknown) -> unknown
 
 -- A row or a set of changes, copied: string keys to scalars. A value that is itself a table could
 -- be changed under the writer after admission, so none is taken, but for the NULL sentinel.
-local function copyRow(value: unknown): (Row?, string?)
-  if type(value) ~= 'table' then return nil, nil end
+-- What a scalar weighs in a request's byte count.
+local function weight(value: unknown): number
+  local kind = type(value)
+  return if kind == 'string' then #(value :: string) elseif kind == 'number' then 8 elseif value == nil then 0 else 1
+end
+
+-- The third value is what the row weighs.
+local function copyRow(value: unknown): (Row?, string?, number)
+  if type(value) ~= 'table' then return nil, nil, 0 end
   local copy: Row = {}
+  local size = 0
   for name, held in next, value :: { [unknown]: unknown } do
-    if type(name) ~= 'string' then return nil, 'a column name is a string' end
+    if type(name) ~= 'string' then return nil, 'a column name is a string', 0 end
     local kind = type(held)
     if kind ~= 'string' and kind ~= 'number' and kind ~= 'boolean' and held ~= mutations.NULL then
-      return nil, 'a value is a string, a number, a boolean or NULL'
+      return nil, 'a value is a string, a number, a boolean or NULL', 0
     end
 
     copy[name :: string] = held
+    size += #(name :: string) + weight(held)
   end
 
   freeze(copy)
-  return copy, nil
+  return copy, nil, size
 end
 
 -- The writer's own copy of what a caller submitted, with only the fields a request has, or why it
 -- is not a request. Read with `rawget` and `next`: nothing of the caller's runs here.
-local function snapshot(request: unknown, maxOperations: number): (Request?, string?)
-  if type(request) ~= 'table' then return nil, 'a request is a table' end
+-- The third value is what the request weighs (see `Options.maxRequestBytes`).
+local function snapshot(request: unknown, maxOperations: number): (Request?, string?, number)
+  if type(request) ~= 'table' then return nil, 'a request is a table', 0 end
   local given = request :: { [unknown]: unknown }
   local listed = rawget(given, 'operations')
-  if type(listed) ~= 'table' then return nil, `1 to {maxOperations} operations` end
+  if type(listed) ~= 'table' then return nil, `1 to {maxOperations} operations`, 0 end
   local count = rawlen(listed :: { unknown })
-  if count == 0 or count > maxOperations then return nil, `1 to {maxOperations} operations` end
+  if count == 0 or count > maxOperations then return nil, `1 to {maxOperations} operations`, 0 end
 
   local operations: { Operation } = {}
+  local size = weight(rawget(given, 'id'))
   for index = 1, count do
     local operation = rawget(listed :: { unknown }, index)
-    if type(operation) ~= 'table' then return nil, `operation {index} names no table` end
+    if type(operation) ~= 'table' then return nil, `operation {index} names no table`, 0 end
     local fields = operation :: { [unknown]: unknown }
     local key = rawget(fields, 'key')
     if key ~= nil and type(key) ~= 'string' and type(key) ~= 'number' and type(key) ~= 'boolean' then
-      return nil, `operation {index}: a key is a string, a number or a boolean`
+      return nil, `operation {index}: a key is a string, a number or a boolean`, 0
     end
 
-    local row, rowProblem = copyRow(rawget(fields, 'row'))
-    if rowProblem then return nil, `operation {index}: {rowProblem}` end
-    local changes, changesProblem = copyRow(rawget(fields, 'changes'))
-    if changesProblem then return nil, `operation {index}: {changesProblem}` end
+    local row, rowProblem, rowSize = copyRow(rawget(fields, 'row'))
+    if rowProblem then return nil, `operation {index}: {rowProblem}`, 0 end
+    local changes, changesProblem, changesSize = copyRow(rawget(fields, 'changes'))
+    if changesProblem then return nil, `operation {index}: {changesProblem}`, 0 end
 
     local copied: Operation = { op = rawget(fields, 'op') :: string, table = rawget(fields, 'table') :: string,
       row = row, key = key, changes = changes }
+    size += weight(copied.op) + weight(copied.table) + weight(key) + rowSize + changesSize
     freeze(copied)
     operations[index] = copied
   end
@@ -165,17 +190,41 @@ local function snapshot(request: unknown, maxOperations: number): (Request?, str
   freeze(operations)
   local taken: Request = { id = rawget(given, 'id') :: string, operations = operations }
   local problem = invalid(taken, maxOperations)
-  if problem then return nil, problem end
+  if problem then return nil, problem, 0 end
 
   freeze(taken)
-  return taken, nil
+  return taken, nil, size
+end
+
+-- What anything offered as a request weighs, whether or not it is one: every string, number
+-- and boolean in it, keys and values, as deep as a request goes and no deeper, and no more
+-- than a request has parts. Past either it weighs more than any limit. For a layer that must
+-- bound what it forwards before the writer has had its say about what it is.
+function writer.weigh(value: unknown): number
+  local seen = 0
+  local function walk(node: unknown, depth: number): number
+    if type(node) ~= 'table' then return weight(node) end
+    if depth > 4 then return math.huge end
+
+    local size = 0
+    for key, held in next, node :: { [unknown]: unknown } do
+      seen += 1
+      if seen > 4096 * 64 then return math.huge end
+
+      size += weight(key) + walk(held, depth + 1)
+    end
+
+    return size
+  end
+
+  return walk(value, 1)
 end
 
 -- For every layer that keeps a request beyond the call that handed it over (a writer's queue,
 -- and a supervisor that sends it again after a worker dies): the same copy, validated and
 -- frozen all the way down, or nil and why it is not a request. What is kept must be this and
 -- never the caller's table, which the caller is free to change the moment the call returns.
-function writer.snapshot(request: unknown, maxOperations: number?): (Request?, string?)
+function writer.snapshot(request: unknown, maxOperations: number?): (Request?, string?, number)
   local most = maxOperations or 4096
   if not whole(most, 1, 4096) then error('jessql writer: invalid maxOperations', 2) end
 
@@ -209,6 +258,11 @@ function writer.new(db: catalog.Database, options: Options?): Writer
   if not whole(maxBatch, 1, 256) then error('jessql writer: invalid maxBatch', 2) end
   if not whole(maxOperations, 1, 4096) then error('jessql writer: invalid maxOperations', 2) end
 
+  local maxRequestBytes = if options and options.maxRequestBytes ~= nil then options.maxRequestBytes else writer.DefaultRequestBytes
+  local maxQueuedBytes = if options and options.maxQueuedBytes ~= nil then options.maxQueuedBytes else writer.DefaultQueuedBytes
+  if not whole(maxRequestBytes, 1, writer.MaxRequestBytes) then error('jessql writer: invalid maxRequestBytes', 2) end
+  if not whole(maxQueuedBytes, maxRequestBytes, writer.MaxQueuedBytes) then error('jessql writer: invalid maxQueuedBytes', 2) end
+
   local kept = if options then options.ledger else nil
   local ledgerProblem = if kept ~= nil then ledger.problem(kept) else nil
   if ledgerProblem then error('jessql writer: ' .. ledgerProblem, 2) end
@@ -217,7 +271,8 @@ function writer.new(db: catalog.Database, options: Options?): Writer
   local queue: { [number]: Request } = {}
   local head, tail = 1, 0
   local waiting: { [string]: boolean } = {}
-  local status: Status = { queued = 0, committed = 0, rejected = 0, unknown = 0, batches = 0, stopped = false, reason = nil }
+  local sizes: { [string]: number } = {}
+  local status: Status = { queued = 0, queuedBytes = 0, committed = 0, rejected = 0, unknown = 0, batches = 0, stopped = false, reason = nil }
   local self = {} :: Writer
 
   local function take(count: number): { Request }
@@ -227,6 +282,8 @@ function writer.new(db: catalog.Database, options: Options?): Writer
       queue[head] = nil
       head += 1
       waiting[request.id] = nil
+      status.queuedBytes -= sizes[request.id] or 0
+      sizes[request.id] = nil
       taken[#taken + 1] = request
     end
 
@@ -237,14 +294,20 @@ function writer.new(db: catalog.Database, options: Options?): Writer
   function self.submit(_self: Writer, request: Request): Admission
     if status.stopped then return { admitted = false, reason = 'stopped', queued = status.queued } end
     -- From here on only the copy is looked at: the caller's table is not read again, now or later.
-    local taken, problem = snapshot(request, maxOperations)
+    local taken, problem, size = snapshot(request, maxOperations)
     if not taken then return { admitted = false, reason = 'invalid: ' .. (problem or 'malformed'), queued = status.queued } end
+    if size > maxRequestBytes then return { admitted = false, reason = 'too-large', queued = status.queued } end
     if waiting[taken.id] then return { admitted = false, reason = 'duplicate-id', queued = status.queued } end
-    if status.queued >= maxQueued then return { admitted = false, reason = 'queue-full', queued = status.queued } end
+
+    if status.queued >= maxQueued or status.queuedBytes + size > maxQueuedBytes then
+      return { admitted = false, reason = 'queue-full', queued = status.queued }
+    end
 
     tail += 1
     queue[tail] = taken
     waiting[taken.id] = true
+    sizes[taken.id] = size
+    status.queuedBytes += size
     status.queued += 1
     return { admitted = true, reason = nil, queued = status.queued }
   end

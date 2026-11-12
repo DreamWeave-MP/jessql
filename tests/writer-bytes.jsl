@@ -1,0 +1,136 @@
+--!strict
+-- #32: a queue bounded by what it holds, not only by how many. A request has a weight; one too
+-- heavy is refused, and so is one that would take the queue, or what a client has sent and not
+-- had answered, past its bytes. The limits are held before a message enters a worker's mailbox.
+local memfs = require('@jessql/memfs')
+local service = require('@jessql/writer_service')
+local sql = require('@jessql')
+local test = require('@jess/test')
+local writer = require('@jessql/writer')
+
+local expect = test.expect
+local suite = test.new()
+
+local Tables: { sql.CatalogTableSpec } = { { tableName = 'events', columns = { 'id', 'body' }, primaryKey = 'id' } }
+
+local function sized(id: string, key: number, bodyBytes: number): writer.Request
+  return { id = id, operations = { { op = 'insert', table = 'events', row = { id = key, body = string.rep('x', bodyBytes) } } } }
+end
+
+suite.describe('a writer bounded in bytes', function()
+  suite.it('weighs a request by its id, names, keys and values', function()
+    -- id 2; op 6, table 6; row: 'id' 2 + number 8, 'body' 4 + 100.
+    local taken, problem, size = writer.snapshot(sized('ab', 1, 100))
+    expect(problem).toBe(nil)
+    expect(taken ~= nil).toBe(true)
+    expect(size).toBe(2 + 6 + 6 + 2 + 8 + 4 + 100)
+
+    local update: writer.Request = { id = 'u', operations = { { op = 'update', table = 'events', key = 'k9', changes = { body = true } } } }
+    expect(select(3, writer.snapshot(update))).toBe(1 + 6 + 6 + 2 + 4 + 1)
+    -- Anything at all has a weight, a request or not; what is too deep or too many is over any limit.
+    -- Every key and value it finds: the field names too, and the list's own index.
+    expect(writer.weigh(sized('ab', 1, 100))).toBe(2 + 2 + 10 + 8 + 2 + 6 + 5 + 6 + 3 + 2 + 8 + 4 + 100)
+    expect(writer.weigh('seven..')).toBe(7)
+    expect(writer.weigh({ first = { second = { third = { fourth = { fifth = 1 } } } } })).toBe(math.huge)
+  end)
+
+  suite.it('refuses a request over its bytes however short the queue, which a count alone admitted', function()
+    local disk = memfs.new()
+    local db = sql.catalog.create('/memory/heavy', { tables = Tables, storage = disk.backend })
+    -- The probe from review: one request of 5 MiB, a queue of one.
+    local queue = writer.new(db, { maxQueued = 1, maxOperations = 1 })
+    local heavy = queue:submit(sized('heavy', 1, 5 * 1024 * 1024))
+    expect(`{tostring(heavy.admitted)} {tostring(heavy.reason)} {heavy.queued}`).toBe('false too-large 0')
+    expect(queue:status().queuedBytes).toBe(0)
+    -- At the limit it is taken; one byte over it is not.
+    local limit = writer.DefaultRequestBytes
+    local overhead = select(3, writer.snapshot(sized('edge', 2, 0)))
+    expect(queue:submit(sized('edge', 2, limit - overhead)).admitted).toBe(true)
+    expect(queue:status().queuedBytes).toBe(limit)
+    expect(#queue:drain()).toBe(1)
+    expect(queue:status().queuedBytes).toBe(0)
+    expect(queue:submit(sized('over', 3, limit - overhead + 1)).reason).toBe('too-large')
+    db:close()
+  end)
+
+  suite.it('refuses what would take the queue past its bytes, and takes it again once the queue has drained', function()
+    local disk = memfs.new()
+    local db = sql.catalog.create('/memory/full', { tables = Tables, storage = disk.backend })
+    local queue = writer.new(db, { maxQueued = 1000, maxRequestBytes = 2000, maxQueuedBytes = 5000 })
+    local each = select(3, writer.snapshot(sized('q0', 0, 1500)))
+    for number = 1, 3 do expect(queue:submit(sized(`q{number}`, number, 1500)).admitted).toBe(true) end
+
+    expect(queue:status().queuedBytes).toBe(3 * each)
+    -- Three of a thousand in count; full in bytes.
+    local fourth = queue:submit(sized('q4', 4, 1500))
+    expect(`{tostring(fourth.admitted)} {tostring(fourth.reason)} {fourth.queued}`).toBe('false queue-full 3')
+    -- A small one still fits.
+    expect(queue:submit(sized('small', 5, 10)).admitted).toBe(true)
+    expect(#queue:drain()).toBe(4)
+    expect(queue:status().queuedBytes).toBe(0)
+    expect(queue:submit(sized('q4', 4, 1500)).admitted).toBe(true)
+    -- Stopping gives the bytes back with the requests.
+    expect(#queue:stop('closing')).toBe(1)
+    expect(queue:status().queuedBytes).toBe(0)
+    db:close()
+
+    local notLimits: { writer.Options } = { { maxRequestBytes = 0 }, { maxRequestBytes = writer.MaxRequestBytes + 1 },
+      { maxRequestBytes = 100, maxQueuedBytes = 99 }, { maxQueuedBytes = 1.5 } }
+
+    for _, bad in notLimits do
+      -- Limits that are not limits raise when the writer is made.
+      expect((pcall(function() return writer.new(db, bad) end))).toBe(false)
+    end
+  end)
+
+  suite.it('holds a client to its bytes before anything enters the worker\'s mailbox', function()
+    local disk = memfs.new()
+    local host = service.host({ storage = disk.backend })
+    local mailbox: { unknown }, replies: { unknown } = {}, {}
+    local carried = 0
+    local lane: service.Lane = {
+      send = function(_self: service.Lane, message: unknown)
+        table.insert(mailbox, message)
+        -- The request in the message, if it carries one: a request is as deep as is weighed.
+        carried += writer.weigh((message :: { request: unknown? }).request)
+      end,
+      receive = function(_self: service.Lane, _seconds: number?): unknown
+        for _, message in mailbox do
+          local reply = host(message)
+          if reply ~= nil then table.insert(replies, reply) end
+        end
+
+        table.clear(mailbox)
+        return table.remove(replies, 1)
+      end,
+    }
+
+    local client = service.client(lane, { maxRequestBytes = 2000, maxOutstandingBytes = 5000 })
+    assert(client:open('/memory/served', Tables))
+    carried = 0
+    -- Too heavy: refused here, and the mailbox never saw it.
+    expect(client:submit(sized('heavy', 1, 5 * 1024 * 1024)).reason).toBe('too-large')
+    expect(`{#mailbox} {carried}`).toBe('0 0')
+    -- Something that is not a request and is heavy is refused the same way; small, it goes
+    -- on to the writer to be refused there, as it always did.
+    expect(client:submit({ id = 'junk', operations = {}, padding = string.rep('p', 3000) } :: any).reason).toBe('too-large')
+    expect(client:submit({ id = 'empty', operations = {} }).admitted).toBe(true)
+
+    for number = 1, 3 do expect(client:submit(sized(`c{number}`, number, 1500)).admitted).toBe(true) end
+
+    local full = client:submit(sized('c4', 4, 1500))
+    expect(`{tostring(full.admitted)} {tostring(full.reason)}`).toBe('false backpressure')
+    expect(client:status().outstandingBytes <= 5000).toBe(true)
+    -- What crossed the lane, weighed with every field name in it (which a request's own
+    -- weight leaves out): the limit and a little a message, never megabytes.
+    expect(carried <= 5000 + 5 * 120).toBe(true)
+
+    -- Answered, the bytes come back and the fourth is taken.
+    expect(#client:poll(0)).toBe(4)
+    expect(client:status().outstandingBytes).toBe(0)
+    expect(client:submit(sized('c4', 4, 1500)).admitted).toBe(true)
+    client:close(0)
+  end)
+end)
+
+return suite
