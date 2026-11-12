@@ -22,6 +22,7 @@ export type HybridDatabase = hybrid.Database
 export type ManagedDatabase = managed.Database
 export type ManagedOptions = managed.Options
 export type CatalogDatabase = catalog.Database
+export type CatalogPinnedView = catalog.PinnedView
 export type CatalogOptions = catalog.Options
 export type CatalogTableSpec = catalog.TableSpec
 export type CatalogVerifyReport = catalog.VerifyReport

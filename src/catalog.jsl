@@ -47,7 +47,27 @@ export type Options = {
   queryLimits: engine.Limits?,
   -- Deterministic fault injection for integration tests. Throws at a named stage.
   testHook: ((string) -> ())?,
+  -- Seconds, monotonic: what a pin's lifetime is measured by. Injected in tests.
+  now: (() -> number)?,
 }
+
+-- #34. A reader's hold on the state of the database as it was published when the pin was
+-- taken. While the pin is held, a flush or a compaction publishes a newer state for everyone
+-- else and leaves this one readable: its cold files are not removed and its readers are not
+-- closed. It is not a snapshot of the hot rows: until the next publication a pinned view sees
+-- what is committed after it was taken, as the database itself does; from that publication on
+-- it sees nothing newer. A pin ends when it is released, when its time is up, or when the
+-- database is closed, and what it kept is reclaimed then.
+export type PinnedView = {
+  epoch: number,
+  get: (self: PinnedView, tableName: string, key: unknown) -> Row?,
+  query: (self: PinnedView, sql: string, params: { unknown }?) -> engine.Result,
+  -- A plan over the pinned state; it may be run or opened as a cursor for as long as the pin is held.
+  prepare: (self: PinnedView, sql: string) -> engine.Plan,
+  release: (self: PinnedView) -> (),
+  held: (self: PinnedView) -> boolean,
+}
+export type PinStatus = { pins: number, superseded: number }
 export type BatchResult = storage.BatchResult
 export type Transaction = {
   get: (self: Transaction, tableName: string, key: unknown) -> Row?,
@@ -78,6 +98,11 @@ export type Database = {
   flush: (self: Database) -> number,
   -- The same, and every table with more than one generation is merged into one.
   compact: (self: Database) -> number,
+  -- Holds the published state for a reader for `seconds` (default 60, at most 3600). At most
+  -- `catalog.MaxPins` at once.
+  pin: (self: Database, seconds: number?) -> PinnedView,
+  -- Pins held, and how many published states superseded since are still kept for them.
+  pinStatus: (self: Database) -> PinStatus,
   close: (self: Database) -> (),
 }
 
@@ -104,6 +129,9 @@ local Identity = '__jessql_hybrid_identity'
 local TombstonePrefix = '__jessql_deleted__'
 local MaxEpoch = manifest.MaxEpoch
 local catalog = {}
+
+-- #34. The most pins one open database holds at once.
+catalog.MaxPins = 64
 
 local function assertOK(ok: boolean?, message: string?, action: string)
   if not ok then error('jessql catalog: ' .. action .. ': ' .. tostring(message), 3) end
@@ -351,11 +379,22 @@ local function exportDelta(fs: vfs.Backend, overlay: Overlay, entry: Table, rows
 end
 
 -- Removes what `nextValue` no longer names: the previous log, and generations merged away.
-local function retire(fs: vfs.Backend, base: string, parent: string, prior: Catalog, nextValue: Catalog)
+-- `kept` are published states a reader still holds: nothing they name is removed, nor their logs.
+local function retire(fs: vfs.Backend, base: string, parent: string, prior: Catalog, nextValue: Catalog, kept: { Catalog }?)
+  local keptLog = false
+  for _, held in kept or {} do
+    if held.epoch == prior.epoch then keptLog = true end
+  end
+
   for _, entry in prior.tables do
     local retained: { [number]: boolean } = {}
     for _, generation in (manifest.table(nextValue, entry.tableName) :: Table).generations do
       retained[generation.epoch] = true
+    end
+
+    for _, held in kept or {} do
+      local theirs = manifest.table(held, entry.tableName)
+      for _, generation in if theirs then theirs.generations else {} do retained[generation.epoch] = true end
     end
 
     for _, generation in entry.generations do
@@ -366,7 +405,8 @@ local function retire(fs: vfs.Backend, base: string, parent: string, prior: Cata
     end
   end
 
-  clearLog(fs, base, prior.epoch)
+  if not keptLog then clearLog(fs, base, prior.epoch) end
+
   local ok, err = fs.syncDirectory(parent)
   assertOK(ok, err, 'retirement directory')
 end
@@ -523,6 +563,60 @@ local function openCatalog(path: string, options: Options?, intent: string): Dat
   local closed, poisoned, busy, batchActive, activeTransaction = false, false, false, false, false
   local lastMaintenanceError: string? = nil
   local db = {} :: Database
+
+  -- #34. Pins, and the published states that were superseded while one of them held it.
+  type Pin = { overlay: Overlay, value: Catalog, expires: number, held: boolean }
+  local clock = (options and options.now) or os.clock
+  local pins: { Pin } = {}
+  local superseded: { { overlay: Overlay, value: Catalog } } = {}
+
+  local function holders(overlay: Overlay): number
+    local count = 0
+    for _, pin in pins do
+      if pin.held and pin.overlay == overlay then count += 1 end
+    end
+
+    return count
+  end
+
+  -- Closes and retires every superseded state no pin holds any longer. Nothing here can make a
+  -- commit or a publication fail: what is not removed now is removed at the next open.
+  local function reclaim()
+    local remaining: { { overlay: Overlay, value: Catalog } } = {}
+    local freed: { Catalog } = {}
+    for _, state in superseded do
+      if holders(state.overlay) > 0 then
+        table.insert(remaining, state)
+      else
+        -- A reader that fails to close leaves its files for the next open.
+        pcall(function() closeOverlay(state.overlay) end)
+        table.insert(freed, state.value)
+      end
+    end
+
+    superseded = remaining
+    local kept: { Catalog } = {}
+    for _, state in remaining do table.insert(kept, state.value) end
+
+    for _, value in freed do
+      -- Retirement can fail; unreferenced files are safe to leave for the next open.
+      pcall(function() retire(fs, base, parent, value, active, kept) end)
+    end
+
+    local still: { Pin } = {}
+    for _, pin in pins do
+      if pin.held then table.insert(still, pin) end
+    end
+
+    pins = still
+  end
+
+  local function expire()
+    local at = clock()
+    for _, pin in pins do
+      if pin.held and at >= pin.expires then pin.held = false end
+    end
+  end
 
   local function ready()
     if batchActive then error('jessql catalog: batched commit in progress', 3) end
@@ -863,11 +957,23 @@ local function openCatalog(path: string, options: Options?, intent: string): Dat
       live = candidate :: Overlay
       candidate = nil
       active = nextValue
-      -- The old log holds nothing the new generations lack; a failed close of it loses nothing.
-      pcall(function() closeOverlay(previous) end)
+      -- #34. A state a reader still holds is kept whole, readers open, until its pins end.
+      expire()
+      local kept: { Catalog } = {}
+      if holders(previous) > 0 then
+        table.insert(superseded, { overlay = previous, value = prior })
+      else
+        -- The old log holds nothing the new generations lack; a failed close of it loses nothing.
+        pcall(function() closeOverlay(previous) end)
+      end
+
+      for _, state in superseded do table.insert(kept, state.value) end
+
       if hook then hook('before-retire') end
       -- Retirement can fail; unreferenced files are safe to leave for the next open.
-      pcall(function() retire(fs, base, parent, prior, nextValue) end)
+      pcall(function() retire(fs, base, parent, prior, nextValue, kept) end)
+      -- Pins whose time ran out before this publication give up what they kept.
+      pcall(reclaim)
       for name in planned do
         -- Scratch is unpublished and safe to leave for the next open if this fails.
         pcall(function()
@@ -907,6 +1013,96 @@ local function openCatalog(path: string, options: Options?, intent: string): Dat
 
   function db.compact(_self: Database): number
     return transition(true, false)
+  end
+
+  function db.pin(_self: Database, seconds: number?): PinnedView
+    ready()
+    local lifetime = seconds or 60
+    if type(lifetime) ~= 'number' or lifetime ~= lifetime or lifetime <= 0 or lifetime > 3600 then
+      error('jessql catalog: a pin is held for more than 0 and at most 3600 seconds', 2)
+    end
+
+    expire()
+    reclaim()
+    if #pins >= catalog.MaxPins then error('jessql catalog: too many pins', 2) end
+
+    local pin: Pin = { overlay = live, value = active, expires = clock() + lifetime, held = true }
+    table.insert(pins, pin)
+    local view = { epoch = active.epoch } :: PinnedView
+
+    -- The pinned state, or an error that says why it is no longer there.
+    local function state(): Overlay
+      if closed then error('jessql catalog: closed', 3) end
+
+      if pin.held and clock() >= pin.expires then
+        pin.held = false
+        -- Reclaiming cannot fail the caller, who is about to be told the pin is gone.
+        pcall(reclaim)
+        error('jessql catalog: pin expired', 3)
+      end
+
+      if not pin.held then error('jessql catalog: pin released', 3) end
+      -- While it is still the published state it is used as the database itself is.
+      if pin.overlay == live then ready() end
+
+      return pin.overlay
+    end
+
+    function view.get(_view: PinnedView, tableName: string, key: unknown): Row?
+      local overlay = state()
+      local entry = if type(tableName) == 'string' then manifest.table(pin.value, tableName) else nil
+      if not entry then error('jessql catalog: unknown table ' .. tostring(tableName), 2) end
+
+      local name = entry.tableName
+      local row = overlay.store:get(name, key)
+      if row then return row end
+      if overlay.store:get(tombstones(name), hybrid.encodeKey(key)) then return nil end
+      return overlay.colds[name]:get(key)
+    end
+
+    function view.query(_view: PinnedView, sql: string, params: { unknown }?): engine.Result
+      return state().view:query(sql, params)
+    end
+
+    function view.prepare(_view: PinnedView, sql: string): engine.Plan
+      local plan = state().view:prepare(sql)
+      local run, open = plan.run, plan.open
+      function plan.run(params)
+        state()
+        return run(params)
+      end
+
+      function plan.open(params)
+        state()
+        return open(params)
+      end
+
+      return plan
+    end
+
+    function view.release(_view: PinnedView)
+      if not pin.held then return end
+
+      pin.held = false
+      -- Nothing a release cannot remove is lost: it is removed at the next open.
+      pcall(reclaim)
+    end
+
+    function view.held(_view: PinnedView): boolean
+      return pin.held and not closed and clock() < pin.expires
+    end
+
+    return view
+  end
+
+  function db.pinStatus(_self: Database): PinStatus
+    local count = 0
+    local at = clock()
+    for _, pin in pins do
+      if pin.held and at < pin.expires then count += 1 end
+    end
+
+    return { pins = count, superseded = #superseded }
   end
 
   -- A commit that returned is synchronized. Maintenance after it must never turn that into an
@@ -954,6 +1150,12 @@ local function openCatalog(path: string, options: Options?, intent: string): Dat
     if closed then return end
     if busy then error('jessql catalog: cannot close during publication', 2) end
     if activeTransaction then error('jessql catalog: cannot close during transaction', 2) end
+    -- #34. Closing ends every pin and gives up what they kept.
+    for _, pin in pins do pin.held = false end
+
+    -- Reclaiming closes readers and removes files, and either can fail; the close goes on, and
+    -- what is left on the disk is removed at the next open.
+    pcall(reclaim)
     closed = true
     -- Closing a poisoned handle can fail, but the database's lock is still released.
     local ok, err = pcall(function() closeOverlay(live) end)

@@ -153,3 +153,49 @@ Not built yet, and so limits today:
 - No secondary indexes.
 - At most 32 tables and 8 generations a table; the tables are fixed at creation.
 - Verified on the model disk only, like everything the fault laboratory holds.
+
+## Pins: a reader that outlives a publication (#34)
+
+A flush or a compaction publishes a new state and retires the old one: its cold readers are
+closed and the files only it named are removed. A reader in the middle of a long query over
+that state, a cursor above all, would have its files taken from under it. `db:pin(seconds)`
+holds the published state for such a reader:
+
+```luau
+local view = db:pin(120)                 -- default 60 s, at most 3600
+local cursor = view:prepare('SELECT id, body FROM events ORDER BY id').open()
+-- ... flushes and compactions happen here, publishing newer states for everyone else ...
+view:release()
+```
+
+**What a pin guarantees.** The state it holds stays readable until the pin ends: none of the
+files it names is removed, its readers stay open, and from the moment a newer state is
+published the pinned view does not change.
+
+**What it does not.** It is not a snapshot taken at the moment of the pin, and nothing here is
+MVCC. Until the next publication the pinned view *is* the database: a commit made after the
+pin and before that publication is seen through it, as it is through `db:query`. The view is
+frozen by the publication that supersedes it, not by the pin. A reader that needs a fixed
+point takes its pin and reads within one publication, or flushes first.
+
+**How a pin ends, and what happens then.**
+
+| Ends by | Then |
+|---|---|
+| `view:release()` | what only it kept is closed and removed at once |
+| its time running out | the view refuses with `pin expired`; what it kept goes at its next use, the next `pin`, or the next publication, whichever is first. A pin nobody releases cannot hold files past that |
+| `db:close()` | every pin ends and what they kept is removed |
+| the process dying | nothing to do: the next open removes every file the manifest does not name, as it always has |
+
+At most `catalog.MaxPins` (64) are held at once; one more raises. `db:pinStatus()` gives the
+pins held and how many superseded states are still kept for them. Each superseded state kept
+costs its files on disk and its open readers and log until its last pin ends: a pin held
+across many compactions holds one old state, not one a compaction.
+
+Shown in `tests/catalog-pins.jsl` on a disk in memory with a set clock: a cursor opened
+before a flush, a compaction and a delete finishes over the state it started on; the pinned
+files are on the disk while pinned and gone after release, leaving exactly what an unpinned
+history leaves; two states held for three readers go one at a time; expiry by time, with and
+without a later use; the bound; close; and a crash while pinned. **Not measured**: the disk
+and memory a long-held pin costs on a real database, and readers in other processes, which
+this does not serve at all (the database has one owner).
