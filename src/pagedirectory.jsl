@@ -144,8 +144,9 @@ function directory.writer(storage: vfs.Backend, path: string, options: Options?)
   return self, nil
 end
 
-type Leaf = { firsts: { string }, pages: { Page }, stamp: number }
-type RootEntry = { first: string, offset: number, length: number, crc: number, entries: number }
+-- A cached leaf is a link in a list kept in order of use, so that the one to drop is at its
+-- end and is found without looking at the others.
+type Leaf = { index: number, firsts: { string }, places: buffer, newer: Leaf?, older: Leaf? }
 
 -- Opens a directory file of `size` bytes: the footer and the root are read, checked, and held.
 function directory.reader(storage: vfs.Backend, path: string, size: number, options: Options?): (Reader?, string?)
@@ -172,12 +173,17 @@ function directory.reader(storage: vfs.Backend, path: string, size: number, opti
   local rootBody = read(rootOffset, rootLength)
   if not rootBody or bytes.crc32(rootBody) ~= rootCrc then return nil, 'the root does not match its checksum' end
 
-  -- The root, decoded once: one entry a leaf.
+  -- The root, kept packed: the first key of each leaf in one list, and sixteen bytes a leaf in
+  -- one buffer (its offset, length, CRC-32 and entries). A table a leaf is several times that,
+  -- and at a hundred million pages the root is what a reader holds.
   local raw = buffer.fromstring(rootBody)
   local count = buffer.readu32(raw, 0)
-  local entries: { RootEntry } = {}
+  if count * 18 + 4 > rootLength then return nil, 'a root cut short' end
+
+  local firsts: { string } = {}
+  local places = buffer.create(count * 16)
   local at, described, expected = 4, 0, 0
-  for _ = 1, count do
+  for index = 1, count do
     if at + 2 > rootLength then return nil, 'a root cut short' end
 
     local keyLength = buffer.readu16(raw, at)
@@ -185,82 +191,104 @@ function directory.reader(storage: vfs.Backend, path: string, size: number, opti
 
     local first = buffer.readstring(raw, at + 2, keyLength)
     at += 2 + keyLength
-    local entry: RootEntry = { first = first, offset = buffer.readu32(raw, at), length = buffer.readu32(raw, at + 4),
-      crc = buffer.readu32(raw, at + 8), entries = buffer.readu32(raw, at + 12) }
-    at += 16
+    local offset, length, entries = buffer.readu32(raw, at), buffer.readu32(raw, at + 4), buffer.readu32(raw, at + 12)
     -- Leaves are laid end to end from the start of the file, in key order.
-    if entry.offset ~= expected or entry.length < 4 or entry.length > directory.MaxLeafBytes or entry.entries < 1
-      or (#entries > 0 and not (entries[#entries].first < first)) then return nil, 'a root whose leaves are not in order' end
+    if offset ~= expected or length < 4 or length > directory.MaxLeafBytes or entries < 1
+      or (index > 1 and not (firsts[index - 1] < first)) then return nil, 'a root whose leaves are not in order' end
 
-    expected += entry.length
-    described += entry.entries
-    table.insert(entries, entry)
+    buffer.copy(places, (index - 1) * 16, raw, at, 16)
+    at += 16
+    expected += length
+    described += entries
+    firsts[index] = first
   end
 
   if at ~= rootLength or expected ~= rootOffset or described ~= pages then return nil, 'a root that does not describe the file' end
 
   local cache: { [number]: Leaf } = {}
-  local cached, clock, leafReads, hits = 0, 0, 0, 0
+  local cached, leafReads, hits = 0, 0, 0
+  local newest: Leaf?, oldest: Leaf? = nil, nil
+
+  local function unlink(leaf: Leaf)
+    local newer, older = leaf.newer, leaf.older
+    if newer then newer.older = older else newest = older end
+
+    if older then older.newer = newer else oldest = newer end
+
+    leaf.newer, leaf.older = nil, nil
+  end
+
+  local function front(leaf: Leaf)
+    leaf.older = newest
+    local was = newest
+    if was then was.newer = leaf end
+
+    newest = leaf
+    if not oldest then oldest = leaf end
+  end
 
   local function load(index: number): (Leaf?, string?)
-    clock += 1
     local held = cache[index]
     if held then
-      held.stamp = clock
+      if newest ~= held then
+        unlink(held)
+        front(held)
+      end
+
       hits += 1
       return held, nil
     end
 
-    local entry = entries[index]
-    local body = read(entry.offset, entry.length)
+    local place = (index - 1) * 16
+    local leafOffset, leafLength = buffer.readu32(places, place), buffer.readu32(places, place + 4)
+    local leafCrc, leafEntries = buffer.readu32(places, place + 8), buffer.readu32(places, place + 12)
+    local body = read(leafOffset, leafLength)
     leafReads += 1
-    if not body or bytes.crc32(body) ~= entry.crc then return nil, `leaf {index} does not match its checksum` end
+    if not body or bytes.crc32(body) ~= leafCrc then return nil, `leaf {index} does not match its checksum` end
 
     local data = buffer.fromstring(body)
-    if buffer.readu32(data, 0) ~= entry.entries then return nil, `leaf {index} is not the leaf the root describes` end
+    if buffer.readu32(data, 0) ~= leafEntries then return nil, `leaf {index} is not the leaf the root describes` end
 
-    local firsts: { string } = {}
-    local listed: { Page } = {}
+    -- A cached leaf is packed as the root is: its keys, and twelve bytes a page.
+    local leafFirsts: { string } = {}
+    local leafPlaces = buffer.create(leafEntries * 12)
     local cursor = 4
-    for position = 1, entry.entries do
-      if cursor + 2 > entry.length then return nil, `leaf {index} is cut short` end
+    for position = 1, leafEntries do
+      if cursor + 2 > leafLength then return nil, `leaf {index} is cut short` end
 
       local keyLength = buffer.readu16(data, cursor)
-      if cursor + 2 + keyLength + 12 > entry.length then return nil, `leaf {index} is cut short` end
+      if cursor + 2 + keyLength + 12 > leafLength then return nil, `leaf {index} is cut short` end
 
-      local first = buffer.readstring(data, cursor + 2, keyLength)
+      leafFirsts[position] = buffer.readstring(data, cursor + 2, keyLength)
       cursor += 2 + keyLength
-      firsts[position] = first
-      listed[position] = { first = first, segment = buffer.readu32(data, cursor), offset = buffer.readu32(data, cursor + 4), length = buffer.readu32(data, cursor + 8) }
+      buffer.copy(leafPlaces, (position - 1) * 12, data, cursor, 12)
       cursor += 12
     end
 
-    if cursor ~= entry.length or firsts[1] ~= entry.first then return nil, `leaf {index} is not the leaf the root describes` end
+    if cursor ~= leafLength or leafFirsts[1] ~= firsts[index] then return nil, `leaf {index} is not the leaf the root describes` end
 
     -- Room is made before the leaf is kept: the least recently used goes.
-    if cached >= maxLeaves then
-      local oldest, oldestStamp = 0, math.huge
-      for candidate, leaf in cache do
-        if leaf.stamp < oldestStamp then oldest, oldestStamp = candidate, leaf.stamp end
-      end
-
-      cache[oldest] = nil
+    local dropped = oldest
+    if cached >= maxLeaves and dropped then
+      unlink(dropped)
+      cache[dropped.index] = nil
       cached -= 1
     end
 
-    local leaf: Leaf = { firsts = firsts, pages = listed, stamp = clock }
+    local leaf: Leaf = { index = index, firsts = leafFirsts, places = leafPlaces, newer = nil, older = nil }
     cache[index] = leaf
+    front(leaf)
     cached += 1
     return leaf, nil
   end
 
   -- The last position whose key is not after `key`, or 0.
-  local function floor(keys: number, keyAt: (position: number) -> string, key: string): number
-    local low, high = 1, keys
+  local function floor(keys: { string }, key: string): number
+    local low, high = 1, #keys
     local found = 0
     while low <= high do
       local middle = (low + high) // 2
-      if keyAt(middle) <= key then
+      if keys[middle] <= key then
         found = middle
         low = middle + 1
       else
@@ -276,18 +304,20 @@ function directory.reader(storage: vfs.Backend, path: string, size: number, opti
   function self.find(key: string): (Page?, string?)
     if type(key) ~= 'string' then return nil, 'not a key' end
 
-    local index = floor(#entries, function(position: number): string return entries[position].first end, key)
+    local index = floor(firsts, key)
     if index == 0 then return nil, nil end
 
     local leaf, problem = load(index)
     if not leaf then return nil, problem end
 
-    local position = floor(#leaf.firsts, function(at: number): string return leaf.firsts[at] end, key)
-    return leaf.pages[position], nil
+    local position = floor(leaf.firsts, key)
+    local place = (position - 1) * 12
+    return { first = leaf.firsts[position], segment = buffer.readu32(leaf.places, place), offset = buffer.readu32(leaf.places, place + 4),
+      length = buffer.readu32(leaf.places, place + 8) }, nil
   end
 
   function self.stats(): Stats
-    return { pages = pages, leaves = #entries, rootBytes = rootLength, cached = cached, leafReads = leafReads, hits = hits }
+    return { pages = pages, leaves = count, rootBytes = rootLength, cached = cached, leafReads = leafReads, hits = hits }
   end
 
   return self, nil
