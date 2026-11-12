@@ -654,6 +654,38 @@ not p99 latency, a physical power-cut test, or a controlled SQLite/RocksDB
 comparison. `maxHotBytes` is explicitly **not** a hard RSS cap. See
 [hot-byte maintenance semantics](docs/HOT-BYTE-BUDGET.md).
 
+## What an operator budget saves (#16, November 2026)
+
+`bench/operator-budgets.jsl`, one case and one budget a process (a peak only grows), tables in
+memory, one run each on one Linux machine. "Query cost" is the peak resident size less the
+size with the tables loaded.
+
+```sh
+jess run --trusted --package . bench/operator-budgets.jsl skewed-join 200000 [400000]
+jess run --trusted --package . bench/operator-budgets.jsl wide-groups 400000 [50000]
+jess run --trusted --package . bench/operator-budgets.jsl held-rows 400000 [50000]
+```
+
+| Case | Budget | Outcome | Seconds | Query cost |
+|---|---|---|---|---|
+| skewed join, 200,000 × 200,000, 2,179,910 rows out | none | answered | 1.123 | 872 MB |
+| the same | `joinRows` 400,000, checked when the join ended (before) | refused | 0.215 | 284 MB |
+| the same | `joinRows` 400,000, checked as the join goes | refused at 420,000 | 0.052 | 50 MB |
+| GROUP BY, 400,000 groups | none | answered | 0.403 | 239 MB |
+| the same | `groups` 50,000 | refused at 50,001 | 0.021 | 10 MB |
+| 400,000 rows returned at once | none | answered | 0.151 | 129 MB |
+| the same | `heldRows` 50,000 | refused at 50,001 | 0.005 | 8 MB |
+
+**What the bench found.** `joinRows` was compared only once a join had built everything it
+would hand on, so the budget bounded what the *next* step saw and not what the join itself
+cost: 284 MB to refuse a query limited to 400,000 rows. It is now checked at each row of the
+probe side. One probe row can still add as many rows as the build side holds for its key
+before the check (20,000 here, which is why the refusal reads 420,000), so the bound is the
+budget plus one key's matches, not the budget exactly.
+
+Nothing spills: a query over its budget is refused, not finished more slowly. No uncertainty
+is given because each line is one run; the sizes repeat to within a megabyte, the times do not.
+
 ## Grouped synchronized WAL transactions (experimental)
 
 The 960-transaction test compares identical CRC-framed WAL records while
