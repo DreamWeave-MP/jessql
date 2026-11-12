@@ -686,6 +686,58 @@ budget plus one key's matches, not the budget exactly.
 Nothing spills: a query over its budget is refused, not finished more slowly. No uncertainty
 is given because each line is one run; the sizes repeat to within a megabyte, the times do not.
 
+## The two-level page directory at scale (#19, November 2026)
+
+`bench/pagedirectory.jsl`: a directory of page references written to a real file, opened, and
+looked up 20,000 times cold (spread over the whole of it) and 20,000 times warm. One size a
+process; one run each on one Linux machine. The heap figures are after a full collection. A
+flat directory is the same references held as one table.
+
+```sh
+jess run --trusted --package . bench/pagedirectory.jsl 10000000
+jess run --trusted --package . bench/pagedirectory.jsl 100000000 64 keep    # write once
+jess run --trusted --package . bench/pagedirectory.jsl 100000000 64 reuse   # a reader alone
+jess run --trusted --package . bench/pagedirectory.jsl 1000000 64 flat
+```
+
+| Pages | File | Open | Heap, directory open | and 64 leaves cached | Cold lookup | Warm lookup | Flat table |
+|---|---|---|---|---|---|---|---|
+| 100,000 | 2.8 MB | 0.1 ms | 1.3 MB | 5.7 MB | 82 us | 1.5 us | 23 MB (239 bytes a page) |
+| 1,000,000 | 28 MB | 1.5 ms | 2.5 MB | 7.0 MB | 87 us | 1.7 us | 243 MB (249 bytes a page) |
+| 10,000,000 | 281 MB | 10.8 ms | 4.7 MB | 6.3 MB | 63 us | 1.5 us | not run: 2.4 GB by the line above |
+| 100,000,000 | 2.81 GB | 131 ms | **34 MB** | **40 MB** | 88 us | 1.6 us | not run: 24 GB by the line above |
+
+(The first two rows are from before the reader was packed, the last two from after; the small
+sizes change little. 28.1 bytes a page on disk at every size, 256 pages a leaf.)
+
+At 100,000,000 pages, a reader in a process of its own:
+
+| | Root and leaves as tables (first version) | Packed in buffers |
+|---|---|---|
+| open | 241 ms | 131 ms |
+| heap with the directory open | 144 MB | 34 MB |
+| and 64 leaves cached | 152 MB | 40 MB |
+| and 4,096 leaves cached | 427 MB | 133 MB |
+| cold lookup, cache of 64 / of 4,096 | 145 us / 245 us | 88 us / 194 us |
+| the process's own memory after the 20,000 cold lookups (cache of 64) | 540 MB | 105 MB |
+
+**What the bench found, twice.** The first reader kept the root as a table a leaf (369 bytes
+each), so the root alone was 144 MB at this size, over a 64 MiB budget before a page was
+looked up. And its cache found the leaf to drop by looking at every leaf it held, which made a
+miss with 4,096 leaves cost 509 us. The root and each cached leaf are now a list of keys and a
+buffer of fixed-width fields, and the cache is a list in order of use.
+
+**Against the issue's question** (100K to 100M references under 64 to 256 MiB of metadata): a
+reader of 100 million references holds 40 MB with a cache of 64 leaves, inside 64 MiB, and
+133 MB with 4,096, inside 256. Its resident size is higher than its heap while lookups run
+(105 MB with 64 leaves), because every missed leaf is decoded and the collector is not asked
+to keep up.
+
+**Not measured**: CPU beyond these wall times; a cold page cache (the file had just been
+written); concurrent readers; key lengths other than fourteen bytes; anything on Windows. The
+cache is still bounded by a count of leaves and not by bytes, and a directory file is limited
+to 4 GiB, which this run is 70% of.
+
 ## Grouped synchronized WAL transactions (experimental)
 
 The 960-transaction test compares identical CRC-framed WAL records while
