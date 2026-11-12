@@ -1,0 +1,185 @@
+--!strict
+-- #32: fairness between the tenants of one bounded writer. A stand-in writer that answers
+-- requests in the order sent, as many a poll as it is told; a virtual clock; no worker.
+local fair = require('@jessql/writer_fair')
+local test = require('@jess/test')
+local writer = require('@jessql/writer')
+
+local expect = test.expect
+local suite = test.new()
+
+type Behind = {
+  submit: (request: writer.Request) -> fair.Admission,
+  poll: (seconds: number?) -> { writer.Ack },
+  sent: { string },
+  perPoll: number,
+  room: number,
+}
+
+-- Admits up to `room` unanswered, answers `perPoll` a poll, oldest first.
+local function behind(room: number, perPoll: number): Behind
+  local queue: { string } = {}
+  local self = { sent = {}, perPoll = perPoll, room = room } :: Behind
+  self.submit = function(request: writer.Request): fair.Admission
+    if #queue >= self.room then return { admitted = false, reason = 'backpressure', outstanding = #queue } end
+
+    table.insert(queue, request.id)
+    table.insert(self.sent, request.id)
+    return { admitted = true, reason = nil, outstanding = #queue }
+  end
+
+  self.poll = function(_seconds: number?): { writer.Ack }
+    local acks: { writer.Ack } = {}
+    for _ = 1, math.min(self.perPoll, #queue) do
+      table.insert(acks, { id = table.remove(queue, 1) :: string, outcome = 'committed' :: writer.Outcome })
+    end
+
+    return acks
+  end
+
+  return self
+end
+
+local serial = 0
+local function request(): writer.Request
+  serial += 1
+  return { id = `r{serial}`, operations = {} }
+end
+
+suite.describe('fair admission in front of one writer', function()
+  suite.it('gives a tenant alone the whole queue, and its share once another asks', function()
+    local now = 0
+    local back = behind(100, 1)
+    local front = fair.new({ submit = back.submit, poll = back.poll, capacity = 8, now = function(): number return now end })
+    for _ = 1, 8 do expect(front.submit('greedy', request()).admitted).toBe(true) end
+
+    -- Full, and it is alone: this is backpressure, not unfairness.
+    expect(front.submit('greedy', request()).reason).toBe('fair-share')
+    expect(front.status().share).toBe(8)
+
+    -- Another arrives, finds no room, and is owed the next place.
+    local late = front.submit('late', request())
+    expect(late.admitted).toBe(false)
+    expect(late.reason).toBe('backpressure')
+    expect(front.status().tenants.late.waiting).toBe(true)
+    expect(front.status().share).toBe(4)
+
+    -- A place is freed. The one over its share does not get it; the one waiting does.
+    expect(#front.poll(0)).toBe(1)
+    expect(front.submit('greedy', request()).reason).toBe('fair-share')
+    expect(front.submit('late', request()).admitted).toBe(true)
+    expect(front.status().tenants.late.waiting).toBe(false)
+
+    -- So it goes until each holds its share.
+    for _ = 1, 20 do
+      front.poll(0)
+      front.submit('greedy', request())
+      front.submit('late', request())
+    end
+
+    local status = front.status()
+    expect(status.tenants.greedy.outstanding).toBe(4)
+    expect(status.tenants.late.outstanding).toBe(4)
+    expect(status.outstanding).toBe(8)
+  end)
+
+  suite.it('returns a share to the others when its tenant has drained and gone, or stopped waiting', function()
+    local now = 0
+    local back = behind(100, 100)
+    local front = fair.new({ submit = back.submit, poll = back.poll, capacity = 6, waitSeconds = 5, now = function(): number return now end })
+    for _ = 1, 3 do front.submit('one', request()) end
+    for _ = 1, 3 do front.submit('two', request()) end
+
+    expect(front.submit('one', request()).reason).toBe('fair-share')
+    -- Everything is answered; `two` does not come back.
+    front.poll(0)
+    for _ = 1, 6 do expect(front.submit('one', request()).admitted).toBe(true) end
+
+    -- A tenant refused for want of room that never returns is forgotten after its wait.
+    expect(front.submit('three', request()).reason).toBe('backpressure')
+    back.perPoll = 1
+    front.poll(0)
+    expect(front.submit('one', request()).reason).toBe('fair-share')
+    now = 5
+    expect(front.status().tenants.three).toBe(nil)
+    expect(front.submit('one', request()).admitted).toBe(true)
+  end)
+
+  suite.it('keeps a slow tenant from being shut out by a fast one, and every tenant by two of them', function()
+    local now = 0
+    local back = behind(1000, 2)
+    local front = fair.new({ submit = back.submit, poll = back.poll, capacity = 12, now = function(): number return now end })
+    local admitted: { [string]: number } = { fast = 0, faster = 0, slow = 0 }
+    local worstWait, waitingSince = 0, -1
+    for round = 1, 600 do
+      now = round
+      front.poll(0)
+      -- The fast ones ask many times a round; the slow one once.
+      for _ = 1, 10 do
+        if front.submit('fast', request()).admitted then admitted.fast += 1 end
+        if front.submit('faster', request()).admitted then admitted.faster += 1 end
+      end
+
+      if front.submit('slow', request()).admitted then
+        admitted.slow += 1
+        if waitingSince >= 0 then worstWait = math.max(worstWait, round - waitingSince) end
+
+        waitingSince = -1
+      elseif waitingSince < 0 then
+        waitingSince = round
+      end
+    end
+
+    -- Two places free a round among three: the slow one, asking once a round, gets a third of
+    -- them within a little, and is never kept waiting long.
+    expect(admitted.fast + admitted.faster + admitted.slow >= 1190).toBe(true)
+    expect(admitted.slow >= 350).toBe(true)
+    expect(math.abs(admitted.fast - admitted.faster) <= 30).toBe(true)
+    expect(worstWait <= 6).toBe(true)
+
+    -- Without the front the same writer, of the same room, never admits the slow one at all.
+    local bare = behind(12, 2)
+    local got = 0
+    for _ = 1, 600 do
+      bare.poll(0)
+      for _ = 1, 10 do
+        bare.submit(request())
+        bare.submit(request())
+      end
+
+      if bare.submit(request()).admitted then got += 1 end
+    end
+
+    expect(got).toBe(0)
+  end)
+
+  suite.it('passes on what the writer behind refuses, counts nothing it did not admit, and refuses what is not a request', function()
+    local now = 0
+    local back = behind(2, 10)
+    local front = fair.new({ submit = back.submit, poll = back.poll, capacity = 10, maxTenants = 2, now = function(): number return now end })
+    local first = request()
+    expect(front.submit('one', first).admitted).toBe(true)
+    expect(front.submit('one', first).reason).toBe('duplicate-id')
+    expect(front.submit('two', first).reason).toBe('duplicate-id')
+    expect(front.submit('one', request()).admitted).toBe(true)
+    -- The writer behind has room for two: its refusal, and nothing is counted.
+    expect(front.submit('one', request()).reason).toBe('backpressure')
+    expect(front.status().outstanding).toBe(2)
+    expect(front.submit('', request()).reason).toBe('invalid: a request has a tenant')
+    expect(front.submit('one', { id = '', operations = {} }).reason).toBe('invalid: a request has an id')
+    expect(front.submit('two', request()).reason).toBe('backpressure')
+    expect(front.submit('three', request()).reason).toBe('too-many-tenants')
+
+    -- An answer for a request this front never admitted changes no count.
+    local acks = front.poll(0)
+    expect(#acks).toBe(2)
+    expect(front.status().outstanding).toBe(0)
+
+    for _, bad in { 0, -1, 1.5, fair.MaxCapacity + 1 } do
+      -- Construction raises on a capacity that is not one.
+      expect((pcall(function(): fair.Fair return fair.new({ submit = back.submit, poll = back.poll, capacity = bad }) end))).toBe(false)
+    end
+  end)
+end)
+
+return suite

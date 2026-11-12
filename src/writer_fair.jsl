@@ -1,0 +1,175 @@
+--!strict
+-- Fair admission in front of one writer (#32): several tenants, one bounded queue.
+--
+-- A writer client admits until `maxOutstanding` are unanswered and then refuses everyone alike,
+-- so the tenant that submits fastest holds the whole queue and the others are refused for as
+-- long as it keeps coming. This sits in front of the client (or a supervisor: anything with
+-- `submit` and `poll`) and shares the queue out:
+--
+--   * A tenant alone may use all of `capacity`: nothing is held back for tenants who are not
+--     there.
+--   * Among the tenants that hold requests or were refused for want of room, each has a share:
+--     `capacity` divided by how many of them there are, at least one. A tenant at or over its
+--     share is refused with `fair-share`; one under it is admitted when there is room.
+--   * A tenant under its share that finds no room is refused with `backpressure` and remembered
+--     as waiting for `waitSeconds`. While it waits it counts, so the tenants over their share
+--     are refused and the next places freed are left for it. If it does not come back, it is
+--     forgotten and its share returns to the others.
+--
+-- Nothing waits in here and nothing is queued: a refusal is the caller's to retry. What is
+-- promised is that no tenant that keeps asking is shut out by another that asks more: it is
+-- admitted within the time the tenants over their share take to drain down to it.
+local writer = require('@jessql/writer')
+
+export type Admission = { admitted: boolean, reason: string?, outstanding: number }
+export type Options = {
+  -- The writer behind: `submit` answers at once, `poll` returns outcomes learnt.
+  submit: (request: writer.Request) -> Admission,
+  poll: (seconds: number?) -> { writer.Ack },
+  -- The most requests unanswered at once, all tenants together. At most what the writer
+  -- behind admits: past that its own refusal is passed on.
+  capacity: number,
+  -- How long a tenant refused for want of room is counted as waiting (default 5).
+  waitSeconds: number?,
+  -- The most tenants holding or waiting at once (default 1024). One more is refused.
+  maxTenants: number?,
+  -- Seconds, monotonic. Injected in tests.
+  now: (() -> number)?,
+}
+export type TenantStatus = { outstanding: number, waiting: boolean, admitted: number, refused: number }
+export type Status = { outstanding: number, capacity: number, share: number, tenants: { [string]: TenantStatus } }
+export type Fair = {
+  submit: (tenant: string, request: writer.Request) -> Admission,
+  poll: (seconds: number?) -> { writer.Ack },
+  status: () -> Status,
+}
+
+type Tenant = { outstanding: number, waitingUntil: number, admitted: number, refused: number }
+
+local fair = {}
+
+fair.MaxCapacity = 65536
+fair.MaxTenants = 65536
+
+function fair.new(options: Options): Fair
+  local capacity = options.capacity
+  local waitSeconds = if options.waitSeconds ~= nil then options.waitSeconds else 5
+  local maxTenants = if options.maxTenants ~= nil then options.maxTenants else 1024
+  if typeof(capacity) ~= 'number' or capacity ~= math.floor(capacity) or capacity < 1 or capacity > fair.MaxCapacity then
+    error('jessql fair admission: invalid capacity', 2)
+  end
+
+  if typeof(waitSeconds) ~= 'number' or waitSeconds ~= waitSeconds or waitSeconds < 0 or waitSeconds > 3600 then
+    error('jessql fair admission: invalid waitSeconds', 2)
+  end
+
+  if typeof(maxTenants) ~= 'number' or maxTenants ~= math.floor(maxTenants) or maxTenants < 1 or maxTenants > fair.MaxTenants then
+    error('jessql fair admission: invalid maxTenants', 2)
+  end
+
+  local now = options.now or os.clock
+  local tenants: { [string]: Tenant } = {}
+  local tenantCount = 0
+  -- Which tenant sent a request that is not answered yet.
+  local owner: { [string]: string } = {}
+  local outstanding = 0
+
+  -- The tenants that hold requests or are waiting, with those who neither hold nor wait any
+  -- longer forgotten on the way.
+  local function active(at: number): number
+    local count = 0
+    for name, tenant in tenants do
+      if tenant.outstanding > 0 or tenant.waitingUntil > at then
+        count += 1
+      else
+        tenants[name] = nil
+        tenantCount -= 1
+      end
+    end
+
+    return count
+  end
+
+  local function refuse(tenant: Tenant?, reason: string): Admission
+    if tenant then tenant.refused += 1 end
+
+    return { admitted = false, reason = reason, outstanding = outstanding }
+  end
+
+  local self = {} :: Fair
+
+  function self.submit(name: string, request: writer.Request): Admission
+    if typeof(name) ~= 'string' or #name == 0 or #name > 256 then return refuse(nil, 'invalid: a request has a tenant') end
+
+    local id = request.id
+    if typeof(id) ~= 'string' or #id == 0 then return refuse(nil, 'invalid: a request has an id') end
+    if owner[id] then return refuse(tenants[name], 'duplicate-id') end
+
+    local at = now()
+    local others = active(at)
+    local tenant = tenants[name]
+    if not tenant then
+      if tenantCount >= maxTenants then return refuse(nil, 'too-many-tenants') end
+
+      local made: Tenant = { outstanding = 0, waitingUntil = 0, admitted = 0, refused = 0 }
+      tenant = made
+      tenants[name] = made
+      tenantCount += 1
+      others += 1
+    end
+
+    local share = math.max(1, capacity // math.max(1, others))
+    if tenant.outstanding >= share then return refuse(tenant, 'fair-share') end
+
+    if outstanding >= capacity then
+      -- Under its share and no room: it is owed the next places freed.
+      tenant.waitingUntil = at + waitSeconds
+      return refuse(tenant, 'backpressure')
+    end
+
+    local admission = options.submit(request)
+    if not admission.admitted then
+      -- The writer behind is full or gone: its answer, and this tenant is still owed a place.
+      if admission.reason == 'backpressure' then tenant.waitingUntil = at + waitSeconds end
+
+      return refuse(tenant, admission.reason or 'refused')
+    end
+
+    owner[id] = name
+    outstanding += 1
+    tenant.outstanding += 1
+    tenant.admitted += 1
+    tenant.waitingUntil = 0
+    return { admitted = true, reason = nil, outstanding = outstanding }
+  end
+
+  function self.poll(seconds: number?): { writer.Ack }
+    local acks = options.poll(seconds)
+    for _, ack in acks do
+      local name = owner[ack.id]
+      if not name then continue end
+
+      owner[ack.id] = nil
+      outstanding -= 1
+      local tenant = tenants[name]
+      if tenant then tenant.outstanding -= 1 end
+    end
+
+    return acks
+  end
+
+  function self.status(): Status
+    local listed: { [string]: TenantStatus } = {}
+    local at = now()
+    local count = active(at)
+    for name, tenant in tenants do
+      listed[name] = { outstanding = tenant.outstanding, waiting = tenant.waitingUntil > at, admitted = tenant.admitted, refused = tenant.refused }
+    end
+
+    return { outstanding = outstanding, capacity = capacity, share = math.max(1, capacity // math.max(1, count)), tenants = listed }
+  end
+
+  return self
+end
+
+return fair

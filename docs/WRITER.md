@@ -95,6 +95,27 @@ the worker gone before its reply): the client reports all six `unknown`, a new w
 over the same database, all six are sent again blind with the ledger on, and each is refused
 as already committed. Seven rows for thirteen requests sent.
 
+## Several tenants, one writer: `@jessql/writer_fair`
+
+A client admits until `maxOutstanding` are unanswered and then refuses everyone alike, so the
+caller that submits fastest holds the whole queue. `fair.new({ submit, poll, capacity })` sits
+in front of a client or a supervisor and shares the queue out between named tenants:
+
+- a tenant alone may use all of `capacity`: nothing is held back for tenants who are absent;
+- among the tenants that hold requests or were refused for want of room, each has a share,
+  `capacity` divided by their number; one at its share is refused with `fair-share`;
+- a tenant under its share that finds no room is refused with `backpressure` and counted as
+  waiting for `waitSeconds` (default 5): the tenants over their share are then refused and the
+  next places freed are left for it. One that does not come back is forgotten.
+
+Nothing waits or is queued inside it; a refusal is the caller's to retry. In
+`tests/writer-fair.jsl`, on a virtual clock with a stand-in writer that frees two places a
+round: two tenants asking ten times a round and one asking once, 600 rounds, queue of 12. The
+slow tenant is admitted at least 350 times and never waits more than 6 rounds; the same
+writer with no front admits it **0** times. What is not there: weights or priorities (every
+tenant's share is equal), fairness by bytes or by time in the writer rather than by requests,
+and any measurement against a real worker.
+
 ## As a library: `@jessql/writer_service`
 
 The protocol and both of its ends, without the spawning: `service.host()` is the worker's
