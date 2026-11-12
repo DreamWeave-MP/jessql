@@ -64,10 +64,14 @@ The issue asks for committed, aborted, rejected and outcome-unknown. Three exist
 | `rejected` | the request changed nothing: refused at admission, or its transaction raised and was rolled back whole | the owner; or the client, for a request it never sent (`backpressure`, `duplicate-id`, `closed`, `stopped`, `transport`) |
 | `unknown` | the request may or may not be durable | the owner, when a synchronization failed; the client, when the owner died or went silent |
 
-There is no separate `aborted`: a transaction that raised is `rejected` with the error as its
-reason, because for the caller the two are the same fact (nothing changed) and a fourth word
-would invite code that treats them differently. If review wants the distinction (refused
-before running against rolled back after running), it is a field on `rejected`, not a state.
+There is no separate `aborted` state, by the maintainer's decision (2026-11-12): a
+transaction that raised is `rejected`, because for the caller the two are the same fact
+(nothing changed) and a fourth word would invite code that treats them differently. The
+distinction is a field: a `rejected` acknowledgement carries `aborted = true` when the
+request's transaction **ran and was rolled back**, and no `aborted` at all when it never ran
+(refused at admission, or the writer stopped first). The client takes the field from the
+owner only as `true` and only on a rejection; on anything else it is dropped
+(`tests/writer-aborted.jsl`).
 
 **The rule that must hold in every version:** nothing is `committed` that the owner did not
 say was synchronized, and nothing is `rejected` that might be durable. A caller who gets

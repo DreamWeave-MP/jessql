@@ -229,7 +229,9 @@ function service.client(lane: Lane, options: ClientOptions?): Client
         if not settle(id) then continue end
 
         local problem = field(ack, 'error')
-        table.insert(acks, { id = id, outcome = outcome :: writer.Outcome, error = if typeof(problem) == 'string' then problem else nil })
+        table.insert(acks, { id = id, outcome = outcome :: writer.Outcome, error = if typeof(problem) == 'string' then problem else nil,
+          -- Only on a rejection, and only what the owner said.
+          aborted = if outcome == 'rejected' and field(ack, 'aborted') == true then true else nil })
       end
     end
   end
@@ -505,7 +507,8 @@ function service.supervisor(spawn: () -> Lane, options: SupervisorOptions): Supe
       elseif held[ack.id] ~= nil then
         -- Sent to an earlier worker too, and refused by this one as already there: it committed.
         local outcome: writer.Outcome = if ack.outcome == 'rejected' and retried[ack.id] and ledger.wasCommitted(ack.error) then 'committed' else ack.outcome
-        table.insert(acks, { id = ack.id, outcome = outcome, error = if outcome == 'committed' then nil else ack.error })
+        table.insert(acks, { id = ack.id, outcome = outcome, error = if outcome == 'committed' then nil else ack.error,
+          aborted = if outcome == 'rejected' then ack.aborted else nil })
         settle(ack.id)
       end
     end
@@ -533,7 +536,8 @@ function service.supervisor(spawn: () -> Lane, options: SupervisorOptions): Supe
       if held[ack.id] == nil then continue end
 
       local outcome: writer.Outcome = if ack.outcome == 'rejected' and retried[ack.id] and ledger.wasCommitted(ack.error) then 'committed' else ack.outcome
-      table.insert(acks, { id = ack.id, outcome = outcome, error = if outcome == 'committed' then nil else ack.error })
+      table.insert(acks, { id = ack.id, outcome = outcome, error = if outcome == 'committed' then nil else ack.error,
+        aborted = if outcome == 'rejected' then ack.aborted else nil })
       settle(ack.id)
     end
 

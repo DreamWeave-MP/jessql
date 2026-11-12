@@ -44,7 +44,11 @@ export type Operation = {
 }
 export type Request = { id: string, operations: { Operation } }
 export type Outcome = 'committed' | 'rejected' | 'unknown'
-export type Ack = { id: string, outcome: Outcome, error: string? }
+-- `aborted` is only ever on a `rejected` outcome, and only ever true: the request's
+-- transaction ran, raised, and was rolled back whole. A `rejected` without it never ran (it was
+-- refused at admission, or the writer stopped first). Either way it changed nothing; the field
+-- says which, for a caller who wants to know whether its own operations were at fault.
+export type Ack = { id: string, outcome: Outcome, error: string?, aborted: boolean? }
 export type Admission = { admitted: boolean, reason: string?, queued: number }
 export type Options = {
   -- The most requests waiting at once (default 1024, at most 65536). One more is refused.
@@ -277,7 +281,7 @@ function writer.new(db: catalog.Database, options: Options?): Writer
         acks[#acks + 1] = { id = request.id, outcome = 'committed', error = nil }
         status.committed += 1
       else
-        acks[#acks + 1] = { id = request.id, outcome = 'rejected', error = result.error }
+        acks[#acks + 1] = { id = request.id, outcome = 'rejected', error = result.error, aborted = true }
         status.rejected += 1
       end
     end
