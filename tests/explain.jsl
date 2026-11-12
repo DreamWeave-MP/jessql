@@ -1,0 +1,112 @@
+--!strict
+-- #17: an explanation that says why, and does not pass a guess off as a fact. Each join names
+-- the rule that chose its strategy; a table's row count is given only when its provider has an
+-- exact one; and the answer is the same whichever strategy the providers' declarations lead to.
+local sql = require('@jessql')
+local test = require('@jess/test')
+
+local expect = test.expect
+local suite = test.new()
+
+type Shape = { indexed: boolean, counted: boolean }
+
+local function provider(rows: sql.SourceRows, shape: Shape): sql.Provider
+  return {
+    columns = { 'id', 'kind', 'value' },
+    scan = function(_request) return rows end,
+    indexes = if shape.indexed then { id = true } else nil,
+    lookup = if shape.indexed then function(_column, id, _request)
+      local found: { sql.SourceRow } = {}
+      for _, row in rows do
+        if row.id == id then table.insert(found, row) end
+      end
+
+      return found
+    end else nil,
+    count = if shape.counted then function(): number return #rows end else nil,
+  }
+end
+
+local function database(left: Shape, right: Shape): sql.Database
+  local leftRows: { sql.SourceRow }, rightRows: { sql.SourceRow } = {}, {}
+  for id = 1, 60 do
+    local row: sql.SourceRow = { id = id, kind = if id % 3 == 0 then 'hot' else 'cold', value = id }
+    table.insert(leftRows, row)
+    for copy = 1, 2 do
+      local other: sql.SourceRow = { id = id, kind = if copy == 1 then 'a' else 'b', value = id * 10 + copy }
+      table.insert(rightRows, other)
+    end
+  end
+
+  local db = sql.new()
+  db:register('left_rows', provider(leftRows, left))
+  db:register('right_rows', provider(rightRows, right))
+  return db
+end
+
+local Equal = "SELECT l.id, r.value FROM left_rows l INNER JOIN right_rows r ON l.id = r.id WHERE l.kind = 'hot' ORDER BY r.value"
+
+local function values(result: sql.Result): string
+  local seen: { string } = {}
+  for _, row in result.rows do table.insert(seen, `{tostring(row.id)}:{tostring(row.value)}`) end
+
+  return table.concat(seen, ' ')
+end
+
+suite.describe('an explanation that says why', function()
+  suite.it('names the rule behind each join strategy, and gives the same answer under every one', function()
+    local cases: { { left: Shape, right: Shape, strategy: string, reason: string } } = {
+      { left = { indexed = false, counted = false }, right = { indexed = false, counted = false }, strategy = 'hash',
+        reason = 'an equality between columns, and neither side offers an index lookup on its column' },
+      { left = { indexed = true, counted = false }, right = { indexed = false, counted = false }, strategy = 'index-left',
+        reason = 'only the left side offers an index lookup on the join column' },
+      { left = { indexed = false, counted = false }, right = { indexed = true, counted = false }, strategy = 'index-right',
+        reason = 'only the right side offers an index lookup on the join column' },
+      { left = { indexed = true, counted = false }, right = { indexed = true, counted = false }, strategy = 'index-right',
+        reason = 'both sides are indexed on the join column; the WHERE narrows the left side more, so it is read and the right looked up' },
+    }
+
+    local answers: { string } = {}
+    for _, case in cases do
+      local plan = database(case.left, case.right):prepare(Equal)
+      local join = plan.explain().joins[1]
+      expect(join.strategy).toBe(case.strategy)
+      expect(string.sub(join.reason, 1, #case.reason)).toBe(case.reason)
+      table.insert(answers, values(plan.run()))
+    end
+
+    -- Twenty hot rows on the left, two on the right for each: forty, the same forty each time.
+    expect(#string.split(answers[1], ' ')).toBe(40)
+    for index = 2, #answers do expect(answers[index]).toBe(answers[1]) end
+
+    -- The score is shown as what it is.
+    local both = database({ indexed = true, counted = false }, { indexed = true, counted = false })
+    local scored = both:prepare(Equal).explain().joins[1].reason
+    expect(string.find(scored, 'not an estimate of rows', 1, true) ~= nil).toBe(true)
+    -- With nothing in the WHERE to tell the sides apart, the tie is said to be a tie.
+    local tied = both:prepare('SELECT l.id FROM left_rows l INNER JOIN right_rows r ON l.id = r.id').explain().joins[1]
+    expect(tied.strategy).toBe('index-left')
+    expect(string.find(tied.reason, 'narrows neither more', 1, true) ~= nil).toBe(true)
+  end)
+
+  suite.it('says when every pair is tested, and when an index was not considered', function()
+    local db = database({ indexed = true, counted = false }, { indexed = true, counted = false })
+    local unequal = db:prepare('SELECT l.id FROM left_rows l INNER JOIN right_rows r ON l.id < r.id').explain().joins[1]
+    expect(unequal.strategy).toBe('nested-loop')
+    expect(unequal.reason).toBe('the join condition is not an equality between one column of each side, so every pair of rows is tested')
+
+    local outer = db:prepare('SELECT l.id FROM left_rows l LEFT JOIN right_rows r ON l.id = r.id').explain().joins[1]
+    expect(outer.strategy).toBe('hash')
+    expect(outer.reason).toBe('an equality between columns; index lookups are only considered for a single inner join of two tables')
+  end)
+
+  suite.it('gives a row count only when the provider has an exact one, and marks nothing as estimated', function()
+    local db = database({ indexed = false, counted = true }, { indexed = false, counted = false })
+    local explained = db:prepare(Equal).explain()
+    expect(explained.scans[1].rows).toBe(60)
+    expect(explained.scans[2].rows).toBe(nil)
+    expect(explained.estimated).toBe(false)
+  end)
+end)
+
+return suite

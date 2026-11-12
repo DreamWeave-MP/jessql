@@ -116,13 +116,17 @@ export type Cursor = {
 }
 
 --- One table of a prepared query, and the columns it is scanned for.
-export type ExplainedScan = { table: string, alias: string, columns: { string } }
+--- `rows` is the table's exact row count when its provider can give one without scanning, and
+--- absent otherwise: it is never an estimate.
+export type ExplainedScan = { table: string, alias: string, columns: { string }, rows: number? }
 
 export type ExplainedJoin = {
   kind: 'inner' | 'left',
   table: string,
   alias: string,
   strategy: 'nested-loop' | 'hash' | 'index-left' | 'index-right',
+  --- Why that strategy, in words: the rule that chose it and what it looked at.
+  reason: string,
 }
 
 --- How a prepared query will run: the columns each table is scanned for, each join's strategy,
@@ -137,6 +141,10 @@ export type Explanation = {
   aggregateCount: number,
   providerCount: boolean,
   parameterCount: number,
+  --- Always false today: no choice here was made from an estimate. Every strategy is a rule
+  --- over what the query says and what the providers declare (#17), and the answer is the same
+  --- whichever is chosen.
+  estimated: boolean,
 }
 
 --- A prepared query. `run` takes the values for its `?` placeholders, in order, and may be called
@@ -220,6 +228,7 @@ type OrderFn = {evaluate: Evaluator, desc: boolean}
 type Unit = {context: unknown, group: Group?, orderKey: unknown?, order: {unknown}?}
 type JoinPlan = {
   strategy: 'nested-loop' | 'hash' | 'index-left' | 'index-right',
+  reason: string,
   leftSourceIndex: number?,
   leftColumn: string?,
   rightColumn: string?,
@@ -1584,7 +1593,8 @@ local function prepare(db: Database, sql: string): Plan
     joinFns[index] = compileExpr(join.on, sources, directSingle, nil)
     local rightIndex = index + 1
     local node = join.on
-    local plan: JoinPlan = { strategy = 'nested-loop' }
+    local plan: JoinPlan = { strategy = 'nested-loop',
+      reason = 'the join condition is not an equality between one column of each side, so every pair of rows is tested' }
 
     if node.tag == 'binary' and node.op == '=' and node.left.tag == 'column' and node.right.tag == 'column' then
       local leftCol, rightCol = node.left, node.right
@@ -1592,6 +1602,9 @@ local function prepare(db: Database, sql: string): Plan
 
       if (leftCol.sourceIndex :: number) < rightIndex and rightCol.sourceIndex == rightIndex then
         plan.strategy = 'hash'
+        plan.reason = if #sources == 2 and #ast.joins == 1 and join.kind == 'inner'
+          then 'an equality between columns, and neither side offers an index lookup on its column'
+          else 'an equality between columns; index lookups are only considered for a single inner join of two tables'
         plan.leftSourceIndex = leftCol.sourceIndex
         plan.leftColumn = leftCol.boundName
         plan.rightColumn = rightCol.boundName
@@ -1608,10 +1621,18 @@ local function prepare(db: Database, sql: string): Plan
             local leftScore = sourceFilterScore(leftCol.sourceIndex :: number)
             local rightScore = sourceFilterScore(rightIndex)
             plan.strategy = (if leftScore > rightScore then 'index-right' else 'index-left') :: ('index-right' | 'index-left')
+            -- The side the WHERE narrows more is read, and the other is looked up row by row.
+            plan.reason = 'both sides are indexed on the join column; '
+              .. (if leftScore > rightScore then 'the WHERE narrows the left side more, so it is read and the right looked up'
+                elseif leftScore < rightScore then 'the WHERE narrows the right side more, so it is read and the left looked up'
+                else 'the WHERE narrows neither more, so the right is read and the left looked up')
+              .. `: a score of each side's conditions ({leftScore} left, {rightScore} right), not an estimate of rows`
           elseif leftIndexed then
             plan.strategy = 'index-left' :: 'index-left'
+            plan.reason = 'only the left side offers an index lookup on the join column'
           elseif rightIndexed then
             plan.strategy = 'index-right' :: 'index-right'
+            plan.reason = 'only the right side offers an index lookup on the join column'
           end
         end
       end
@@ -2890,10 +2911,17 @@ local function prepare(db: Database, sql: string): Plan
         table = join.source.name,
         alias = join.source.alias,
         strategy = joinPlans[index].strategy,
+        reason = joinPlans[index].reason,
       }
     ]
 
-    local scans = [for index, source in enumerate(sources) => { table = source.name, alias = source.alias, columns = neededColumns[index] }]
+    local scans = [
+      for index, source in enumerate(sources) => {
+        table = source.name, alias = source.alias, columns = neededColumns[index],
+        -- Exact, from the provider, or not given at all.
+        rows = if type(source.provider.count) == 'function' then (source.provider.count :: () -> number)() else nil,
+      }
+    ]
 
     return {
       scans = scans,
@@ -2903,6 +2931,7 @@ local function prepare(db: Database, sql: string): Plan
       aggregateCount = #aggregateSpecs,
       providerCount = directProviderCount or directFilteredCount,
       parameterCount = ast.params,
+      estimated = false,
     }
   end
 
