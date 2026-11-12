@@ -57,7 +57,13 @@ suite.describe('per-operator budgets', function()
     db:limits({ joinRows = 600 })
     expect(#db:query(Join).rows).toBe(600)
     db:limits({ joinRows = 100 })
-    expect(refusal(db, Join)).toBe('jessql: query exceeds its budget: the rows a join hands on, 600 rows (limit 100)')
+    -- Stopped at the row of the probe side that finds the budget passed, with what the join
+    -- had handed on by then (three lines an order: 102 after the thirty-fourth), and not after
+    -- all 600 were built.
+    expect(refusal(db, Join)).toBe('jessql: query exceeds its budget: the rows a join hands on, 102 rows (limit 100)')
+    -- The same for a join with no index and no equality to hash on.
+    expect(refusal(db, 'SELECT o.id FROM orders o JOIN lines l ON l.order_id < o.id')).toContain('the rows a join hands on, ')
+    expect((string.find(refusal(db, 'SELECT o.id FROM orders o JOIN lines l ON l.order_id < o.id'), '59700 rows', 1, true))).toBe(nil)
   end)
 
   suite.it('stops an aggregate that holds more groups than its budget, at the group that passes it', function()

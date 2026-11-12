@@ -2198,6 +2198,8 @@ local function prepare(db: Database, sql: string): Plan
           local function consumeRight(right: SourceRow)
             local key = right[joinPlan.rightColumn :: string]
             if key == nil then return end
+            if joinLimit and #nextContexts > joinLimit then overBudget('the rows a join hands on', #nextContexts, joinLimit) end
+
             local leftRows = cache[key]
 
             if leftRows == nil and not missing[key] then
@@ -2262,6 +2264,8 @@ local function prepare(db: Database, sql: string): Plan
           local function consumeLeft(leftRow: SourceRow)
             local key = leftRow[joinPlan.leftColumn :: string]
             if key == nil then return end
+            if joinLimit and #nextContexts > joinLimit then overBudget('the rows a join hands on', #nextContexts, joinLimit) end
+
             local rightRows = cache[key]
 
             if rightRows == nil and not missing[key] then
@@ -2342,6 +2346,8 @@ local function prepare(db: Database, sql: string): Plan
           end
 
           for _, leftRow in rowsBySource[1] :: SourceRows do
+            if joinLimit and #nextContexts > joinLimit then overBudget('the rows a join hands on', #nextContexts, joinLimit) end
+
             local key = leftRow[joinPlan.leftColumn :: string]
             local first = if key == nil then nil else buckets[key]
 
@@ -2359,6 +2365,8 @@ local function prepare(db: Database, sql: string): Plan
           end
         elseif joinIndex == 1 and not directSingle then
           for _, leftRow in rowsBySource[1] :: SourceRows do
+            if joinLimit and #nextContexts > joinLimit then overBudget('the rows a join hands on', #nextContexts, joinLimit) end
+
             local matched = false
 
             for _, right in rhs :: SourceRows do
@@ -2400,6 +2408,8 @@ local function prepare(db: Database, sql: string): Plan
           end
 
           for _, left in contexts :: {JoinContext} do
+            if joinLimit and #nextContexts > joinLimit then overBudget('the rows a join hands on', #nextContexts, joinLimit) end
+
             local sourceRow = (left :: JoinContext)[joinPlan.leftSourceIndex :: number]
             local key = if sourceRow == nil then nil else sourceRow[joinPlan.leftColumn :: string]
             local first = if key == nil then nil else buckets[key]
@@ -2427,6 +2437,8 @@ local function prepare(db: Database, sql: string): Plan
           end
         else
           for _, left in contexts :: {JoinContext} do
+            if joinLimit and #nextContexts > joinLimit then overBudget('the rows a join hands on', #nextContexts, joinLimit) end
+
             local matched = false
 
             for _, right in rhs :: SourceRows do
