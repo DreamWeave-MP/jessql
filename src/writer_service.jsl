@@ -39,6 +39,10 @@ export type Lane = {
 export type HostOptions = {
   -- For tests: the backend the database is opened on. A worker uses the VM default.
   storage: vfs.Backend?,
+  -- #31. The one directory this service keeps databases in. When set, `open` does not take a
+  -- path: it takes a database's name (`service.validName`), and the path is the service's own
+  -- affair. A client can then name no file outside the root, whatever it sends.
+  root: string?,
 }
 export type ClientOptions = {
   -- The most requests sent and not yet answered (default 768, at most 960: a worker's mailbox
@@ -65,6 +69,23 @@ local service = {}
 -- What an application gives `jess.worker.spawn` as `source`.
 service.source = "return require('@jessql/writer_service').host()"
 service.MaxOutstanding = 960
+-- #31. The protocol's version, sent with `open` and answered with `opened`. A host refuses an
+-- `open` of another version; one that names none is taken as this one, which is what clients
+-- before the field sent.
+service.Protocol = 1
+
+-- A database's name under a confined host: a letter or digit, then letters, digits, `_` and
+-- `-`, 64 at most. No separator, no dot, nothing a path could be made of.
+function service.validName(name: unknown): boolean
+  return typeof(name) == 'string' and #(name :: string) <= 64 and string.match(name :: string, '^[%w][%w_%-]*$') ~= nil
+end
+
+-- What an application gives `jess.worker.spawn` for a host confined to `root`.
+function service.sourceFor(root: string): string
+  if typeof(root) ~= 'string' or #root == 0 or string.find(root, '%z') then error('jessql writer service: invalid root', 2) end
+
+  return string.format("return require('@jessql/writer_service').host({ root = %q })", root)
+end
 
 local function field(message: unknown, key: string): unknown
   return if typeof(message) == 'table' then (message :: { [string]: unknown })[key] else nil
@@ -75,6 +96,10 @@ end
 function service.host(options: HostOptions?): (message: unknown) -> unknown
   local db: catalog.Database? = nil
   local actor: writer.Writer? = nil
+  local root = if options then options.root else nil
+  if root ~= nil and (typeof(root) ~= 'string' or #root == 0 or string.find(root, '%z')) then
+    error('jessql writer service: invalid root', 2)
+  end
 
   return function(message: unknown): unknown
     local kind = field(message, 'kind')
@@ -83,6 +108,16 @@ function service.host(options: HostOptions?): (message: unknown) -> unknown
 
       local path, tables, writerOptions = field(message, 'path'), field(message, 'tables'), field(message, 'options')
       if typeof(path) ~= 'string' or typeof(tables) ~= 'table' then return { kind = 'failed', reason = 'open needs a path and tables' } end
+
+      local version = field(message, 'version')
+      if version ~= nil and version ~= service.Protocol then return { kind = 'failed', reason = 'unsupported protocol version' } end
+
+      if root then
+        -- Confined: what was sent is a name, and nothing else is ever joined to the root.
+        if not service.validName(path) then return { kind = 'failed', reason = 'not a database name' } end
+
+        path = `{string.gsub(root, '/+$', '')}/{path :: string}`
+      end
 
       -- A path that cannot be opened, or options the writer refuses, are an answer.
       local ok, problem = pcall(function()
@@ -100,7 +135,7 @@ function service.host(options: HostOptions?): (message: unknown) -> unknown
         return { kind = 'failed', reason = tostring(problem) }
       end
 
-      return { kind = 'opened' }
+      return { kind = 'opened', version = service.Protocol }
     end
 
     local queue = actor
@@ -209,7 +244,7 @@ function service.client(lane: Lane, options: ClientOptions?): Client
 
   function self.open(_self: Client, path: string, tables: { catalog.TableSpec }, writerOptions: writer.Options?, seconds: number?): (boolean, string?)
     if opened or stopped then return false, 'already opened' end
-    if not send({ kind = 'open', path = path, tables = tables, options = writerOptions }) then return false, 'the worker took no message' end
+    if not send({ kind = 'open', version = service.Protocol, path = path, tables = tables, options = writerOptions }) then return false, 'the worker took no message' end
 
     local reply, failed = receive(seconds or 30)
     if failed or field(reply, 'kind') ~= 'opened' then
