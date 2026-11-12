@@ -45,8 +45,18 @@ file exclusively: a segment file is written once. The set records each segment's
 and CRC-32; `verify` reads a segment whole against them. A read does **not** verify: it is
 held to lengths only. **Open for review:** whether the checksum belongs to the segment (as
 here), to pages inside it (as cold pages have today), or both; and CRC-32 against something
-stronger. The prototype holds a whole segment in memory to seal or verify it, which is its
-limit and not a proposal.
+stronger. Neither side holds a segment: the writer hands bytes to the open segment's file as
+they arrive and carries the checksum along, and `verify` reads a megabyte at a time. A segment
+is synced, closed and its directory synced when it fills or at `finish`; a writer whose write
+failed takes no more bytes, since how much of that write landed is not known.
+
+### Measured on real files
+
+`bench/cold-segments.jsl`, 4,160 MiB (4,362,076,160 bytes) as five 1 GiB segments on an NVMe
+disk under LUKS, one run: written in 8.9 s, every segment verified in 3.9 s, six reads checked
+byte for byte (either side of 4 GiB, at 4 GiB, across the last segment edge, the last 4 KiB),
+a read past the end refused. Peak resident size **36 MiB** for the whole process. One machine,
+one run, Linux only; no Windows run has been made.
 
 ## File names
 

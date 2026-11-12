@@ -1,0 +1,89 @@
+--!strict
+-- #20: a set of real segment files holding more than 4 GiB, written, checked and read back at
+-- logical offsets past 4 GiB, with the process's resident size at each step.
+--
+--   jess run --trusted --package . bench/cold-segments.jsl <directory> [megabytes=4160] [segmentMegabytes=1024]
+--
+-- `directory` must not exist: it is made, filled and removed. Every byte is a function of its
+-- logical offset, so what is read back is checked without keeping what was written. Linux only
+-- for the sizes (procfs).
+local address = require('@jessql/coldaddress')
+local fs = require('@dream/fs')
+local vfs = require('@jessql/vfs')
+
+local arguments = { ... } :: { string }
+local directory = assert(arguments[1], 'a directory that does not exist')
+local megabytes = math.floor(tonumber(arguments[2]) or 4160)
+local segmentBytes = math.floor(tonumber(arguments[3]) or 1024) * 1024 * 1024
+local MiB = 1024 * 1024
+
+local function resident(field: string?): number
+  local data = fs.readFileString('/proc/self/status')
+  local amount = if data then string.match(data, (field or 'VmRSS') .. ':%s*(%d+)') else nil
+  return if amount then (tonumber(amount) or 0) / 1024 else -1
+end
+
+-- The megabyte that starts at megabyte `index`: sixteen bytes that name it and the line inside
+-- it, 65,536 times over.
+local function megabyte(index: number): string
+  local lines = table.create(256) :: { string }
+  for line = 0, 255 do lines[line + 1] = string.rep(string.format('%08x%04x....', index, line), 256) end
+
+  return table.concat(lines)
+end
+
+assert(not fs.exists(directory), 'the directory already exists')
+assert((fs.mkdir(directory, { recursive = true })))
+local storage = vfs.native()
+local writer = assert(address.writer(storage, directory, 'bench', segmentBytes))
+
+local began = os.clock()
+for index = 0, megabytes - 1 do
+  local start = assert(writer.append(megabyte(index)))
+  assert(start == index * MiB, 'an append did not start where the last one ended')
+end
+
+local set = assert(writer.finish())
+local wrote = os.clock() - began
+local total = megabytes * MiB
+print(`wrote {megabytes} MiB ({total} bytes) as {#set.segments} segments in {string.format('%.1f', wrote)} s; resident {string.format('%.0f', resident())} MiB, peak {string.format('%.0f', resident('VmHWM'))} MiB`)
+
+local reader = assert(address.reader(storage, directory, 'bench', set))
+began = os.clock()
+for _, entry in set.segments do
+  local sound, why = reader.verify(entry.id)
+  assert(sound, why)
+end
+
+print(`verified every segment in {string.format('%.1f', os.clock() - began)} s; peak {string.format('%.0f', resident('VmHWM'))} MiB`)
+
+-- Reads at the edges that matter: 4 GiB itself, either side of it, across a segment's edge past
+-- it, and the last bytes of all.
+local FourGiB = 4 * 1024 * MiB
+local checked = 0
+local function check(logical: number, length: number)
+  local got = assert(reader.read(logical, length))
+  local first = logical // MiB
+  local expected: { string } = {}
+  for index = first, (logical + length - 1) // MiB do table.insert(expected, megabyte(index)) end
+
+  local from = logical - first * MiB
+  assert(got == string.sub(table.concat(expected), from + 1, from + length), `bytes at {logical} are not what was written`)
+  checked += 1
+end
+
+if total > FourGiB then
+  check(FourGiB - 7, 14)
+  check(FourGiB, 4096)
+  check(FourGiB + 123456789 % (total - FourGiB - 4096), 4096)
+end
+
+local lastEdge = (#set.segments - 1) * segmentBytes
+if lastEdge > 0 then check(lastEdge - 5000, 10000) end
+check(total - 4096, 4096)
+check(0, 16)
+assert(reader.read(total - 1, 2) == nil, 'a read past the end was answered')
+print(`{checked} reads checked byte for byte, the furthest ending at logical offset {total}; a read past the end is refused`)
+
+assert((fs.remove(directory, { recursive = true })))
+print(`removed {directory}; peak resident {string.format('%.0f', resident('VmHWM'))} MiB`)
