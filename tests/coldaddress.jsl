@@ -214,6 +214,64 @@ suite.describe('the prototype reader over segment files', function()
     expect((reader.read(4096, 10))).toBe(nil)
     expect((reader.verify(7))).toBe(false)
   end)
+
+  suite.it('checks a segment a piece at a time, and finds one changed byte in any piece', function()
+    local disk = memfs.new()
+    disk.backend.mkdir(Directory, { recursive = true })
+    local writer = assert(address.writer(disk.backend, Directory, 'wide', 4 * 1024 * 1024))
+    -- Two and a half pieces in the first segment, in appends that do not line up with them.
+    local line = string.rep('0123456789abcdef', 4093)
+    local total = 0
+    while total < 2.5 * address.VerifyPieceBytes do
+      assert(writer.append(line))
+      total += #line
+    end
+
+    local set = assert(writer.finish())
+    expect(`{#set.segments} {set.segments[1].length == total}`).toBe('1 true')
+    -- The checksum carried across the appends is the checksum of the whole.
+    local path = `{Directory}/wide.s00000000.cold`
+    local whole = disk.visible()[path]
+    expect(set.segments[1].crc).toBe(bytes.crc32(whole))
+    local reader = assert(address.reader(disk.backend, Directory, 'wide', set))
+    expect((reader.verify(0))).toBe(true)
+
+    for _, at in { 0, address.VerifyPieceBytes - 1, address.VerifyPieceBytes, 2 * address.VerifyPieceBytes + 5, total - 1 } do
+      local changed = string.sub(whole, 1, at) .. 'Z' .. string.sub(whole, at + 2)
+      expect((disk.backend.writeFile(path, changed))).toBe(#changed)
+      expect(`{at}: {reason(reader.verify(0))}`).toBe(`{at}: segment 0 does not match its checksum`)
+    end
+  end)
+
+  suite.it('puts a sealed segment on the disk for good, and holds nothing of it once written', function()
+    local disk = memfs.new()
+    disk.backend.mkdir(Directory, { recursive = true })
+    local writer = assert(address.writer(disk.backend, Directory, 'kept', 4096))
+    assert(writer.append(string.rep('k', 4096 + 100)))
+    -- The first segment filled and was sealed: a crash now keeps all of it.
+    local first = `{Directory}/kept.s00000000.cold`
+    expect(#(disk.surviving()[first] or '')).toBe(4096)
+    local set = assert(writer.finish())
+    expect(`{set.segments[1].length} {set.segments[2].length}`).toBe('4096 100')
+    expect(#(disk.surviving()[`{Directory}/kept.s00000001.cold`] or '')).toBe(100)
+  end)
+
+  suite.it('names no segment a write failed in, and takes no more bytes after', function()
+    local disk = memfs.new()
+    disk.backend.mkdir(Directory, { recursive = true })
+    local writer = assert(address.writer(disk.backend, Directory, 'full', 4096))
+    assert(writer.append(string.rep('a', 4096)))
+    disk.capacity(disk.used() + 10)
+    expect((writer.append(string.rep('b', 100)))).toBe(nil)
+    disk.capacity(nil)
+    -- Room again is not a reason to go on: how much of the failed append landed is not known.
+    expect((writer.append('c'))).toBe(nil)
+    expect((writer.finish())).toBe(nil)
+
+    -- A file already there is never written over.
+    local again = assert(address.writer(disk.backend, Directory, 'full', 4096))
+    expect((again.append('d'))).toBe(nil)
+  end)
 end)
 
 return suite

@@ -15,8 +15,8 @@
 --     clamped or wrapped.
 --
 -- `reader` and `writer` are the prototype: raw segment files, a set record the caller keeps
--- (in a database, the manifest would), and a CRC-32 a segment. They hold a whole segment in
--- memory to check or to seal it, which is a prototype's limit and not a format decision.
+-- (in a database, the manifest would), and a CRC-32 a segment. Neither holds a segment: the
+-- writer hands bytes to the file as they come, and `verify` reads a piece at a time.
 local bytes = require('@dream/bytes')
 local vfs = require('@jessql/vfs')
 
@@ -50,6 +50,8 @@ address.MaxLogical = 2 ^ 53 - 1
 -- The most segments one read or one set may touch here.
 address.MaxSpans = 4096
 address.EncodedBytes = 8
+-- How much of a segment `verify` holds at once.
+address.VerifyPieceBytes = 1024 * 1024
 
 local function whole(value: unknown, least: number, most: number): boolean
   return type(value) == 'number' and value == value and value == math.floor(value :: number)
@@ -241,9 +243,20 @@ function address.reader(storage: vfs.Backend, directory: string, base: string, s
     local entry = known[segment]
     if not entry then return false, `segment {tostring(segment)} is not in the set` end
 
-    local body, problem = piece({ segment = segment, offset = 0, length = entry.length })
-    if not body then return false, problem end
-    if bytes.crc32(body) ~= entry.crc then return false, `segment {segment} does not match its checksum` end
+    -- A piece at a time, the checksum carried from one to the next: a segment of 2 GiB is
+    -- checked in the memory of one piece.
+    local crc: number? = nil
+    local at = 0
+    while at < entry.length do
+      local take = math.min(address.VerifyPieceBytes, entry.length - at)
+      local body, problem = piece({ segment = segment, offset = at, length = take })
+      if not body then return false, problem end
+
+      crc = bytes.crc32(body, crc)
+      at += take
+    end
+
+    if (crc or bytes.crc32('')) ~= entry.crc then return false, `segment {segment} does not match its checksum` end
 
     return true, nil
   end
@@ -251,26 +264,46 @@ function address.reader(storage: vfs.Backend, directory: string, base: string, s
   return self, nil
 end
 
--- A writer that fills segment files in order from id 0, for the prototype and its tests.
+-- A writer that fills segment files in order from id 0, for the prototype and its tests. What
+-- it is given goes to the open segment's file as it arrives, and the checksum is carried along:
+-- it holds no more than the caller's own bytes, however large a segment is. `finish`, or the
+-- segment filling, syncs and closes the file; a set names only segments that were.
 function address.writer(storage: vfs.Backend, directory: string, base: string, segmentBytes: number): (Writer?, string?)
   if not address.validSegmentBytes(segmentBytes) then return nil, 'not a segment size' end
   if not address.validBase(base) then return nil, 'not a base name' end
 
   local sealed: { Segment } = {}
-  local open: { string } = {}
+  local file: dream_fs_Writer? = nil
   local openBytes, finished = 0, false
+  local openCrc: number? = nil
+  local broken: string? = nil
 
-  local function seal(): string?
+  local function begin(): string?
     local id = #sealed
     if id > address.MaxSegment or id >= address.MaxSpans then return 'too many segments' end
 
-    local body = table.concat(open)
     local name = assert(address.fileName(base, id))
-    local written, problem = storage.writeFile(storage.join(directory, name), body, { exclusive = true })
-    if not written then return problem or 'not written' end
+    local opened, problem = storage.openWrite(storage.join(directory, name), { exclusive = true, append = true })
+    if not opened then return problem or 'not opened' end
 
-    table.insert(sealed, { id = id, length = #body, crc = bytes.crc32(body) })
-    open, openBytes = {}, 0
+    file, openBytes, openCrc = opened, 0, nil
+    return nil
+  end
+
+  local function seal(): string?
+    local held = assert(file)
+    local synced, syncProblem = held:syncAll()
+    local closed, closeProblem = held:close()
+    file = nil
+    if not synced then return syncProblem or 'not synced' end
+    if not closed then return closeProblem or 'not closed' end
+
+    -- The bytes are on the disk; the name is not until its directory is.
+    local named, nameProblem = storage.syncDirectory(directory)
+    if not named then return nameProblem or 'directory not synced' end
+
+    table.insert(sealed, { id = #sealed, length = openBytes, crc = openCrc or bytes.crc32('') })
+    openBytes, openCrc = 0, nil
     return nil
   end
 
@@ -278,6 +311,8 @@ function address.writer(storage: vfs.Backend, directory: string, base: string, s
 
   function self.append(data: string): (number?, string?)
     if finished then return nil, 'finished' end
+    -- A segment that failed part way is not appended to: its length is no longer known.
+    if broken then return nil, broken end
     if type(data) ~= 'string' then return nil, 'not bytes' end
 
     local start, problem = address.join({ segment = #sealed, offset = openBytes }, segmentBytes)
@@ -285,13 +320,25 @@ function address.writer(storage: vfs.Backend, directory: string, base: string, s
 
     local at = 1
     while at <= #data do
+      if not file then
+        local failure = begin()
+        if failure then broken = failure; return nil, failure end
+      end
+
       local take = math.min(#data - at + 1, segmentBytes - openBytes)
-      table.insert(open, string.sub(data, at, at + take - 1))
+      local part = if take == #data then data else string.sub(data, at, at + take - 1)
+      local written, failure = assert(file):write(part)
+      if written ~= take then
+        broken = failure or 'short write'
+        return nil, broken
+      end
+
+      openCrc = bytes.crc32(part, openCrc)
       openBytes += take
       at += take
       if openBytes == segmentBytes then
-        local failure = seal()
-        if failure then return nil, failure end
+        local sealFailure = seal()
+        if sealFailure then broken = sealFailure; return nil, sealFailure end
       end
     end
 
@@ -300,10 +347,11 @@ function address.writer(storage: vfs.Backend, directory: string, base: string, s
 
   function self.finish(): (Set?, string?)
     if finished then return nil, 'finished' end
+    if broken then return nil, broken end
 
-    if openBytes > 0 then
+    if file then
       local failure = seal()
-      if failure then return nil, failure end
+      if failure then broken = failure; return nil, failure end
     end
 
     finished = true
