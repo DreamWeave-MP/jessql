@@ -171,6 +171,17 @@ local function snapshot(request: unknown, maxOperations: number): (Request?, str
   return taken, nil
 end
 
+-- For every layer that keeps a request beyond the call that handed it over (a writer's queue,
+-- and a supervisor that sends it again after a worker dies): the same copy, validated and
+-- frozen all the way down, or nil and why it is not a request. What is kept must be this and
+-- never the caller's table, which the caller is free to change the moment the call returns.
+function writer.snapshot(request: unknown, maxOperations: number?): (Request?, string?)
+  local most = maxOperations or 4096
+  if not whole(most, 1, 4096) then error('jessql writer: invalid maxOperations', 2) end
+
+  return snapshot(request, most)
+end
+
 -- One request as one transaction: every operation, or an error that leaves none of them.
 local function apply(tx: catalog.Transaction, request: Request, kept: ledger.Options?)
   if kept then ledger.enter(tx, kept, request.id) end

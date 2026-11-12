@@ -479,13 +479,18 @@ function service.supervisor(spawn: () -> Lane, options: SupervisorOptions): Supe
     local current = client
     if stopped or not current then return { admitted = false, reason = 'stopped', outstanding = outstanding } end
 
-    local id = field(request, 'id')
-    if typeof(id) == 'string' and held[id] ~= nil then return { admitted = false, reason = 'duplicate-id', outstanding = outstanding } end
+    -- From here on only the copy is looked at, sent and kept: a worker that dies is sent this
+    -- again, and it must be what was admitted whatever the caller has done to its table since.
+    local taken, invalid = writer.snapshot(request)
+    if not taken then return { admitted = false, reason = 'invalid: ' .. (invalid or 'malformed'), outstanding = outstanding } end
 
-    local admission = current:submit(request)
+    local id = taken.id
+    if held[id] ~= nil then return { admitted = false, reason = 'duplicate-id', outstanding = outstanding } end
+
+    local admission = current:submit(taken)
     if admission.admitted then
-      held[id :: string] = request
-      table.insert(order, id :: string)
+      held[id] = taken
+      table.insert(order, id)
       outstanding += 1
     elseif admission.reason == 'stopped' then
       -- The worker died between two looks: said as backpressure, since the next poll replaces it.

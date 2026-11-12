@@ -297,6 +297,71 @@ suite.describe('the writer as a service in a worker', function()
     expect(rows(disk)).toBe(9)
   end)
 
+  suite.it('sends a dead worker\'s requests again as they were admitted, whatever the caller has done to them since', function()
+    local kept: ledger.Options = { table = 'requests', scope = 'frozen' }
+    local disk = memfs.new()
+    local worlds: { World } = {}
+    local function spawn(): service.Lane
+      if #worlds > 0 then disk.crash() end
+
+      local made = world(nil, disk)
+      table.insert(worlds, made)
+      return made.lane
+    end
+
+    local supervised = service.supervisor(spawn, { path = Path, tables = Tables, writer = { ledger = kept }, restartBackoffSeconds = 0 })
+    local requests: { writer.Request } = {}
+    for number = 1, 4 do
+      requests[number] = { id = `m{number}`, operations = {
+        { op = 'insert', table = 'events', row = { id = number, body = 'ORIGINAL' } },
+        { op = 'upsert', table = 'counters', row = { id = 'last', value = number } },
+      } }
+      expect(supervised:submit(requests[number]).admitted).toBe(true)
+    end
+
+    -- Admitted. Now everything a caller can reach is changed: a value in a row, a row itself,
+    -- an operation, the list of operations, the id.
+    local function meddle()
+      local first = requests[1].operations[1].row :: { [string]: unknown }
+      first.body = 'MUTATED'
+      first.id = 901
+      requests[2].operations[1].row = { id = 902, body = 'MUTATED' }
+      requests[3].operations[1] = { op = 'insert', table = 'events', row = { id = 903, body = 'MUTATED' } }
+      table.insert(requests[3].operations, { op = 'insert', table = 'events', row = { id = 913, body = 'MUTATED' } })
+      requests[4].operations = { { op = 'insert', table = 'events', row = { id = 904, body = 'MUTATED' } } }
+      requests[4].id = 'm4-renamed'
+    end
+
+    meddle()
+    -- The first worker dies with all four still in its mailbox: none was committed, so what
+    -- the second is sent is what will be.
+    worlds[1].dead = true
+    expect(#supervised:poll(0)).toBe(0)
+    expect(#worlds).toBe(2)
+    -- Changed again while they wait in the second worker's mailbox.
+    meddle()
+    expect(outcomes(supervised:poll(0))).toBe('m1=committed m2=committed m3=committed m4=committed')
+    expect(#supervised:close(5)).toBe(0)
+
+    local db = sql.catalog.openExisting(Path, { storage = disk.backend })
+    local stored = db:query('SELECT id, body FROM events ORDER BY id').rows
+    expect(#stored).toBe(4)
+    for number, row in stored do expect(`{tostring(row.id)} {tostring(row.body)}`).toBe(`{number} ORIGINAL`) end
+
+    expect(db:query('SELECT value FROM counters').rows[1].value).toBe(4)
+    local state = ledger.lookup(db, kept, { 'm1', 'm4', 'm4-renamed' })
+    expect(`{state.m1} {state.m4} {state['m4-renamed']}`).toBe('committed committed absent')
+    db:close()
+
+    -- What is not a request is refused where it is offered, and nothing of it is kept.
+    local late = service.supervisor(spawn, { path = Path, tables = Tables, writer = { ledger = kept }, restartBackoffSeconds = 0 })
+    expect(late:submit({ id = 'bad', operations = { { op = 'insert', table = 'events', row = { id = 5, body = { 'a table' } } } } } :: any).reason)
+      .toBe('invalid: operation 1: a value is a string, a number, a boolean or NULL')
+    expect(late:submit({ id = '', operations = {} } :: any).admitted).toBe(false)
+    expect(late:status().outstanding).toBe(0)
+    late:close(5)
+  end)
+
   suite.it('gives its requests up as unknown when workers keep dying, and will not retry without a ledger', function()
     local kept: ledger.Options = { table = 'requests' }
     local disk = memfs.new()
