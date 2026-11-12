@@ -95,6 +95,15 @@ the worker gone before its reply): the client reports all six `unknown`, a new w
 over the same database, all six are sent again blind with the ledger on, and each is refused
 as already committed. Seven rows for thirteen requests sent.
 
+## A service that owns its paths
+
+`service.host({ root = '/absolute/dir' })`, or `service.sourceFor(root)` for a worker, confines
+the service to one directory: `open` then takes a database's **name** (letters, digits, `_`
+and `-`, 64 at most), never a path, and anything else is refused with nothing created. A host
+with no root opens whatever path it is sent, as before. `open` carries the protocol's version
+(1); another version is refused. The threat model and the whole protocol are in
+`WRITER-SERVICE-RFC.md`.
+
 ## Several tenants, one writer: `@jessql/writer_fair`
 
 A client admits until `maxOutstanding` are unanswered and then refuses everyone alike, so the
