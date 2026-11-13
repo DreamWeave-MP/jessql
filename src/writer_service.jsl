@@ -438,6 +438,8 @@ function service.supervisor(spawn: () -> Lane, options: SupervisorOptions): Supe
   local order: { string } = {}
   local holes = 0
   local retried: { [string]: boolean } = {}
+  -- Where in `order` each unanswered id was last sent.
+  local position: { [string]: number } = {}
   local outstanding, restarts = 0, 0
   local window = if options.restartWindowSeconds ~= nil then options.restartWindowSeconds else 3600
   if typeof(window) ~= 'number' or window ~= window or window < 1 or window > 30 * 24 * 3600 then
@@ -471,14 +473,14 @@ function service.supervisor(spawn: () -> Lane, options: SupervisorOptions): Supe
     return true, nil
   end
 
-  -- Unanswered ids in the order they were first sent, each once.
+  -- Unanswered ids in the order they were sent, each once, where it was sent last: an id that was
+  -- answered and sent again stands where it was sent again, after what was sent before that.
   local function compacted(): { string }
     local kept: { string } = {}
-    local seen: { [string]: boolean } = {}
-    for _, id in order do
-      if held[id] ~= nil and not seen[id] then
-        seen[id] = true
+    for index, id in order do
+      if held[id] ~= nil and position[id] == index then
         table.insert(kept, id)
+        position[id] = #kept
       end
     end
 
@@ -488,7 +490,7 @@ function service.supervisor(spawn: () -> Lane, options: SupervisorOptions): Supe
   local function settle(id: string)
     if held[id] == nil then return end
 
-    held[id], retried[id] = nil, nil
+    held[id], retried[id], position[id] = nil, nil, nil
     outstanding -= 1
     holes += 1
     if holes > 64 and holes * 2 > #order then
@@ -508,6 +510,7 @@ function service.supervisor(spawn: () -> Lane, options: SupervisorOptions): Supe
     end
 
     order, holes = {}, 0
+    table.clear(position)
     return acks
   end
 
@@ -564,6 +567,7 @@ function service.supervisor(spawn: () -> Lane, options: SupervisorOptions): Supe
     if admission.admitted then
       held[id] = taken
       table.insert(order, id)
+      position[id] = #order
       outstanding += 1
     elseif admission.reason == 'stopped' then
       -- The worker died between two looks: said as backpressure, since the next poll replaces it.

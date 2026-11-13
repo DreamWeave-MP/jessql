@@ -658,6 +658,45 @@ suite.describe('a supervisor\'s requests over time', function()
     subject:close(5)
   end)
 
+  -- Re-review of #97: an id answered and sent again goes again where it was sent again.
+  suite.it('sends unanswered requests again in the order they were last sent, an id used again included', function()
+    local disk = memfs.new()
+    local subject, worlds = supervised(disk)
+    local function remove(id: string): writer.Request
+      return { id = id, operations = { { op = 'delete', table = 'events', key = 1 } } }
+    end
+
+    -- `x` deletes a row that is not there: answered, rejected.
+    subject:submit(remove('x'))
+    expect(outcomes(subject:poll(0))).toBe('x=rejected')
+    -- Then `y` makes the row and `x` again deletes it; the worker dies before either is handled.
+    subject:submit(insert('y', 1, 'made'))
+    subject:submit(remove('x'))
+    worlds[#worlds].dead = true
+    local acks: { service.Ack } = {}
+    for _ = 1, 4 do
+      for _, ack in subject:poll(0) do table.insert(acks, ack) end
+    end
+
+    expect(outcomes(acks)).toBe('y=committed x=committed')
+    subject:close(5)
+    -- Applied as they were sent: made, then deleted.
+    expect(rows(disk)).toBe(0)
+  end)
+
+  suite.it('takes a retry built again with -0 for 0, or another NaN, as the same request', function()
+    local function with(value: number): writer.Request
+      return { id = 'same', operations = { { op = 'upsert', table = 'counters', row = { id = 'n', value = value } } } }
+    end
+
+    expect(writer.digest(with(0)) == writer.digest(with(-0))).toBe(true)
+    expect(writer.digest(with(0 / 0)) == writer.digest(with(-(0 / 0)))).toBe(true)
+    expect(writer.digest(with(1)) == writer.digest(with(1.0))).toBe(true)
+    expect(writer.digest(with(1)) == writer.digest(with(2))).toBe(false)
+    expect(writer.digest({ id = 'same', operations = { { op = 'delete', table = 'events', key = '1' } } })
+      == writer.digest({ id = 'same', operations = { { op = 'delete', table = 'events', key = 1 } } })).toBe(false)
+  end)
+
   suite.it('counts replacements within a window, and answers every held request when closed while it waits', function()
     local disk = memfs.new()
     local subject, worlds, clock = supervised(disk, { maxRestarts = 3, restartWindowSeconds = 3600 })

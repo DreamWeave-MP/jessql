@@ -217,7 +217,8 @@ suite.describe('fair admission in front of one writer', function()
     local first = request()
     expect(front.submit('one', first).admitted).toBe(true)
     expect(front.submit('one', first).reason).toBe('duplicate-id')
-    expect(front.submit('two', first).reason).toBe('duplicate-id')
+    -- Another tenant with the same id is not refused for it: ids are each tenant's own (see
+    -- "keeps each tenant's ids its own").
     expect(front.submit('one', request()).admitted).toBe(true)
     -- The writer behind has room for two: its refusal, and nothing is counted.
     expect(front.submit('one', request()).reason).toBe('backpressure')
@@ -348,6 +349,47 @@ suite.describe('fair admission in front of one writer', function()
     now = 300.011
     local ended = front.status()
     expect(`{ended.active} {ended.examined} {ended.tenants.refused == nil}`).toBe('1 1 true')
+  end)
+
+  -- Re-review of #97: tenants behind one writer shared its ids. One could take an id another
+  -- would use (and have that tenant's request refused as reused), learn which ids another had
+  -- in flight, or be told `committed` for another's request of the same content.
+  suite.it('keeps each tenant\'s ids its own, through a writer and its ledger', function()
+    local ledger = require('@jessql/ledger')
+    local memfs = require('@jessql/memfs')
+    local sql = require('@jessql')
+    local disk = memfs.new()
+    local db = sql.catalog.create('/memory/fair', { storage = disk.backend, tables = {
+      { tableName = 'events', columns = { 'id', 'body' }, primaryKey = 'id' }, ledger.table('requests'),
+    } })
+    local queue = writer.new(db, { ledger = { table = 'requests' } })
+    local front = fair.new({ capacity = 8,
+      submit = function(sent: writer.Request): fair.Admission
+        local admission = queue:submit(sent)
+        return { admitted = admission.admitted, reason = admission.reason, outstanding = admission.queued }
+      end,
+      poll = function(_seconds: number?): { writer.Ack } return queue:drain() end })
+
+    local function insert(id: string, number: number, body: string): writer.Request
+      return { id = id, operations = { { op = 'insert', table = 'events', row = { id = number, body = body } } } }
+    end
+
+    -- Both use `invoice-7`, at once and for different things: neither is refused for the other.
+    expect(front.submit('a', insert('invoice-7', 1, 'A')).admitted).toBe(true)
+    expect(front.submit('b', insert('invoice-7', 2, 'B')).admitted).toBe(true)
+    local told: { string } = {}
+    for _, ack in front.poll(0) do table.insert(told, `{ack.tenant}:{ack.id}={ack.outcome}`) end
+    table.sort(told)
+    expect(table.concat(told, ' ')).toBe('a:invoice-7=committed b:invoice-7=committed')
+
+    -- Later, `b` sends what `a` sent under `a`'s id: that is `b`'s own request, applied as `b`'s
+    -- (and refused here only by the row already being there), never answered with `a`'s commit.
+    expect(front.submit('b', insert('invoice-8', 1, 'A')).admitted).toBe(true)
+    local later = front.poll(0)
+    expect(`{later[1].tenant}:{later[1].id}={later[1].outcome}`).toBe('b:invoice-8=rejected')
+    expect(ledger.wasCommitted(later[1].error)).toBe(false)
+    expect(`{(db:get('events', 1) :: { body: string }).body} {(db:get('events', 2) :: { body: string }).body}`).toBe('A B')
+    db:close()
   end)
 end)
 

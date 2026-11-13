@@ -29,6 +29,11 @@
 --
 -- What is held is one record a tenant and nothing a refusal: a tenant refused a hundred
 -- thousand times is remembered once.
+--
+-- Ids are each tenant's own. A request goes to the writer behind under its tenant's name and
+-- its id, length-framed (`fair.scoped`), and its outcome comes back under the id the tenant
+-- gave, with the tenant's name. So no tenant can take, refuse or learn of another's ids, and a
+-- ledger behind sees two requests where two tenants used one id.
 local writer = require('@jessql/writer')
 
 export type Admission = { admitted: boolean, reason: string?, outstanding: number }
@@ -50,9 +55,12 @@ export type TenantStatus = { outstanding: number, waiting: boolean, admitted: nu
 -- `active` is how many tenants the queue is shared between now; `examined` how many waits have
 -- run out since the start, each looked at once, which is at most one a tenant that waited.
 export type Status = { outstanding: number, capacity: number, share: number, tenants: { [string]: TenantStatus }, active: number, examined: number }
+-- An outcome, under the id its tenant gave, with that tenant's name. An outcome of a request
+-- that was not sent through here keeps its id and has no tenant.
+export type Ack = { id: string, outcome: writer.Outcome, error: string?, aborted: boolean?, tenant: string? }
 export type Fair = {
   submit: (tenant: string, request: writer.Request) -> Admission,
-  poll: (seconds: number?) -> { writer.Ack },
+  poll: (seconds: number?) -> { Ack },
   status: () -> Status,
 }
 
@@ -69,6 +77,11 @@ local fair = {}
 
 fair.MaxCapacity = 65536
 fair.MaxTenants = 65536
+
+-- The id a tenant's request goes to the writer under: no tenant's can be another's.
+function fair.scoped(tenant: string, id: string): string
+  return `{#tenant}:{tenant}{id}`
+end
 
 function fair.new(options: Options): Fair
   local capacity = options.capacity
@@ -89,8 +102,8 @@ function fair.new(options: Options): Fair
   local now = options.now or os.clock
   local tenants: { [string]: Tenant } = {}
   local tenantCount = 0
-  -- Which tenant sent a request that is not answered yet.
-  local owner: { [string]: string } = {}
+  -- By the id a request went to the writer under: which tenant sent it, and the id it gave.
+  local owner: { [string]: { tenant: string, id: string } } = {}
   local outstanding = 0
 
   -- How many tenants hold requests or are waiting, kept as each one changes and never counted
@@ -210,8 +223,9 @@ function fair.new(options: Options): Fair
   function self.submit(name: string, request: writer.Request): Admission
     if typeof(name) ~= 'string' or #name == 0 or #name > 256 then return refuse(nil, 'invalid: a request has a tenant') end
 
-    local id = request.id
-    if typeof(id) ~= 'string' or #id == 0 then return refuse(nil, 'invalid: a request has an id') end
+    local given = request.id
+    if typeof(given) ~= 'string' or #given == 0 then return refuse(nil, 'invalid: a request has an id') end
+    local id = fair.scoped(name, given)
     if owner[id] then return refuse(tenants[name], 'duplicate-id') end
 
     local at = now()
@@ -244,7 +258,7 @@ function fair.new(options: Options): Fair
       return refuse(tenant, 'backpressure')
     end
 
-    local admission = options.submit(request)
+    local admission = options.submit({ id = id, operations = request.operations })
     if not admission.admitted then
       -- The writer behind is full or gone: its answer, and this tenant is still owed a place.
       if admission.reason == 'backpressure' then wait(tenant, at) end
@@ -253,7 +267,7 @@ function fair.new(options: Options): Fair
       return refuse(tenant, admission.reason or 'refused')
     end
 
-    owner[id] = name
+    owner[id] = { tenant = name, id = given }
     outstanding += 1
     tenant.outstanding += 1
     tenant.admitted += 1
@@ -262,16 +276,20 @@ function fair.new(options: Options): Fair
     return { admitted = true, reason = nil, outstanding = outstanding }
   end
 
-  function self.poll(seconds: number?): { writer.Ack }
-    local acks = options.poll(seconds)
+  function self.poll(seconds: number?): { Ack }
+    local answered: { Ack } = {}
     local at = now()
-    for _, ack in acks do
-      local name = owner[ack.id]
-      if not name then continue end
+    for _, ack in options.poll(seconds) do
+      local sent = owner[ack.id]
+      if not sent then
+        table.insert(answered, { id = ack.id, outcome = ack.outcome, error = ack.error, aborted = ack.aborted, tenant = nil })
+        continue
+      end
 
       owner[ack.id] = nil
+      table.insert(answered, { id = sent.id, outcome = ack.outcome, error = ack.error, aborted = ack.aborted, tenant = sent.tenant })
       outstanding -= 1
-      local tenant = tenants[name]
+      local tenant = tenants[sent.tenant]
       if tenant then
         tenant.outstanding -= 1
         settle(tenant)
@@ -279,7 +297,7 @@ function fair.new(options: Options): Fair
     end
 
     expire(at)
-    return acks
+    return answered
   end
 
   function self.status(): Status

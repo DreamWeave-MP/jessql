@@ -232,12 +232,22 @@ function writer.snapshot(request: unknown, maxOperations: number?): (Request?, s
   return snapshot(request, most)
 end
 
--- One value of a request, framed and tagged by kind: no two different values encode alike.
+-- One value of a request, framed and tagged by kind: no two different values encode alike, and
+-- values the store takes as the same (-0 and 0; every NaN) encode alike, so a retry a caller
+-- builds again is still the same request.
 local function encoded(value: unknown): string
   if value == nil then return '-' end
   if value == mutations.NULL then return 'N' end
   if type(value) == 'string' then return `s{#(value :: string)}:{value :: string}` end
-  if type(value) == 'number' then return 'n' .. string.pack('<d', value :: number) end
+
+  if type(value) == 'number' then
+    local number = value :: number
+    if number ~= number then return 'nNaN' end
+    if number == 0 then number = 0 end
+
+    return 'n' .. string.pack('<d', number)
+  end
+
   if value == true then return 'T' end
   if value == false then return 'F' end
   error('jessql writer: a request value that is not one', 2)
