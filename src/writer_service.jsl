@@ -502,11 +502,10 @@ function service.supervisor(spawn: () -> Lane, options: SupervisorOptions): Supe
   local function giveUp(why: string): { Ack }
     stopped, reason = true, why
     local acks: { Ack } = {}
-    for _, id in order do
-      if held[id] ~= nil then
-        table.insert(acks, { id = id, outcome = 'unknown' :: writer.Outcome, error = why })
-        settle(id)
-      end
+    -- In the order they were last sent, as everything else here answers them.
+    for _, id in compacted() do
+      table.insert(acks, { id = id, outcome = 'unknown' :: writer.Outcome, error = why })
+      settle(id)
     end
 
     order, holes = {}, 0

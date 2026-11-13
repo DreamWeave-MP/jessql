@@ -78,6 +78,11 @@ local fair = {}
 fair.MaxCapacity = 65536
 fair.MaxTenants = 65536
 
+-- A tenant's name, and the tenant and an id together as the writer behind takes them (the
+-- writer's own limit on an id).
+fair.MaxTenantBytes = 64
+fair.MaxScopedBytes = 128
+
 -- The id a tenant's request goes to the writer under: no tenant's can be another's.
 function fair.scoped(tenant: string, id: string): string
   return `{#tenant}:{tenant}{id}`
@@ -221,11 +226,19 @@ function fair.new(options: Options): Fair
   local self = {} :: Fair
 
   function self.submit(name: string, request: writer.Request): Admission
-    if typeof(name) ~= 'string' or #name == 0 or #name > 256 then return refuse(nil, 'invalid: a request has a tenant') end
+    if typeof(name) ~= 'string' or #name == 0 or #name > fair.MaxTenantBytes then
+      return refuse(nil, `invalid: a request has a tenant of 1 to {fair.MaxTenantBytes} bytes`)
+    end
 
     local given = request.id
     if typeof(given) ~= 'string' or #given == 0 then return refuse(nil, 'invalid: a request has an id') end
     local id = fair.scoped(name, given)
+
+    -- What the writer behind takes as an id is the tenant and its id together.
+    if #id > fair.MaxScopedBytes then
+      return refuse(tenants[name], `invalid: the tenant and the id together are more than {fair.MaxScopedBytes} bytes`)
+    end
+
     if owner[id] then return refuse(tenants[name], 'duplicate-id') end
 
     local at = now()

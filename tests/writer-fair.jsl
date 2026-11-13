@@ -223,7 +223,7 @@ suite.describe('fair admission in front of one writer', function()
     -- The writer behind has room for two: its refusal, and nothing is counted.
     expect(front.submit('one', request()).reason).toBe('backpressure')
     expect(front.status().outstanding).toBe(2)
-    expect(front.submit('', request()).reason).toBe('invalid: a request has a tenant')
+    expect(front.submit('', request()).reason).toBe('invalid: a request has a tenant of 1 to 64 bytes')
     expect(front.submit('one', { id = '', operations = {} }).reason).toBe('invalid: a request has an id')
     expect(front.submit('two', request()).reason).toBe('backpressure')
     expect(front.submit('three', request()).reason).toBe('too-many-tenants')
@@ -390,6 +390,20 @@ suite.describe('fair admission in front of one writer', function()
     expect(ledger.wasCommitted(later[1].error)).toBe(false)
     expect(`{(db:get('events', 1) :: { body: string }).body} {(db:get('events', 2) :: { body: string }).body}`).toBe('A B')
     db:close()
+  end)
+
+  -- Re-review of #97: the writer behind takes the tenant and the id together as its id. A
+  -- tenant name too long for that could never send anything, and was told its id was too long.
+  suite.it('says plainly when a tenant\'s name, or the name and the id together, are too long', function()
+    local back = behind(100, 100)
+    local front = fair.new({ submit = back.submit, poll = back.poll, capacity = 8 })
+    local tenant = string.rep('t', fair.MaxTenantBytes)
+    expect(front.submit(tenant .. 't', request()).reason).toBe('invalid: a request has a tenant of 1 to 64 bytes')
+    -- `64:` and the name take 67 bytes, so an id of 61 is the most: admitted, and one more is not.
+    expect(front.submit(tenant, { id = string.rep('i', 61), operations = {} }).admitted).toBe(true)
+    expect(front.submit(tenant, { id = string.rep('i', 62), operations = {} }).reason)
+      .toBe('invalid: the tenant and the id together are more than 128 bytes')
+    expect(#back.sent[1]).toBe(fair.MaxScopedBytes)
   end)
 end)
 
