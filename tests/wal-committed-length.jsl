@@ -608,12 +608,33 @@ suite.describe('a managed database', function()
     expect(refused.visible()[Log] == damaged).toBe(true)
     expect(refused.visible()[walmark.path(Log)] == mark).toBe(true)
 
-    -- The same append torn by a power cut, its later pages never written, is still cut.
+    -- Its length raised by one bit, still within the limit, so the frame looks cut short: its
+    -- payload is all there and checks, so the length is damaged, and that is refused too, with
+    -- the log alone or with zeros a later torn append left after it.
+    local length = buffer.readu32(buffer.fromstring(frame), 0)
+    expect(bit32.band(length, 0x100000)).toBe(0)
+    local lengthened = string.pack('<I4', bit32.bor(length, 0x100000)) .. string.sub(frame, 5)
+    for _, after in { '', string.rep('\0', 64) } do
+      local overlong = whole .. lengthened .. after
+      local stretched = closedStore(5)
+      overwrite(stretched, Log, overlong)
+      -- The open raises; the refusal is the assertion.
+      local stretchedOpened, stretchedProblem = pcall(open, stretched)
+      expect(`{#after}: {stretchedOpened}`).toBe(`{#after}: false`)
+      expect((string.find(tostring(stretchedProblem), 'invalid frame length', 1, true)) ~= nil).toBe(true)
+      expect(stretched.visible()[Log] == overlong).toBe(true)
+      expect(stretched.visible()[walmark.path(Log)] == mark).toBe(true)
+    end
+
+    -- The same append torn by a power cut, its later pages never written, is still cut, whether
+    -- the log was left as long as the frame or as long as what was written.
     local cut = 4096 - #whole % 4096
-    local torn = closedStore(5)
-    overwrite(torn, Log, whole .. string.sub(frame, 1, cut) .. string.rep('\0', #frame - cut))
-    expect(rows(torn)).toBe(5)
-    expect(#torn.visible()[Log]).toBe(#whole)
+    for _, rest in { string.rep('\0', #frame - cut), '' } do
+      local torn = closedStore(5)
+      overwrite(torn, Log, whole .. string.sub(frame, 1, cut) .. rest)
+      expect(rows(torn)).toBe(5)
+      expect(#torn.visible()[Log]).toBe(#whole)
+    end
   end)
 
   suite.it('cuts no more zeros than one batch of frames can leave unsynchronized', function()

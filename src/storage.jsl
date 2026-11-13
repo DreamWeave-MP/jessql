@@ -1612,7 +1612,26 @@ local function load(state: DatabaseState, recoverTail: boolean)
       error('jessql storage: invalid frame length', 2)
     end
 
-    if size - offset - HeaderBytes < length then break end
+    if size - offset - HeaderBytes < length then
+      -- A frame cut short by a crash holds only the start of its payload, which does not check.
+      -- One whose bytes, up to any zeros a later torn append left, check is all there: its length
+      -- is what was damaged, and it is refused, not cut (J-FINAL-01, re-review).
+      local present = reader:readAt(offset + HeaderBytes, size - offset - HeaderBytes)
+      if not present then
+        reader:close()
+        error('jessql storage: read failed', 2)
+      end
+
+      local last = buffer.len(present)
+      while last > 0 and buffer.readu8(present, last - 1) == 0 do last -= 1 end
+
+      if last > 0 and bytes.crc32(buffer.readstring(present, 0, last)) == checksum then
+        reader:close()
+        error('jessql storage: invalid frame length', 2)
+      end
+
+      break
+    end
     local body = reader:readAt(offset + HeaderBytes, length)
     if not body or buffer.len(body) ~= length then
       reader:close()
