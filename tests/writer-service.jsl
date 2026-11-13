@@ -530,4 +530,175 @@ suite.describe('the writer as a service in a worker', function()
   end)
 end)
 
+-- The review of 2026-11-13 (after #95): the supervisor's own bookkeeping.
+suite.describe('a supervisor\'s requests over time', function()
+  -- A supervisor whose workers each start where the dead one left off.
+  local function supervised(disk: Disk, extra: { [string]: unknown }?): (service.Supervisor, { World }, { now: number })
+    local worlds: { World } = {}
+    local clock = { now = 0 }
+    local function spawn(): service.Lane
+      if #worlds > 0 then disk.crash() end
+
+      local made = world(nil, disk)
+      table.insert(worlds, made)
+      return made.lane
+    end
+
+    local options: service.SupervisorOptions = { path = Path, tables = Tables, writer = { ledger = { table = 'requests', scope = 'shared' } },
+      restartBackoffSeconds = 0, client = { now = function(): number return clock.now end } }
+
+    for name, value in extra or {} do (options :: { [string]: unknown })[name] = value end
+
+    return service.supervisor(spawn, options), worlds, clock
+  end
+
+  local function insert(id: string, number: number, body: string): writer.Request
+    return { id = id, operations = { { op = 'insert', table = 'events', row = { id = number, body = body } } } }
+  end
+
+  suite.it('never calls a request committed because another request with its id committed before', function()
+    local disk = memfs.new()
+    -- One process: a request `order-1` commits, and the supervisor closes.
+    local first = supervised(disk)
+    first:submit(insert('order-1', 1, 'A: pay 10'))
+    expect(outcomes(first:poll(0))).toBe('order-1=committed')
+    first:close(5)
+
+    -- The next, over the same database and ledger: another request with the same id, whose
+    -- worker dies before it is handled. Sent again, the ledger refuses it as an id reused.
+    local second, worlds = supervised(disk)
+    expect(second:submit(insert('order-1', 2, 'B: pay 99')).admitted).toBe(true)
+    worlds[#worlds].dead = true
+    local acks: { service.Ack } = {}
+    for _ = 1, 4 do
+      for _, ack in second:poll(0) do table.insert(acks, ack) end
+    end
+
+    expect(outcomes(acks)).toBe('order-1=rejected')
+    expect(acks[1].error).toBe(ledger.Reused)
+    expect(ledger.wasCommitted(acks[1].error)).toBe(false)
+    second:close(5)
+    local db = sql.catalog.openExisting(Path, { storage = disk.backend })
+    expect(`{db:get('events', 1) ~= nil} {db:get('events', 2) ~= nil}`).toBe('true false')
+    db:close()
+
+    -- The same request again, the same content in another column order: a retry, committed.
+    local third, again = supervised(disk)
+    third:submit({ id = 'order-1', operations = { { op = 'insert', table = 'events', row = { body = 'A: pay 10', id = 1 } } } })
+    again[#again].dead = true
+    local retried: { service.Ack } = {}
+    for _ = 1, 4 do
+      for _, ack in third:poll(0) do table.insert(retried, ack) end
+    end
+
+    expect(outcomes(retried)).toBe('order-1=committed')
+    third:close(5)
+  end)
+
+  suite.it('keeps no more of the requests it has answered than it must', function()
+    local collect = require('@jess/bench').collect
+    local disk = memfs.new()
+    local subject, worlds = supervised(disk)
+    -- Each request deletes a row that is not there: it is answered (rejected) and the database
+    -- keeps nothing of it, so what grows is the supervisor's own.
+    local function absent(id: string, number: number): writer.Request
+      return { id = id, operations = { { op = 'delete', table = 'events', key = number } } }
+    end
+
+    -- Warm: the database open, the first batches done.
+    for number = 1, 200 do subject:submit(absent(`w{number}`, number)) end
+
+    subject:poll(0)
+    collect()
+    local before = gcinfo()
+    for round = 1, 200 do
+      for slot = 1, 100 do
+        local number = 1000 + round * 100 + slot
+        subject:submit(absent(`request-{number}`, number))
+      end
+
+      local looks = 0
+      while subject:status().outstanding > 0 and looks < 20 do
+        subject:poll(0)
+        looks += 1
+      end
+
+      -- The stand-in worker's record of what it handled is the test's, not the supervisor's.
+      table.clear(worlds[#worlds].handled)
+    end
+
+    collect()
+    local grown = gcinfo() - before
+    expect(subject:status().outstanding).toBe(0)
+    -- 20,000 answered requests kept forever would be about 1,500 KB.
+    expect(`grew {grown} KB: {grown < 256}`).toBe(`grew {grown} KB: true`)
+    subject:close(5)
+  end)
+
+  suite.it('sends an id answered and then sent again once, when the worker dies, and keeps going', function()
+    local disk = memfs.new()
+    local subject, worlds = supervised(disk)
+    subject:submit(insert('x', 1, 'first'))
+    expect(outcomes(subject:poll(0))).toBe('x=committed')
+    -- The same id again (refused by the ledger, as it should be), and another request; then the
+    -- worker dies with both waiting.
+    subject:submit(insert('x', 1, 'first'))
+    subject:submit(insert('c1', 2, 'other'))
+    worlds[#worlds].dead = true
+    local acks: { service.Ack } = {}
+    for _ = 1, 4 do
+      for _, ack in subject:poll(0) do table.insert(acks, ack) end
+    end
+
+    table.sort(acks, function(left: service.Ack, right: service.Ack): boolean return left.id < right.id end)
+    expect(outcomes(acks)).toBe('c1=committed x=committed')
+    local status = subject:status()
+    expect(`{status.stopped} {status.restarts}`).toBe('false 1')
+    expect(subject:submit(insert('c2', 3, 'later')).admitted).toBe(true)
+    subject:close(5)
+  end)
+
+  suite.it('counts replacements within a window, and answers every held request when closed while it waits', function()
+    local disk = memfs.new()
+    local subject, worlds, clock = supervised(disk, { maxRestarts = 3, restartWindowSeconds = 3600 })
+    -- Four deaths a day apart, each recovered: never given up on.
+    for day = 1, 4 do
+      clock.now = day * 86400
+      subject:submit(insert(`d{day}`, day, 'x'))
+      worlds[#worlds].dead = true
+      local acks: { service.Ack } = {}
+      for _ = 1, 4 do
+        for _, ack in subject:poll(0) do table.insert(acks, ack) end
+      end
+
+      expect(`{day}: {outcomes(acks)} {subject:status().stopped}`).toBe(`{day}: d{day}=committed false`)
+    end
+
+    expect(subject:status().restarts).toBe(4)
+
+    -- Closed while a dead worker waits to be replaced: the request held gets an outcome.
+    local waiting, lanes = supervised(memfs.new(), { restartBackoffSeconds = 10 })
+    waiting:submit(insert('a', 1, 'x'))
+    expect(outcomes(waiting:poll(0))).toBe('a=committed')
+    waiting:submit(insert('b', 2, 'x'))
+    lanes[#lanes].dead = true
+    local answered: { service.Ack } = {}
+    for _ = 1, 4 do
+      for _, ack in waiting:poll(0) do table.insert(answered, ack) end
+    end
+
+    expect(outcomes(answered)).toBe('b=committed')
+    waiting:submit(insert('c', 3, 'x'))
+    lanes[#lanes].dead = true
+    -- The second death comes within the backoff: nothing replaces the worker yet.
+    expect(#waiting:poll(0)).toBe(0)
+    local closed = waiting:close(5)
+    local said: { string } = {}
+    for _, ack in closed do table.insert(said, `{ack.id}={ack.outcome}`) end
+    table.sort(said)
+    expect(table.concat(said, ' ')).toBe('c=unknown')
+    expect(waiting:status().outstanding).toBe(0)
+  end)
+end)
+
 return suite

@@ -27,6 +27,7 @@
 -- before its reply, is reconciliation by id: put a row keyed by the request's id in a table of
 -- the same request (an `insert` refuses a duplicate), and a retry of a request that did commit is
 -- `rejected` with a duplicate key instead of being applied twice.
+local bytes = require('@dream/bytes')
 local catalog = require('@jessql/catalog')
 local ledger = require('@jessql/ledger')
 local mutations = require('@jessql/mutations')
@@ -231,9 +232,50 @@ function writer.snapshot(request: unknown, maxOperations: number?): (Request?, s
   return snapshot(request, most)
 end
 
+-- One value of a request, framed and tagged by kind: no two different values encode alike.
+local function encoded(value: unknown): string
+  if value == nil then return '-' end
+  if value == mutations.NULL then return 'N' end
+  if type(value) == 'string' then return `s{#(value :: string)}:{value :: string}` end
+  if type(value) == 'number' then return 'n' .. string.pack('<d', value :: number) end
+  if value == true then return 'T' end
+  if value == false then return 'F' end
+  error('jessql writer: a request value that is not one', 2)
+end
+
+local function encodedRow(row: Row?): string
+  if not row then return '-' end
+  local names: { string } = {}
+  for name in row do table.insert(names, name) end
+  table.sort(names)
+  local parts = { `r{#names}` }
+  for _, name in names do
+    table.insert(parts, encoded(name))
+    table.insert(parts, encoded(row[name]))
+  end
+
+  return table.concat(parts)
+end
+
+-- What a request says, as a SHA-256: the same for the same id and operations, in whatever order
+-- a row's columns were given, and different for anything else. The ledger keeps it beside the
+-- id, so an id used again for another request is told apart from a retry of the same one.
+function writer.digest(request: Request): string
+  local parts = { encoded(request.id), `o{#request.operations}` }
+  for _, operation in request.operations do
+    table.insert(parts, encoded(operation.op))
+    table.insert(parts, encoded(operation.table))
+    table.insert(parts, encoded(operation.key))
+    table.insert(parts, encodedRow(operation.row))
+    table.insert(parts, encodedRow(operation.changes))
+  end
+
+  return bytes.sha256(table.concat(parts))
+end
+
 -- One request as one transaction: every operation, or an error that leaves none of them.
 local function apply(tx: catalog.Transaction, request: Request, kept: ledger.Options?)
-  if kept then ledger.enter(tx, kept, request.id) end
+  if kept then ledger.enter(tx, kept, request.id, writer.digest(request)) end
 
   for index, operation in request.operations do
     if operation.op == 'insert' then

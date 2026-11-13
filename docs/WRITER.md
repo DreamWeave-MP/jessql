@@ -188,6 +188,10 @@ changes are, whatever moment a crash chooses, and there is no second store to di
 
 - A request whose id is already there is `rejected` with `ledger: already committed`
   (`ledger.wasCommitted(ack.error)`) and changes nothing. That is the answer to a retry.
+- The entry keeps a SHA-256 of what the request said (`writer.digest`: its id and operations,
+  columns in any order). The same id with anything else is `rejected` with
+  `ledger: id reused with different content` (`ledger.Reused`), changes nothing, and is never
+  read as committed, by `ledger.wasCommitted` or by a supervisor.
 - `ledger.lookup(db, options, ids)` answers `committed` or `absent` for each id, from the
   database as it is: what a caller or an operator asks after a reopen.
 - The scope is part of the key, length-framed: the same id under two scopes is two requests.
@@ -234,8 +238,13 @@ supervisor; a worker that cannot be started.
 - Between one replacement and the next the supervisor waits (`restartBackoffSeconds`, default
   1, doubling up to 30); the first replacement is immediate. While it waits nothing is admitted
   (`backpressure`) and the unanswered requests stay held. Tested on an injected clock only.
-- A ledger entry does not record the request's content: a different request reusing an id is
-  refused as already committed, not detected as a conflict.
+- A different request reusing an id is refused as reused, never as already committed (review of
+  2026-11-13: before, a supervisor resending it after a worker's death told its caller
+  `committed` for a request that never ran). Ids are still shared by everything that writes
+  through one ledger scope: tenants behind `writer_fair` should not choose ids another can.
+- The supervisor sends each unanswered request again once, keeps no record of answered ones
+  (its list is compacted), counts replacements within `restartWindowSeconds` (default an hour),
+  and answers every held request `unknown` if it is closed while a dead worker waits.
 - **Fairness** between several clients: one client owns one worker, first in, first out.
 - The spawning itself is the application's: a worker needs a script domain.
 - Death of a worker between the synchronization and its reply: the caller reconciles by id (a

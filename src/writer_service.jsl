@@ -394,9 +394,12 @@ export type SupervisorOptions = {
   -- that did commit cannot be applied twice.
   writer: writer.Options,
   client: ClientOptions?,
-  -- How many times a dead or silent worker is replaced before its requests are given up as
-  -- unknown (default 3, at most 100).
+  -- How many times a dead or silent worker is replaced within `restartWindowSeconds` before its
+  -- requests are given up as unknown (default 3, at most 100).
   maxRestarts: number?,
+  -- The window replacements are counted in (default 3600 s): a worker that died once a day for
+  -- a week is not given up on, one that dies again and again in an hour is.
+  restartWindowSeconds: number?,
   openSeconds: number?,
   -- The least time between one replacement and the next: this many seconds after the first,
   -- doubling each time, up to 30 (default 1; 0 for none). The first replacement is immediate.
@@ -430,9 +433,19 @@ function service.supervisor(spawn: () -> Lane, options: SupervisorOptions): Supe
   -- Unanswered requests in the order they were first sent, and which of them have been sent to
   -- more than one worker: only for those does "already committed" mean "committed by us".
   local held: { [string]: writer.Request } = {}
+  -- Ids in the order they were first sent; one that is answered leaves a hole, and the list is
+  -- compacted once holes are most of it, so it holds at most twice what is unanswered.
   local order: { string } = {}
+  local holes = 0
   local retried: { [string]: boolean } = {}
   local outstanding, restarts = 0, 0
+  local window = if options.restartWindowSeconds ~= nil then options.restartWindowSeconds else 3600
+  if typeof(window) ~= 'number' or window ~= window or window < 1 or window > 30 * 24 * 3600 then
+    error('jessql writer service: invalid restartWindowSeconds', 2)
+  end
+
+  -- When each replacement within the window was made: the cap counts these, not all time.
+  local recent: { number } = {}
   local stopped, reason = false, nil :: string?
   local client: Client? = nil
   local self = {} :: Supervisor
@@ -458,11 +471,30 @@ function service.supervisor(spawn: () -> Lane, options: SupervisorOptions): Supe
     return true, nil
   end
 
+  -- Unanswered ids in the order they were first sent, each once.
+  local function compacted(): { string }
+    local kept: { string } = {}
+    local seen: { [string]: boolean } = {}
+    for _, id in order do
+      if held[id] ~= nil and not seen[id] then
+        seen[id] = true
+        table.insert(kept, id)
+      end
+    end
+
+    return kept
+  end
+
   local function settle(id: string)
     if held[id] == nil then return end
 
     held[id], retried[id] = nil, nil
     outstanding -= 1
+    holes += 1
+    if holes > 64 and holes * 2 > #order then
+      order = compacted()
+      holes = 0
+    end
   end
 
   local function giveUp(why: string): { Ack }
@@ -475,31 +507,41 @@ function service.supervisor(spawn: () -> Lane, options: SupervisorOptions): Supe
       end
     end
 
-    order = {}
+    order, holes = {}, 0
     return acks
   end
 
-  -- The worker is gone: another, and everything unanswered sent to it again, in order.
+  -- Replacements made within the window, as of now.
+  local function replacedLately(): number
+    local now = clock()
+    local kept: { number } = {}
+    for _, at in recent do
+      if now - at < window then table.insert(kept, at) end
+    end
+
+    recent = kept
+    return #recent
+  end
+
+  -- The worker is gone: another, and everything unanswered sent to it again, in order, each once.
   local function replace(): string?
-    if restarts >= maxRestarts then return 'the worker was replaced as often as allowed' end
+    local lately = replacedLately()
+    if lately >= maxRestarts then return 'the worker was replaced as often as allowed' end
 
     restarts += 1
-    notBefore = clock() + math.min(30, backoff * 2 ^ (restarts - 1))
+    table.insert(recent, clock())
+    notBefore = clock() + math.min(30, backoff * 2 ^ lately)
     local started, problem = start()
     if not started then return problem end
 
-    local remaining: { string } = {}
+    -- An id answered and then sent again is in the list twice; it is sent once.
+    order, holes = compacted(), 0
     for _, id in order do
-      local request = held[id]
-      if request == nil then continue end
-
-      table.insert(remaining, id)
       retried[id] = true
-      local admission = (client :: Client):submit(request)
+      local admission = (client :: Client):submit(held[id])
       if not admission.admitted then return `a request could not be sent again: {tostring(admission.reason)}` end
     end
 
-    order = remaining
     return nil
   end
 
@@ -551,7 +593,7 @@ function service.supervisor(spawn: () -> Lane, options: SupervisorOptions): Supe
 
     -- Too soon after the last replacement: the requests stay held, and this is looked at
     -- again at the next poll. Nothing is admitted meanwhile.
-    if (lost or current:status().stopped) and restarts < maxRestarts and clock() < notBefore then return acks end
+    if (lost or current:status().stopped) and replacedLately() < maxRestarts and clock() < notBefore then return acks end
 
     if lost or current:status().stopped then
       local problem = replace()
@@ -575,6 +617,13 @@ function service.supervisor(spawn: () -> Lane, options: SupervisorOptions): Supe
       table.insert(acks, { id = ack.id, outcome = outcome, error = if outcome == 'committed' then nil else ack.error,
         aborted = if outcome == 'rejected' then ack.aborted else nil })
       settle(ack.id)
+    end
+
+    -- What the worker never answered (it was dead, waiting to be replaced): every request still
+    -- gets an outcome, and it is the honest one.
+    for _, id in compacted() do
+      table.insert(acks, { id = id, outcome = 'unknown' :: writer.Outcome, error = 'closed before the worker answered' })
+      settle(id)
     end
 
     stopped, reason = true, 'closed'

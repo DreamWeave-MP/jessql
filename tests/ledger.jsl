@@ -43,13 +43,20 @@ suite.describe('the durable request ledger', function()
     queue:submit(deposit('pay-1', 7, 100))
     expect(outcomes(queue:drain())).toBe('pay-1=committed')
 
-    -- The same id again with another effect: refused, and the first effect stands.
+    -- The same id again with another effect: refused, and the first effect stands. It is not
+    -- the request that committed, so the refusal does not say it was (review of 2026-11-13).
     queue:submit(deposit('pay-1', 7, 999))
     queue:submit(deposit('pay-2', 8, 50))
     local acks = queue:drain()
     expect(outcomes(acks)).toBe('pay-1=rejected pay-2=committed')
-    expect(ledger.wasCommitted(acks[1].error)).toBe(true)
+    expect(acks[1].error).toBe(ledger.Reused)
+    expect(ledger.wasCommitted(acks[1].error)).toBe(false)
     expect(ledger.wasCommitted(acks[2].error)).toBe(false)
+    -- The same request again, as a retry is: refused as already committed.
+    queue:submit(deposit('pay-1', 7, 100))
+    local retried = queue:drain()
+    expect(outcomes(retried)).toBe('pay-1=rejected')
+    expect(ledger.wasCommitted(retried[1].error)).toBe(true)
     expect((db:get('accounts', 7) :: { balance: number }).balance).toBe(100)
     expect(count(db, 'requests')).toBe(2)
 

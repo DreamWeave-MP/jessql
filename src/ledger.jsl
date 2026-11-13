@@ -10,6 +10,9 @@
 --
 --   * A request whose id is already in the ledger is refused with `ledger: already committed`
 --     and changes nothing. That refusal is the answer to a retry: it committed the first time.
+--     The entry keeps a digest of what the request said: only the same request is a retry. The
+--     same id with anything else is refused with `ledger: id reused with different content`,
+--     which says nothing about whether *this* request ever ran, and is never read as committed.
 --   * `ledger.lookup` answers, for ids, `committed` or `absent`, from the database alone: what
 --     a caller or an operator asks after a reopen.
 --   * A scope (a tenant, a client) is part of the key, length-framed, so the same id under two
@@ -35,13 +38,14 @@ export type State = 'committed' | 'absent'
 local ledger = {}
 
 ledger.AlreadyCommitted = 'ledger: already committed'
+ledger.Reused = 'ledger: id reused with different content'
 ledger.MaxScopeBytes = 200
 ledger.MaxIdBytes = 512
 ledger.MaxPrune = 10000
 
 -- The table a ledger lives in. Give it to `sql.catalog.create` beside the application's own.
 function ledger.table(name: string): catalog.TableSpec
-  return { tableName = name, columns = { 'key', 'scope', 'id', 'at' }, primaryKey = 'key' }
+  return { tableName = name, columns = { 'key', 'scope', 'id', 'at', 'digest' }, primaryKey = 'key' }
 end
 
 -- The row key of `id` under `scope`: the scope's length frames it, so no id can reach into
@@ -61,15 +65,19 @@ function ledger.problem(options: unknown): string?
 end
 
 -- Inside the request's own transaction, before its operations: refuses a request that is
--- already there, and writes its id beside what it is about to change.
-function ledger.enter(tx: catalog.Transaction, options: Options, id: string)
+-- already there, and writes its id and `digest` (what the request says) beside what it is about
+-- to change. An id already there with another digest is not this request: refused as reused.
+function ledger.enter(tx: catalog.Transaction, options: Options, id: string, digest: string)
   if #id > ledger.MaxIdBytes then error('ledger: a request id is at most 512 bytes', 0) end
   local scope = options.scope or ''
   local key = ledger.key(scope, id)
-  if tx:get(options.table, key) ~= nil then error(ledger.AlreadyCommitted, 0) end
+  local found = tx:get(options.table, key)
+  if found ~= nil then
+    error(if found.digest == digest then ledger.AlreadyCommitted else ledger.Reused, 0)
+  end
 
   local now = options.now or os.time
-  tx:insert(options.table, { key = key, scope = scope, id = id, at = now() })
+  tx:insert(options.table, { key = key, scope = scope, id = id, at = now(), digest = digest })
 end
 
 -- Whether a writer's refusal means the request had committed before.
