@@ -19,18 +19,26 @@ end
 
 suite.describe('a writer bounded in bytes', function()
   suite.it('weighs a request by its id, names, keys and values', function()
-    -- id 2; op 6, table 6; row: 'id' 2 + number 8, 'body' 4 + 100.
+    -- What each part costs where it is kept (review of 2026-11-13): a string its header and its
+    -- bytes, a table its header, an entry its slot, an operation its own table and list slot.
+    local text, tableCost, slot, operation = writer.Weights.string, writer.Weights.table, writer.Weights.entry, writer.Weights.operation
+    -- The request and its list; id 2; one operation: op 6, table 6; row: 'id' 2 + number 8,
+    -- 'body' 4 + 100.
     local taken, problem, size = writer.snapshot(sized('ab', 1, 100))
     expect(problem).toBe(nil)
     expect(taken ~= nil).toBe(true)
-    expect(size).toBe(2 + 6 + 6 + 2 + 8 + 4 + 100)
+    expect(size).toBe(2 * tableCost + (text + 2) + operation + (text + 6) + (text + 6) + tableCost + (slot + text + 2 + 8)
+      + (slot + text + 4 + text + 100))
 
     local update: writer.Request = { id = 'u', operations = { { op = 'update', table = 'events', key = 'k9', changes = { body = true } } } }
-    expect(select(3, writer.snapshot(update))).toBe(1 + 6 + 6 + 2 + 4 + 1)
+    expect(select(3, writer.snapshot(update))).toBe(2 * tableCost + (text + 1) + operation + (text + 6) + (text + 6) + (text + 2)
+      + tableCost + (slot + text + 4 + 1))
     -- Anything at all has a weight, a request or not; what is too deep or too many is over any limit.
     -- Every key and value it finds: the field names too, and the list's own index.
-    expect(writer.weigh(sized('ab', 1, 100))).toBe(2 + 2 + 10 + 8 + 2 + 6 + 5 + 6 + 3 + 2 + 8 + 4 + 100)
-    expect(writer.weigh('seven..')).toBe(7)
+    expect(writer.weigh(sized('ab', 1, 100))).toBe(tableCost + (slot + text + 2 + text + 2) + (slot + text + 10) + tableCost
+      + (slot + 8) + tableCost + (slot + text + 2 + text + 6) + (slot + text + 5 + text + 6) + (slot + text + 3) + tableCost
+      + (slot + text + 2 + 8) + (slot + text + 4 + text + 100))
+    expect(writer.weigh('seven..')).toBe(text + 7)
     expect(writer.weigh({ first = { second = { third = { fourth = { fifth = 1 } } } } })).toBe(math.huge)
   end)
 
@@ -56,7 +64,9 @@ suite.describe('a writer bounded in bytes', function()
   suite.it('refuses what would take the queue past its bytes, and takes it again once the queue has drained', function()
     local disk = memfs.new()
     local db = sql.catalog.create('/memory/full', { tables = Tables, storage = disk.backend })
-    local queue = writer.new(db, { maxQueued = 1000, maxRequestBytes = 2000, maxQueuedBytes = 5000 })
+    -- A request of 1,500 bytes of body weighs 2,134: three fit in 7,100, a fourth does not, and
+    -- a small one (644) still does.
+    local queue = writer.new(db, { maxQueued = 1000, maxRequestBytes = 3000, maxQueuedBytes = 7100 })
     local each = select(3, writer.snapshot(sized('q0', 0, 1500)))
     for number = 1, 3 do expect(queue:submit(sized(`q{number}`, number, 1500)).admitted).toBe(true) end
 
@@ -105,7 +115,8 @@ suite.describe('a writer bounded in bytes', function()
       end,
     }
 
-    local client = service.client(lane, { maxRequestBytes = 2000, maxOutstandingBytes = 5000 })
+    -- As above: three requests of 2,134 and an empty one fit 7,100 outstanding; a fourth does not.
+    local client = service.client(lane, { maxRequestBytes = 3000, maxOutstandingBytes = 7100 })
     assert(client:open('/memory/served', Tables))
     carried = 0
     -- Too heavy: refused here, and the mailbox never saw it.
@@ -120,16 +131,59 @@ suite.describe('a writer bounded in bytes', function()
 
     local full = client:submit(sized('c4', 4, 1500))
     expect(`{tostring(full.admitted)} {tostring(full.reason)}`).toBe('false backpressure')
-    expect(client:status().outstandingBytes <= 5000).toBe(true)
+    expect(client:status().outstandingBytes <= 7100).toBe(true)
     -- What crossed the lane, weighed with every field name in it (which a request's own
     -- weight leaves out): the limit and a little a message, never megabytes.
-    expect(carried <= 5000 + 5 * 120).toBe(true)
+    expect(carried <= 7100 + 5 * 600).toBe(true)
 
     -- Answered, the bytes come back and the fourth is taken.
     expect(#client:poll(0)).toBe(4)
     expect(client:status().outstandingBytes).toBe(0)
     expect(client:submit(sized('c4', 4, 1500)).admitted).toBe(true)
     client:close(0)
+  end)
+
+  -- Review of 2026-11-13: the bytes counted were the text alone, and the heap held about 21 times
+  -- as much: a 64 MiB ceiling let 1.3 GB through.
+  suite.it('counts about what the requests it holds take in the heap', function()
+    local collect = require('@jess/bench').collect
+    for _, shape in { 'deletes', 'inserts' } do
+      local held: { unknown } = {}
+      -- A worker that answers nothing: what is sent is held.
+      local lane: service.Lane = {
+        send = function(_self: service.Lane, message: unknown) table.insert(held, message) end,
+        receive = function(_self: service.Lane, _seconds: number?): unknown
+          for index, message in held do
+            if (message :: { kind: string }).kind == 'open' then
+              table.remove(held, index)
+              return { kind = 'opened', version = service.Protocol }
+            end
+          end
+
+          return nil
+        end,
+      }
+      -- The defaults: 768 requests and 64 MiB outstanding, which 400 such requests are within.
+      local client = service.client(lane)
+      assert(client:open('/memory/weighed', Tables, { maxOperations = 64 }))
+      collect()
+      local before = gcinfo()
+      for number = 1, 400 do
+        local operations: { writer.Operation } = {}
+        for index = 1, 64 do
+          operations[index] = if shape == 'deletes' then { op = 'delete', table = 'events', key = index }
+            else { op = 'insert', table = 'events', row = { id = index, body = string.rep('b', 40) } }
+        end
+
+        assert(client:submit({ id = `r{number}`, operations = operations }).admitted)
+      end
+
+      collect()
+      local heap = (gcinfo() - before) * 1024
+      local counted = client:status().outstandingBytes
+      local ratio = heap / counted
+      expect(`{shape}: {string.format('%.2f', ratio)} {ratio >= 0.5 and ratio <= 2}`).toBe(`{shape}: {string.format('%.2f', ratio)} true`)
+    end
   end)
 end)
 

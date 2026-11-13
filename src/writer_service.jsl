@@ -201,6 +201,9 @@ function service.client(lane: Lane, options: ClientOptions?): Client
   local order: { string } = {}
   local outstanding = 0
   local opened, closed, stopped = false, false, false
+  -- The most operations the writer behind takes in a request (its own default until it is opened
+  -- with others): a request with more is not one, and is weighed and refused as such here.
+  local operationLimit = 256
   local reason: string? = nil
   local serial, flushing, flushedAt, flushes = 0, false, 0, 0
   local self = {} :: Client
@@ -268,6 +271,9 @@ function service.client(lane: Lane, options: ClientOptions?): Client
 
   function self.open(_self: Client, path: string, tables: { catalog.TableSpec }, writerOptions: writer.Options?, seconds: number?): (boolean, string?)
     if opened or stopped then return false, 'already opened' end
+    local limit = if writerOptions then writerOptions.maxOperations else nil
+    if typeof(limit) == 'number' and limit >= 1 and limit <= 4096 and limit == math.floor(limit) then operationLimit = limit end
+
     if not send({ kind = 'open', version = service.Protocol, path = path, tables = tables, options = writerOptions }) then return false, 'the worker took no message' end
 
     local reply, failed = receive(seconds or 30)
@@ -292,7 +298,7 @@ function service.client(lane: Lane, options: ClientOptions?): Client
     -- Weighed before it goes anywhere, whatever it is. What is a request is sent as the
     -- writer's own frozen copy, so a lane that does not copy what it is handed cannot be
     -- changed under; what is not one is sent as it is, small, for the writer to refuse.
-    local taken, _, weighed = writer.snapshot(request)
+    local taken, _, weighed = writer.snapshot(request, operationLimit)
     local size = if taken then weighed else writer.weigh(request)
     if size > maxRequestBytes then return refused('too-large') end
     if pending[id] then return refused('duplicate-id') end

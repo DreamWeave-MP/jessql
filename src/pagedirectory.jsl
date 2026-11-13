@@ -33,8 +33,8 @@ export type Writer = {
 }
 export type Stats = {
   pages: number, leaves: number, rootBytes: number, cached: number, leafReads: number, hits: number,
-  -- What the cached leaves weigh: the bytes each is on disk, which is what it holds in memory
-  -- give or take the table around its keys.
+  -- What the cached leaves weigh in the heap: each key a string with its header, a slot for it,
+  -- and twelve bytes a page (not the bytes each is on disk, about a third of that).
   cachedBytes: number,
 }
 export type Reader = {
@@ -267,6 +267,9 @@ function directory.reader(storage: vfs.Backend, path: string, size: number, opti
     -- A cached leaf is packed as the root is: its keys, and twelve bytes a page.
     local leafFirsts: { string } = {}
     local leafPlaces = buffer.create(leafEntries * 12)
+    -- What the leaf holds in the heap, not on disk (review of 2026-11-13: the disk's bytes were
+    -- about a third of it): a table, its places, a slot in the list and a string a key.
+    local held = 64 + leafEntries * (12 + 16)
     local cursor = 4
     for position = 1, leafEntries do
       if cursor + 2 > leafLength then return nil, `leaf {index} is cut short` end
@@ -274,6 +277,7 @@ function directory.reader(storage: vfs.Backend, path: string, size: number, opti
       local keyLength = buffer.readu16(data, cursor)
       if cursor + 2 + keyLength + 12 > leafLength then return nil, `leaf {index} is cut short` end
 
+      held += 24 + keyLength
       leafFirsts[position] = buffer.readstring(data, cursor + 2, keyLength)
       cursor += 2 + keyLength
       buffer.copy(leafPlaces, (position - 1) * 12, data, cursor, 12)
@@ -282,15 +286,15 @@ function directory.reader(storage: vfs.Backend, path: string, size: number, opti
 
     if cursor ~= leafLength or leafFirsts[1] ~= firsts[index] then return nil, `leaf {index} is not the leaf the root describes` end
 
-    local leaf: Leaf = { index = index, firsts = leafFirsts, places = leafPlaces, bytes = leafLength, newer = nil, older = nil }
+    local leaf: Leaf = { index = index, firsts = leafFirsts, places = leafPlaces, bytes = held, newer = nil, older = nil }
     -- A leaf that is over the budget by itself answers this lookup and is not kept: the budget
     -- is what the reader holds between lookups, and one leaf cannot be let to break it.
-    if maxCacheBytes and leafLength > maxCacheBytes then return leaf, nil end
+    if maxCacheBytes and held > maxCacheBytes then return leaf, nil end
 
     -- Room is made before the leaf is kept: the least recently used go, until it fits by number
     -- and by weight.
     local dropped = oldest
-    while dropped and (cached >= maxLeaves or (maxCacheBytes ~= nil and cachedBytes + leafLength > maxCacheBytes)) do
+    while dropped and (cached >= maxLeaves or (maxCacheBytes ~= nil and cachedBytes + held > maxCacheBytes)) do
       unlink(dropped)
       cache[dropped.index] = nil
       cached -= 1
@@ -301,7 +305,7 @@ function directory.reader(storage: vfs.Backend, path: string, size: number, opti
     cache[index] = leaf
     front(leaf)
     cached += 1
-    cachedBytes += leafLength
+    cachedBytes += held
     return leaf, nil
   end
 
