@@ -297,6 +297,21 @@ suite.describe('in-memory disk: injected faults', function()
 
     expect(#outcomes).toBe(total)
   end)
+
+  -- Re-review of 2026-11-13: the folders a synchronized store made for itself were never made
+  -- durable, so a crash lost them and the store reopened empty, its acknowledged commits gone.
+  suite.it('keeps a synchronized store made in folders that did not exist, and its commits, across a crash', function()
+    local disk = memfs.new()
+    local path = '/memory/state/db/app.wal'
+    local db = sql.open(path, { durability = 'sync', storage = disk.backend })
+    db:createTable('events', { 'id' }, 'id')
+    for id = 1, 5 do db:insert('events', { id = id }) end
+
+    disk.crash()
+    local again = sql.open(path, { durability = 'sync', storage = disk.backend })
+    expect(again:query('SELECT COUNT(*) AS n FROM events').rows[1].n).toBe(5)
+    again:close()
+  end)
 end)
 
 suite.describe('storage seam: a backend is never replaced under an open database', function()

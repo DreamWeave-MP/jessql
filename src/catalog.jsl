@@ -1321,11 +1321,12 @@ function catalog.backup(sourcePath: string, destinationPath: string, options: Ba
     -- The log's committed-length mark travels with the log it describes.
     if from.exists(walmark.path(source .. wal)) then copy(walmark.path(wal)) end
 
-    -- The manifest LAST: without it nothing here can be mistaken for a database.
-    local created, createError = onto.createDurable(destination .. '.jql-manifest', raw)
-    if created ~= #raw then error('manifest create: ' .. tostring(createError)) end
+    -- The manifest LAST: without it nothing here can be mistaken for a database. The copies'
+    -- names are made durable first; the manifest is then put in place whole, as the live one is
+    -- (re-review of 2026-11-13: made in place, a crash could leave it empty).
     local synced, syncError = onto.syncDirectory(parent)
     if not synced then error('destination directory sync: ' .. tostring(syncError)) end
+    publicationKernel.publishText(destination, parent, raw, nil, { started = false }, onto)
 
     -- Open the copy as a database: this replays its log and checks its binding, which the scan
     -- does not. It takes the destination's lock itself, so that one is handed over here.

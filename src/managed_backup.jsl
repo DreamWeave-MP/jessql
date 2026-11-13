@@ -4,6 +4,7 @@
 -- BOTH managed namespace locks for the entire validation/copy operation.
 local vfs = require('@jessql/vfs')
 local manifest = require('@jessql/managed_manifest')
+local publication = require('@jessql/managed_publication')
 local verify = require('@jessql/managed_verification')
 
 export type Result = { version: number, epoch: number, files: number, bytes: number,
@@ -104,11 +105,13 @@ function backup.copy(source: string, destination: string, parent: string,
 
   -- Publish the manifest LAST. An interrupted backup without its manifest
   -- can never be mistaken for a new empty database, and incomplete artifacts
-  -- are deliberately left in place for an operator to investigate.
-  local created, createError = fs.createDurable(destination .. '.jql-manifest', raw)
-  if created ~= #raw then error('jessql backup: manifest create: ' .. tostring(createError), 2) end
+  -- are deliberately left in place for an operator to investigate. The copies'
+  -- names are made durable first; the manifest is then put in place whole, as
+  -- the live one is (re-review of 2026-11-13: made in place, a crash could
+  -- leave it empty, a copy that has a manifest and cannot be opened).
   local synced, syncError = fs.syncDirectory(parent)
   assertOK(synced, syncError, 'destination directory sync')
+  publication.publishText(destination, parent, raw, nil, { started = false }, fs)
 
   local result = verify.scan(destination, { semantic = true, storage = fs })
   if not result.ok or not result.walSemanticReplayChecked then

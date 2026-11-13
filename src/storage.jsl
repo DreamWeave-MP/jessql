@@ -1725,6 +1725,18 @@ function storage.open(path: string, options: Options?): Store
     error('jessql storage: durability must be buffered or sync', 2)
   end
 
+  -- The folders the lock is about to make, outermost first. A new folder is durable only once the
+  -- folder that holds it is synchronized (re-review of 2026-11-13: a synchronized store made in a
+  -- new folder lost the folder, and every acknowledged commit in it, at a crash).
+  local made: { string } = {}
+  if durability == 'sync' then
+    local folder = fs.parent(path)
+    while folder and folder ~= '' and not fs.exists(folder) do
+      table.insert(made, 1, folder)
+      folder = fs.parent(folder)
+    end
+  end
+
   local lock, err = fs.lock(path .. '.lock', { createParents = true })
   if not lock then error('jessql storage: database locked: ' .. tostring(err), 2) end
 
@@ -1737,6 +1749,14 @@ function storage.open(path: string, options: Options?): Store
 
   -- Opening can fail on invalid frames; release the advisory lock on failure.
   local ok, failure = pcall(function()
+    for _, folder in made do
+      local holder = fs.parent(folder)
+      if not holder then continue end
+
+      local fenced, fenceError = fs.syncDirectory(holder)
+      if not fenced then error('jessql storage: new folder synchronization: ' .. tostring(fenceError)) end
+    end
+
     -- A synchronized log made by a process killed before its first bytes were whole: nothing
     -- or part of the header. It can hold no transaction, and is made again rather than refused,
     -- unless its mark says transactions were committed to it: then it is what is left of a log

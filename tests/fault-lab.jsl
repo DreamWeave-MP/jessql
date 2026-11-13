@@ -7,6 +7,7 @@ local lab = require('@jessql/faultlab')
 local memfs = require('@jessql/memfs')
 local sql = require('@jessql')
 local test = require('@jess/test')
+local world = require('./catalogworld')
 
 local expect = test.expect
 local suite = test.new()
@@ -247,6 +248,28 @@ local function backupScenario(): lab.Scenario
   }
 end
 
+-- The same for a database of several tables: its three steps, copied whole or not published.
+local function catalogBackupScenario(): lab.Scenario
+  return {
+    name = 'catalog backup',
+    prepare = world.prepare,
+    exercise = function(disk: memfs.Disk, _ledger: lab.Ledger)
+      sql.catalog.backup(world.Path, '/memory/copy', { storage = disk.backend })
+    end,
+    recover = function(disk: memfs.Disk): lab.Observed
+      local observed = world.recover(disk)
+      if disk.backend.exists('/memory/copy.jql-manifest') then
+        local copy = sql.catalog.openExisting('/memory/copy', { storage = disk.backend })
+        local rows = copy:query('SELECT COUNT(*) AS n FROM handled').rows[1].n :: number
+        copy:close()
+        if rows ~= 3 then error(`a published backup holds {rows} of 3 steps`, 0) end
+      end
+
+      return observed
+    end,
+  }
+end
+
 suite.describe('the store, stopped at every storage step', function()
   suite.it('keeps every acknowledged WAL commit, whole, and recovers from a crashed recovery', function()
     local report = lab.run(walScenario(), { crashRecovery = true })
@@ -273,8 +296,11 @@ suite.describe('the store, stopped at every storage step', function()
   -- Review of 2026-11-13: the model only ever lost unsynchronized bytes whole, and made every
   -- `createDurable` whole or not at all; a real disk can leave a tail of zeros and a name with no
   -- bytes. The same stores, stopped at every step with what was being written torn.
+  -- Re-review of 2026-11-13: a backup's manifest, made in place, could be left empty, a copy with
+  -- a manifest that cannot be opened; the backups are swept torn too.
   suite.it('keeps every acknowledged commit when what was being written is torn, not lost', function()
-    for _, scenario in { walScenario(), managedScenario('flush'), managedScenario('checkpoint') } do
+    for _, scenario in { walScenario(), managedScenario('flush'), managedScenario('checkpoint'), backupScenario(),
+      catalogBackupScenario() } do
       local report = lab.run(scenario, { modes = { 'torn' } })
       expect(`{scenario.name}: {findings(report)}`).toBe(`{scenario.name}: `)
       expect(report.truncated).toBe(false)
@@ -289,9 +315,11 @@ suite.describe('the store, stopped at every storage step', function()
   end)
 
   suite.it('leaves the source whole and never publishes half a backup', function()
-    local report = lab.run(backupScenario())
-    expect(findings(report)).toBe('')
-    expect(report.truncated).toBe(false)
+    for _, scenario in { backupScenario(), catalogBackupScenario() } do
+      local report = lab.run(scenario)
+      expect(`{scenario.name}: {findings(report)}`).toBe(`{scenario.name}: `)
+      expect(report.truncated).toBe(false)
+    end
   end)
 end)
 
