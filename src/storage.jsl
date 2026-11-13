@@ -1655,6 +1655,20 @@ local function load(state: DatabaseState, recoverTail: boolean)
   end
 end
 
+-- Records the commits synchronized so far in the mark. A record that does not reach storage
+-- leaves the mark behind: the store is then no longer witnessed, and takes no commit until it is
+-- opened again, as after a log synchronization that failed (re-review of #99).
+local function recordMark(state: DatabaseState)
+  local mark = state.mark
+  if not mark or mark.record(state.sequence, state.walLength) then return end
+
+  state.poisoned = true
+  state.mark = nil
+  -- Closing a handle whose synchronization failed can raise; the store is poisoned either way.
+  pcall(mark.close)
+  error('jessql storage: committed-length mark could not be synchronized (reopen required)', 3)
+end
+
 local function write(state: DatabaseState, ops: { Operation }, deferSync: boolean?)
   if #ops == 0 then return end
   local payload = json.encodeTable({ version = 1, sequence = state.sequence + 1, ops = ops })
@@ -1689,7 +1703,7 @@ local function write(state: DatabaseState, ops: { Operation }, deferSync: boolea
   end
   state.sequence += 1
   -- Only once this transaction is synchronized is it recorded as committed.
-  if state.mark and deferSync ~= true then state.mark.record(state.sequence, state.walLength) end
+  if deferSync ~= true then recordMark(state) end
 end
 
 local storage = {}
@@ -1914,7 +1928,7 @@ function storage.open(path: string, options: Options?): Store
 
         if batchTestHook then batchTestHook('after-sync') end
         -- The whole batch is synchronized: it is recorded as committed in one mark.
-        if state.mark then state.mark.record(state.sequence, state.walLength) end
+        recordMark(state)
       end
       return results
     end)
@@ -2315,7 +2329,7 @@ function storage.open(path: string, options: Options?): Store
     state.sequence = sequence
     if durable then
       state.walLength = compacted
-      if state.mark then state.mark.record(state.sequence, state.walLength) end
+      recordMark(state)
     end
 
     -- Discard dead key slots and stale secondary postings after compaction.
