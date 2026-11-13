@@ -1582,6 +1582,48 @@ local function load(state: DatabaseState, recoverTail: boolean)
     return true
   end
 
+  -- Whether the bytes from `from` to the end begin with a whole JSON object. Every payload is
+  -- one (`json.encodeTable`, which escapes quotes, backslashes and control bytes in strings), so
+  -- the start of one never holds a whole one: the object closes at the payload's last byte.
+  local function wholeObjectFrom(from: number): boolean
+    local depth, quoted, escaped = 0, false, false
+    local at = from
+    while at < size do
+      local piece = reader:readAt(at, math.min(1048576, size - at))
+      if not piece or buffer.len(piece) == 0 then
+        reader:close()
+        error('jessql storage: read failed', 3)
+      end
+
+      local text = buffer.tostring(piece)
+      if at == from and string.byte(text, 1) ~= 123 then return false end
+      local index = if escaped then 2 else 1
+      escaped = false
+      while true do
+        local found = string.find(text, if quoted then '["\\]' else '[{}%[%]"]', index)
+        if not found then break end
+        local byte = string.byte(text, found)
+        index = found + 1
+        if byte == 34 then
+          quoted = not quoted
+        elseif byte == 92 then
+          -- Inside a string, a backslash escapes the byte after it, perhaps in the next piece.
+          if found == #text then escaped = true end
+          index = found + 2
+        elseif byte == 123 or byte == 91 then
+          depth += 1
+        else
+          depth -= 1
+          if depth == 0 then return true end
+        end
+      end
+
+      at += buffer.len(piece)
+    end
+
+    return false
+  end
+
   -- At most what one append left unsynchronized when the power went: one batch of frames.
   local inFlight = MaxBatchEntries * (HeaderBytes + limit)
 
@@ -1613,19 +1655,10 @@ local function load(state: DatabaseState, recoverTail: boolean)
     end
 
     if size - offset - HeaderBytes < length then
-      -- A frame cut short by a crash holds only the start of its payload, which does not check.
-      -- One whose bytes, up to any zeros a later torn append left, check is all there: its length
-      -- is what was damaged, and it is refused, not cut (J-FINAL-01, re-review).
-      local present = reader:readAt(offset + HeaderBytes, size - offset - HeaderBytes)
-      if not present then
-        reader:close()
-        error('jessql storage: read failed', 2)
-      end
-
-      local last = buffer.len(present)
-      while last > 0 and buffer.readu8(present, last - 1) == 0 do last -= 1 end
-
-      if last > 0 and bytes.crc32(buffer.readstring(present, 0, last)) == checksum then
+      -- A frame cut short by a crash holds only the start of its payload, never a whole object.
+      -- One whose payload is all there, whatever follows it (frames after it, or zeros), has a
+      -- damaged length, and is refused, not cut (J-FINAL-01, re-review).
+      if wholeObjectFrom(offset + HeaderBytes) then
         reader:close()
         error('jessql storage: invalid frame length', 2)
       end

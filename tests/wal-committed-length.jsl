@@ -627,13 +627,84 @@ suite.describe('a managed database', function()
     end
 
     -- The same append torn by a power cut, its later pages never written, is still cut, whether
-    -- the log was left as long as the frame or as long as what was written.
+    -- the log was left as long as the frame or as long as what was written, wherever it stops.
     local cut = 4096 - #whole % 4096
-    for _, rest in { string.rep('\0', #frame - cut), '' } do
+    local tears = { string.sub(frame, 1, cut) .. string.rep('\0', #frame - cut), string.sub(frame, 1, 100) .. string.rep('\0', 100) }
+    for _, kept in { 9, 100, cut, #frame - 1 } do table.insert(tears, string.sub(frame, 1, kept)) end
+
+    for index, tear in tears do
       local torn = closedStore(5)
-      overwrite(torn, Log, whole .. string.sub(frame, 1, cut) .. rest)
-      expect(rows(torn)).toBe(5)
-      expect(#torn.visible()[Log]).toBe(#whole)
+      overwrite(torn, Log, whole .. tear)
+      expect(`{index}: {rows(torn)}`).toBe(`{index}: 5`)
+      expect(`{index}: {#torn.visible()[Log]}`).toBe(`{index}: {#whole}`)
+    end
+  end)
+
+  -- The log of `closedStore(5)`, the frames `extra` appends to it, and the mark that witnesses
+  -- only the first: the process that made them, synchronized and acknowledged, was killed before
+  -- the mark was brought up to them.
+  local function appended(extra: (sql.PersistentDatabase) -> ()): (string, string, string)
+    local disk = closedStore(5)
+    local whole, mark = disk.visible()[Log], disk.visible()[walmark.path(Log)]
+    local scratch = memfs.new()
+    assert((scratch.backend.createDurable(Log, whole)))
+    assert((scratch.backend.createDurable(walmark.path(Log), mark)))
+    local other = sql.open(Log, { durability = 'sync', storage = scratch.backend })
+    extra(other)
+    other:close()
+    return whole, string.sub(scratch.visible()[Log], #whole + 1), mark
+  end
+
+  -- Re-review of J-FINAL-01: with frames after it, a frame whose length was raised past the end
+  -- of the log was cut as short, and every acknowledged frame after it with it.
+  suite.it('refuses a frame past an older mark whose length runs past whole frames after it', function()
+    local whole, frames, mark = appended(function(db)
+      db:insert('events', { id = 6, body = string.rep('p', 3000) })
+      db:insert('events', { id = 7, body = string.rep('q', 3000) })
+    end)
+    local intact = closedStore(5)
+    overwrite(intact, Log, whole .. frames)
+    expect(rows(intact)).toBe(7)
+
+    local length = buffer.readu32(buffer.fromstring(frames), 0)
+    for _, raised in { bit32.bor(length, 0x100000), bit32.bxor(length, 0x2000) } do
+      expect(raised > #frames).toBe(true)
+      for _, after in { '', string.rep('\0', 64) } do
+        local overlong = whole .. string.pack('<I4', raised) .. string.sub(frames, 5) .. after
+        local disk = closedStore(5)
+        overwrite(disk, Log, overlong)
+        -- The open raises; the refusal is the assertion.
+        local opened, problem = pcall(open, disk)
+        expect(`{raised} {#after}: {opened}`).toBe(`{raised} {#after}: false`)
+        expect((string.find(tostring(problem), 'invalid frame length', 1, true)) ~= nil).toBe(true)
+        expect(disk.visible()[Log] == overlong).toBe(true)
+        expect(disk.visible()[walmark.path(Log)] == mark).toBe(true)
+      end
+    end
+  end)
+
+  suite.it('still cuts a batch of frames that a power cut tore a page in', function()
+    local whole, frames = appended(function(db)
+      db:transactionBatch({
+        function(tx) tx:insert('events', { id = 6, body = string.rep('a', 3000) }) end,
+        function(tx) tx:insert('events', { id = 7, body = string.rep('b', 3000) }) end,
+        function(tx) tx:insert('events', { id = 8, body = string.rep('c', 3000) }) end,
+      })
+    end)
+    local page = 4096 - #whole % 4096
+    -- Kept up to the end of the first page, then the second: as long as the batch with zeros,
+    -- or as long as what was written. What is left is the frames wholly inside what was kept.
+    local ends = frameEnds(whole .. frames)
+    expect(#ends).toBe(9)
+    for _, kept in { page, page + 4096 } do
+      local whole6, whole7 = ends[7] <= #whole + kept, ends[8] <= #whole + kept
+      expect(`{kept}: {whole6} {whole7} {ends[9] <= #whole + kept}`).toBe(`{kept}: {whole6} {whole7} false`)
+      local left = 5 + (if whole6 then 1 else 0) + (if whole7 then 1 else 0)
+      for _, rest in { string.rep('\0', #frames - kept), '' } do
+        local disk = closedStore(5)
+        overwrite(disk, Log, whole .. string.sub(frames, 1, kept) .. rest)
+        expect(`{kept} {#rest}: {rows(disk)}`).toBe(`{kept} {#rest}: {left}`)
+      end
     end
   end)
 
