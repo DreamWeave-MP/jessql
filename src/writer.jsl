@@ -304,6 +304,20 @@ function writer.digest(request: Request): string
   return bytes.sha256(table.concat(parts))
 end
 
+-- Which operation of `request`, if any, names the ledger's table: only the ledger writes there.
+-- An entry's key and digest are computable by anyone, so a request that could write one could
+-- have another request refused as committed without running (review of e2d173d). The catalog
+-- matches table names exactly and holds them lowercase; every case of the name is refused here
+-- all the same, so no spelling the name could be resolved from gets through.
+local function writesLedger(request: Request, kept: ledger.Options): string?
+  local guarded = string.lower(kept.table)
+  for index, operation in request.operations do
+    if string.lower(operation.table) == guarded then return `operation {index} writes the ledger's table` end
+  end
+
+  return nil
+end
+
 -- One request as one transaction: every operation, or an error that leaves none of them. A
 -- request the ledger holds as committed already is refused, and `replayed` is called first: that
 -- call, not the refusal's text, is how the writer knows.
@@ -374,6 +388,8 @@ function writer.new(db: catalog.Database, options: Options?): Writer
     -- From here on only the copy is looked at: the caller's table is not read again, now or later.
     local taken, problem, size = snapshot(request, maxOperations)
     if not taken then return { admitted = false, reason = 'invalid: ' .. (problem or 'malformed'), queued = status.queued } end
+    local trespass = if kept then writesLedger(taken, kept) else nil
+    if trespass then return { admitted = false, reason = 'invalid: ' .. trespass, queued = status.queued } end
     if size > maxRequestBytes then return { admitted = false, reason = 'too-large', queued = status.queued } end
     if waiting[taken.id] then return { admitted = false, reason = 'duplicate-id', queued = status.queued } end
 

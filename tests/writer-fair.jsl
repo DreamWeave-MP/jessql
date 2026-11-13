@@ -389,6 +389,18 @@ suite.describe('fair admission in front of one writer', function()
     expect(`{later[1].tenant}:{later[1].id}={later[1].outcome}`).toBe('b:invoice-8=rejected')
     expect(later[1].alreadyCommitted == true).toBe(false)
     expect(`{(db:get('events', 1) :: { body: string }).body} {(db:get('events', 2) :: { body: string }).body}`).toBe('A B')
+
+    -- Review of e2d173d: `mallory` writes the ledger entry `b`'s next request would make, its
+    -- scoped id and digest computed in the open. Refused at admission, and `b`'s request runs.
+    local victim = insert('pay', 3, 'b pays')
+    local scoped: writer.Request = { id = fair.scoped('b', 'pay'), operations = victim.operations }
+    local forged = front.submit('mallory', { id = 'x', operations = { { op = 'insert', table = 'requests',
+      row = { key = ledger.key('', scoped.id), scope = '', id = scoped.id, at = 1, digest = writer.digest(scoped) } } } })
+    expect(`{forged.admitted} {forged.reason}`).toBe('false invalid: operation 1 writes the ledger\'s table')
+    expect(front.submit('b', victim).admitted).toBe(true)
+    local paid = front.poll(0)
+    expect(`{paid[1].tenant}:{paid[1].id}={paid[1].outcome}`).toBe('b:pay=committed')
+    expect((db:get('events', 3) :: { body: string }).body).toBe('b pays')
     db:close()
   end)
 

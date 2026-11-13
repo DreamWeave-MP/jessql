@@ -796,6 +796,58 @@ suite.describe('a supervisor\'s requests over time', function()
     expect(outcomes(again:close(5))).toBe('real=committed')
     expect(rows(disk)).toBe(1)
   end)
+
+  -- Review of e2d173d: a request that writes the ledger's table enters another request's id and
+  -- digest, both computable by anyone, and that other is refused as committed without running;
+  -- after a replacement the supervisor called it committed. The writer takes no such request.
+  local function forger(victim: writer.Request): writer.Request
+    return { id = 'attacker', operations = { { op = 'insert', table = 'requests',
+      row = { key = ledger.key('shared', victim.id), scope = 'shared', id = victim.id, at = 1, digest = writer.digest(victim) } } } }
+  end
+
+  -- The victim's own row, and its ledger entry is its own.
+  local function ranItself(disk: Disk, number: number): string
+    local db = sql.catalog.openExisting(Path, { storage = disk.backend })
+    local said = `{db:get('events', number) ~= nil} {db:query('SELECT COUNT(*) AS n FROM requests').rows[1].n}`
+    db:close()
+    return said
+  end
+
+  suite.it('refuses a request that writes the ledger\'s table, and its victim runs, answered by poll', function()
+    local disk = memfs.new()
+    local polled, worlds = supervised(disk)
+    local victim = insert('victim', 42, 'v')
+    expect(polled:submit(forger(victim)).admitted).toBe(true)
+    expect(polled:submit(victim).admitted).toBe(true)
+    worlds[#worlds].dead = true
+    local acks: { service.Ack } = {}
+    for _ = 1, 4 do
+      for _, ack in polled:poll(0) do table.insert(acks, ack) end
+    end
+
+    expect(polled:status().restarts).toBe(1)
+    expect(outcomes(acks)).toBe('attacker=rejected victim=committed')
+    expect(acks[1].error).toBe('refused: invalid: operation 1 writes the ledger\'s table')
+    expect(#polled:close(5)).toBe(0)
+    expect(ranItself(disk, 42)).toBe('true 1')
+  end)
+
+  suite.it('refuses a request that writes the ledger\'s table, and its victim runs, answered by close', function()
+    local disk = memfs.new()
+    local closing, lanes = supervised(disk)
+    local victim = insert('victim', 43, 'v')
+    expect(closing:submit(forger(victim)).admitted).toBe(true)
+    expect(closing:submit(victim).admitted).toBe(true)
+    lanes[#lanes].dead = true
+    expect(#closing:poll(0)).toBe(0)
+    expect(closing:status().restarts).toBe(1)
+    local closed = closing:close(5)
+    local said: { string } = {}
+    for _, ack in closed do table.insert(said, `{ack.id}={ack.outcome}`) end
+    table.sort(said)
+    expect(table.concat(said, ' ')).toBe('attacker=rejected victim=committed')
+    expect(ranItself(disk, 43)).toBe('true 1')
+  end)
 end)
 
 return suite

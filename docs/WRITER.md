@@ -191,6 +191,14 @@ changes are, whatever moment a crash chooses, and there is no second store to di
   field is set only by the writer, from `ledger.claim`'s answer; the error's text is for people
   and is never read for it, since a request's own table names can say the same words
   (J-FINAL-02).
+- Only the ledger writes the ledger's table. A writer with a ledger refuses at admission any
+  request with an operation on that table, in any case of its name: `rejected` with
+  `invalid: operation N writes the ledger's table`, never run. An entry's key (`ledger.key`) and
+  digest (`writer.digest`) are computable by anyone, so a request that could write one could
+  have another request, another tenant's behind `writer_fair` included, refused as committed
+  without running, and a supervisor would have called it `committed` (review of e2d173d).
+  Code that writes the database directly, through the catalog or SQL rather than the writer, is
+  not held to this (P3): keeping it away from the ledger's table remains the application's.
 - The entry keeps a SHA-256 of what the request said (`writer.digest`: its id and operations,
   columns in any order). The same id with anything else is `rejected` with
   `ledger: id reused with different content` (`ledger.Reused`), changes nothing, and is never

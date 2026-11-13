@@ -166,6 +166,37 @@ suite.describe('the durable request ledger', function()
     db:close()
   end)
 
+  -- Review of e2d173d: a request could write the ledger's own table, so one request could enter
+  -- another's id and digest (both computable by anyone) and have that other refused as
+  -- committed without running. A writer with a ledger takes no operation on its table.
+  suite.it('refuses at admission any request that writes the ledger\'s own table', function()
+    local disk = memfs.new()
+    local db = sql.catalog.create(Path, { tables = Tables, storage = disk.backend })
+    local options: ledger.Options = { table = 'requests', scope = 's', now = function(): number return 1 end }
+    local queue = writer.new(db, { ledger = options })
+    local victim = deposit('victim', 7, 100)
+    local entry = { key = ledger.key('s', 'victim'), scope = 's', id = 'victim', at = 1, digest = writer.digest(victim) }
+    for _, operation in { { op = 'insert', table = 'requests', row = entry }, { op = 'upsert', table = 'requests', row = entry },
+      { op = 'update', table = 'requests', key = entry.key, changes = { digest = 'x' } }, { op = 'delete', table = 'requests', key = entry.key } } :: { writer.Operation } do
+      -- Alone, or behind an operation that is allowed.
+      for _, operations in { { operation }, { deposit('x', 1, 1).operations[1], operation } } do
+        local admission = queue:submit({ id = 'attacker', operations = operations })
+        expect(`{admission.admitted} {admission.reason}`).toBe(`false invalid: operation {#operations} writes the ledger's table`)
+      end
+    end
+
+    expect(queue:status().queued).toBe(0)
+    queue:submit(victim)
+    expect(outcomes(queue:drain())).toBe('victim=committed')
+    expect((db:get('accounts', 7) :: { balance: number }).balance).toBe(100)
+    expect(ledger.lookup(db, options, { 'victim', 'attacker' }).attacker).toBe('absent')
+
+    -- A writer without a ledger has no such table to keep: it is an ordinary table there.
+    local plain = writer.new(db)
+    expect(plain:submit({ id = 'p', operations = { { op = 'delete', table = 'requests', key = entry.key } } }).admitted).toBe(true)
+    db:close()
+  end)
+
   suite.it('prunes old entries a bounded number at a time, after which a retry is applied again', function()
     local disk = memfs.new()
     local db = sql.catalog.create(Path, { tables = Tables, storage = disk.backend })
