@@ -10,10 +10,12 @@
 --
 -- What the mark promises, exactly: it is written only after the log's own synchronization, so
 -- it never claims more than is durable; a crash can therefore never make a sound log look
--- damaged. It is not synchronized with every commit (that would double the cost of one): it is
--- synchronized when the store is closed, and before a checkpoint shortens the log. So after a
--- clean close every commit is covered, and after a crash every commit up to whatever mark had
--- reached storage. The newest commits before a crash are protected as they were before: not.
+-- damaged. It is synchronized with every commit (a second synchronization per commit, or per
+-- group of commits), so that after a crash it covers every commit that was acknowledged. That is
+-- what tells the tail a power cut tore (past the mark: never acknowledged, cut) from acknowledged
+-- frames that came back as zeros (within the mark: damage, refused). It used to be synchronized
+-- only at close and before a checkpoint, and a mark that far behind made the two look the same
+-- (review of 2026-11-13). A record that does not reach storage leaves the mark behind, still true.
 --
 -- The file is `<log>.committed`: a magic and two slots written alternately, each with its own
 -- checksum, so a write torn by a crash leaves the other slot standing.
@@ -33,7 +35,8 @@ export type Mark = { sequence: number, length: number }
 -- What is beside a log: no mark, one that can be read, or one that is there and cannot be.
 export type Condition = 'absent' | 'sound' | 'damaged'
 export type Writer = {
-  -- Records that the log holds `sequence` transactions in `length` bytes, all synchronized.
+  -- Records, durably, that the log holds `sequence` transactions in `length` bytes, all
+  -- synchronized.
   record: (sequence: number, length: number) -> (),
   -- Makes "nothing is committed" durable, before the log is replaced by a shorter one. Returns
   -- whether it is durable; the caller must not shorten the log if it is not.
@@ -192,8 +195,8 @@ function walmark.open(fs: vfs.Backend, log: string): Writer?
   return {
     record = function(sequence: number, length: number)
       if closed or (sequence == latest.sequence and length == latest.length) then return end
-
-      put(sequence, length)
+      -- Best effort: a record that does not reach storage leaves the mark behind, still true.
+      if put(sequence, length) then handle:syncData() end
     end,
     reset = function(): boolean
       if closed then return false end

@@ -208,7 +208,7 @@ local function openHybrid(fs: vfs.Backend, base: string, value: Manifest, option
   if value.version == 2 then source, deletes = indexedPaths(base, value) end
 
   return hybrid.open(active.wal, source, value.tableName, {
-    durability = 'sync', requireIdentity = requiredWal,
+    durability = 'sync', requireIdentity = requiredWal, manifestNamesLog = true,
     trackPayloadBytes = options ~= nil and options.maxHotBytes ~= nil,
     deletePaths = deletes,
     rowLayout = if options then options.rowLayout else 'packed',

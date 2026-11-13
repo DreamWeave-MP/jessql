@@ -135,6 +135,8 @@ type DatabaseState = {
 
 local Magic = 'JQLW1\n'
 local HeaderBytes = 8
+-- The most transactions one batch frames behind a single synchronization.
+local MaxBatchEntries = 256
 local DefaultMaxFrame = 16 * 1024 * 1024
 local Deleted = false
 
@@ -1577,13 +1579,17 @@ local function load(state: DatabaseState, recoverTail: boolean)
     return true
   end
 
+  -- At most what one append left unsynchronized when the power went: one batch of frames.
+  local inFlight = MaxBatchEntries * (HeaderBytes + limit)
+
   -- A frame that cannot be read is a torn tail, to be cut, only when it lies wholly past what
-  -- the mark says was committed and everything from it on is zeros: blocks a power cut left
-  -- allocated and never written. That was never acknowledged. Anything else is refused as
-  -- before (review of 2026-11-13: such a tail made a sound store refuse to open).
+  -- the mark says was committed, no further from the end than one append can reach, and every
+  -- byte from `zerosFrom` on is zero: blocks a power cut left allocated and never written. The
+  -- mark is synchronized with every commit, so nothing past it was acknowledged. Anything else
+  -- is refused as before (review of 2026-11-13: such a tail made a sound store refuse to open).
   local function tornTail(zerosFrom: number): boolean
     return recoverTail and committed ~= nil and offset >= committed.length and state.sequence >= committed.sequence
-      and zeroFrom(zerosFrom)
+      and size - offset <= inFlight and zeroFrom(zerosFrom)
   end
 
   while offset < size do
@@ -1610,7 +1616,9 @@ local function load(state: DatabaseState, recoverTail: boolean)
     end
     local payload = buffer.tostring(body)
     if bytes.crc32(payload) ~= checksum then
-      if tornTail(offset + HeaderBytes) then break end
+      -- Writeback a page at a time can keep the start of the last frame and lose the rest: it is
+      -- torn when nothing but zeros follows where it claims to end.
+      if tornTail(offset + HeaderBytes + length) then break end
 
       reader:close()
       error('jessql storage: checksum mismatch', 2)
@@ -1730,10 +1738,18 @@ function storage.open(path: string, options: Options?): Store
   -- Opening can fail on invalid frames; release the advisory lock on failure.
   local ok, failure = pcall(function()
     -- A synchronized log made by a process killed before its first bytes were whole: nothing
-    -- or part of the header. It can hold no transaction, and is made again rather than refused.
+    -- or part of the header. It can hold no transaction, and is made again rather than refused,
+    -- unless its mark says transactions were committed to it: then it is what is left of a log
+    -- that was damaged, and is refused with nothing changed, the mark kept as the evidence
+    -- (review of 2026-11-13: it was remade, and the mark with it).
     if durability == 'sync' and fs.exists(path) then
       local held = fs.readFileString(path)
       if held ~= nil and #held < #Magic and string.sub(Magic, 1, #held) == held then
+        local witness, recorded = walmark.examine(fs, path)
+        if witness == 'damaged' or (recorded and recorded.sequence > 0) then
+          error(`jessql storage: the log holds no transaction, and the committed-length mark beside it says {if recorded then recorded.sequence else 'some'} were committed to it: it was damaged (remove {walmark.path(path)} only to accept that loss and start an empty log)`)
+        end
+
         local removed, removeError = fs.remove(path)
         if not removed then error('jessql storage: an unfinished log could not be removed: ' .. tostring(removeError)) end
       end
@@ -1842,7 +1858,7 @@ function storage.open(path: string, options: Options?): Store
 
     if state.busy then error('jessql storage: nested or concurrent transaction', 2) end
 
-    if type(callbacks) ~= 'table' or #callbacks == 0 or #callbacks > 256 then
+    if type(callbacks) ~= 'table' or #callbacks == 0 or #callbacks > MaxBatchEntries then
       error('jessql storage: transactionBatch requires 1..256 callbacks', 2)
     end
 

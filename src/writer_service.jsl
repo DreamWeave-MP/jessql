@@ -141,7 +141,11 @@ function service.host(options: HostOptions?): (message: unknown) -> unknown
         return { kind = 'failed', reason = tostring(problem) }
       end
 
-      return { kind = 'opened', version = service.Protocol }
+      -- The writer took its options, so this is the limit it holds requests to: the client is told
+      -- it, rather than trusting what it asked for.
+      local asked = field(writerOptions, 'maxOperations')
+      return { kind = 'opened', version = service.Protocol,
+        maxOperations = if typeof(asked) == 'number' then asked else writer.DefaultOperations }
     end
 
     local queue = actor
@@ -201,9 +205,10 @@ function service.client(lane: Lane, options: ClientOptions?): Client
   local order: { string } = {}
   local outstanding = 0
   local opened, closed, stopped = false, false, false
-  -- The most operations the writer behind takes in a request (its own default until it is opened
-  -- with others): a request with more is not one, and is weighed and refused as such here.
-  local operationLimit = 256
+  -- The most operations the writer behind takes in a request, as its answer to `open` says (re-
+  -- review of 2026-11-13: it was taken from what the client asked for): a request with more is
+  -- not one, and is weighed and refused as such here.
+  local operationLimit = writer.DefaultOperations
   local reason: string? = nil
   local serial, flushing, flushedAt, flushes = 0, false, 0, 0
   local self = {} :: Client
@@ -271,8 +276,6 @@ function service.client(lane: Lane, options: ClientOptions?): Client
 
   function self.open(_self: Client, path: string, tables: { catalog.TableSpec }, writerOptions: writer.Options?, seconds: number?): (boolean, string?)
     if opened or stopped then return false, 'already opened' end
-    local limit = if writerOptions then writerOptions.maxOperations else nil
-    if typeof(limit) == 'number' and limit >= 1 and limit <= 4096 and limit == math.floor(limit) then operationLimit = limit end
 
     if not send({ kind = 'open', version = service.Protocol, path = path, tables = tables, options = writerOptions }) then return false, 'the worker took no message' end
 
@@ -281,6 +284,11 @@ function service.client(lane: Lane, options: ClientOptions?): Client
       stopped, reason = true, 'not opened'
       return false, if failed then 'the worker failed' elseif reply == nil then 'the worker did not answer' else tostring(field(reply, 'reason'))
     end
+
+    -- A worker that does not say its limit holds requests to what it was asked for.
+    local limit = field(reply, 'maxOperations')
+    if limit == nil and writerOptions then limit = writerOptions.maxOperations end
+    if typeof(limit) == 'number' and limit >= 1 and limit <= 4096 and limit == math.floor(limit) then operationLimit = limit end
 
     opened = true
     return true, nil

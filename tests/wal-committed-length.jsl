@@ -494,16 +494,24 @@ suite.describe('a managed database', function()
   -- Review of 2026-11-13: a power cut can leave a log's end allocated and never written. Past
   -- what the mark says was committed, that is a tail nobody was told of: cut, not refused.
   suite.it('cuts a tail of zeros past the committed length, and refuses anything else there', function()
-    for _, case in { 'zeros', 'header-then-zeros', 'garbage' } do
+    -- A last frame whose bytes do not check is torn too, when it ends at the end of the log or
+    -- only zeros follow it (re-review of 2026-11-13: writeback a page at a time leaves that).
+    -- Bytes past where it claims to end that are not zeros are something else, and refused.
+    local tails: { [string]: string } = {
+      zeros = string.rep('\0', 64),
+      ['header-then-zeros'] = string.pack('<I4I4', 40, 12345) .. string.rep('\0', 40),
+      ['last-frame-garbled'] = string.pack('<I4I4', 40, 12345) .. string.rep('x', 40),
+      ['garbage-past-a-frame'] = string.pack('<I4I4', 40, 12345) .. string.rep('x', 40) .. 'x',
+      ['garbage-as-a-header'] = string.rep('x', 48),
+    }
+
+    for _, case in { 'zeros', 'header-then-zeros', 'last-frame-garbled', 'garbage-past-a-frame', 'garbage-as-a-header' } do
       local disk = closedStore(5)
       local body = disk.visible()[Log]
-      local tail = if case == 'zeros' then string.rep('\0', 64)
-        elseif case == 'header-then-zeros' then string.pack('<I4I4', 40, 12345) .. string.rep('\0', 40)
-        else string.pack('<I4I4', 40, 12345) .. string.rep('x', 40)
-      overwrite(disk, Log, body .. tail)
+      overwrite(disk, Log, body .. tails[case])
       -- The open raises for the tail that is refused; whether it opened is the assertion.
       local opened, db = pcall(open, disk)
-      expect(`{case}: {opened}`).toBe(`{case}: {case ~= 'garbage'}`)
+      expect(`{case}: {opened}`).toBe(`{case}: {string.sub(case, 1, 7) ~= 'garbage'}`)
       if opened then
         (db :: sql.PersistentDatabase):close()
         expect(`{case}: {rows(disk)}`).toBe(`{case}: 5`)
@@ -520,6 +528,76 @@ suite.describe('a managed database', function()
     expect((pcall(open, disk))).toBe(false)
   end)
 
+  -- Re-review of 2026-11-13: the mark was synchronized only at close, so after a crash it could
+  -- be any number of acknowledged commits behind, and acknowledged frames past it that came back
+  -- as zeros were cut as a torn tail.
+  suite.it('refuses acknowledged commits that come back as zeros, however recent', function()
+    local disk = closedStore(5)
+    local before = #disk.visible()[Log]
+    local again = open(disk)
+    for index = 6, 8 do again:insert('events', { id = index, body = `row {index}` }) end
+
+    disk.crash()
+    local whole = disk.surviving()[Log]
+    expect(#whole > before).toBe(true)
+    expect((walmark.read(disk.backend, Log) :: walmark.Mark).length).toBe(#whole)
+    overwrite(disk, Log, string.sub(whole, 1, before) .. string.rep('\0', #whole - before))
+    -- The open raises; the refusal is the assertion.
+    local opened, problem = pcall(open, disk)
+    expect(opened).toBe(false)
+    expect((string.find(tostring(problem), 'invalid frame length', 1, true)) ~= nil).toBe(true)
+    expect(#disk.visible()[Log]).toBe(#whole)
+  end)
+
+  suite.it('cuts a last frame that page-at-a-time writeback kept only the start of', function()
+    local disk = closedStore(5)
+    local whole = disk.visible()[Log]
+    -- The frame a sixth commit of a long row appends, made on a copy and never acknowledged here.
+    local scratch = memfs.new()
+    assert((scratch.backend.createDurable(Log, whole)))
+    assert((scratch.backend.createDurable(walmark.path(Log), disk.visible()[walmark.path(Log)])))
+    local other = sql.open(Log, { durability = 'sync', storage = scratch.backend })
+    other:insert('events', { id = 6, body = string.rep('y', 10000) })
+    other:close()
+    local frame = string.sub(scratch.visible()[Log], #whole + 1)
+    local kept = 4096 - #whole % 4096
+    for _, tail in { string.sub(frame, 1, kept) .. string.rep('\0', #frame - kept),
+      string.sub(frame, 1, kept) .. string.rep('\0', #frame - kept + 100) } do
+      local torn = closedStore(5)
+      overwrite(torn, Log, whole .. tail)
+      expect(rows(torn)).toBe(5)
+      expect(#torn.visible()[Log]).toBe(#whole)
+    end
+
+    -- The same frame with anything but zeros after where it claims to end is not a torn tail.
+    local garbled = closedStore(5)
+    overwrite(garbled, Log, whole .. string.sub(frame, 1, kept) .. string.rep('\0', #frame - kept) .. 'x')
+    -- The open raises; the refusal is the assertion.
+    expect((pcall(open, garbled))).toBe(false)
+  end)
+
+  suite.it('cuts no more zeros than one batch of frames can leave unsynchronized', function()
+    -- 256 frames of at most 1024 bytes, each behind its 8-byte header.
+    local reach = 256 * (8 + 1024)
+    for _, case in { { zeros = reach, opens = true }, { zeros = reach + 1, opens = false } } do
+      local disk = memfs.new()
+      local function openSmall(): sql.PersistentDatabase
+        return sql.open(Log, { durability = 'sync', maxFrameBytes = 1024, storage = disk.backend })
+      end
+
+      local db = openSmall()
+      db:createTable('events', { 'id' }, 'id')
+      db:insert('events', { id = 1 })
+      db:close()
+      local body = disk.visible()[Log]
+      overwrite(disk, Log, body .. string.rep('\0', case.zeros))
+      -- The open raises for the tail that is refused; whether it opened is the assertion.
+      local opened, reopened = pcall(openSmall)
+      expect(`{case.zeros}: {opened}`).toBe(`{case.zeros}: {case.opens}`)
+      if opened then (reopened :: sql.PersistentDatabase):close() end
+    end
+  end)
+
   -- A process killed while a new log's first bytes were written left nothing, or part of its
   -- header, which was refused for good as a header that is not one.
   suite.it('makes a new log again whose making was cut off before its header was whole', function()
@@ -532,6 +610,51 @@ suite.describe('a managed database', function()
       db:close()
       expect(`"{left}": {rows(disk)}`).toBe(`"{left}": 1`)
     end
+  end)
+
+  -- Re-review of 2026-11-13: a log damaged to nothing, or to part of its header, was taken for
+  -- an unfinished new one and remade, and its mark with it.
+  suite.it('does not remake a log whose mark says transactions were committed to it', function()
+    for _, left in { '', 'JQL' } do
+      local disk = closedStore(9)
+      local mark = disk.visible()[walmark.path(Log)]
+      expect((walmark.read(disk.backend, Log) :: walmark.Mark).sequence).toBe(10)
+      overwrite(disk, Log, left)
+      -- The open raises; the refusal is the assertion.
+      local opened, problem = pcall(open, disk)
+      expect(`"{left}": {opened}`).toBe(`"{left}": false`)
+      expect((string.find(tostring(problem), 'it was damaged', 1, true)) ~= nil).toBe(true)
+      expect(disk.visible()[Log]).toBe(left)
+      expect(disk.visible()[walmark.path(Log)]).toBe(mark)
+    end
+  end)
+
+  -- Re-review of 2026-11-13: a hybrid opened on its own, with no manifest, took its own log for
+  -- one a manifest had just named, and opened empty over a lost one.
+  suite.it('refuses a hybrid opened on its own over a log that was lost', function()
+    local disk = memfs.new()
+    local count = 0
+    sql.paged.create('/memory/h.base', { 'id', 'value' }, 'id', function(): Row?
+      count += 1
+      if count > 10 then return nil end
+      return { id = count, value = count }
+    end, { storage = disk.backend })
+
+    local function openHybrid(): sql.HybridDatabase
+      return sql.hybrid.open('/memory/h.wal', '/memory/h.base', 'events', { durability = 'sync', storage = disk.backend })
+    end
+
+    local db = openHybrid()
+    for id = 11, 15 do db:transaction(function(tx) tx:insert({ id = id, value = id }) end) end
+
+    db:close()
+    local mark = disk.visible()['/memory/h.wal.committed']
+    assert((disk.backend.remove('/memory/h.wal')))
+    -- The open raises; the refusal is the assertion.
+    local opened, problem = pcall(openHybrid)
+    expect(opened).toBe(false)
+    expect((string.find(tostring(problem), 'the log is gone', 1, true)) ~= nil).toBe(true)
+    expect(disk.visible()['/memory/h.wal.committed']).toBe(mark)
   end)
 
   suite.it('says whether a log is witnessed, so one running without its mark is seen', function()
