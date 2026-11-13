@@ -16,6 +16,11 @@ export type Row = { [string]: unknown }
 export type Options = { maxFrameBytes: number?, recoverTail: boolean?, queryCacheEntries: number?, rowLayout: string?, durability: string?, trackPayloadBytes: boolean?,
   -- The backend the database lives on; without it, the VM default at the time it is opened.
   storage: vfs.Backend?,
+  -- For a database whose manifest names its logs (managed, catalog): a log that is not there is
+  -- one the manifest has just named, and a mark of that name left beside no log says nothing
+  -- about it. Without this, a mark that says transactions were committed to a log that is gone
+  -- refuses the open.
+  manifestNamesLog: boolean?,
   -- Fault injection for deterministic tests of uncertain batch acknowledgments.
   batchTestHook: ((string) -> ())? }
 export type BatchResult = { ok: boolean, error: string? }
@@ -42,6 +47,10 @@ export type Store = {
   stats: (self: Store) -> { [string]: TableMetrics },
   tableFootprint: (self: Store, name: string) -> { rows: number, payloadBytes: number? },
   cacheStats: (self: Store) -> CacheMetrics,
+  -- Whether the log's committed length is being witnessed: `witnessed` (a synchronized log with
+  -- its mark), `unwitnessed` (synchronized, but the mark could not be made: a log found short
+  -- will not be caught), or `not-synchronized`.
+  witness: ((self: Store) -> string)?,
   checkpoint: (self: Store) -> (),
   close: (self: Store) -> (),
 }
@@ -1545,6 +1554,38 @@ local function load(state: DatabaseState, recoverTail: boolean)
   end
   local offset = #Magic
   local limit = state.maxFrameBytes
+  -- The other witness to where the log ends, read before the log is: it also says which broken
+  -- frame at the end can only be a write a power cut tore.
+  local witness, committed = walmark.examine(state.fs, state.path)
+  if witness == 'damaged' then
+    reader:close()
+    -- Not the same as no mark: something wrote one and it cannot be read now, so whether the
+    -- log beside it is whole cannot be said. Refused, as a log found short is.
+    error(`jessql storage: the committed-length mark beside the log is damaged, so it cannot be said whether the log is whole (remove {walmark.path(state.path)} to accept the log as it is)`, 2)
+  end
+
+  -- Whether every byte from `from` to the end is zero.
+  local function zeroFrom(from: number): boolean
+    local at = from
+    while at < size do
+      local piece = reader:readAt(at, math.min(1048576, size - at))
+      if not piece or buffer.len(piece) == 0 then return false end
+      if string.find(buffer.tostring(piece), '[^\0]') then return false end
+      at += buffer.len(piece)
+    end
+
+    return true
+  end
+
+  -- A frame that cannot be read is a torn tail, to be cut, only when it lies wholly past what
+  -- the mark says was committed and everything from it on is zeros: blocks a power cut left
+  -- allocated and never written. That was never acknowledged. Anything else is refused as
+  -- before (review of 2026-11-13: such a tail made a sound store refuse to open).
+  local function tornTail(zerosFrom: number): boolean
+    return recoverTail and committed ~= nil and offset >= committed.length and state.sequence >= committed.sequence
+      and zeroFrom(zerosFrom)
+  end
+
   while offset < size do
     if size - offset < HeaderBytes then break end
     local header = reader:readAt(offset, HeaderBytes)
@@ -1555,6 +1596,8 @@ local function load(state: DatabaseState, recoverTail: boolean)
     local length = buffer.readu32(header, 0)
     local checksum = buffer.readu32(header, 4)
     if length == 0 or length > limit then
+      if tornTail(offset) then break end
+
       reader:close()
       error('jessql storage: invalid frame length', 2)
     end
@@ -1567,6 +1610,8 @@ local function load(state: DatabaseState, recoverTail: boolean)
     end
     local payload = buffer.tostring(body)
     if bytes.crc32(payload) ~= checksum then
+      if tornTail(offset + HeaderBytes) then break end
+
       reader:close()
       error('jessql storage: checksum mismatch', 2)
     end
@@ -1581,15 +1626,8 @@ local function load(state: DatabaseState, recoverTail: boolean)
     offset += HeaderBytes + length
   end
   reader:close()
-  -- The other witness to where the log ends. A log shorter than its mark did not get that way
-  -- by a crash: it was damaged or replaced, and is refused before anything is truncated.
-  local witness, committed = walmark.examine(state.fs, state.path)
-  if witness == 'damaged' then
-    -- Not the same as no mark: something wrote one and it cannot be read now, so whether the
-    -- log beside it is whole cannot be said. Refused, as a log found short is.
-    error(`jessql storage: the committed-length mark beside the log is damaged, so it cannot be said whether the log is whole (remove {walmark.path(state.path)} to accept the log as it is)`, 2)
-  end
-
+  -- A log shorter than its mark did not get that way by a crash: it was damaged or replaced, and
+  -- is refused before anything is truncated.
   if committed and (committed.length > offset or committed.sequence > state.sequence) then
     error(`jessql storage: the log holds {state.sequence} transactions in {offset} bytes, fewer than the {committed.sequence} in {committed.length} bytes it was recorded to hold: it was damaged or replaced by an older copy (remove {walmark.path(state.path)} only to accept that loss)`, 2)
   end
@@ -1691,7 +1729,26 @@ function storage.open(path: string, options: Options?): Store
 
   -- Opening can fail on invalid frames; release the advisory lock on failure.
   local ok, failure = pcall(function()
+    -- A synchronized log made by a process killed before its first bytes were whole: nothing
+    -- or part of the header. It can hold no transaction, and is made again rather than refused.
+    if durability == 'sync' and fs.exists(path) then
+      local held = fs.readFileString(path)
+      if held ~= nil and #held < #Magic and string.sub(Magic, 1, #held) == held then
+        local removed, removeError = fs.remove(path)
+        if not removed then error('jessql storage: an unfinished log could not be removed: ' .. tostring(removeError)) end
+      end
+    end
+
     if not fs.exists(path) then
+      -- A log that is gone while its mark says transactions were committed to it was lost, not
+      -- never made: refused, as a log found short is (review of 2026-11-13: it was opened empty
+      -- and the mark, the only evidence, deleted). A mark that cannot be read is refused too.
+      local witness, recorded = walmark.examine(fs, path)
+      local named = options ~= nil and options.manifestNamesLog == true
+      if not named and (witness == 'damaged' or (recorded and recorded.sequence > 0)) then
+        error(`jessql storage: the log is gone, and the committed-length mark beside it says {if recorded then recorded.sequence else 'some'} transactions were committed to it: it was lost or moved (remove {walmark.path(path)} only to accept that loss and start an empty log)`)
+      end
+
       local count, writeError: string?
       if durability == 'sync' then
         count, writeError = fs.createDurable(path, Magic)
@@ -2061,6 +2118,12 @@ function storage.open(path: string, options: Options?): Store
   end
 
   -- Snapshot-only counters for verifying memory growth and index maintenance.
+  function db.witness(_self: Store): string
+    if state.durability ~= 'sync' then return 'not-synchronized' end
+
+    return if state.mark then 'witnessed' else 'unwitnessed'
+  end
+
   function db.stats(_self: Store): { [string]: TableMetrics }
     ready()
     local output: { [string]: TableMetrics } = {}

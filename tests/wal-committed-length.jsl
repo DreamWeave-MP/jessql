@@ -151,10 +151,15 @@ suite.describe('what the mark does not claim', function()
     db:close()
     expect(disk.visible()[walmark.path(Log)]).toBe(nil)
 
-    -- A mark left behind by a log that is gone says nothing about the log that replaces it.
+    -- A mark left behind by a log that is gone says transactions were committed to a log that is
+    -- no longer there: the open is refused (review of 2026-11-13; this used to start an empty log
+    -- and delete the mark). Removing the mark is accepting that, and the new log is witnessed.
     local stale = closedStore(5)
     assert((stale.backend.remove(Log)))
     assert((stale.backend.remove(Log .. '.lock')))
+    -- The open raises; the refusal is the assertion.
+    expect((pcall(open, stale))).toBe(false)
+    assert((stale.backend.remove(walmark.path(Log))))
     local fresh = open(stale)
     fresh:createTable('events', { 'id', 'body' }, 'id')
     fresh:insert('events', { id = 1, body = 'new' })
@@ -465,6 +470,85 @@ suite.describe('a managed database', function()
     local fresh = sql.managed.create('/memory/n', { tableName = 'events', columns = { 'id' }, primaryKey = 'id', storage = leftover.backend })
     fresh:insert({ id = 1 })
     fresh:close()
+  end)
+
+  -- Review of 2026-11-13: a log that was lost while its mark survived was opened empty, and the
+  -- mark (the only evidence of the loss) deleted.
+  suite.it('refuses to start an empty log where a lost one had committed transactions, until the mark is removed', function()
+    local disk = closedStore(5)
+    local mark = disk.visible()[walmark.path(Log)]
+    assert((disk.backend.remove(Log)))
+    assert((disk.backend.remove(Log .. '.lock')))
+    -- The open raises; the refusal is the assertion.
+    local opened, problem = pcall(open, disk)
+    expect(opened).toBe(false)
+    expect((string.find(tostring(problem), 'the log is gone', 1, true)) ~= nil).toBe(true)
+    expect(disk.visible()[walmark.path(Log)]).toBe(mark)
+    -- Removing the mark is accepting the loss: an empty log, witnessed from nothing again.
+    assert((disk.backend.remove(walmark.path(Log))))
+    local db = open(disk)
+    expect(#db:tables()).toBe(0)
+    db:close()
+  end)
+
+  -- Review of 2026-11-13: a power cut can leave a log's end allocated and never written. Past
+  -- what the mark says was committed, that is a tail nobody was told of: cut, not refused.
+  suite.it('cuts a tail of zeros past the committed length, and refuses anything else there', function()
+    for _, case in { 'zeros', 'header-then-zeros', 'garbage' } do
+      local disk = closedStore(5)
+      local body = disk.visible()[Log]
+      local tail = if case == 'zeros' then string.rep('\0', 64)
+        elseif case == 'header-then-zeros' then string.pack('<I4I4', 40, 12345) .. string.rep('\0', 40)
+        else string.pack('<I4I4', 40, 12345) .. string.rep('x', 40)
+      overwrite(disk, Log, body .. tail)
+      -- The open raises for the tail that is refused; whether it opened is the assertion.
+      local opened, db = pcall(open, disk)
+      expect(`{case}: {opened}`).toBe(`{case}: {case ~= 'garbage'}`)
+      if opened then
+        (db :: sql.PersistentDatabase):close()
+        expect(`{case}: {rows(disk)}`).toBe(`{case}: 5`)
+        expect(`{case}: {#disk.visible()[Log]}`).toBe(`{case}: {#body}`)
+      end
+    end
+
+    -- Zeros where the mark says committed transactions were are damage, and refused as before.
+    local disk = closedStore(5)
+    local body = disk.visible()[Log]
+    local ends = frameEnds(body)
+    overwrite(disk, Log, string.sub(body, 1, ends[4]) .. string.rep('\0', #body - ends[4]))
+    -- The open raises; the refusal is the assertion.
+    expect((pcall(open, disk))).toBe(false)
+  end)
+
+  -- A process killed while a new log's first bytes were written left nothing, or part of its
+  -- header, which was refused for good as a header that is not one.
+  suite.it('makes a new log again whose making was cut off before its header was whole', function()
+    for _, left in { '', 'JQL' } do
+      local disk = memfs.new()
+      assert((disk.backend.createDurable(Log, left)))
+      local db = open(disk)
+      db:createTable('events', { 'id', 'body' }, 'id')
+      db:insert('events', { id = 1, body = 'row 1' })
+      db:close()
+      expect(`"{left}": {rows(disk)}`).toBe(`"{left}": 1`)
+    end
+  end)
+
+  suite.it('says whether a log is witnessed, so one running without its mark is seen', function()
+    local disk = memfs.new()
+    local db = open(disk)
+    expect((db :: any):witness()).toBe('witnessed')
+    db:close()
+
+    -- The mark cannot be made: the store runs, and says it is unwitnessed.
+    local bare = memfs.new()
+    bare.inject(function(step: string, path: string, _occurrence: number): memfs.Fault?
+      if step == 'createDurable' and string.find(path, walmark.Suffix, 1, true) then return { message = 'no space' } end
+      return nil
+    end)
+    local running = open(bare)
+    expect((running :: any):witness()).toBe('unwitnessed')
+    running:close()
   end)
 end)
 

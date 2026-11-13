@@ -458,7 +458,7 @@ function hybrid.open(walPath: string, snapshotPath: string | { string }, tableNa
   local ok, failure = pcall(function()
     hot = storage.open(walPath, { rowLayout = if options then options.rowLayout else 'packed',
       durability = if options then options.durability else nil,
-      trackPayloadBytes = if options then options.trackPayloadBytes else nil, storage = fs })
+      trackPayloadBytes = if options then options.trackPayloadBytes else nil, storage = fs, manifestNamesLog = true })
   end)
 
   if not ok then

@@ -276,7 +276,8 @@ local function openOverlay(fs: vfs.Backend, base: string, value: Catalog, option
   -- A locked or damaged log raises; the cold readers are closed before that is reported.
   local opened, failure = pcall(function()
     local store = storage.open(wal, { rowLayout = if options then options.rowLayout else 'packed',
-      durability = 'sync', trackPayloadBytes = options ~= nil and options.maxHotBytes ~= nil, storage = fs })
+      durability = 'sync', trackPayloadBytes = options ~= nil and options.maxHotBytes ~= nil, storage = fs,
+      manifestNamesLog = true })
     hot = store
     local existing: { [string]: { string } } = {}
     local count = 0
