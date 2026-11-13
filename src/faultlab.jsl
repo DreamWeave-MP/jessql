@@ -29,7 +29,10 @@
 local bytes = require('@dream/bytes')
 local memfs = require('@jessql/memfs')
 
-export type Mode = 'crash' | 'fail' | 'fail-live'
+-- `torn` is a crash where what was being written is torn rather than lost: a file keeps the size
+-- it had and zeros where its unsynchronized bytes were, and a `createDurable` it stops leaves its
+-- name with no bytes. Not among the defaults: a scenario asks for it.
+export type Mode = 'crash' | 'fail' | 'fail-live' | 'torn'
 
 -- Kept by the laboratory across one run. A scenario calls `begin` before it attempts a commit,
 -- with how many rows that commit carries, and `acknowledge` once the commit call has returned.
@@ -179,6 +182,12 @@ local function stopped(disk: memfs.Disk, stop: number?, mode: Mode, body: () -> 
       dead = true
       disk.crash()
       return { message = 'faultlab: the process is gone', kind = 'other' }
+    end
+
+    if mode == 'torn' then
+      dead = true
+      disk.crash({ torn = true })
+      return { message = 'faultlab: the process is gone', kind = if string.sub(step, 1, 13) == 'createDurable' then 'torn' else 'other' }
     end
 
     return { message = 'faultlab: no space left on device', kind = 'other' }

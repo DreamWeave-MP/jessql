@@ -36,7 +36,9 @@ export type Disk = {
   -- Pass as `storage` when opening a database, or install as the VM default with `vfs.use`.
   backend: vfs.Backend,
   -- Discards everything not synchronized, releases every lock and invalidates every open handle.
-  crash: () -> (),
+  -- With `torn`, a file whose size changed since it was last synchronized keeps that size: grown,
+  -- its old bytes then zeros; cut, its old bytes as far as it now goes.
+  crash: (options: CrashOptions?) -> (),
   inject: (injector: Injector?) -> (),
   -- Every operation since creation, as `step path`, in order.
   steps: () -> { string },
@@ -51,6 +53,7 @@ export type Disk = {
 }
 
 export type Options = { cwd: string? }
+export type CrashOptions = { torn: boolean? }
 
 local memfs = {}
 
@@ -85,6 +88,8 @@ function memfs.new(options: Options?): Disk
   local injector: Injector? = nil
   -- Bumped by a crash: a handle opened before it belongs to a process that is gone.
   local generation = 0
+  -- The writers open now, by what hands their unwritten bytes to their file.
+  local openHands: { [() -> ()]: boolean } = {}
   local limit: number? = nil
 
   local function used(): number
@@ -110,11 +115,13 @@ function memfs.new(options: Options?): Disk
     return string.match(path, '^(.*)/[^/]*$') or ''
   end
 
+  -- A directory is an entry in its parent like a file: its name survives once the parent is
+  -- synchronized (review of 2026-11-13: they survived at once). Those the disk starts with do.
+  local starting = true
   local function directory(path: string): Inode
     local node: Inode = { kind = 'dir', data = '', durable = '' }
     names[path] = node
-    -- Directories themselves are not what this models losing: only the entries inside them.
-    durableNames[path] = node
+    if starting or path == '' then durableNames[path] = node end
     return node
   end
 
@@ -128,6 +135,7 @@ function memfs.new(options: Options?): Disk
 
   directory('')
   makeParents(cwd .. '/x')
+  starting = false
 
   -- nil to proceed, or the failure an injector asked for.
   local function step(name: string, path: string): (string?, string?)
@@ -379,7 +387,9 @@ function memfs.new(options: Options?): Disk
     local returned = if node and not settings.append and not settings.offset then #node.data else 0
     if full(#text - returned) then return nil, 'no space left on device', 'other' end
 
-    local file: Inode = if node then node else { kind = 'file', data = '', durable = '' }
+    -- An atomic write is a new file renamed over the name: the file there before, and what it
+    -- last synchronized, stay what a crash finds until the directory is synchronized.
+    local file: Inode = if node and not settings.atomic then node else { kind = 'file', data = '', durable = '' }
     if settings.append then
       file.data ..= text
     elseif settings.offset then
@@ -481,6 +491,9 @@ function memfs.new(options: Options?): Disk
       table.clear(pending)
     end
 
+    -- A torn crash hands over what an open writer holds: written, so its size can reach the disk.
+    openHands[hand] = true
+
     function writer.write(_self: unknown, data: buffer | string, offset: number?, length: number?): (number?, string?, string?)
       local refused, refusedKind = refuse('write')
       if refused then return nil, refused, refusedKind end
@@ -542,6 +555,7 @@ function memfs.new(options: Options?): Disk
       local injected, injectedKind = step('close', resolved)
       if injected then return nil, injected, injectedKind end
       hand()
+      openHands[hand] = nil
       return true, nil, nil
     end
 
@@ -632,16 +646,46 @@ function memfs.new(options: Options?): Disk
   local exposed = (backend :: unknown) :: vfs.Backend
   return {
     backend = exposed,
-    crash = function()
+    crash = function(crashOptions: CrashOptions?)
       generation += 1
       table.clear(locks)
+      local torn = crashOptions ~= nil and crashOptions.torn == true
+      -- What open writers were given had been handed to the system: in a torn crash it makes the
+      -- files that long, and is then torn with the rest of what was not synchronized.
+      if torn then
+        for hand in openHands do hand() end
+      end
+
+      table.clear(openHands)
 
       -- Names go back to what the directories last had synchronized, and every file to the bytes
       -- it last had synchronized.
       table.clear(names)
       for path, node in durableNames do
-        if node.kind == 'file' then node.data = node.durable end
+        if node.kind == 'file' then
+          if torn and #node.data ~= #node.durable then
+            -- Its size reached the disk and its new bytes did not: grown, the old bytes and then
+            -- zeros; cut, the old bytes as far as it now goes. Bytes rewritten in place are a
+            -- torn sector's business, which this does not model.
+            node.durable = string.sub(node.durable, 1, math.min(#node.data, #node.durable))
+              .. string.rep('\0', math.max(0, #node.data - #node.durable))
+          end
+
+          node.data = node.durable
+        end
+
         names[path] = node
+      end
+
+      -- An entry whose directory did not survive did not either, and so on down.
+      local paths: { string } = {}
+      for path in names do table.insert(paths, path) end
+      table.sort(paths, function(left: string, right: string): boolean return #left < #right end)
+      for _, path in paths do
+        if path ~= '' and not names[parentOf(path)] then
+          names[path] = nil
+          durableNames[path] = nil
+        end
       end
     end,
     inject = function(next: Injector?) injector = next end,

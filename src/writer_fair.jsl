@@ -30,7 +30,8 @@
 --     counts towards the shares for `waitSeconds`.
 --
 -- Nothing waits in here and nothing is queued: a refusal is the caller's to retry. What is
--- promised is that no tenant that keeps asking, at least once every `claimSeconds`, is shut out by
+-- promised is that no tenant that keeps asking, sooner each time than `claimSeconds` after the
+-- last (one asking exactly that late finds its turn just gone, every time), is shut out by
 -- another that asks more: it is admitted once the tenants that began waiting before it have had
 -- the places freed. The promise needs waiting to be remembered: with `waitSeconds = 0` nothing
 -- is, and none is made.

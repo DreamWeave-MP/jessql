@@ -270,6 +270,17 @@ suite.describe('the store, stopped at every storage step', function()
     end)
   end
 
+  -- Review of 2026-11-13: the model only ever lost unsynchronized bytes whole, and made every
+  -- `createDurable` whole or not at all; a real disk can leave a tail of zeros and a name with no
+  -- bytes. The same stores, stopped at every step with what was being written torn.
+  suite.it('keeps every acknowledged commit when what was being written is torn, not lost', function()
+    for _, scenario in { walScenario(), managedScenario('flush'), managedScenario('checkpoint') } do
+      local report = lab.run(scenario, { modes = { 'torn' } })
+      expect(`{scenario.name}: {findings(report)}`).toBe(`{scenario.name}: `)
+      expect(report.truncated).toBe(false)
+    end
+  end)
+
   suite.it('recovers a flush whose recovery is itself crashed at every step', function()
     local report = lab.run(managedScenario('flush'), { modes = { 'crash' }, crashRecovery = true })
     expect(findings(report)).toBe('')
