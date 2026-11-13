@@ -610,17 +610,22 @@ suite.describe('a managed database', function()
 
     -- Its length raised by one bit, still within the limit, so the frame looks cut short: its
     -- payload is all there and checks, so the length is damaged, and that is refused too, with
-    -- the log alone or with zeros a later torn append left after it.
+    -- the log alone or with zeros a later torn append left after it; and raised less, so that it
+    -- ends inside those zeros, where a torn frame would end too (re-review of J-FINAL-01).
     local length = buffer.readu32(buffer.fromstring(frame), 0)
     expect(bit32.band(length, 0x100000)).toBe(0)
-    local lengthened = string.pack('<I4', bit32.bor(length, 0x100000)) .. string.sub(frame, 5)
-    for _, after in { '', string.rep('\0', 64) } do
-      local overlong = whole .. lengthened .. after
+    local zeros = string.rep('\0', 64)
+    local raisings = { { bit32.bor(length, 0x100000), '' }, { bit32.bor(length, 0x100000), zeros }, { length + 1, zeros },
+      { length + 60, zeros } }
+
+    for _, raising in raisings do
+      local raised, after = raising[1] :: number, raising[2] :: string
+      local overlong = whole .. string.pack('<I4', raised) .. string.sub(frame, 5) .. after
       local stretched = closedStore(5)
       overwrite(stretched, Log, overlong)
       -- The open raises; the refusal is the assertion.
       local stretchedOpened, stretchedProblem = pcall(open, stretched)
-      expect(`{#after}: {stretchedOpened}`).toBe(`{#after}: false`)
+      expect(`{raised} {#after}: {stretchedOpened}`).toBe(`{raised} {#after}: false`)
       expect((string.find(tostring(stretchedProblem), 'invalid frame length', 1, true)) ~= nil).toBe(true)
       expect(stretched.visible()[Log] == overlong).toBe(true)
       expect(stretched.visible()[walmark.path(Log)] == mark).toBe(true)
@@ -666,20 +671,25 @@ suite.describe('a managed database', function()
     overwrite(intact, Log, whole .. frames)
     expect(rows(intact)).toBe(7)
 
+    -- Raised past the end of the log, with and without zeros after it, and raised to end inside
+    -- zeros after the frame that follows it, where a torn frame would end too.
     local length = buffer.readu32(buffer.fromstring(frames), 0)
-    for _, raised in { bit32.bor(length, 0x100000), bit32.bxor(length, 0x2000) } do
-      expect(raised > #frames).toBe(true)
-      for _, after in { '', string.rep('\0', 64) } do
-        local overlong = whole .. string.pack('<I4', raised) .. string.sub(frames, 5) .. after
-        local disk = closedStore(5)
-        overwrite(disk, Log, overlong)
-        -- The open raises; the refusal is the assertion.
-        local opened, problem = pcall(open, disk)
-        expect(`{raised} {#after}: {opened}`).toBe(`{raised} {#after}: false`)
-        expect((string.find(tostring(problem), 'invalid frame length', 1, true)) ~= nil).toBe(true)
-        expect(disk.visible()[Log] == overlong).toBe(true)
-        expect(disk.visible()[walmark.path(Log)] == mark).toBe(true)
-      end
+    local zeros = string.rep('\0', 64)
+    local raisings = { { bit32.bor(length, 0x100000), '' }, { bit32.bor(length, 0x100000), zeros },
+      { bit32.bxor(length, 0x2000), '' }, { bit32.bxor(length, 0x2000), zeros }, { #frames - 8 + 32, zeros } }
+
+    for _, raising in raisings do
+      local raised, after = raising[1] :: number, raising[2] :: string
+      expect(raised > #frames - 8).toBe(true)
+      local overlong = whole .. string.pack('<I4', raised) .. string.sub(frames, 5) .. after
+      local disk = closedStore(5)
+      overwrite(disk, Log, overlong)
+      -- The open raises; the refusal is the assertion.
+      local opened, problem = pcall(open, disk)
+      expect(`{raised} {#after}: {opened}`).toBe(`{raised} {#after}: false`)
+      expect((string.find(tostring(problem), 'invalid frame length', 1, true)) ~= nil).toBe(true)
+      expect(disk.visible()[Log] == overlong).toBe(true)
+      expect(disk.visible()[walmark.path(Log)] == mark).toBe(true)
     end
   end)
 

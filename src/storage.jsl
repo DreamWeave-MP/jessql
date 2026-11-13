@@ -1676,8 +1676,16 @@ local function load(state: DatabaseState, recoverTail: boolean)
       -- torn when its own last byte is a zero, which no payload ends in, and nothing but zeros
       -- follows where it claims to end. A frame that is all there and does not check is damage,
       -- refused: zeros after it, or none, say nothing of it (J-FINAL-01: a changed byte in an
-      -- acknowledged last frame past a mark behind it was cut as a tear).
-      if buffer.readu8(body, length - 1) == 0 and tornTail(offset + HeaderBytes + length) then break end
+      -- acknowledged last frame past a mark behind it was cut as a tear). Nor is one whose bytes
+      -- hold a whole object before the zeros: the start of a payload never does, so its payload
+      -- is all there and its length was raised into zeros after it (re-review). The scan is
+      -- bounded: `tornTail` has held what is left of the log to one batch.
+      if buffer.readu8(body, length - 1) == 0 and tornTail(offset + HeaderBytes + length) then
+        if not wholeObjectFrom(offset + HeaderBytes) then break end
+
+        reader:close()
+        error('jessql storage: invalid frame length', 2)
+      end
 
       reader:close()
       error('jessql storage: checksum mismatch', 2)
