@@ -2,6 +2,7 @@
 -- #32: a queue bounded by what it holds, not only by how many. A request has a weight; one too
 -- heavy is refused, and so is one that would take the queue, or what a client has sent and not
 -- had answered, past its bytes. The limits are held before a message enters a worker's mailbox.
+local fair = require('@jessql/writer_fair')
 local memfs = require('@jessql/memfs')
 local service = require('@jessql/writer_service')
 local sql = require('@jessql')
@@ -64,9 +65,9 @@ suite.describe('a writer bounded in bytes', function()
   suite.it('refuses what would take the queue past its bytes, and takes it again once the queue has drained', function()
     local disk = memfs.new()
     local db = sql.catalog.create('/memory/full', { tables = Tables, storage = disk.backend })
-    -- A request of 1,500 bytes of body weighs 2,134: three fit in 7,100, a fourth does not, and
-    -- a small one (644) still does.
-    local queue = writer.new(db, { maxQueued = 1000, maxRequestBytes = 3000, maxQueuedBytes = 7100 })
+    -- A request of 1,500 bytes of body weighs 2,294: three fit in 7,700, a fourth does not, and
+    -- a small one (804) still does.
+    local queue = writer.new(db, { maxQueued = 1000, maxRequestBytes = 3000, maxQueuedBytes = 7700 })
     local each = select(3, writer.snapshot(sized('q0', 0, 1500)))
     for number = 1, 3 do expect(queue:submit(sized(`q{number}`, number, 1500)).admitted).toBe(true) end
 
@@ -115,8 +116,8 @@ suite.describe('a writer bounded in bytes', function()
       end,
     }
 
-    -- As above: three requests of 2,134 and an empty one fit 7,100 outstanding; a fourth does not.
-    local client = service.client(lane, { maxRequestBytes = 3000, maxOutstandingBytes = 7100 })
+    -- As above: three requests of 2,294 and an empty one fit 7,700 outstanding; a fourth does not.
+    local client = service.client(lane, { maxRequestBytes = 3000, maxOutstandingBytes = 7700 })
     assert(client:open('/memory/served', Tables))
     carried = 0
     -- Too heavy: refused here, and the mailbox never saw it.
@@ -131,10 +132,10 @@ suite.describe('a writer bounded in bytes', function()
 
     local full = client:submit(sized('c4', 4, 1500))
     expect(`{tostring(full.admitted)} {tostring(full.reason)}`).toBe('false backpressure')
-    expect(client:status().outstandingBytes <= 7100).toBe(true)
+    expect(client:status().outstandingBytes <= 7700).toBe(true)
     -- What crossed the lane, weighed with every field name in it (which a request's own
     -- weight leaves out): the limit and a little a message, never megabytes.
-    expect(carried <= 7100 + 5 * 600).toBe(true)
+    expect(carried <= 7700 + 5 * 600).toBe(true)
 
     -- Answered, the bytes come back and the fourth is taken.
     expect(#client:poll(0)).toBe(4)
@@ -183,7 +184,83 @@ suite.describe('a writer bounded in bytes', function()
       local counted = client:status().outstandingBytes
       local ratio = heap / counted
       expect(`{shape}: {string.format('%.2f', ratio)} {ratio >= 0.5 and ratio <= 2}`).toBe(`{shape}: {string.format('%.2f', ratio)} true`)
+      -- Re-review of 2026-11-13: an operation with no row was counted at 160 bytes and held
+      -- about 320, 1.4 times what was counted, which the band above let through.
+      if shape == 'deletes' then
+        expect(`{shape}: {string.format('%.2f', ratio)} {ratio <= 1.2}`).toBe(`{shape}: {string.format('%.2f', ratio)} true`)
+      end
     end
+  end)
+
+  -- Re-review of 2026-11-13: anything but a string, a number, a boolean or NULL weighed one
+  -- byte, so a 64 MiB buffer beside a request was admitted as a few hundred bytes and sent on.
+  suite.it('refuses at the client what no request can hold, beside a request or as its operations', function()
+    local disk = memfs.new()
+    local host = service.host({ storage = disk.backend })
+    local mailbox: { unknown } = {}
+    local lane: service.Lane = {
+      send = function(_self: service.Lane, message: unknown) table.insert(mailbox, message) end,
+      receive = function(_self: service.Lane, _seconds: number?): unknown
+        local message = table.remove(mailbox, 1)
+        return if message ~= nil then host(message) else nil
+      end,
+    }
+
+    local client = service.client(lane)
+    assert(client:open('/memory/foreign', Tables))
+    local foreign: { [string]: unknown } = { buffer = buffer.create(16), vector = vector.create(1, 2, 3),
+      ['function'] = function() end }
+
+    for kind, value in foreign do
+      local offers: { { [string]: unknown } } = { { id = `beside-{kind}`, operations = {}, padding = value },
+        { id = `within-{kind}`, operations = { value, value } } }
+
+      for _, offered in offers do
+        local admission = client:submit(offered :: writer.Request)
+        expect(`{offered.id}: {tostring(admission.admitted)} {tostring(admission.reason)}`)
+          .toBe(`{offered.id}: false too-large`)
+      end
+    end
+
+    -- In front of the client, a tenant's request whose operations are buffers fares the same.
+    local front = fair.new({ capacity = 8,
+      submit = function(request: writer.Request): fair.Admission return client:submit(request) end,
+      poll = function(seconds: number?): { writer.Ack } return client:poll(seconds) end })
+    local buffers: { [string]: unknown } = { id = 'tenant-buffers', operations = { buffer.create(16), buffer.create(16) } }
+    local admission = front.submit('tenant', buffers :: writer.Request)
+    expect(`{tostring(admission.admitted)} {tostring(admission.reason)}`).toBe('false too-large')
+    -- None of it reached the worker's mailbox.
+    expect(#mailbox).toBe(0)
+    client:close(0)
+  end)
+
+  -- Re-review of 2026-11-13: the client held requests to the operation limit it asked for, which
+  -- the writer behind need not be the one it has.
+  suite.it('holds requests to the operation limit the writer says it has', function()
+    local sent: { unknown } = {}
+    local lane: service.Lane = {
+      send = function(_self: service.Lane, message: unknown) table.insert(sent, message) end,
+      receive = function(_self: service.Lane, _seconds: number?): unknown
+        return { kind = 'opened', version = service.Protocol, maxOperations = 2 }
+      end,
+    }
+
+    local client = service.client(lane)
+    assert(client:open('/memory/limited', Tables, { maxOperations = 64 }))
+    table.clear(sent)
+    local function deletes(id: string, count: number): writer.Request
+      local operations: { writer.Operation } = {}
+      for index = 1, count do operations[index] = { op = 'delete', table = 'events', key = index } end
+
+      return { id = id, operations = operations }
+    end
+
+    -- Within the writer's limit: sent as the writer's own frozen copy. Past it, it is no request,
+    -- and goes on as it is, weighed as such, for the writer to refuse.
+    expect(client:submit(deletes('two', 2)).admitted).toBe(true)
+    expect(client:submit(deletes('three', 3)).admitted).toBe(true)
+    local first, second = (sent[1] :: { request: unknown }).request, (sent[2] :: { request: unknown }).request
+    expect(`{table.isfrozen(first :: {})} {table.isfrozen(second :: {})}`).toBe('true false')
   end)
 end)
 

@@ -86,6 +86,7 @@ export type Writer = {
 local writer = {}
 
 writer.DefaultRequestBytes = 1024 * 1024
+writer.DefaultOperations = 256
 writer.MaxRequestBytes = 64 * 1024 * 1024
 writer.DefaultQueuedBytes = 64 * 1024 * 1024
 writer.MaxQueuedBytes = 1024 * 1024 * 1024
@@ -131,14 +132,23 @@ local freeze = table.freeze :: (value: unknown) -> unknown
 -- What a request costs where it is kept, as the Luau heap holds it, not only its bytes of text
 -- (review of 2026-11-13: counting text alone let a 64 MiB ceiling hold about 1.3 GB). A string
 -- has a header; a table has a header and a slot for every entry; an operation is a table of its
--- own, and has a slot in the request's list. Measured, not exact: rounded up.
-local StringBytes, TableBytes, EntryBytes, OperationBytes = 24, 64, 40, 160
+-- own, and has a slot in the request's list. Measured, not exact: rounded up. An operation is a
+-- frozen table of five fields with its slot in the list: about 320 bytes a delete measured
+-- (re-review of 2026-11-13: 160 counted 1.4 times too little).
+local StringBytes, TableBytes, EntryBytes, OperationBytes = 24, 64, 40, 320
 writer.Weights = table.freeze({ string = StringBytes, table = TableBytes, entry = EntryBytes, operation = OperationBytes })
 
--- What a scalar weighs in a request's byte count.
+-- What a scalar weighs in a request's byte count. Only what a request can hold has a weight: a
+-- buffer, a vector, a function or userdata outweighs every limit, so it is refused before it is
+-- sent anywhere (re-review of 2026-11-13: a 64 MiB buffer weighed 1).
 local function weight(value: unknown): number
   local kind = type(value)
-  return if kind == 'string' then StringBytes + #(value :: string) elseif kind == 'number' then 8 elseif value == nil then 0 else 1
+  if kind == 'string' then return StringBytes + #(value :: string) end
+  if kind == 'number' then return 8 end
+  if value == nil then return 0 end
+  if kind == 'boolean' or value == mutations.NULL then return 1 end
+
+  return math.huge
 end
 
 -- The third value is what the row weighs.
@@ -312,7 +322,7 @@ end
 function writer.new(db: catalog.Database, options: Options?): Writer
   local maxQueued = if options and options.maxQueued ~= nil then options.maxQueued else 1024
   local maxBatch = if options and options.maxBatch ~= nil then options.maxBatch else 64
-  local maxOperations = if options and options.maxOperations ~= nil then options.maxOperations else 256
+  local maxOperations = if options and options.maxOperations ~= nil then options.maxOperations else writer.DefaultOperations
   if not whole(maxQueued, 1, 65536) then error('jessql writer: invalid maxQueued', 2) end
   if not whole(maxBatch, 1, 256) then error('jessql writer: invalid maxBatch', 2) end
   if not whole(maxOperations, 1, 4096) then error('jessql writer: invalid maxOperations', 2) end
