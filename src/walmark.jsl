@@ -139,7 +139,17 @@ function walmark.open(fs: vfs.Backend, log: string): Writer?
     -- another name and then put in place, as a manifest is published.
     local empty = Magic .. slot(0, 0) .. slot(0, 0)
     local candidate = path .. walmark.CandidateSuffix
-    if fs.exists(candidate) and not fs.remove(candidate) then return nil end
+    if fs.exists(candidate) then
+      -- Only what an interrupted creation leaves is removed: the start of a fresh mark (nothing,
+      -- part of it, or all of it). Anything else under that name is someone's file (another
+      -- store's log, say): it is not this mark's to delete, and the store does not open past it.
+      local left = fs.readFileString(candidate)
+      if left == nil or #left > #empty or string.sub(empty, 1, #left) ~= left then
+        error(`jessql storage: {candidate} is in the way of the committed-length mark and is not one; move it to open the log`, 0)
+      end
+
+      if not fs.remove(candidate) then return nil end
+    end
 
     if fs.createDurable(candidate, empty) ~= #empty then
       if fs.exists(candidate) then fs.remove(candidate) end

@@ -424,8 +424,8 @@ local function collectOrphans(fs: vfs.Backend, base: string, parent: string, val
     local orphan = false
     if string.sub(name, 1, #logPrefix) == logPrefix then
       local number, extension = string.match(string.sub(name, #logPrefix + 1), '^(%d%d%d%d%d%d%d%d)%.([%a%.]+)$')
-      orphan = number ~= nil and (extension == 'wal' or extension == 'wal.lock' or extension == 'wal.committed')
-        and tonumber(number) ~= value.epoch
+      orphan = number ~= nil and (extension == 'wal' or extension == 'wal.lock' or extension == 'wal.committed'
+        or extension == 'wal.committed.tmp') and tonumber(number) ~= value.epoch
     elseif string.sub(name, 1, #tablePrefix) == tablePrefix then
       local tableName, number, extension = string.match(string.sub(name, #tablePrefix + 1),
         '^([%l_][%l%d_]*)%.g(%d%d%d%d%d%d%d%d)%.(.+)$')

@@ -223,6 +223,39 @@ suite.describe('what the mark does not claim', function()
     end
   end)
 
+  -- Re-review of #96: what is left where the mark is made is removed only when it is the start of
+  -- a fresh mark. Another store's log under that name keeps its rows, and this log does not open.
+  suite.it('removes only what an interrupted creation of the mark leaves, never another file of that name', function()
+    local disk = memfs.new()
+    local candidate = walmark.path(Log) .. walmark.CandidateSuffix
+    local other = sql.open(candidate, { durability = 'sync', storage = disk.backend })
+    other:createTable('events', { 'id', 'body' }, 'id')
+    for index = 1, 5 do other:insert('events', { id = index, body = `row {index}` }) end
+    other:close()
+
+    -- The open raises on the file in the way; the refusal is the assertion.
+    local opened, problem = pcall(open, disk)
+    expect(opened).toBe(false)
+    expect((string.find(tostring(problem), 'is in the way of the committed-length mark', 1, true)) ~= nil).toBe(true)
+    local again = sql.open(candidate, { durability = 'sync', storage = disk.backend })
+    expect(again:query('SELECT COUNT(*) AS n FROM events').rows[1].n).toBe(5)
+    again:close()
+
+    -- Part of a fresh mark, as a full disk can leave: removed, and the mark made. A fresh mark is
+    -- what a store only opened and closed leaves.
+    local blank = memfs.new()
+    open(blank):close()
+    local whole = blank.visible()[walmark.path(Log)]
+    expect(#whole).toBe(6 + 48)
+    for _, length in { 0, 3, 6 + 24, 6 + 48 } do
+      local fresh = closedStore(2)
+      assert((fresh.backend.remove(walmark.path(Log))))
+      assert((fresh.backend.createDurable(candidate, string.sub(whole, 1, length))))
+      expect(`{length}: {rows(fresh)} {walmark.examine(fresh.backend, Log)}`).toBe(`{length}: 2 sound`)
+      expect(`{length}: {fresh.visible()[candidate]}`).toBe(`{length}: nil`)
+    end
+  end)
+
   -- Review J-03: a mark that is there and cannot be read is not the same as no mark.
   suite.it('refuses a log whose mark is damaged, cut or not, until the mark is removed by hand', function()
     -- A sound log beside a mark that cannot be read: whether the log is whole cannot be said.

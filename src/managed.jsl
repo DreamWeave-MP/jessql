@@ -253,14 +253,15 @@ local function collectOrphans(fs: vfs.Backend, base: string, parent: string, val
       '^(%d%d%d%d%d%d%d%d)%.([%a%.%-]+)$')
     if not number or (extension ~= 'rows' and extension ~= 'deleted'
       and extension ~= 'wal' and extension ~= 'wal.lock' and extension ~= 'wal.committed'
-      and extension ~= 'hot-rows' and extension ~= 'hot-deleted') then continue end
+      and extension ~= 'wal.committed.tmp' and extension ~= 'hot-rows' and extension ~= 'hot-deleted') then continue end
 
     local epoch = tonumber(number) :: number
     if epoch < 1 or epoch > MaxEpoch then continue end
     local generation = referenced[epoch]
     if (extension == 'rows' and generation ~= nil)
       or (extension == 'deleted' and generation ~= nil and generation.deleted)
-      or ((extension == 'wal' or extension == 'wal.lock' or extension == 'wal.committed') and epoch == value.epoch) then
+      or ((extension == 'wal' or extension == 'wal.lock' or extension == 'wal.committed' or extension == 'wal.committed.tmp')
+        and epoch == value.epoch) then
       continue
     end
     -- The known managed filename was not referenced by the verified manifest.
