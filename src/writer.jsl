@@ -49,7 +49,11 @@ export type Outcome = 'committed' | 'rejected' | 'unknown'
 -- transaction ran, raised, and was rolled back whole. A `rejected` without it never ran (it was
 -- refused at admission, or the writer stopped first). Either way it changed nothing; the field
 -- says which, for a caller who wants to know whether its own operations were at fault.
-export type Ack = { id: string, outcome: Outcome, error: string?, aborted: boolean? }
+-- `alreadyCommitted` is likewise only ever on a `rejected` outcome and only ever true: the
+-- writer's ledger found this very request (its id and digest) already committed, and so it was
+-- refused having changed nothing. Only the ledger's answer sets it, never an error's text: it is
+-- what a retry is told, and what a supervisor reads as `committed` (J-FINAL-02).
+export type Ack = { id: string, outcome: Outcome, error: string?, aborted: boolean?, alreadyCommitted: boolean? }
 export type Admission = { admitted: boolean, reason: string?, queued: number }
 export type Options = {
   -- The most requests waiting at once (default 1024, at most 65536). One more is refused.
@@ -300,9 +304,14 @@ function writer.digest(request: Request): string
   return bytes.sha256(table.concat(parts))
 end
 
--- One request as one transaction: every operation, or an error that leaves none of them.
-local function apply(tx: catalog.Transaction, request: Request, kept: ledger.Options?)
-  if kept then ledger.enter(tx, kept, request.id, writer.digest(request)) end
+-- One request as one transaction: every operation, or an error that leaves none of them. A
+-- request the ledger holds as committed already is refused, and `replayed` is called first: that
+-- call, not the refusal's text, is how the writer knows.
+local function apply(tx: catalog.Transaction, request: Request, kept: ledger.Options?, replayed: () -> ())
+  if kept and ledger.claim(tx, kept, request.id, writer.digest(request)) == 'committed' then
+    replayed()
+    error(ledger.AlreadyCommitted, 0)
+  end
 
   for index, operation in request.operations do
     if operation.op == 'insert' then
@@ -398,8 +407,12 @@ function writer.new(db: catalog.Database, options: Options?): Writer
     if #batch == 0 then return {} end
 
     local callbacks: { (catalog.Transaction) -> () } = {}
+    -- Which requests of this batch the ledger refused as committed before.
+    local replays: { [number]: boolean } = {}
     for index, request in batch do
-      callbacks[index] = function(tx: catalog.Transaction) apply(tx, request, kept) end
+      callbacks[index] = function(tx: catalog.Transaction)
+        apply(tx, request, kept, function() replays[index] = true end)
+      end
     end
 
     status.batches += 1
@@ -424,7 +437,8 @@ function writer.new(db: catalog.Database, options: Options?): Writer
         acks[#acks + 1] = { id = request.id, outcome = 'committed', error = nil }
         status.committed += 1
       else
-        acks[#acks + 1] = { id = request.id, outcome = 'rejected', error = result.error, aborted = true }
+        acks[#acks + 1] = { id = request.id, outcome = 'rejected', error = result.error, aborted = true,
+          alreadyCommitted = if replays[index] then true else nil }
         status.rejected += 1
       end
     end

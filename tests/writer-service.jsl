@@ -224,7 +224,7 @@ suite.describe('the writer as a service in a worker', function()
     for _, ack in second do
       if ack.outcome == 'committed' then
         fresh += 1
-      elseif ack.outcome == 'rejected' and ledger.wasCommitted(ack.error) then
+      elseif ack.outcome == 'rejected' and ack.alreadyCommitted then
         already += 1
       end
     end
@@ -286,8 +286,8 @@ suite.describe('the writer as a service in a worker', function()
     supervised:submit({ id = 'other', operations = credit(2).operations })
     local refused = supervised:poll(0)
     expect(outcomes(refused)).toBe('s1=rejected other=rejected')
-    expect(ledger.wasCommitted(refused[1].error)).toBe(true)
-    expect(ledger.wasCommitted(refused[2].error)).toBe(false)
+    expect(refused[1].alreadyCommitted == true).toBe(true)
+    expect(refused[2].alreadyCommitted == true).toBe(false)
     expect(supervised:submit(credit(9)).admitted).toBe(true)
     expect(supervised:submit(credit(9)).reason).toBe('duplicate-id')
     expect(outcomes(supervised:close(5))).toBe('s9=committed')
@@ -576,7 +576,7 @@ suite.describe('a supervisor\'s requests over time', function()
 
     expect(outcomes(acks)).toBe('order-1=rejected')
     expect(acks[1].error).toBe(ledger.Reused)
-    expect(ledger.wasCommitted(acks[1].error)).toBe(false)
+    expect(acks[1].alreadyCommitted == true).toBe(false)
     second:close(5)
     local db = sql.catalog.openExisting(Path, { storage = disk.backend })
     expect(`{db:get('events', 1) ~= nil} {db:get('events', 2) ~= nil}`).toBe('true false')
@@ -737,6 +737,64 @@ suite.describe('a supervisor\'s requests over time', function()
     table.sort(said)
     expect(table.concat(said, ' ')).toBe('c=unknown')
     expect(waiting:status().outstanding).toBe(0)
+  end)
+
+  -- J-FINAL-02 (hostile review, 2026-11-13): the supervisor read "committed before" out of an
+  -- error's text, and a request's own table name is in its error's text. A request against a
+  -- table named like the ledger's refusal, sent again to a new worker, was called committed
+  -- though it never ran. Only the ledger itself may say so, in a field, not in words.
+  local function forged(id: string): writer.Request
+    return { id = id, operations = { { op = 'insert', table = ledger.AlreadyCommitted, row = { id = 1, body = 'x' } } } }
+  end
+
+  -- Neither the request nor its id is in the database: it never ran.
+  local function absent(disk: Disk, id: string)
+    local db = sql.catalog.openExisting(Path, { storage = disk.backend })
+    expect(ledger.lookup(db, { table = 'requests', scope = 'shared' }, { id })[id]).toBe('absent')
+    expect(db:query('SELECT COUNT(*) AS n FROM requests').rows[1].n).toBe(0)
+    db:close()
+  end
+
+  suite.it('never calls a request committed because its error says the ledger\'s words, answered by poll', function()
+    local disk = memfs.new()
+    local polled, worlds = supervised(disk)
+    expect(polled:submit(forged('forged-poll')).admitted).toBe(true)
+    -- The worker dies before it handles the request; the next one runs it, and it fails.
+    worlds[#worlds].dead = true
+    local acks: { service.Ack } = {}
+    for _ = 1, 4 do
+      for _, ack in polled:poll(0) do table.insert(acks, ack) end
+    end
+
+    expect(polled:status().restarts).toBe(1)
+    expect(outcomes(acks)).toBe('forged-poll=rejected')
+    expect(acks[1].aborted).toBe(true)
+    expect(acks[1].alreadyCommitted).toBe(nil)
+    expect(#polled:close(5)).toBe(0)
+    absent(disk, 'forged-poll')
+  end)
+
+  suite.it('never calls a request committed because its error says the ledger\'s words, answered by close', function()
+    local disk = memfs.new()
+    local closing, lanes = supervised(disk)
+    expect(closing:submit(forged('forged-close')).admitted).toBe(true)
+    -- The worker dies; the next poll replaces it and sends the request again; the close answers.
+    lanes[#lanes].dead = true
+    expect(#closing:poll(0)).toBe(0)
+    expect(closing:status().restarts).toBe(1)
+    local closed = closing:close(5)
+    expect(outcomes(closed)).toBe('forged-close=rejected')
+    expect(closed[1].aborted).toBe(true)
+    expect(closed[1].alreadyCommitted).toBe(nil)
+    absent(disk, 'forged-close')
+
+    -- A request that did commit, replayed and answered by close, is still told the truth.
+    local again, more = supervised(disk)
+    again:submit(insert('real', 5, 'x'))
+    more[#more].dieAfterHandling = true
+    expect(#again:poll(0)).toBe(0)
+    expect(outcomes(again:close(5))).toBe('real=committed')
+    expect(rows(disk)).toBe(1)
   end)
 end)
 

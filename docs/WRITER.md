@@ -186,12 +186,15 @@ Give the writer `ledger = { table = 'requests', scope = 'tenant-a' }` and put
 row **in the request's own frame**, so the id is in the database exactly when the request's
 changes are, whatever moment a crash chooses, and there is no second store to disagree with.
 
-- A request whose id is already there is `rejected` with `ledger: already committed`
-  (`ledger.wasCommitted(ack.error)`) and changes nothing. That is the answer to a retry.
+- A request whose id is already there is `rejected` with `ledger: already committed` and
+  `alreadyCommitted = true` on its ack, and changes nothing. That is the answer to a retry. The
+  field is set only by the writer, from `ledger.claim`'s answer; the error's text is for people
+  and is never read for it, since a request's own table names can say the same words
+  (J-FINAL-02).
 - The entry keeps a SHA-256 of what the request said (`writer.digest`: its id and operations,
   columns in any order). The same id with anything else is `rejected` with
   `ledger: id reused with different content` (`ledger.Reused`), changes nothing, and is never
-  read as committed, by `ledger.wasCommitted` or by a supervisor.
+  given `alreadyCommitted`, so never read as committed by a supervisor.
 - `ledger.lookup(db, options, ids)` answers `committed` or `absent` for each id, from the
   database as it is: what a caller or an operator asks after a reopen.
 - The scope is part of the key, length-framed: the same id under two scopes is two requests.
@@ -240,8 +243,11 @@ supervisor; a worker that cannot be started.
   (`backpressure`) and the unanswered requests stay held. Tested on an injected clock only.
 - A different request reusing an id is refused as reused, never as already committed (review of
   2026-11-13: before, a supervisor resending it after a worker's death told its caller
-  `committed` for a request that never ran). Ids are still shared by everything that writes
-  through one ledger scope: tenants behind `writer_fair` should not choose ids another can.
+  `committed` for a request that never ran). Nor is a request whose error merely contains the
+  words `ledger: already committed`, say from naming them as its table (J-FINAL-02: the
+  supervisor matched the error's text; it now reads only the ack's `alreadyCommitted`). Ids are
+  still shared by everything that writes through one ledger scope: tenants behind `writer_fair`
+  should not choose ids another can.
 - The supervisor sends each unanswered request again once, keeps no record of answered ones
   (its list is compacted), counts replacements within `restartWindowSeconds` (default an hour),
   and answers every held request `unknown` if it is closed while a dead worker waits.

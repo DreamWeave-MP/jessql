@@ -71,7 +71,7 @@ export type TenantStatus = { outstanding: number, waiting: boolean, claiming: bo
 export type Status = { outstanding: number, capacity: number, share: number, tenants: { [string]: TenantStatus }, active: number, examined: number }
 -- An outcome, under the id its tenant gave, with that tenant's name. An outcome of a request
 -- that was not sent through here keeps its id and has no tenant.
-export type Ack = { id: string, outcome: writer.Outcome, error: string?, aborted: boolean?, tenant: string? }
+export type Ack = { id: string, outcome: writer.Outcome, error: string?, aborted: boolean?, alreadyCommitted: boolean?, tenant: string? }
 export type Fair = {
   submit: (tenant: string, request: writer.Request) -> Admission,
   poll: (seconds: number?) -> { Ack },
@@ -359,12 +359,12 @@ function fair.new(options: Options): Fair
     for _, ack in options.poll(seconds) do
       local sent = owner[ack.id]
       if not sent then
-        table.insert(answered, { id = ack.id, outcome = ack.outcome, error = ack.error, aborted = ack.aborted, tenant = nil })
+        table.insert(answered, { id = ack.id, outcome = ack.outcome, error = ack.error, aborted = ack.aborted, alreadyCommitted = ack.alreadyCommitted, tenant = nil })
         continue
       end
 
       owner[ack.id] = nil
-      table.insert(answered, { id = sent.id, outcome = ack.outcome, error = ack.error, aborted = ack.aborted, tenant = sent.tenant })
+      table.insert(answered, { id = sent.id, outcome = ack.outcome, error = ack.error, aborted = ack.aborted, alreadyCommitted = ack.alreadyCommitted, tenant = sent.tenant })
       outstanding -= 1
       local tenant = tenants[sent.tenant]
       if tenant then

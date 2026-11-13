@@ -50,13 +50,13 @@ suite.describe('the durable request ledger', function()
     local acks = queue:drain()
     expect(outcomes(acks)).toBe('pay-1=rejected pay-2=committed')
     expect(acks[1].error).toBe(ledger.Reused)
-    expect(ledger.wasCommitted(acks[1].error)).toBe(false)
-    expect(ledger.wasCommitted(acks[2].error)).toBe(false)
+    expect(acks[1].alreadyCommitted == true).toBe(false)
+    expect(acks[2].alreadyCommitted == true).toBe(false)
     -- The same request again, as a retry is: refused as already committed.
     queue:submit(deposit('pay-1', 7, 100))
     local retried = queue:drain()
     expect(outcomes(retried)).toBe('pay-1=rejected')
-    expect(ledger.wasCommitted(retried[1].error)).toBe(true)
+    expect(retried[1].alreadyCommitted == true).toBe(true)
     expect((db:get('accounts', 7) :: { balance: number }).balance).toBe(100)
     expect(count(db, 'requests')).toBe(2)
 
@@ -64,8 +64,16 @@ suite.describe('the durable request ledger', function()
     queue:submit({ id = 'pay-3', operations = { { op = 'update', table = 'accounts', key = 404, changes = { balance = 1 } } } })
     local failed = queue:drain()
     expect(outcomes(failed)).toBe('pay-3=rejected')
-    expect(ledger.wasCommitted(failed[1].error)).toBe(false)
+    expect(failed[1].alreadyCommitted == true).toBe(false)
     expect(ledger.lookup(db, options, { 'pay-3' })['pay-3']).toBe('absent')
+    -- One whose error carries the ledger's own words, by naming them as its table (J-FINAL-02):
+    -- the text is the request's, and the ledger has not spoken.
+    queue:submit({ id = 'pay-4', operations = { { op = 'insert', table = ledger.AlreadyCommitted, row = { id = 1 } } } })
+    local forged = queue:drain()
+    expect(outcomes(forged)).toBe('pay-4=rejected')
+    expect(string.find(forged[1].error or '', ledger.AlreadyCommitted, 1, true) ~= nil).toBe(true)
+    expect(forged[1].alreadyCommitted).toBe(nil)
+    expect(ledger.lookup(db, options, { 'pay-4' })['pay-4']).toBe('absent')
     queue:submit(deposit('pay-3', 9, 5))
     expect(outcomes(queue:drain())).toBe('pay-3=committed')
 
@@ -113,7 +121,7 @@ suite.describe('the durable request ledger', function()
     for _, ack in retry:drain() do
       if ack.outcome == 'committed' then
         fresh += 1
-      elseif ledger.wasCommitted(ack.error) then
+      elseif ack.alreadyCommitted then
         already += 1
       end
     end
