@@ -1621,8 +1621,11 @@ local function load(state: DatabaseState, recoverTail: boolean)
     local payload = buffer.tostring(body)
     if bytes.crc32(payload) ~= checksum then
       -- Writeback a page at a time can keep the start of the last frame and lose the rest: it is
-      -- torn when nothing but zeros follows where it claims to end.
-      if tornTail(offset + HeaderBytes + length) then break end
+      -- torn when its own last byte is a zero, which no payload ends in, and nothing but zeros
+      -- follows where it claims to end. A frame that is all there and does not check is damage,
+      -- refused: zeros after it, or none, say nothing of it (J-FINAL-01: a changed byte in an
+      -- acknowledged last frame past a mark behind it was cut as a tear).
+      if buffer.readu8(body, length - 1) == 0 and tornTail(offset + HeaderBytes + length) then break end
 
       reader:close()
       error('jessql storage: checksum mismatch', 2)

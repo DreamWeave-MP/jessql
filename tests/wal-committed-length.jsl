@@ -494,18 +494,21 @@ suite.describe('a managed database', function()
   -- Review of 2026-11-13: a power cut can leave a log's end allocated and never written. Past
   -- what the mark says was committed, that is a tail nobody was told of: cut, not refused.
   suite.it('cuts a tail of zeros past the committed length, and refuses anything else there', function()
-    -- A last frame whose bytes do not check is torn too, when it ends at the end of the log or
-    -- only zeros follow it (re-review of 2026-11-13: writeback a page at a time leaves that).
-    -- Bytes past where it claims to end that are not zeros are something else, and refused.
+    -- A last frame whose bytes do not check is torn too, when it ends in zeros and only zeros
+    -- follow it (re-review of 2026-11-13: writeback a page at a time leaves that). A frame that
+    -- is all there and does not check is damage, zeros after it or not (J-FINAL-01). Bytes past
+    -- where it claims to end that are not zeros are something else, and refused.
     local tails: { [string]: string } = {
       zeros = string.rep('\0', 64),
       ['header-then-zeros'] = string.pack('<I4I4', 40, 12345) .. string.rep('\0', 40),
-      ['last-frame-garbled'] = string.pack('<I4I4', 40, 12345) .. string.rep('x', 40),
+      ['garbage-as-a-whole-last-frame'] = string.pack('<I4I4', 40, 12345) .. string.rep('x', 40),
+      ['garbage-as-a-whole-frame-before-zeros'] = string.pack('<I4I4', 40, 12345) .. string.rep('x', 40) .. string.rep('\0', 16),
       ['garbage-past-a-frame'] = string.pack('<I4I4', 40, 12345) .. string.rep('x', 40) .. 'x',
       ['garbage-as-a-header'] = string.rep('x', 48),
     }
 
-    for _, case in { 'zeros', 'header-then-zeros', 'last-frame-garbled', 'garbage-past-a-frame', 'garbage-as-a-header' } do
+    for _, case in { 'zeros', 'header-then-zeros', 'garbage-as-a-whole-last-frame', 'garbage-as-a-whole-frame-before-zeros',
+      'garbage-past-a-frame', 'garbage-as-a-header' } do
       local disk = closedStore(5)
       local body = disk.visible()[Log]
       overwrite(disk, Log, body .. tails[case])
@@ -563,6 +566,54 @@ suite.describe('a managed database', function()
     overwrite(garbled, Log, whole .. string.sub(frame, 1, kept) .. string.rep('\0', #frame - kept) .. 'x')
     -- The open raises; the refusal is the assertion.
     expect((pcall(open, garbled))).toBe(false)
+  end)
+
+  -- J-FINAL-01: a last frame whose bytes are all there, past a mark that is behind, was cut as
+  -- torn when it did not check, since no zeros followed it. A process killed after a commit was
+  -- acknowledged leaves just that, so a changed byte in it lost an acknowledged transaction.
+  suite.it('refuses a whole last frame past an older mark that does not check, and leaves it be', function()
+    local disk = closedStore(5)
+    local whole = disk.visible()[Log]
+    local mark = disk.visible()[walmark.path(Log)]
+    -- A sixth commit, synchronized and acknowledged, whose process was killed before the mark
+    -- was brought up to it: made on a copy, and only its log is kept.
+    local scratch = memfs.new()
+    assert((scratch.backend.createDurable(Log, whole)))
+    assert((scratch.backend.createDurable(walmark.path(Log), mark)))
+    local other = sql.open(Log, { durability = 'sync', storage = scratch.backend })
+    other:insert('events', { id = 6, body = string.rep('y', 10000) })
+    other:close()
+    local frame = string.sub(scratch.visible()[Log], #whole + 1)
+    -- The mark is older than the log: it witnesses the create and five inserts, not the sixth.
+    expect((walmark.read(disk.backend, Log) :: walmark.Mark).sequence).toBe(6)
+    expect((walmark.read(disk.backend, Log) :: walmark.Mark).length).toBe(#whole)
+
+    -- Unaltered, the sixth commit is there.
+    local kept = closedStore(5)
+    overwrite(kept, Log, whole .. frame)
+    expect(rows(kept)).toBe(6)
+
+    -- One byte of its payload changed to another that is not zero: damage, not a tear.
+    local at = #frame - 10
+    local flipped = bit32.bxor(string.byte(frame, at), 1)
+    expect(flipped ~= 0).toBe(true)
+    local damaged = whole .. string.sub(frame, 1, at - 1) .. string.char(flipped) .. string.sub(frame, at + 1)
+    local refused = closedStore(5)
+    overwrite(refused, Log, damaged)
+    -- The open raises; the refusal is the assertion.
+    local opened, problem = pcall(open, refused)
+    expect(opened).toBe(false)
+    expect((string.find(tostring(problem), 'checksum mismatch', 1, true)) ~= nil).toBe(true)
+    -- Nothing was cut: the log and its mark are as they were.
+    expect(refused.visible()[Log] == damaged).toBe(true)
+    expect(refused.visible()[walmark.path(Log)] == mark).toBe(true)
+
+    -- The same append torn by a power cut, its later pages never written, is still cut.
+    local cut = 4096 - #whole % 4096
+    local torn = closedStore(5)
+    overwrite(torn, Log, whole .. string.sub(frame, 1, cut) .. string.rep('\0', #frame - cut))
+    expect(rows(torn)).toBe(5)
+    expect(#torn.visible()[Log]).toBe(#whole)
   end)
 
   suite.it('cuts no more zeros than one batch of frames can leave unsynchronized', function()
