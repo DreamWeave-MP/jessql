@@ -528,26 +528,15 @@ suite.describe('a managed database', function()
     expect((pcall(open, disk))).toBe(false)
   end)
 
-  -- Re-review of 2026-11-13: the mark was synchronized only at close, so after a crash it could
-  -- be any number of acknowledged commits behind, and acknowledged frames past it that came back
-  -- as zeros were cut as a torn tail.
-  suite.it('refuses acknowledged commits that come back as zeros, however recent', function()
-    local disk = closedStore(5)
-    local before = #disk.visible()[Log]
-    local again = open(disk)
-    for index = 6, 8 do again:insert('events', { id = index, body = `row {index}` }) end
-
-    disk.crash()
-    local whole = disk.surviving()[Log]
-    expect(#whole > before).toBe(true)
-    expect((walmark.read(disk.backend, Log) :: walmark.Mark).length).toBe(#whole)
-    overwrite(disk, Log, string.sub(whole, 1, before) .. string.rep('\0', #whole - before))
-    -- The open raises; the refusal is the assertion.
-    local opened, problem = pcall(open, disk)
-    expect(opened).toBe(false)
-    expect((string.find(tostring(problem), 'invalid frame length', 1, true)) ~= nil).toBe(true)
-    expect(#disk.visible()[Log]).toBe(#whole)
-  end)
+  -- Not tested, by decision (2026-11-13): acknowledged commits that come back as zeros past a
+  -- mark that is behind. The re-review of #99 showed them cut as a torn tail when the mark is
+  -- synchronized only at close and before a checkpoint, and #99 first answered by synchronizing
+  -- the mark with every commit, at about one and a half times the cost of a single commit. The
+  -- decision was to trust instead a synchronization the operating system reports as done: an
+  -- acknowledged commit was synchronized, so it is on the disk whole, and only a disk that
+  -- reports a synchronization it did not do can give it back as zeros. Such a disk is outside
+  -- what the store defends against (see `@jessql/walmark`). What the mark does still catch is
+  -- above: zeros where it says committed transactions were are refused.
 
   suite.it('cuts a last frame that page-at-a-time writeback kept only the start of', function()
     local disk = closedStore(5)
@@ -674,10 +663,9 @@ suite.describe('a managed database', function()
     running:close()
   end)
 
-  -- Re-review of #99: a mark whose synchronization failed once stayed behind for the rest of the
-  -- session while commits went on being acknowledged, the store still said it was witnessed, and
-  -- a reopen cut acknowledged frames that came back as zeros past it as a torn tail.
-  suite.it('takes no commit past a mark that could not be synchronized, and loses none it acknowledged', function()
+  -- Re-review of #99: a mark that could not be written stayed behind for the rest of the session,
+  -- and the store went on saying it was witnessed.
+  suite.it('says it is unwitnessed once its mark cannot be written, and keeps every commit it acknowledges', function()
     local disk = memfs.new()
     local db = open(disk)
     db:createTable('events', { 'id' }, 'id')
@@ -685,30 +673,20 @@ suite.describe('a managed database', function()
 
     local failed = false
     disk.inject(function(step: string, path: string, _occurrence: number): memfs.Fault?
-      if failed or step ~= 'syncData' or path ~= walmark.path(Log) then return nil end
+      if failed or step ~= 'write' or path ~= walmark.path(Log) then return nil end
 
       failed = true
       return { message = 'EIO', kind = 'other' }
     end)
-    -- The commit whose mark failed is not acknowledged, and none after it is taken.
-    local acknowledged = 5
-    for index = 6, 20 do
-      -- The insert raises once the store refuses commits; that is what is counted.
-      if pcall(function() db:insert('events', { id = index }) end) then acknowledged += 1 end
-    end
 
+    for index = 6, 20 do db:insert('events', { id = index }) end
     disk.inject(nil)
-    expect(`{failed} {acknowledged} {(db :: any):witness()}`).toBe('true 5 unwitnessed')
+    expect(`{failed} {(db :: any):witness()}`).toBe('true unwitnessed')
 
-    -- Power is lost, and everything past the mark comes back as zeros: nothing acknowledged is.
+    -- Every commit was acknowledged, and is there after a crash; reopened, the mark is kept again.
     disk.crash()
-    local _, mark = walmark.examine(disk.backend, Log)
-    local whole = assert(disk.surviving()[Log])
-    local kept = assert(mark).length
-    local zeroed = disk.backend.writeFile(Log, string.sub(whole, 1, kept) .. string.rep('\0', #whole - kept))
-    expect(zeroed).toBe(#whole)
     local again = open(disk)
-    expect(again:query('SELECT COUNT(*) AS n FROM events').rows[1].n).toBe(acknowledged)
+    expect(again:query('SELECT COUNT(*) AS n FROM events').rows[1].n).toBe(20)
     expect((again :: any):witness()).toBe('witnessed')
     again:insert('events', { id = 21 })
     again:close()
