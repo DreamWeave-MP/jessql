@@ -12,6 +12,9 @@ local vfs = require('@jessql/vfs')
 
 export type Row = { [string]: unknown }
 export type Options = { cachePages: number?, readMode: string?, durability: string?, rowLayout: string?, secondaryIndexPath: string?, secondaryIndexPaths: { string }?, deletePaths: { [number]: string }?, requireIdentity: boolean?, trackPayloadBytes: boolean?, storage: vfs.Backend?,
+  -- For a log a manifest names (managed): see `storage.Options.manifestNamesLog`. A hybrid opened
+  -- on its own has no manifest, and leaves it unset.
+  manifestNamesLog: boolean?,
   -- `stream` (the default) reads the hot overlay through a cursor for scans that do not ask for
   -- primary-key order; `materialize` copies it first, as every scan did before.
   hotScan: string? }
@@ -458,7 +461,8 @@ function hybrid.open(walPath: string, snapshotPath: string | { string }, tableNa
   local ok, failure = pcall(function()
     hot = storage.open(walPath, { rowLayout = if options then options.rowLayout else 'packed',
       durability = if options then options.durability else nil,
-      trackPayloadBytes = if options then options.trackPayloadBytes else nil, storage = fs, manifestNamesLog = true })
+      trackPayloadBytes = if options then options.trackPayloadBytes else nil, storage = fs,
+      manifestNamesLog = options ~= nil and options.manifestNamesLog == true })
   end)
 
   if not ok then
