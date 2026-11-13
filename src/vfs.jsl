@@ -22,10 +22,11 @@ local native = require('@dream/fs')
 -- What a backend is: the shape of `@dream/fs`. It need only implement the functions below.
 export type Backend = typeof(native)
 
-type WriteOptions = { offset: number?, append: boolean?, create: boolean?, exclusive: boolean?, atomic: boolean?, createParents: boolean? }
-type OpenWriteOptions = { append: boolean?, truncate: boolean?, create: boolean?, exclusive: boolean?, writeThrough: boolean? }
+type WriteOptions = { offset: number?, append: boolean?, create: boolean?, exclusive: boolean?, atomic: boolean?, createParents: boolean?, mode: number? }
+type OpenWriteOptions = { append: boolean?, truncate: boolean?, create: boolean?, exclusive: boolean?, writeThrough: boolean?, mode: number? }
 type RecursiveOptions = { recursive: boolean? }
-type LockOptions = { shared: boolean?, createParents: boolean? }
+type MkdirOptions = { recursive: boolean?, mode: number? }
+type LockOptions = { shared: boolean?, createParents: boolean?, mode: number? }
 
 local current: Backend = native
 local vfs = {}
@@ -86,7 +87,7 @@ function vfs.createDurable(path: string, data: buffer | string) return current.c
 function vfs.syncDirectory(path: string) return current.syncDirectory(path) end
 function vfs.replace(source: string, destination: string) return current.replace(source, destination) end
 function vfs.rename(from: string, to: string) return current.rename(from, to) end
-function vfs.mkdir(path: string, options: RecursiveOptions?) return current.mkdir(path, options) end
+function vfs.mkdir(path: string, options: MkdirOptions?) return current.mkdir(path, options) end
 function vfs.remove(path: string, options: RecursiveOptions?) return current.remove(path, options) end
 function vfs.lock(path: string, options: LockOptions?) return current.lock(path, options) end
 

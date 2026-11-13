@@ -45,8 +45,8 @@ export type Amplification = {
   read: number?,
 }
 
-type WriteOptions = { offset: number?, append: boolean?, create: boolean?, exclusive: boolean?, atomic: boolean?, createParents: boolean? }
-type OpenWriteOptions = { append: boolean?, truncate: boolean?, create: boolean?, exclusive: boolean?, writeThrough: boolean? }
+type WriteOptions = { offset: number?, append: boolean?, create: boolean?, exclusive: boolean?, atomic: boolean?, createParents: boolean?, mode: number? }
+type OpenWriteOptions = { append: boolean?, truncate: boolean?, create: boolean?, exclusive: boolean?, writeThrough: boolean?, mode: number? }
 type RecursiveOptions = { recursive: boolean? }
 
 local Classes: { Class } = { 'wal', 'rows', 'deleted', 'manifest', 'scratch', 'lock', 'other' }
