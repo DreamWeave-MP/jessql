@@ -23,6 +23,12 @@
 -- well: that disk is outside what this store defends against. (Holding the mark current with
 -- every commit would catch it, for about one and a half times the cost of a single commit.)
 --
+-- The same holds for a log that is lost whole. A mark claiming commits refuses a log that is gone
+-- or holds none, but only a mark that reached storage claims anything: until the store's first
+-- clean close or checkpoint, a crash can leave a mark that claims none, and a log lost then opens
+-- as new. A store that must not be opened empty over a lost log closes or checkpoints once after
+-- its first commits (re-review of #99).
+--
 -- A record that does not reach storage leaves the mark behind, still true; the store then says it
 -- is unwitnessed (re-review of #99: it went on saying it was witnessed).
 --
