@@ -189,6 +189,40 @@ suite.describe('what the mark does not claim', function()
     expect(walmark.decode('JQLC1\n')).toBe(nil)
   end)
 
+  -- Review of #95: creating a file durably names it before it has bytes. A process killed, or a
+  -- disk that filled, while the mark was first made must not leave a mark that reads as damage:
+  -- that would refuse a sound log for good.
+  suite.it('never leaves a damaged mark when making the first one is cut off, on a new log or one from before marks', function()
+    for _, case in { 'new', 'before-marks' } do
+      local disk = if case == 'new' then memfs.new() else closedStore(5)
+      if case == 'before-marks' then assert((disk.backend.remove(walmark.path(Log)))) end
+      local torn = 0
+      -- The mark's own name or any other it is made under: the creation is cut after the name.
+      disk.inject(function(step: string, path: string, _occurrence: number): memfs.Fault?
+        if step ~= 'createDurable' or not string.find(path, walmark.Suffix, 1, true) then return nil end
+        torn += 1
+        return { message = 'killed while the mark was made', kind = 'torn' }
+      end)
+      -- A mark that could not be made is no mark: the store opens unwitnessed, as a log from
+      -- before marks does, and the process is then killed.
+      local opened = pcall(open, disk)
+      expect(`{case}: {opened} {torn}`).toBe(`{case}: true 1`)
+      disk.inject(nil)
+      disk.crash()
+      -- Nothing that reads as a damaged mark is left; the next open makes the mark and is sound.
+      expect(`{case}: {walmark.examine(disk.backend, Log)}`).toBe(`{case}: absent`)
+      local db = open(disk)
+      if case == 'new' then
+        db:createTable('events', { 'id', 'body' }, 'id')
+        db:insert('events', { id = 1, body = 'row 1' })
+      end
+      db:close()
+      expect(`{case}: {walmark.examine(disk.backend, Log)}`).toBe(`{case}: sound`)
+      expect(`{case}: {rows(disk)}`).toBe(`{case}: {if case == 'new' then 1 else 5}`)
+      expect(`{case}: {disk.visible()[walmark.path(Log) .. walmark.CandidateSuffix]}`).toBe(`{case}: nil`)
+    end
+  end)
+
   -- Review J-03: a mark that is there and cannot be read is not the same as no mark.
   suite.it('refuses a log whose mark is damaged, cut or not, until the mark is removed by hand', function()
     -- A sound log beside a mark that cannot be read: whether the log is whole cannot be said.

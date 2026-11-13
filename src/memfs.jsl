@@ -399,6 +399,15 @@ function memfs.new(options: Options?): Disk
   function backend.createDurable(path: string, data: buffer | string): (number?, string?, string?)
     local resolved = resolve(path)
     local failure, kind = step('createDurable', resolved)
+    if failure and kind == 'torn' and not names[resolved] and not parentMissing(resolved) then
+      -- The real call creates the name, then writes, then synchronizes: a crash or a full disk
+      -- between the first two leaves the name with no bytes, and the name can survive.
+      local empty: Inode = { kind = 'file', data = '', durable = '' }
+      names[resolved] = empty
+      durableNames[resolved] = empty
+      return nil, failure, 'other'
+    end
+
     if failure then return nil, failure, kind end
     if names[resolved] then return nil, `{path}: already exists`, 'alreadyExists' end
     if parentMissing(resolved) then return nil, `{path}: parent not found`, 'notFound' end

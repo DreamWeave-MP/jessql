@@ -25,10 +25,11 @@ suite.describe('a managed database of several tables', function()
     }, { crashRecovery = true })
     expect(findings(report)).toBe('')
     expect(report.truncated).toBe(false)
-    -- One publication: one manifest replacement, however many tables it moved.
+    -- One publication: one manifest replacement, however many tables it moved. (A new log's
+    -- committed-length mark is put in place by a replacement of its own, which is not one.)
     local replacements = 0
     for _, taken in report.schedule do
-      if string.match(taken, '^replace ') then replacements += 1 end
+      if string.match(taken, '^replace .*%.jql%-manifest$') then replacements += 1 end
     end
 
     expect(replacements).toBe(1)
