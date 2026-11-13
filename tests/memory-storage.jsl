@@ -312,6 +312,33 @@ suite.describe('in-memory disk: injected faults', function()
     expect(again:query('SELECT COUNT(*) AS n FROM events').rows[1].n).toBe(5)
     again:close()
   end)
+
+  -- Re-review of #101: an open refused because a new folder could not be synchronized left the
+  -- folder; a retry found it there, synchronized nothing, and its commits were lost at a crash.
+  suite.it('keeps the commits of a store opened again after its folders could not be synchronized', function()
+    local disk = memfs.new()
+    local path = '/memory/state/db/app.wal'
+    local failed = false
+    disk.inject(function(step: string, _path: string, _occurrence: number): memfs.Fault?
+      if failed or step ~= 'syncDirectory' then return nil end
+
+      failed = true
+      return { message = 'EIO', kind = 'other' }
+    end)
+    -- The first open raises on the injected failure; that refusal is the first assertion.
+    local first = pcall(function() sql.open(path, { durability = 'sync', storage = disk.backend }) end)
+    disk.inject(nil)
+    expect(`{failed} {first}`).toBe('true false')
+
+    local db = sql.open(path, { durability = 'sync', storage = disk.backend })
+    db:createTable('events', { 'id' }, 'id')
+    for id = 1, 5 do db:insert('events', { id = id }) end
+
+    disk.crash()
+    local again = sql.open(path, { durability = 'sync', storage = disk.backend })
+    expect(again:query('SELECT COUNT(*) AS n FROM events').rows[1].n).toBe(5)
+    again:close()
+  end)
 end)
 
 suite.describe('storage seam: a backend is never replaced under an open database', function()
