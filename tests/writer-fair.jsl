@@ -283,10 +283,7 @@ suite.describe('fair admission in front of one writer', function()
   suite.it('keeps a place for the tenant that waits, lets it go when that tenant stops asking, and is not held by one at its share', function()
     local now = 0
     local back = behind(1, 1)
-    -- Claims kept as long as the wait, so that the turns are what is looked at here: how long a
-    -- claim lasts by default has a test of its own.
-    local front = fair.new({ submit = back.submit, poll = back.poll, capacity = 1, waitSeconds = 5, claimSeconds = 5,
-      now = function(): number return now end })
+    local front = fair.new({ submit = back.submit, poll = back.poll, capacity = 1, waitSeconds = 5, now = function(): number return now end })
     expect(front.submit('holder', request()).admitted).toBe(true)
     expect(front.submit('first', request()).reason).toBe('backpressure')
     now = 1
@@ -456,6 +453,43 @@ suite.describe('fair admission in front of one writer', function()
       -- Before: at 5 one-shot tenants a second, under 3% of the steady throughput was left.
       expect(`{rate}/s: {haunted} of {alone}: {haunted >= alone * 0.9}`).toBe(`{rate}/s: {haunted} of {alone}: true`)
     end
+  end)
+
+  -- Re-review of #98: a claim that lapsed after a second starved a tenant that asks again every
+  -- two seconds, an ordinary retry. By default a claim lasts the whole wait.
+  suite.it('keeps the turn of a tenant that asks again every two seconds, with fewer places than tenants', function()
+    local now = 0
+    local queue: { string } = {}
+    local front = fair.new({ capacity = 2, now = function(): number return now end,
+      submit = function(sent: writer.Request): fair.Admission
+        table.insert(queue, sent.id)
+        return { admitted = true, reason = nil, outstanding = #queue }
+      end,
+      poll = function(_seconds: number?): { writer.Ack }
+        -- The writer finishes one every 50 ms.
+        local acks: { writer.Ack } = {}
+        if #queue > 0 then table.insert(acks, { id = table.remove(queue, 1) :: string, outcome = 'committed' :: writer.Outcome }) end
+        return acks
+      end })
+    local slow, waited, since = 0, 0, 0
+    for tick = 1, 12000 do
+      now = tick * 0.01
+      if tick % 5 == 0 then front.poll(0) end
+
+      for index = 1, 3 do front.submit(`fast{index}`, request()) end
+      since += 0.01
+      if tick % 200 == 0 then
+        if front.submit('slow', request()).admitted then
+          slow += 1
+          waited = math.max(waited, since)
+          since = 0
+        end
+      end
+    end
+
+    -- 60 asks in 120 s. Before: 25 admitted in 600 s, with waits past a minute.
+    expect(`admitted {slow}, longest wait {math.floor(waited)} s: {slow >= 20 and waited <= 6.5}`)
+      .toBe(`admitted {slow}, longest wait {math.floor(waited)} s: true`)
   end)
 
   -- Re-review of #97: the writer behind takes the tenant and the id together as its id. A

@@ -21,16 +21,19 @@
 --     it. So the tenant that has waited longest always has the next place, however quickly
 --     another asks, and however few places there are: with one place and two tenants they
 --     take turns. A tenant turned away by this rule waits too, and has its turn.
+--   * At most half the places (at least one) are kept for those who wait, however many wait
+--     (review of 2026-11-13: one-shot tenants refused once and gone held every place empty, and
+--     took a writer down to a few per cent). Under a flood of them a writer is still at least half
+--     used by the tenants that are there.
 --   * A place is kept for a waiting tenant only while it keeps asking: its claim lapses
---     `claimSeconds` (default 1, at most `waitSeconds`) after it last asked, and its turn with
---     it. A tenant that gave up does not hold places empty for the rest of its wait (review of
---     2026-11-13: one-shot tenants refused once and gone took a writer down to a few per cent).
---     It still counts towards the shares for `waitSeconds`.
+--     `claimSeconds` (default `waitSeconds`) after it last asked, and its turn with it. It still
+--     counts towards the shares for `waitSeconds`.
 --
 -- Nothing waits in here and nothing is queued: a refusal is the caller's to retry. What is
--- promised is that no tenant that keeps asking is shut out by another that asks more: it is
--- admitted once the tenants that began waiting before it have had the places freed. The promise
--- needs waiting to be remembered: with `waitSeconds = 0` nothing is, and none is made.
+-- promised is that no tenant that keeps asking, at least once every `claimSeconds`, is shut out by
+-- another that asks more: it is admitted once the tenants that began waiting before it have had
+-- the places freed. The promise needs waiting to be remembered: with `waitSeconds = 0` nothing
+-- is, and none is made.
 --
 -- What is held is one record a tenant and nothing a refusal: a tenant refused a hundred
 -- thousand times is remembered once.
@@ -52,14 +55,16 @@ export type Options = {
   -- How long a tenant refused for want of room is counted as waiting (default 5).
   waitSeconds: number?,
   -- How long after it last asked a waiting tenant keeps its turn and the place owed to it
-  -- (default 1, or `waitSeconds` when that is less).
+  -- (default `waitSeconds`, at most `waitSeconds`). A tenant that asks less often than this loses
+  -- its turn each time.
   claimSeconds: number?,
   -- The most tenants holding or waiting at once (default 1024). One more is refused.
   maxTenants: number?,
   -- Seconds, monotonic. Injected in tests.
   now: (() -> number)?,
 }
-export type TenantStatus = { outstanding: number, waiting: boolean, admitted: number, refused: number }
+-- `waiting`: still counted towards the shares; `claiming`: still owed a place, in turn.
+export type TenantStatus = { outstanding: number, waiting: boolean, claiming: boolean, admitted: number, refused: number }
 -- `active` is how many tenants the queue is shared between now; `examined` how many waits have
 -- run out since the start, each looked at once, which is at most one a tenant that waited.
 export type Status = { outstanding: number, capacity: number, share: number, tenants: { [string]: TenantStatus }, active: number, examined: number }
@@ -114,7 +119,7 @@ function fair.new(options: Options): Fair
     error('jessql fair admission: invalid maxTenants', 2)
   end
 
-  local claimSeconds = if options.claimSeconds ~= nil then options.claimSeconds else math.min(1, waitSeconds)
+  local claimSeconds = if options.claimSeconds ~= nil then options.claimSeconds else waitSeconds
   if typeof(claimSeconds) ~= 'number' or claimSeconds ~= claimSeconds or claimSeconds < 0 or claimSeconds > waitSeconds then
     error('jessql fair admission: invalid claimSeconds', 2)
   end
@@ -376,7 +381,8 @@ function fair.new(options: Options): Fair
     local at = now()
     expire(at)
     for name, tenant in tenants do
-      listed[name] = { outstanding = tenant.outstanding, waiting = tenant.sharing, admitted = tenant.admitted, refused = tenant.refused }
+      listed[name] = { outstanding = tenant.outstanding, waiting = tenant.sharing, claiming = tenant.waiting,
+        admitted = tenant.admitted, refused = tenant.refused }
     end
 
     return { outstanding = outstanding, capacity = capacity, share = math.max(1, capacity // math.max(1, activeCount)), tenants = listed,
