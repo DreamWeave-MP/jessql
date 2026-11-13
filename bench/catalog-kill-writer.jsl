@@ -1,0 +1,48 @@
+--!strict
+-- The child of `bench/catalog-kill.jsl`: commits five-table service steps to a multi-table managed
+-- database on a real directory for as long as it lives, under budgets small enough that flushes
+-- and compactions happen every few commits. After each commit returns it writes the step's number
+-- and a newline to standard output: that line is the acknowledgement its parent holds it to.
+local process = require('@dream/process')
+local sql = require('@jessql')
+
+local base = ...
+if type(base) ~= 'string' or string.sub(base, 1, 1) ~= '/' then error('usage: catalog-kill-writer <absolute database path>', 0) end
+
+local Tables: { sql.CatalogTableSpec } = {
+  { tableName = 'reservations', columns = { 'id', 'effect' }, primaryKey = 'id' },
+  { tableName = 'handled', columns = { 'id' }, primaryKey = 'id' },
+  { tableName = 'conversation', columns = { 'id', 'body' }, primaryKey = 'id' },
+  { tableName = 'outbox', columns = { 'id' }, primaryKey = 'id' },
+  { tableName = 'counters', columns = { 'id', 'value' }, primaryKey = 'id' },
+}
+
+local db = sql.catalog.open(base, { tables = Tables, maxHotRows = 40, maxGenerations = 3 })
+-- A budget the last life crossed before it was killed is remembered: clear it as an operator would.
+if db:maintenanceStatus().lastError then
+  local stats = db:stats()
+  local most = 0
+  for _, held in stats.tables do most = math.max(most, held.generations) end
+
+  if most >= 3 then db:compact() else db:flush() end
+end
+
+local counter = db:get('counters', 'total')
+local number = if counter then counter.value :: number else 0
+local body = string.rep('x', 256)
+while true do
+  number += 1
+  db:transaction(function(tx)
+    tx:insert('reservations', { id = number, effect = `send-{number}` })
+    tx:insert('handled', { id = number })
+    tx:insert('conversation', { id = number, body = body })
+    tx:insert('outbox', { id = number })
+    if number > 1 then tx:delete('outbox', number - 1) end
+
+    tx:upsert('counters', { id = 'total', value = number })
+  end)
+  process.write('stdout', `{number}\n`)
+  -- Maintenance that failed would refuse the next write; say so and stop, which the parent reports.
+  local failed = db:maintenanceStatus().lastError
+  if failed then error('maintenance failed: ' .. failed, 0) end
+end

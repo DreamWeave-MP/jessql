@@ -1,0 +1,326 @@
+--!strict
+-- The fault laboratory, on itself and on the store. First it must catch stores that are wrong on
+-- purpose, or a clean report means nothing. Then every durability stage of the real store is
+-- stopped at every storage step: WAL commits, delta publication, checkpoint, selective compaction
+-- with retirement, and backup. In memory; no filesystem capability.
+local lab = require('@jessql/faultlab')
+local memfs = require('@jessql/memfs')
+local sql = require('@jessql')
+local test = require('@jess/test')
+local world = require('./catalogworld')
+
+local expect = test.expect
+local suite = test.new()
+
+type Row = { [string]: unknown }
+
+-- Every artifact as text, so a failing expectation shows where and what.
+local function findings(report: lab.Report): string
+  local texts: { string } = {}
+  for index, artifact in report.violations do
+    if index > 3 then break end
+    table.insert(texts, lab.describe(artifact))
+  end
+
+  return table.concat(texts, '\n')
+end
+
+local function kinds(report: lab.Report): { [string]: number }
+  local counted: { [string]: number } = {}
+  for _, artifact in report.violations do counted[artifact.violation] = (counted[artifact.violation] or 0) + 1 end
+
+  return counted
+end
+
+-- A store that is wrong in a chosen way: one file per commit, one line per row.
+local function broken(name: string, flaw: string): lab.Scenario
+  local function commit(disk: memfs.Disk, ledger: lab.Ledger, id: string)
+    local on = disk.backend
+    ledger.begin(id, 2)
+    if flaw == 'acknowledges-before-sync' then
+      -- Visible, never synchronized, and acknowledged anyway.
+      assert((on.writeFile(`/memory/{id}`, 'row\nrow\n')))
+    elseif flaw == 'tears' then
+      -- Two rows made durable one at a time: a stop between them leaves half a commit.
+      assert((on.createDurable(`/memory/{id}`, 'row\n')))
+      local writer = assert((on.openWrite(`/memory/{id}`, { append = true, create = false })))
+      assert((writer:write('row\n')))
+      assert((writer:syncAll()))
+      writer:close()
+    else
+      assert((on.createDurable(`/memory/{id}`, 'row\nrow\n')))
+    end
+
+    ledger.acknowledge(id)
+  end
+
+  return {
+    name = name,
+    prepare = function(disk: memfs.Disk, ledger: lab.Ledger) commit(disk, ledger, 'a') end,
+    exercise = function(disk: memfs.Disk, ledger: lab.Ledger)
+      commit(disk, ledger, 'b')
+      commit(disk, ledger, 'c')
+    end,
+    recover = function(disk: memfs.Disk): lab.Observed
+      local observed: lab.Observed = {}
+      for _, entry in assert((disk.backend.list('/memory'))) do
+        local body = assert((disk.backend.readFileString(`/memory/{entry}`)))
+        observed[entry] = select(2, string.gsub(body, 'row\n', ''))
+      end
+
+      if flaw == 'invents' then observed.z = 1 end
+
+      return observed
+    end,
+  }
+end
+
+suite.describe('the laboratory catches a store that is wrong', function()
+  suite.it('passes a store that makes each commit durable before acknowledging it', function()
+    local report = lab.run(broken('sound', 'none'))
+    expect(findings(report)).toBe('')
+    expect(#report.schedule > 0).toBe(true)
+    expect(report.runs > #report.schedule).toBe(true)
+  end)
+
+  suite.it('reports an acknowledgment that was not durable, with where it stopped and what survived', function()
+    local report = lab.run(broken('early-ack', 'acknowledges-before-sync'))
+    expect((kinds(report)['acknowledged-lost'] or 0) > 0).toBe(true)
+    local artifact = report.violations[1]
+    expect(artifact.scenario).toBe('early-ack')
+    expect(#artifact.acknowledged > 0).toBe(true)
+    expect(#artifact.tail > 0).toBe(true)
+    expect(type(artifact.surviving)).toBe('table')
+    expect((string.find(lab.describe(artifact), 'acknowledged-lost', 1, true)) ~= nil).toBe(true)
+  end)
+
+  suite.it('reports half a commit, and a row nobody wrote', function()
+    expect((kinds(lab.run(broken('torn', 'tears')))['uncertain-torn'] or 0) > 0).toBe(true)
+    expect((kinds(lab.run(broken('phantom', 'invents')))['phantom'] or 0) > 0).toBe(true)
+  end)
+
+  suite.it('reports a recovery that raises, and says when it stopped short of its bound', function()
+    local scenario = broken('unrecoverable', 'none')
+    scenario.recover = function(_disk: memfs.Disk): lab.Observed error('cannot open', 0) end
+    local report = lab.run(scenario)
+    expect(report.violations[1].violation).toBe('recovery-failed')
+    expect(report.violations[1].detail).toBe('cannot open')
+
+    local bounded = lab.run(broken('bounded', 'none'), { maxRuns = 3 })
+    expect(bounded.truncated).toBe(true)
+    expect(bounded.runs).toBe(3)
+  end)
+end)
+
+-- The write-ahead log alone: `sql.open`, synchronized commits.
+local function walScenario(): lab.Scenario
+  local path = '/memory/events.wal'
+  local function open(disk: memfs.Disk) return sql.open(path, { durability = 'sync', storage = disk.backend }) end
+
+  local function commit(db: sql.PersistentDatabase, ledger: lab.Ledger, id: string, first: number)
+    ledger.begin(id, 3)
+    db:transaction(function(tx)
+      for offset = 0, 2 do tx:insert('events', { id = first + offset, batch = id }) end
+    end)
+    ledger.acknowledge(id)
+  end
+
+  return {
+    name = 'wal commits',
+    prepare = function(disk: memfs.Disk, ledger: lab.Ledger)
+      local db = open(disk)
+      db:createTable('events', { 'id', 'batch' }, 'id')
+      commit(db, ledger, 'p1', 10)
+      db:close()
+    end,
+    exercise = function(disk: memfs.Disk, ledger: lab.Ledger)
+      local db = open(disk)
+      -- A commit may raise at the fault; the database is closed either way.
+      local ok, problem = pcall(function()
+        commit(db, ledger, 'e1', 20)
+        commit(db, ledger, 'e2', 30)
+      end)
+      pcall(function() db:close() end)
+      if not ok then error(problem, 0) end
+    end,
+    recover = function(disk: memfs.Disk): lab.Observed
+      local db = open(disk)
+      local observed: lab.Observed = {}
+      for _, row in db:query('SELECT batch FROM events').rows do
+        local batch = (row :: Row).batch :: string
+        observed[batch] = (observed[batch] or 0) + 1
+      end
+
+      db:close()
+      return observed
+    end,
+  }
+end
+
+-- A managed database: `stage` is the generation transition put under test.
+local function managedScenario(stage: string): lab.Scenario
+  local base = '/memory/events'
+  local function options(disk: memfs.Disk): sql.ManagedOptions
+    return { tableName = 'events', columns = { 'id', 'batch' }, primaryKey = 'id', cachePages = 1,
+      compactionFanIn = 2, storage = disk.backend }
+  end
+
+  local function commit(db: sql.ManagedDatabase, ledger: lab.Ledger, id: string, first: number)
+    ledger.begin(id, 4)
+    db:transaction(function(tx)
+      for offset = 0, 3 do tx:insert({ id = first + offset, batch = id }) end
+    end)
+    ledger.acknowledge(id)
+  end
+
+  return {
+    name = `managed {stage}`,
+    -- Tiered compaction names its scratch files at random and removes them in no fixed order:
+    -- one scratch file is as good as another for saying which step this is.
+    stable = function(step: string): string return (string.gsub(step, 'jql%-tiers%-%d+.*$', 'jql-tiers-scratch')) end,
+    prepare = function(disk: memfs.Disk, ledger: lab.Ledger)
+      local db = sql.managed.create(base, options(disk))
+      commit(db, ledger, 'p1', 100)
+      db:flush()
+      commit(db, ledger, 'p2', 200)
+      db:flush()
+      commit(db, ledger, 'p3', 300)
+      if stage == 'compact' then db:flush() end
+      db:close()
+    end,
+    exercise = function(disk: memfs.Disk, ledger: lab.Ledger)
+      local db = sql.managed.openExisting(base, options(disk))
+      -- The transition may raise at the fault; the database is closed either way.
+      local ok, problem = pcall(function()
+        commit(db, ledger, 'e1', 400)
+        if stage == 'flush' then
+          db:flush()
+        elseif stage == 'checkpoint' then
+          db:checkpoint()
+        else
+          db:compact()
+        end
+
+        commit(db, ledger, 'e2', 500)
+      end)
+      pcall(function() db:close() end)
+      if not ok then error(problem, 0) end
+    end,
+    recover = function(disk: memfs.Disk): lab.Observed
+      local db = sql.managed.openExisting(base, options(disk))
+      local observed: lab.Observed = {}
+      for _, row in db:query('SELECT batch FROM events').rows do
+        local batch = (row :: Row).batch :: string
+        observed[batch] = (observed[batch] or 0) + 1
+      end
+
+      db:close()
+      -- What recovery published must also pass the offline scan, with a semantic WAL replay.
+      local report = sql.managed.verify(base, { semantic = true, storage = disk.backend })
+      if not report.ok then error(`offline verification: {if report.issues[1] then report.issues[1].code else 'UNKNOWN'}`, 0) end
+
+      return observed
+    end,
+  }
+end
+
+-- A backup to a second namespace: the source must be untouched, and a copy that has a manifest
+-- must be a whole copy.
+local function backupScenario(): lab.Scenario
+  local inner = managedScenario('flush')
+  return {
+    name = 'managed backup',
+    prepare = inner.prepare,
+    exercise = function(disk: memfs.Disk, _ledger: lab.Ledger)
+      sql.managed.backup('/memory/events', '/memory/copy', { storage = disk.backend })
+    end,
+    recover = function(disk: memfs.Disk): lab.Observed
+      local observed = inner.recover(disk)
+      if disk.backend.exists('/memory/copy.jql-manifest') then
+        local copy = sql.managed.openExisting('/memory/copy', { storage = disk.backend })
+        local rows = copy:query('SELECT COUNT(*) AS n FROM events').rows[1].n :: number
+        copy:close()
+        if rows ~= 12 then error(`a published backup holds {rows} of 12 rows`, 0) end
+      end
+
+      return observed
+    end,
+  }
+end
+
+-- The same for a database of several tables: its three steps, copied whole or not published.
+local function catalogBackupScenario(): lab.Scenario
+  return {
+    name = 'catalog backup',
+    prepare = world.prepare,
+    exercise = function(disk: memfs.Disk, _ledger: lab.Ledger)
+      sql.catalog.backup(world.Path, '/memory/copy', { storage = disk.backend })
+    end,
+    recover = function(disk: memfs.Disk): lab.Observed
+      local observed = world.recover(disk)
+      if disk.backend.exists('/memory/copy.jql-manifest') then
+        local copy = sql.catalog.openExisting('/memory/copy', { storage = disk.backend })
+        local rows = copy:query('SELECT COUNT(*) AS n FROM handled').rows[1].n :: number
+        copy:close()
+        if rows ~= 3 then error(`a published backup holds {rows} of 3 steps`, 0) end
+      end
+
+      return observed
+    end,
+  }
+end
+
+suite.describe('the store, stopped at every storage step', function()
+  suite.it('keeps every acknowledged WAL commit, whole, and recovers from a crashed recovery', function()
+    local report = lab.run(walScenario(), { crashRecovery = true })
+    expect(findings(report)).toBe('')
+    expect(report.truncated).toBe(false)
+    expect(#report.schedule >= 4).toBe(true)
+  end)
+
+  for _, stage in { 'flush', 'checkpoint', 'compact' } do
+    suite.it(`keeps every acknowledged commit across a {stage}: sealing, manifest replacement, directory sync, retirement`, function()
+      local report = lab.run(managedScenario(stage))
+      expect(findings(report)).toBe('')
+      expect(report.truncated).toBe(false)
+      -- The schedule covers the stages the transition is made of.
+      local seen: { [string]: boolean } = {}
+      for _, step in report.schedule do seen[string.match(step, '^(%S+)') :: string] = true end
+
+      expect(seen.replace).toBe(true)
+      expect(seen.syncDirectory).toBe(true)
+      expect(seen.remove).toBe(true)
+    end)
+  end
+
+  -- Review of 2026-11-13: the model only ever lost unsynchronized bytes whole, and made every
+  -- `createDurable` whole or not at all; a real disk can leave a tail of zeros and a name with no
+  -- bytes. The same stores, stopped at every step with what was being written torn.
+  -- Re-review of 2026-11-13: a backup's manifest, made in place, could be left empty, a copy with
+  -- a manifest that cannot be opened; the backups are swept torn too.
+  suite.it('keeps every acknowledged commit when what was being written is torn, not lost', function()
+    for _, scenario in { walScenario(), managedScenario('flush'), managedScenario('checkpoint'), backupScenario(),
+      catalogBackupScenario() } do
+      local report = lab.run(scenario, { modes = { 'torn' } })
+      expect(`{scenario.name}: {findings(report)}`).toBe(`{scenario.name}: `)
+      expect(report.truncated).toBe(false)
+    end
+  end)
+
+  suite.it('recovers a flush whose recovery is itself crashed at every step', function()
+    local report = lab.run(managedScenario('flush'), { modes = { 'crash' }, crashRecovery = true })
+    expect(findings(report)).toBe('')
+    expect(report.truncated).toBe(false)
+    expect(report.recoverySteps > 0).toBe(true)
+  end)
+
+  suite.it('leaves the source whole and never publishes half a backup', function()
+    for _, scenario in { backupScenario(), catalogBackupScenario() } do
+      local report = lab.run(scenario)
+      expect(`{scenario.name}: {findings(report)}`).toBe(`{scenario.name}: `)
+      expect(report.truncated).toBe(false)
+    end
+  end)
+end)
+
+return suite

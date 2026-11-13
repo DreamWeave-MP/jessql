@@ -1,6 +1,6 @@
 --!strict
 local sql = require('@jessql')
-local fs = require('@dream/fs')
+local fs = require('@jessql/vfs')
 local test = require('@jess/test')
 local suite, expect = test.new(), test.expect
 
@@ -14,7 +14,7 @@ local function fixture(name: string): string
 
   for epoch = 1, 32 do
     local suffix = string.format('.g%08d', epoch)
-    for _, ending in { '.rows', '.deleted', '.wal', '.wal.lock', '.hot-rows', '.hot-deleted' } do
+    for _, ending in { '.rows', '.deleted', '.wal', '.wal.lock', '.wal.committed', '.hot-rows', '.hot-deleted' } do
       fs.remove(base .. suffix .. ending)
     end
   end
@@ -26,7 +26,7 @@ local function removeFixture(base: string)
 
   for epoch = 1, 32 do
     local suffix = string.format('.g%08d', epoch)
-    for _, ending in { '.rows', '.deleted', '.wal', '.wal.lock', '.hot-rows', '.hot-deleted' } do
+    for _, ending in { '.rows', '.deleted', '.wal', '.wal.lock', '.wal.committed', '.hot-rows', '.hot-deleted' } do
       fs.remove(base .. suffix .. ending)
     end
   end

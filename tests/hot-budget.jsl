@@ -1,7 +1,7 @@
 --!strict
 local sql = require('@jessql')
 local managed = require('@jessql/managed')
-local fs = require('@dream/fs')
+local fs = require('@jessql/vfs')
 local test = require('@jess/test')
 local expect = test.expect
 local suite = test.new()
@@ -15,7 +15,7 @@ local function cleanup(base: string)
   -- The managed runtime owns epoch retirement. Remove only our test fixtures.
   for epoch = 1, 15 do
     local prefix = base .. string.format('.g%08d', epoch)
-    for _, extension in { '.rows', '.deleted', '.wal', '.wal.lock', '.hot-rows', '.hot-deleted' } do
+    for _, extension in { '.rows', '.deleted', '.wal', '.wal.lock', '.wal.committed', '.hot-rows', '.hot-deleted' } do
       fs.remove(prefix .. extension)
     end
   end
@@ -25,6 +25,7 @@ local function cleanup(base: string)
   end
   fs.remove(base)
   fs.remove(base .. '.lock')
+  fs.remove(base .. '.committed')
 end
 
 local function newManaged(base: string, options: managed.Options?)

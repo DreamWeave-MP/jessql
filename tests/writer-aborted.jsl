@@ -1,0 +1,86 @@
+--!strict
+-- #31: a rejection says whether the request ran. `aborted` is true on a request whose
+-- transaction ran and was rolled back, absent on one that never ran, and never on anything
+-- that is not a rejection, whoever says so.
+local memfs = require('@jessql/memfs')
+local service = require('@jessql/writer_service')
+local sql = require('@jessql')
+local test = require('@jess/test')
+local writer = require('@jessql/writer')
+
+local expect = test.expect
+local suite = test.new()
+
+local Tables: { sql.CatalogTableSpec } = { { tableName = 'events', columns = { 'id', 'body' }, primaryKey = 'id' } }
+
+local function insert(id: string, key: number): writer.Request
+  return { id = id, operations = { { op = 'insert', table = 'events', row = { id = key, body = id } } } }
+end
+
+local function told(acks: { writer.Ack }): string
+  local parts: { string } = {}
+  for _, ack in acks do table.insert(parts, `{ack.id}={ack.outcome}{if ack.aborted == nil then '' else `/aborted={tostring(ack.aborted)}`}`) end
+
+  return table.concat(parts, ' ')
+end
+
+suite.describe('a rejection that says whether the request ran', function()
+  suite.it('marks a rolled-back request aborted, and a request that never ran not at all', function()
+    local disk = memfs.new()
+    local db = sql.catalog.create('/memory/aborted', { tables = Tables, storage = disk.backend })
+    local queue = writer.new(db, { maxBatch = 8 })
+    queue:submit(insert('first', 1))
+    -- The same key again: its transaction runs, raises, and is rolled back.
+    queue:submit(insert('again', 1))
+    queue:submit(insert('second', 2))
+    expect(told(queue:drain())).toBe('first=committed again=rejected/aborted=true second=committed')
+    expect(db:query('SELECT COUNT(*) AS n FROM events').rows[1].n).toBe(2)
+
+    -- Waiting when the writer stops: refused without running.
+    queue:submit(insert('late', 3))
+    queue:submit(insert('later', 4))
+    expect(told(queue:stop('closing'))).toBe('late=rejected later=rejected')
+    expect(db:query('SELECT COUNT(*) AS n FROM events').rows[1].n).toBe(2)
+    db:close()
+  end)
+
+  suite.it('carries it through the service, and takes it from the owner only on a rejection', function()
+    local disk = memfs.new()
+    local host = service.host({ storage = disk.backend })
+    local replies: { unknown } = {}
+    local forged = false
+    local lane: service.Lane = {
+      send = function(_self: service.Lane, message: unknown)
+        local reply = host(message)
+        if reply == nil then return end
+
+        -- A worker that lies: `aborted` on what it says committed, and a string for a boolean.
+        local acks = (reply :: { acks: { { [string]: unknown } }? }).acks
+        if forged and acks then
+          for _, ack in acks do ack.aborted = if ack.outcome == 'committed' then true else 'yes' end
+        end
+
+        table.insert(replies, reply)
+      end,
+      receive = function(_self: service.Lane, _seconds: number?): unknown
+        return table.remove(replies, 1)
+      end,
+    }
+
+    local client = service.client(lane)
+    assert(client:open('/memory/served', Tables))
+    client:submit(insert('first', 1))
+    client:submit(insert('again', 1))
+    expect(told(client:poll(0))).toBe('first=committed again=rejected/aborted=true')
+
+    -- One more that commits and one that is rolled back, relayed by a worker that lies.
+    expect(client:submit(insert('first', 9)).admitted).toBe(true)
+    forged = true
+    client:submit(insert('clash', 9))
+    -- The owner's word is taken only as `true` and only on a rejection.
+    expect(told(client:poll(0))).toBe('first=committed clash=rejected')
+    client:close(0)
+  end)
+end)
+
+return suite

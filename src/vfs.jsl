@@ -1,0 +1,94 @@
+--!strict
+-- The one place JessQL reaches the filesystem. Every storage module requires this instead of
+-- `@dream/fs`, so the disk underneath a database can be replaced: by the in-memory disk in
+-- `@jessql/memfs` for tests that run with no filesystem capability, or by a wrapper that injects
+-- a fault at a chosen durability step.
+--
+-- Storage is owned per database. Every function that opens, creates, verifies or copies a
+-- database takes a `storage` backend (in its options, or as its last argument) and resolves it
+-- once, on entry, with `vfs.resolve`. Everything that database does afterwards goes to that
+-- backend, held in the database's own closure: two databases in one VM can sit on two disks, and
+-- nothing done to the VM later can move an open database onto another.
+--
+-- `vfs.use` sets the VM's default: the backend a database gets when it is opened without one.
+-- It is read at open and never again, so changing it under an open database changes nothing for
+-- that database. With nothing installed and nothing passed, the backend is `@dream/fs`.
+--
+-- The forwarding functions below (`vfs.exists` and the rest) act on the VM default. They are for
+-- tests and tools; the storage modules do not call them.
+
+local native = require('@dream/fs')
+
+-- What a backend is: the shape of `@dream/fs`. It need only implement the functions below.
+export type Backend = typeof(native)
+
+type WriteOptions = { offset: number?, append: boolean?, create: boolean?, exclusive: boolean?, atomic: boolean?, createParents: boolean?, mode: number? }
+type OpenWriteOptions = { append: boolean?, truncate: boolean?, create: boolean?, exclusive: boolean?, writeThrough: boolean?, mode: number? }
+type RecursiveOptions = { recursive: boolean? }
+type MkdirOptions = { recursive: boolean?, mode: number? }
+type LockOptions = { shared: boolean?, createParents: boolean?, mode: number? }
+
+local current: Backend = native
+local vfs = {}
+
+-- The backend a database will use: the one it was given, else the VM default as it is now.
+-- Call it once per entry point and keep the result; never per operation.
+function vfs.resolve(storage: Backend?): Backend
+  return storage or current
+end
+
+-- Installs `backend` as this VM's default and returns a function that puts back what was there,
+-- exactly once (calling it again does nothing). Installations nest, and must be undone innermost
+-- first: restoring out of order raises. Databases already open are unaffected either way.
+function vfs.use(backend: Backend): () -> ()
+  local previous = current
+  current = backend
+  local restored = false
+  return function()
+    if restored then return end
+    if current ~= backend then error('jessql vfs: storage backends must be restored innermost first', 2) end
+
+    restored = true
+    current = previous
+  end
+end
+
+-- The VM default, and the host filesystem whatever the default is.
+function vfs.backend(): Backend return current end
+function vfs.native(): Backend return native end
+
+-- Paths. Lexical in every backend; `canonicalize` and `cwd` are the backend's own.
+function vfs.join(...: string): string return current.join(...) end
+function vfs.parent(path: string) return current.parent(path) end
+function vfs.fileName(path: string) return current.fileName(path) end
+function vfs.isFileName(name: string) return current.isFileName(name) end
+function vfs.absolute(path: string) return current.absolute(path) end
+function vfs.canonicalize(path: string) return current.canonicalize(path) end
+function vfs.cwd() return current.cwd() end
+
+-- What is there.
+function vfs.exists(path: string) return current.exists(path) end
+function vfs.isFile(path: string) return current.isFile(path) end
+function vfs.isDir(path: string) return current.isDir(path) end
+function vfs.stat(path: string) return current.stat(path) end
+function vfs.list(path: string) return current.list(path) end
+
+-- Reading.
+function vfs.readFile(path: string) return current.readFile(path) end
+function vfs.readFileString(path: string) return current.readFileString(path) end
+function vfs.readAt(path: string, offset: number, length: number) return current.readAt(path, offset, length) end
+function vfs.open(path: string) return current.open(path) end
+function vfs.openPositional(path: string) return current.openPositional(path) end
+
+-- Writing, and the steps that make a write or a name durable.
+function vfs.writeFile(path: string, data: buffer | string, options: WriteOptions?) return current.writeFile(path, data, options) end
+function vfs.openWrite(path: string, options: OpenWriteOptions?) return current.openWrite(path, options) end
+function vfs.createDurable(path: string, data: buffer | string) return current.createDurable(path, data) end
+function vfs.syncDirectory(path: string) return current.syncDirectory(path) end
+function vfs.replace(source: string, destination: string) return current.replace(source, destination) end
+function vfs.rename(from: string, to: string) return current.rename(from, to) end
+function vfs.mkdir(path: string, options: MkdirOptions?) return current.mkdir(path, options) end
+function vfs.remove(path: string, options: RecursiveOptions?) return current.remove(path, options) end
+function vfs.lock(path: string, options: LockOptions?) return current.lock(path, options) end
+
+return vfs

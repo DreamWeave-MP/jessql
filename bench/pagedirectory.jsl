@@ -1,0 +1,126 @@
+--!strict
+-- #19: the two-level page directory at scale. A directory of `pages` page references is
+-- written to a real file, opened, and looked up cold and warm, with the process's resident
+-- size at each step. One size a process, because a peak only grows:
+--
+--   jess run --trusted --package . bench/pagedirectory.jsl <pages> [maxLeaves=64] [flat|keep|reuse]
+--
+-- `keep` leaves the file behind and `reuse` opens one left behind without building it, so that
+-- a reader can be measured in a process that never held the writer: what a reader costs is
+-- the question, and a process that has just written a hundred million references still holds
+-- what writing them took.
+--
+-- With `flat` the same references are held as one table instead, which is what a flat
+-- directory costs to open. Linux only for the sizes (procfs). The file is in the working
+-- directory and is removed afterwards.
+local directory = require('@jessql/pagedirectory')
+local fs = require('@dream/fs')
+local vfs = require('@jessql/vfs')
+
+local arguments = { ... } :: { string }
+local pages = math.floor(tonumber(arguments[1]) or 100000)
+local maxLeaves = math.floor(tonumber(arguments[2]) or 64)
+local flat = arguments[3] == 'flat'
+local keep, reuse = arguments[3] == 'keep', arguments[3] == 'reuse'
+local collect = require('@jess/bench').collect
+
+local function resident(field: string?): number
+  local data = fs.readFileString('/proc/self/status')
+  local amount = if data then string.match(data, (field or 'VmRSS') .. ':%s*(%d+)') else nil
+  return if amount then tonumber(amount) or 0 else -1
+end
+
+local function key(index: number): string
+  return string.format('key-%010d', index)
+end
+
+local cwd = assert((fs.cwd()))
+local path = fs.join(cwd, `.jessql-pagedirectory-bench-{pages}.dir`)
+if not reuse then fs.remove(path) end
+
+local storage = vfs.native()
+local base = resident()
+
+if flat then
+  local began = os.clock()
+  local held: { directory.Page } = table.create(pages) :: { directory.Page }
+  for index = 1, pages do held[index] = { first = key(index), segment = index // 100000, offset = (index % 100000) * 4096, length = 4096 } end
+
+  print(string.format('pages=%d flat: built in %.2f s; resident %d kB over a base of %d kB (%.0f bytes a page)', pages, os.clock() - began,
+    resident() - base, base, (resident() - base) * 1024 / pages))
+  return 0
+end
+
+local began = os.clock()
+if not reuse then
+  local writer = assert(directory.writer(storage, path))
+  for index = 1, pages do
+    local problem = writer.add({ first = key(index), segment = index // 100000, offset = (index % 100000) * 4096, length = 4096 })
+    if problem then error(problem, 0) end
+  end
+
+  assert(writer.finish())
+end
+
+local buildSeconds = os.clock() - began
+collect()
+local size = (assert((fs.stat(path))) :: { size: number }).size
+local afterBuild = resident()
+local ownAfterBuild = resident('RssAnon')
+
+began = os.clock()
+local reader = assert(directory.reader(storage, path, size, { maxLeaves = maxLeaves }))
+local openSeconds = os.clock() - began
+local opened = reader.stats()
+collect()
+local heldOpen = gcinfo()
+local afterOpen = resident()
+local ownAfterOpen = resident('RssAnon')
+
+-- Cold: lookups spread over the whole directory, each in a leaf not seen before (or evicted).
+local Probes = 20000
+local step = math.max(1, pages // Probes)
+began = os.clock()
+local found = 0
+for probe = 1, Probes do
+  local index = ((probe * 7919) % pages) + 1
+  local page = reader.find(key(index))
+  if page and page.first == key(index) then found += 1 end
+end
+
+local coldSeconds = os.clock() - began
+local cold = reader.stats()
+collect()
+local heldCold = gcinfo()
+local afterCold = resident()
+-- The file's pages read through a mapping are the kernel's cache counted against the process;
+-- what the process itself holds is the anonymous part.
+local ownAfterCold, mappedAfterCold = resident('RssAnon'), resident('RssFile')
+
+-- Warm: the same number of lookups inside the leaves the cache holds.
+began = os.clock()
+local warmFound = 0
+for probe = 1, Probes do
+  local index = pages - (probe % math.min(pages, maxLeaves * 128))
+  local page = reader.find(key(index))
+  if page and page.first == key(index) then warmFound += 1 end
+end
+
+local warmSeconds = os.clock() - began
+local warm = reader.stats()
+if not keep and not reuse then fs.remove(path) end
+
+print(string.format('pages=%d maxLeaves=%d step=%d', pages, maxLeaves, step))
+print('| What | Result |')
+print('|---|---|')
+print(string.format('| build | %.2f s; file %d bytes (%.1f a page); %d leaves; root %d bytes |', buildSeconds, size, size / pages, opened.leaves, opened.rootBytes))
+print(string.format('| open (footer and root only) | %.1f ms; resident %d kB more than before it |', openSeconds * 1000, afterOpen - afterBuild))
+print(string.format('| %d cold lookups | %.2f s (%.1f us each); %d found; %d leaf reads; resident %d kB more |', Probes, coldSeconds, coldSeconds * 1e6 / Probes, found,
+  cold.leafReads, afterCold - afterOpen))
+print(string.format('| %d warm lookups | %.3f s (%.2f us each); %d found; %d more leaf reads; %d leaves held |', Probes, warmSeconds, warmSeconds * 1e6 / Probes, warmFound,
+  warm.leafReads - cold.leafReads, warm.cached))
+print(string.format('| the script\'s heap after a full collection | with the directory open %d kB; with %d leaves cached as well %d kB |', heldOpen, cold.cached, heldCold))
+print(string.format('| resident | base %d kB; after building %d; after opening %d; after the lookups %d |', base, afterBuild, afterOpen, afterCold))
+print(string.format('| of that, the process\'s own (not mapped file pages) | after building %d kB; after opening %d; after the lookups %d, with %d kB of mapped file |',
+  ownAfterBuild, ownAfterOpen, ownAfterCold, mappedAfterCold))
+return 0

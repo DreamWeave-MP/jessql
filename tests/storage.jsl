@@ -1,6 +1,6 @@
 --!strict
 local sql = require('@jessql')
-local fs = require('@dream/fs')
+local fs = require('@jessql/vfs')
 local test = require('@jess/test')
 local expect = test.expect
 local suite = test.new()
@@ -9,12 +9,14 @@ local function fixture(name: string): string
   local path = fs.join(assert((fs.cwd())), '.jessql-' .. name .. '.wal')
   fs.remove(path)
   fs.remove(path .. '.lock')
+  fs.remove(path .. '.committed')
   return path
 end
 
 local function clean(path: string)
   fs.remove(path)
   fs.remove(path .. '.lock')
+  fs.remove(path .. '.committed')
 end
 
 suite.describe('native persistent store', function()

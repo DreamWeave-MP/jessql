@@ -1,0 +1,175 @@
+--!strict
+-- P0-04: what JessQL persists, held to a registry and to golden files. A file written by 0.2.0
+-- must still open, read and accept writes; today's writers must still produce those bytes; a
+-- version this build does not know must be refused in so many words, never read as empty.
+local build = require('./fixtures/formats-build')
+local bytes = require('@dream/bytes')
+local formats = require('@jessql/formats')
+local golden = require('./fixtures/formats-v1')
+local marks = require('./fixtures/formats-mark-v1')
+local memfs = require('@jessql/memfs')
+local sql = require('@jessql')
+local test = require('@jess/test')
+
+local expect = test.expect
+local suite = test.new()
+
+type Row = { [string]: unknown }
+
+-- Every pinned file: what 0.2.0 wrote, and the committed-length mark this code adds beside a log.
+local every: { [string]: string } = {}
+for path, encoded in golden do every[path] = encoded end
+
+for path, encoded in marks do every[path] = encoded end
+
+-- A disk holding the golden files, each made durable as the store would have left it.
+local function restored(change: ((path: string, body: string) -> string)?): memfs.Disk
+  local disk = memfs.new()
+  for path, encoded in golden do
+    local body = buffer.tostring(assert((bytes.fromBase64(encoded))))
+    if change then body = change(path, body) end
+    assert((disk.backend.createDurable(path, body)))
+  end
+
+  return disk
+end
+
+local function rowsOf(db: sql.ManagedDatabase): string
+  local seen: { string } = {}
+  for _, row in db:query('SELECT id, room, body FROM events ORDER BY id').rows do
+    local record = row :: Row
+    table.insert(seen, `{record.id}:{record.room}:{record.body}`)
+  end
+
+  return table.concat(seen, ' ')
+end
+
+suite.describe('the format registry', function()
+  suite.it('identifies every golden file, and by the name the store wrote it under', function()
+    local seen: { [string]: number } = {}
+    for path, encoded in every do
+      local body = buffer.tostring(assert((bytes.fromBase64(encoded))))
+      local format = formats.identify(body)
+      expect(`{path} identified={format ~= nil}`).toBe(`{path} identified=true`)
+      local identified = format :: formats.Format
+      seen[identified.id] = (seen[identified.id] or 0) + 1
+      local expected = formats.expected(path)
+      if expected then expect(`{path} {expected.id}`).toBe(`{path} {identified.id}`) end
+    end
+
+    -- Every registered format has a golden file: none is listed without one.
+    for _, format in formats.list do expect(`{format.id} {(seen[format.id] or 0) > 0}`).toBe(`{format.id} true`) end
+  end)
+
+  suite.it('knows nothing of a later version or of bytes that are not a JessQL file', function()
+    for _, head in { 'JQLW2\n', 'JQLP3\n', 'JQLS2\n', 'JQLM2\n', 'JQLP1\n', 'SQLite format 3', '', 'JQLW1' } do
+      expect(`{head} {tostring(formats.identify(head))}`).toBe(`{head} nil`)
+    end
+  end)
+
+  suite.it('lists distinct ids and magics, and only versions it both names and reads', function()
+    local ids: { [string]: boolean }, magics: { [string]: boolean } = {}, {}
+    for _, format in formats.list do
+      expect(ids[format.id] == nil and magics[format.magic] == nil).toBe(true)
+      ids[format.id], magics[format.magic] = true, true
+      expect(#format.magic).toBe(6)
+      expect(string.sub(format.magic, 5, 5)).toBe(tostring(format.version))
+      for _, written in format.writes do expect(table.find(format.reads, written) ~= nil).toBe(true) end
+    end
+  end)
+end)
+
+suite.describe('files written by 0.2.0', function()
+  suite.it('open, read back exactly, verify offline, and accept new writes', function()
+    local disk = restored()
+    local db = sql.managed.openExisting('/memory/g', { storage = disk.backend })
+    expect(rowsOf(db)).toBe('2:b:two 3:a:three 4:c:four')
+    expect(db:get(1)).toBe(nil)
+    expect(db:stats().generations).toBe(3)
+    db:transaction(function(tx) tx:insert({ id = 5, room = 'd', body = 'five' }) end)
+    expect(db:checkpoint() > 3).toBe(true)
+    db:close()
+
+    local again = sql.managed.openExisting('/memory/g', { storage = disk.backend })
+    expect(rowsOf(again)).toBe('2:b:two 3:a:three 4:c:four 5:d:five')
+    again:close()
+    expect(sql.managed.verify('/memory/g', { semantic = true, storage = disk.backend }).ok).toBe(true)
+  end)
+
+  suite.it('pass the offline scan as they are, before anything is written', function()
+    local disk = restored()
+    local report = sql.managed.verify('/memory/g', { semantic = true, storage = disk.backend })
+    expect(report.ok).toBe(true)
+    expect(report.walSemanticReplayChecked).toBe(true)
+    expect(sql.managed.inspect('/memory/g', disk.backend).epoch).toBe(3)
+  end)
+
+  suite.it('open as a snapshot with both kinds of secondary index, and answer the same', function()
+    local disk = restored()
+    local on = disk.backend
+    for _, sidecar in { '/memory/s.index', '/memory/s.legacy' } do
+      local snapshot = sql.paged.open('/memory/s.rows', { storage = on })
+      local index = sql.secondary.open(sidecar, snapshot, { storage = on })
+      expect(index.partitionColumn).toBe('room')
+      expect(index.count).toBe(3)
+      local found: { string } = {}
+      for row in index:iterate('a') do table.insert(found, `{row.id}:{row.body}`) end
+
+      expect(`{sidecar} {table.concat(found, ' ')}`).toBe(`{sidecar} 1:x1 3:x3`)
+      index:close()
+      snapshot:close()
+    end
+  end)
+
+  suite.it('are what today\'s writers still produce, byte for byte', function()
+    local today = build()
+    for path, encoded in every do
+      local body = buffer.tostring(assert((bytes.fromBase64(encoded))))
+      -- A difference here is a format change: register a new version and add a fixture for it.
+      expect(`{path} {today[path] == body}`).toBe(`{path} true`)
+    end
+
+    for path in today do expect(`{path} {every[path] ~= nil}`).toBe(`{path} true`) end
+  end)
+end)
+
+suite.describe('a version this build does not know', function()
+  -- The golden files with one file's magic moved to the next version.
+  local function bumped(target: string): memfs.Disk
+    return restored(function(path: string, body: string): string
+      if path ~= target then return body end
+      local digit = tonumber(string.sub(body, 5, 5)) :: number
+      return string.sub(body, 1, 4) .. tostring(digit + 1) .. string.sub(body, 6)
+    end)
+  end
+
+  suite.it('is refused at open for the WAL, a row generation, a deletion sidecar and the manifest', function()
+    for _, target in { '/memory/g.g00000003.wal', '/memory/g.g00000001.rows', '/memory/g.g00000002.deleted', '/memory/g.jql-manifest' } do
+      local disk = bumped(target)
+      -- openExisting raises on the unknown version; that refusal is the assertion.
+      local opened, problem = pcall(function() return sql.managed.openExisting('/memory/g', { storage = disk.backend }) end)
+      expect(`{target} opened={tostring(opened)}`).toBe(`{target} opened=false`)
+      expect(#tostring(problem) > 0).toBe(true)
+      -- And the offline scan reports it rather than passing.
+      local scanned, report = pcall(function() return sql.managed.verify('/memory/g', { semantic = true, storage = disk.backend }) end)
+      expect(`{target} verified={tostring(scanned and (report :: any).ok)}`).toBe(`{target} verified=false`)
+    end
+  end)
+
+  suite.it('is refused for a snapshot and for each secondary index', function()
+    for _, target in { '/memory/s.rows', '/memory/s.index', '/memory/s.legacy' } do
+      local disk = bumped(target)
+      local on = disk.backend
+      -- The open raises on the unknown version; that refusal is the assertion.
+      local opened = pcall(function()
+        local snapshot = sql.paged.open('/memory/s.rows', { storage = on })
+        local index = sql.secondary.open(if target == '/memory/s.rows' then '/memory/s.index' else target, snapshot, { storage = on })
+        index:close()
+        snapshot:close()
+      end)
+      expect(`{target} opened={tostring(opened)}`).toBe(`{target} opened=false`)
+    end
+  end)
+end)
+
+return suite

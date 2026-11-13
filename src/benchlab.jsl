@@ -1,0 +1,318 @@
+--!strict
+-- A benchmark laboratory: seeded datasets with a fingerprint, key samplers, and a harness that
+-- keeps setup, loading, timed work and teardown apart, rotates the order of what it compares,
+-- keeps every raw measurement, and refuses a result its oracle does not recognize.
+--
+-- Nothing here knows about a database. A workload is a table of functions; the harness times
+-- them with the clock it is given. Datasets depend only on their specification: the same
+-- specification gives the same rows and the same fingerprint on every platform, so two runs can
+-- say whether they measured the same data, and refuse to be compared if they did not.
+
+local bytes = require('@dream/bytes')
+
+export type Row = { [string]: unknown }
+
+export type Distribution = 'uniform' | 'zipf'
+
+export type DatasetSpec = {
+  seed: number,
+  rows: number,
+  -- Bytes of the `body` column of each row: every row between these, drawn uniformly.
+  minBodyBytes: number, maxBodyBytes: number,
+  -- How many distinct values the `category` column takes.
+  categories: number,
+  -- One row in this many carries a `blob` of `blobBytes` as well. Nil or zero: none do.
+  blobEvery: number?, blobBytes: number?,
+}
+
+export type Dataset = {
+  spec: DatasetSpec,
+  -- A fresh pass over the rows, in key order: `id` from 1 to `rows`.
+  iterate: () -> () -> Row?,
+  -- SHA-256 over every row in order. Equal fingerprints mean the same data.
+  fingerprint: () -> string,
+  -- What the user supplied in all: key and column bytes.
+  userBytes: () -> number,
+}
+
+export type Sampler = () -> number
+
+export type Workload = {
+  name: string,
+  -- Once, before anything is timed. Not timed with the work.
+  setup: (() -> ())?,
+  -- Loads the data. Timed on its own.
+  load: (() -> ())?,
+  -- One operation. Its answer is folded into the trial's checksum.
+  operation: (index: number) -> number,
+  -- The checksum `operations` operations must add up to, worked out without the system under test.
+  expected: (operations: number) -> number,
+  -- After each trial, outside the timed region (a compaction, a cache reset).
+  between: (() -> ())?,
+  teardown: (() -> ())?,
+}
+
+export type Trial = {
+  workload: string, trial: number, order: number,
+  operations: number, seconds: number, checksum: number,
+  -- Seconds per operation at these percentiles, from every operation of the trial.
+  p50: number, p95: number, p99: number, p999: number, slowest: number,
+}
+
+export type Report = {
+  fingerprint: string?,
+  environment: { [string]: string },
+  -- Seconds spent in each workload's setup and load, outside every trial.
+  setupSeconds: { [string]: number }, loadSeconds: { [string]: number },
+  trials: { Trial },
+}
+
+export type Config = {
+  workloads: { Workload },
+  trials: number, operations: number,
+  -- A monotonic clock in seconds. `os.clock` measures processor time, not wall time: say which.
+  clock: () -> number,
+  -- Recorded with the report: versions, machine, durability. The harness does not guess them.
+  environment: { [string]: string }?,
+  fingerprint: string?,
+}
+
+local lab = {}
+
+-- Park-Miller. The same seed gives the same sequence everywhere.
+local function generator(seed: number): () -> number
+  local state = seed % 2147483646 + 1
+  return function(): number
+    state = state * 48271 % 2147483647
+    return state
+  end
+end
+
+local Alphabet = 'abcdefghijklmnopqrstuvwxyz0123456789'
+
+local function validSpec(spec: DatasetSpec)
+  local function whole(value: unknown, least: number, name: string)
+    if type(value) ~= 'number' or value % 1 ~= 0 or value < least then error(`jessql benchlab: {name} must be a whole number of at least {least}`, 3) end
+  end
+
+  whole(spec.seed, 0, 'seed')
+  whole(spec.rows, 1, 'rows')
+  whole(spec.minBodyBytes, 0, 'minBodyBytes')
+  whole(spec.maxBodyBytes, spec.minBodyBytes, 'maxBodyBytes')
+  whole(spec.categories, 1, 'categories')
+  if spec.blobEvery ~= nil and spec.blobEvery ~= 0 then
+    whole(spec.blobEvery, 1, 'blobEvery')
+    whole(spec.blobBytes, 1, 'blobBytes')
+  end
+end
+
+function lab.dataset(spec: DatasetSpec): Dataset
+  validSpec(spec)
+  local span = spec.maxBodyBytes - spec.minBodyBytes + 1
+  local blobEvery = if spec.blobEvery and spec.blobEvery > 0 then spec.blobEvery else nil
+
+  local function iterate(): () -> Row?
+    local next = generator(spec.seed)
+    local index = 0
+    return function(): Row?
+      if index >= spec.rows then return nil end
+      index += 1
+      local length = spec.minBodyBytes + next() % span
+      -- A short random stem repeated to length: cheap to make, and not all one byte.
+      local stem: { string } = {}
+      for _ = 1, 8 do
+        local at = next() % #Alphabet + 1
+        table.insert(stem, string.sub(Alphabet, at, at))
+      end
+
+      local unit = table.concat(stem)
+      local body = string.sub(string.rep(unit, length // #unit + 1), 1, length)
+      local row: Row = { id = index, category = `c{next() % spec.categories}`, body = body }
+      if blobEvery and index % blobEvery == 0 then
+        row.blob = string.rep(string.char(65 + next() % 26), spec.blobBytes :: number)
+      end
+
+      return row
+    end
+  end
+
+  local hash: string? = nil
+  local total: number? = nil
+  local function measure()
+    local parts: { string } = {}
+    local size = 0
+    local running = ''
+    for row in iterate() do
+      local blob = row.blob :: string?
+      local line = `{row.id}|{row.category}|{row.body}|{blob or ''}\n`
+      size += 8 + #(row.category :: string) + #(row.body :: string) + (if blob then #blob else 0)
+      table.insert(parts, line)
+      -- Folded in pieces so a large dataset is never one string.
+      if #parts >= 256 then
+        running = bytes.sha256(running .. table.concat(parts))
+        table.clear(parts)
+      end
+    end
+
+    hash = bytes.sha256(running .. table.concat(parts))
+    total = size
+  end
+
+  return {
+    spec = spec, iterate = iterate,
+    fingerprint = function(): string
+      if not hash then measure() end
+      return hash :: string
+    end,
+    userBytes = function(): number
+      if not total then measure() end
+      return total :: number
+    end,
+  }
+end
+
+-- Keys from 1 to `keys`. `uniform`: each equally likely. `zipf`: key k with weight 1 / k^skew,
+-- so a few keys take most of the draws.
+function lab.sampler(distribution: Distribution, keys: number, seed: number, skew: number?): Sampler
+  if type(keys) ~= 'number' or keys < 1 or keys % 1 ~= 0 then error('jessql benchlab: keys must be a whole number of at least 1', 2) end
+
+  local next = generator(seed)
+  if distribution == 'uniform' then
+    return function(): number return next() % keys + 1 end
+  end
+
+  if distribution ~= 'zipf' then error('jessql benchlab: distribution is uniform or zipf', 2) end
+
+  local exponent = skew or 1
+  if exponent <= 0 then error('jessql benchlab: skew must be above zero', 2) end
+
+  local cumulative: { number } = table.create(keys) :: { number }
+  local sum = 0
+  for key = 1, keys do
+    sum += 1 / key ^ exponent
+    cumulative[key] = sum
+  end
+
+  return function(): number
+    local target = next() / 2147483647 * sum
+    local low, high = 1, keys
+    while low < high do
+      local middle = (low + high) // 2
+      if cumulative[middle] < target then low = middle + 1 else high = middle end
+    end
+
+    return low
+  end
+end
+
+-- The value at a percentile of sorted samples, by nearest rank: one that was really measured.
+function lab.percentile(sorted: { number }, percent: number): number
+  if #sorted == 0 then error('jessql benchlab: no samples', 2) end
+  if percent <= 0 or percent > 100 then error('jessql benchlab: a percentile is above 0 and at most 100', 2) end
+
+  return sorted[math.max(1, math.ceil(percent / 100 * #sorted))]
+end
+
+-- Runs every workload `trials` times, in an order that rotates each round so no workload always
+-- runs first or last. Raises if a trial's checksum is not the one its oracle expects, before the
+-- first timed trial (so a broken setup is not timed) and for every timed trial.
+function lab.run(config: Config): Report
+  if #config.workloads == 0 then error('jessql benchlab: no workloads', 2) end
+  if config.trials < 1 or config.operations < 1 then error('jessql benchlab: at least one trial of one operation', 2) end
+
+  local clock = config.clock
+  local report: Report = { fingerprint = config.fingerprint, environment = config.environment or {},
+    setupSeconds = {}, loadSeconds = {}, trials = {} }
+  local seen: { [string]: boolean } = {}
+
+  for _, workload in config.workloads do
+    if seen[workload.name] then error(`jessql benchlab: two workloads are named {workload.name}`, 2) end
+    -- A name goes into a line of comma-separated values as it is.
+
+    if workload.name == '' or string.find(workload.name, '[,"\n]') then
+      error('jessql benchlab: a workload name has no comma, quote or newline, and is not empty', 2)
+    end
+
+    seen[workload.name] = true
+    local began = clock()
+    if workload.setup then workload.setup() end
+
+    local loaded = clock()
+    if workload.load then workload.load() end
+
+    report.setupSeconds[workload.name] = loaded - began
+    report.loadSeconds[workload.name] = clock() - loaded
+  end
+
+  local function attempt(workload: Workload, timed: boolean): (number, number, { number })
+    local samples: { number } = if timed then (table.create(config.operations) :: { number }) else {}
+    local checksum = 0
+    local began = clock()
+    local last = began
+    for index = 1, config.operations do
+      checksum += workload.operation(index)
+      if timed then
+        local now = clock()
+        samples[index] = now - last
+        last = now
+      end
+    end
+
+    local seconds = clock() - began
+    local expected = workload.expected(config.operations)
+    if checksum ~= expected then
+      error(`jessql benchlab: {workload.name} answered {checksum} where its oracle expects {expected}; nothing is reported for a wrong result`, 0)
+    end
+
+    return seconds, checksum, samples
+  end
+
+  -- One untimed pass each: a wrong answer stops the run before anything is measured.
+  for _, workload in config.workloads do
+    attempt(workload, false)
+    if workload.between then workload.between() end
+  end
+
+  local count = #config.workloads
+  for trial = 1, config.trials do
+    for position = 1, count do
+      local workload = config.workloads[(trial - 1 + position - 1) % count + 1]
+      local seconds, checksum, samples = attempt(workload, true)
+      table.sort(samples)
+      table.insert(report.trials, {
+        workload = workload.name, trial = trial, order = position, operations = config.operations,
+        seconds = seconds, checksum = checksum,
+        p50 = lab.percentile(samples, 50), p95 = lab.percentile(samples, 95), p99 = lab.percentile(samples, 99),
+        p999 = lab.percentile(samples, 99.9), slowest = samples[#samples],
+      })
+
+      if workload.between then workload.between() end
+    end
+  end
+
+  for _, workload in config.workloads do
+    if workload.teardown then workload.teardown() end
+  end
+
+  return report
+end
+
+-- Whether two reports measured the same data. Reports without a fingerprint are never comparable.
+function lab.comparable(left: Report, right: Report): boolean
+  return left.fingerprint ~= nil and left.fingerprint == right.fingerprint
+end
+
+-- Every raw trial as comma-separated values, with a header line.
+function lab.csv(report: Report): string
+  local lines = { 'fingerprint,workload,trial,order,operations,seconds,ops_per_second,p50_us,p95_us,p99_us,p999_us,slowest_us,checksum' }
+  for _, trial in report.trials do
+    table.insert(lines, string.format('%s,%s,%d,%d,%d,%.6f,%.1f,%.2f,%.2f,%.2f,%.2f,%.2f,%d',
+      report.fingerprint or '', trial.workload, trial.trial, trial.order, trial.operations, trial.seconds,
+      if trial.seconds > 0 then trial.operations / trial.seconds else 0,
+      trial.p50 * 1e6, trial.p95 * 1e6, trial.p99 * 1e6, trial.p999 * 1e6, trial.slowest * 1e6, trial.checksum))
+  end
+
+  return table.concat(lines, '\n')
+end
+
+return lab

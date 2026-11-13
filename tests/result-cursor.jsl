@@ -1,0 +1,261 @@
+--!strict
+-- P1-05: a query result read a row or a page at a time. A cursor gives the rows `run` gives, in
+-- the same order; it stops asking its source once the consumer stops; an error or a write while
+-- it is paused surfaces as an error, never as other rows; and reading a large result through it
+-- does not hold the result. In memory.
+local memfs = require('@jessql/memfs')
+local sql = require('@jessql')
+local test = require('@jess/test')
+
+local expect = test.expect
+local suite = test.new()
+
+type Row = { [string]: unknown }
+
+-- A provider that makes `total` rows on demand and counts how many it was asked for. `failAt`
+-- makes it raise when that row is reached.
+local function generated(total: number, failAt: number?): (sql.Provider, () -> number)
+  local asked = 0
+  local function rowOf(index: number): Row
+    return { id = index, room = if index % 3 == 0 then 'north' else 'south', score = index % 10 }
+  end
+
+  local provider: sql.Provider = {
+    columns = { 'id', 'room', 'score' },
+    scan = function(_request: sql.Request): sql.SourceRows
+      local rows: { Row } = {}
+      for index = 1, total do rows[index] = rowOf(index) end
+
+      asked += total
+      return rows
+    end,
+    iterate = function(_request: sql.Request): sql.Iterator
+      local position = 0
+      return {
+        _jessqlIter = 'v1',
+        next = function(): Row?
+          if position >= total then return nil end
+          position += 1
+          asked += 1
+          if failAt == position then error('the source failed', 0) end
+          return rowOf(position)
+        end,
+      }
+    end,
+  }
+  return provider, function(): number return asked end
+end
+
+local function drain(cursor: sql.Cursor): { Row }
+  local rows: { Row } = {}
+  while true do
+    local row = cursor.next()
+    if not row then break end
+    table.insert(rows, row)
+  end
+
+  return rows
+end
+
+local function text(columns: { string }, rows: { Row }): string
+  local lines: { string } = {}
+  for _, row in rows do
+    local cells: { string } = {}
+    for _, column in columns do table.insert(cells, tostring(row[column])) end
+
+    table.insert(lines, table.concat(cells, '|'))
+  end
+
+  return table.concat(lines, '\n')
+end
+
+local Queries: { { sql: string, params: { unknown }?, streams: boolean } } = {
+  { sql = 'SELECT id, room, score FROM things', streams = true },
+  { sql = 'SELECT id FROM things WHERE room = ?', params = { 'north' }, streams = true },
+  { sql = 'SELECT id, score FROM things WHERE score > ? LIMIT 7', params = { 6 }, streams = true },
+  { sql = 'SELECT id FROM things LIMIT 5 OFFSET 12', streams = true },
+  { sql = 'SELECT id FROM things LIMIT 0', streams = false },
+  { sql = 'SELECT id, score FROM things ORDER BY score DESC, id LIMIT 9', streams = false },
+  { sql = 'SELECT room, COUNT(*) AS n FROM things GROUP BY room ORDER BY room', streams = false },
+  { sql = 'SELECT COUNT(*) AS n FROM things WHERE score = ?', params = { 3 }, streams = false },
+}
+
+suite.describe('a cursor over a prepared query', function()
+  suite.it('gives the rows run gives, in the same order, and says which queries it streams', function()
+    local db = sql.new()
+    db:register('things', (generated(200)))
+    for _, query in Queries do
+      local plan = db:prepare(query.sql)
+      local eager = plan.run(query.params)
+      local cursor = plan.open(query.params)
+      local rows = drain(cursor)
+      expect(`{query.sql}\n{text(cursor.columns, rows)}`).toBe(`{query.sql}\n{text(eager.columns, eager.rows)}`)
+      expect(`{query.sql} streams={cursor.streaming()}`).toBe(`{query.sql} streams={query.streams}`)
+      expect(cursor.done()).toBe(true)
+      expect(cursor.next()).toBe(nil)
+      expect(#cursor.page(3)).toBe(0)
+    end
+  end)
+
+  suite.it('hands out pages of the size asked, the last one short, and refuses a page that is not a count', function()
+    local db = sql.new()
+    db:register('things', (generated(23)))
+    local cursor = db:prepare('SELECT id FROM things').open()
+    local sizes: { number } = {}
+    local seen = 0
+    while not cursor.done() do
+      local page = cursor.page(10)
+      if #page == 0 then break end
+      table.insert(sizes, #page)
+      for _, row in page do
+        seen += 1
+        expect(row.id).toBe(seen)
+      end
+    end
+
+    expect(table.concat(sizes, ' ')).toBe('10 10 3')
+    for _, bad in { 0, -1, 1.5 } do
+      -- A page size that is not a positive whole number raises; the refusal is the assertion.
+      expect((pcall(function() db:prepare('SELECT id FROM things').open().page(bad) end))).toBe(false)
+    end
+  end)
+
+  suite.it('asks its source for no more rows once the consumer closes it or the LIMIT is met', function()
+    local db = sql.new()
+    local provider, asked = generated(100000)
+    db:register('things', provider)
+
+    local cursor = db:prepare('SELECT id FROM things').open()
+    expect(asked()).toBe(0)
+    for index = 1, 3 do expect((cursor.next() :: Row).id).toBe(index) end
+
+    cursor.close()
+    expect(asked() <= 4).toBe(true)
+    expect(cursor.done()).toBe(true)
+    expect(cursor.next()).toBe(nil)
+    -- Closing again, or a cursor never read, is nothing.
+    cursor.close()
+    db:prepare('SELECT id FROM things').open().close()
+    expect(asked() <= 4).toBe(true)
+
+    local before = asked()
+    local limited = drain(db:prepare('SELECT id FROM things WHERE room = ? LIMIT 5').open({ 'north' }))
+    expect(#limited).toBe(5)
+    -- Every third row matches: fifteen rows read to find five.
+    expect(asked() - before <= 16).toBe(true)
+  end)
+
+  suite.it('raises what its source raised, at the read that met it, and is finished afterwards', function()
+    local db = sql.new()
+    db:register('things', (generated(50, 4)))
+    local cursor = db:prepare('SELECT id FROM things').open()
+    expect((cursor.next() :: Row).id).toBe(1)
+    expect((cursor.next() :: Row).id).toBe(2)
+    expect((cursor.next() :: Row).id).toBe(3)
+    -- The fourth read meets the row the source fails on; that it raises is the assertion.
+    local ok, problem = pcall(cursor.next)
+    expect(ok).toBe(false)
+    expect((string.find(tostring(problem), 'the source failed', 1, true)) ~= nil).toBe(true)
+    expect(cursor.done()).toBe(true)
+    expect(cursor.next()).toBe(nil)
+  end)
+
+  suite.it('refuses too few parameters when it is opened, not at the first read', function()
+    local db = sql.new()
+    db:register('things', (generated(5)))
+    -- open raises on a missing parameter; the refusal is the assertion.
+    expect((pcall(function() db:prepare('SELECT id FROM things WHERE room = ?').open() end))).toBe(false)
+  end)
+end)
+
+suite.describe('a cursor over a hybrid database', function()
+  local function database(): (sql.HybridDatabase, memfs.Disk)
+    local disk = memfs.new()
+    local on = disk.backend
+    local position = 0
+    sql.paged.create('/memory/cold.rows', { 'id', 'room', 'body' }, 'id', function(): Row?
+      position += 1
+      if position > 40 then return nil end
+      return { id = position, room = if position % 2 == 0 then 'even' else 'odd', body = `cold{position}` }
+    end, { pageBytes = 1024, storage = on })
+    local db = sql.hybrid.open('/memory/hot.wal', '/memory/cold.rows', 'events', { storage = on })
+    db:transaction(function(tx)
+      tx:upsert({ id = 2, room = 'even', body = 'hot2' })
+      tx:delete(4)
+      tx:insert({ id = 100, room = 'even', body = 'hot100' })
+    end)
+    return db, disk
+  end
+
+  suite.it('gives what the eager query gives, hot over cold and deletions included', function()
+    local db = database()
+    for _, query in { 'SELECT id, body FROM events WHERE room = ?', 'SELECT id, body FROM events WHERE room = ? ORDER BY id' } do
+      local plan = db:prepare(query)
+      local eager = plan.run({ 'even' })
+      local rows = drain(plan.open({ 'even' }))
+      local got, want = string.split(text(eager.columns, rows), '\n'), string.split(text(eager.columns, eager.rows), '\n')
+      table.sort(got)
+      table.sort(want)
+      expect(table.concat(got, '\n')).toBe(table.concat(want, '\n'))
+      expect(#rows).toBe(20)
+    end
+
+    db:close()
+  end)
+
+  suite.it('raises rather than mix two states when the database is written while it is paused', function()
+    local db = database()
+    local cursor = db:prepare('SELECT id, body FROM events').open()
+    expect(cursor.next() ~= nil).toBe(true)
+    db:transaction(function(tx) tx:insert({ id = 200, room = 'odd', body = 'late' }) end)
+    -- The next read raises because the store changed under the open cursor.
+    local ok = pcall(function()
+      while cursor.next() do end
+    end)
+    expect(ok).toBe(false)
+    expect(cursor.done()).toBe(true)
+    -- A fresh cursor reads the new state.
+    expect(#drain(db:prepare('SELECT id FROM events').open())).toBe(41)
+    db:close()
+  end)
+end)
+
+suite.describe('reading a large result through a cursor', function()
+  suite.it('does not hold the result: heap growth is flat across a million rows, where the eager query grows with them', function()
+    -- Heap growth sampled after every page of 500 rows. The cursor is measured first: a heap
+    -- already enlarged by an eager result changes how far it may grow before it is collected.
+    local function throughCursor(total: number): (number, number)
+      local db = sql.new()
+      db:register('things', (generated(total)))
+      local cursor = db:prepare('SELECT id, room, score FROM things WHERE score < ?').open({ 9 })
+      local before, most, count = gcinfo(), 0, 0
+      while true do
+        local page = cursor.page(500)
+        if #page == 0 then break end
+        count += #page
+        most = math.max(most, gcinfo() - before)
+      end
+
+      return most, count
+    end
+
+    local small, smallCount = throughCursor(100000)
+    local large, largeCount = throughCursor(1200000)
+    expect(smallCount).toBe(90000)
+    expect(largeCount).toBe(1080000)
+    -- Twelve times the rows, and the same few megabytes at most.
+    expect(small < 8 * 1024).toBe(true)
+    expect(large < 8 * 1024).toBe(true)
+
+    local db = sql.new()
+    db:register('things', (generated(200000)))
+    local before = gcinfo()
+    local eager = db:prepare('SELECT id, room, score FROM things WHERE score < ?').run({ 9 })
+    local held = gcinfo() - before
+    expect(#eager.rows).toBe(180000)
+    expect(held > 5 * large).toBe(true)
+    print(`heap growth: cursor over {smallCount} rows at most {small} KB, over {largeCount} rows at most {large} KB; eager result of {#eager.rows} rows {held} KB`)
+  end)
+end)
+
+return suite

@@ -1,0 +1,199 @@
+--!strict
+-- P3-01: counting what the store does to its storage. The counters are reconciled against the
+-- files themselves, and a sustained run reports write, space and read amplification. In memory.
+local memfs = require('@jessql/memfs')
+local meter = require('@jessql/meter')
+local sql = require('@jessql')
+local test = require('@jess/test')
+
+local expect = test.expect
+local suite = test.new()
+
+type Row = { [string]: unknown }
+
+local Base = '/memory/metered'
+local Body = string.rep('x', 96)
+-- What the user supplied for one row: an 8-byte key and the body.
+local RowBytes = 8 + #Body
+
+local function open(disk: memfs.Disk, metered: meter.Metered, create: boolean): sql.ManagedDatabase
+  local options: sql.ManagedOptions = { tableName = 'events', columns = { 'id', 'body' }, primaryKey = 'id',
+    cachePages = 1, compactionFanIn = 2, storage = metered.backend }
+  return if create then sql.managed.create(Base, options) else sql.managed.openExisting(Base, options)
+end
+
+-- The bytes each file holds now, and their sum, leaving locks out.
+local function physical(disk: memfs.Disk): ({ [string]: number }, number)
+  local sizes: { [string]: number } = {}
+  local total = 0
+  for path, body in disk.visible() do
+    if meter.classify(path) == 'lock' then continue end
+    sizes[path] = #body
+    total += #body
+  end
+
+  return sizes, total
+end
+
+-- A run of `rounds` batches of `batch` upserts over `keys` keys, with a transition after each.
+local function sustained(rounds: number, batch: number, keys: number): (memfs.Disk, meter.Metered, number, number)
+  local disk = memfs.new()
+  local metered = meter.wrap(disk.backend)
+  local db = open(disk, metered, true)
+  local live: { [number]: boolean } = {}
+  local supplied, key = 0, 0
+  for round = 1, rounds do
+    db:transaction(function(tx)
+      for _ = 1, batch do
+        key = key % keys + 1
+        tx:upsert({ id = key, body = Body })
+        live[key] = true
+        supplied += RowBytes
+      end
+    end)
+
+    if round % 4 == 0 then db:compact() else db:flush() end
+  end
+
+  db:close()
+  local liveRows = 0
+  for _ in live do liveRows += 1 end
+
+  return disk, metered, supplied, liveRows * RowBytes
+end
+
+suite.describe('the metering backend', function()
+  suite.it('classifies the names the managed store gives its files', function()
+    local expected: { [string]: meter.Class } = {
+      ['/d/base.g00000003.wal'] = 'wal', ['/d/base.g00000003.rows'] = 'rows', ['/d/base.g00000003.deleted'] = 'deleted',
+      ['/d/base.jql-manifest'] = 'manifest', ['/d/base.jql-manifest.tmp'] = 'scratch', ['/d/base.jql-lock'] = 'lock',
+      ['/d/base.g00000003.wal.lock'] = 'lock', ['/d/base.g00000005.hot-rows'] = 'scratch',
+      ['/d/base.g00000005.rows.jql-tiers-123-1.rows'] = 'scratch', ['/d/notes.txt'] = 'other',
+    }
+
+    for path, class in expected do expect(`{path} {meter.classify(path)}`).toBe(`{path} {class}`) end
+  end)
+
+  suite.it('accounts for every byte of every file left on the disk', function()
+    local disk, metered = sustained(8, 40, 60)
+    local counters = metered.counters()
+    local sizes = physical(disk)
+    local compared = 0
+    for path, bytes in sizes do
+      compared += 1
+      expect(`{path} {counters.files[path]}`).toBe(`{path} {bytes}`)
+    end
+
+    expect(compared >= 3).toBe(true)
+    -- And nothing is tracked that is not there.
+    for path in counters.files do
+      if meter.classify(path) ~= 'lock' then expect(`{path} {sizes[path] ~= nil}`).toBe(`{path} true`) end
+    end
+  end)
+
+  suite.it('balances bytes written against bytes still held and bytes removed, class by class', function()
+    local disk, metered = sustained(8, 40, 60)
+    local counters = metered.counters()
+    local held: { [meter.Class]: number } = {}
+    for path, bytes in (physical(disk)) do
+      local class = meter.classify(path)
+      held[class] = (held[class] or 0) + bytes
+    end
+
+    -- Immutable and append-only files: everything written is either still there or was removed.
+    -- The manifest is the exception (it is replaced, not removed), so it is left out.
+    for _, class in { 'wal', 'rows', 'deleted' } :: { meter.Class } do
+      local counter = counters.classes[class]
+      expect(`{class} written={counter.written}`).toBe(`{class} written={(held[class] or 0) + counter.removedBytes}`)
+    end
+
+    -- Scratch is all gone, and all of it was counted going.
+    expect(held.scratch).toBe(nil)
+    expect(counters.classes.rows.removed > 0).toBe(true)
+    expect(counters.classes.wal.syncs > 0).toBe(true)
+    expect(counters.replaces > 0).toBe(true)
+    expect(counters.directorySyncs >= counters.replaces).toBe(true)
+  end)
+
+  suite.it('reports write, space and read amplification for a sustained run', function()
+    local disk, metered, supplied, live = sustained(12, 40, 60)
+    local _, onDisk = physical(disk)
+    local written = metered.counters()
+
+    -- A read pass on a reopened database, counted on its own.
+    metered.reset()
+    local db = open(disk, metered, false)
+    local returned = 0
+    for _, row in db:query('SELECT id, body FROM events').rows do returned += 8 + #((row :: Row).body :: string) end
+
+    db:close()
+    local reads = metered.counters()
+    expect(returned).toBe(live)
+
+    local ratios = meter.amplification(written, supplied, live, onDisk)
+    local readRatio = meter.amplification(reads, supplied, live, onDisk, returned).read :: number
+    -- Every user byte is written at least twice (the log, then a generation), and rewritten by
+    -- compaction; live data occupies at least its own size. Upper bounds are loose on purpose:
+    -- they catch a regression of kind, not of degree.
+    expect(ratios.write > 2).toBe(true)
+    expect(ratios.write < 40).toBe(true)
+    expect(ratios.space >= 1).toBe(true)
+    expect(ratios.space < 20).toBe(true)
+    expect(readRatio >= 1).toBe(true)
+    expect(readRatio < 50).toBe(true)
+    expect(reads.classes.rows.written).toBe(0)
+    print(`amplification: write {string.format('%.2f', ratios.write)}, space {string.format('%.2f', ratios.space)}, read {string.format('%.2f', readRatio)}`)
+  end)
+
+  suite.it('changes nothing the store does: the same files, byte for byte, with and without it', function()
+    local function build(wrapped: boolean): { [string]: string }
+      local disk = memfs.new()
+      local storage = if wrapped then meter.wrap(disk.backend).backend else disk.backend
+      local db = sql.managed.create(Base, { tableName = 'events', columns = { 'id', 'body' }, primaryKey = 'id', storage = storage })
+      for round = 1, 3 do
+        db:transaction(function(tx)
+          for index = 1, 10 do tx:upsert({ id = round * 100 + index, body = Body }) end
+        end)
+        db:flush()
+      end
+
+      db:close()
+      return disk.visible()
+    end
+
+    local plain, metered = build(false), build(true)
+    local files = 0
+    for path, body in plain do
+      files += 1
+      expect(`{path} {metered[path] == body}`).toBe(`{path} true`)
+    end
+
+    for path in metered do expect(`{path} {plain[path] ~= nil}`).toBe(`{path} true`) end
+
+    expect(files > 3).toBe(true)
+  end)
+
+  suite.it('does not count a write the backend refused', function()
+    local disk = memfs.new()
+    local metered = meter.wrap(disk.backend)
+    disk.inject(function(step: string, _path: string, _occurrence: number): memfs.Fault?
+      return if step == 'createDurable' then { message = 'no space left on device' } else nil
+    end)
+    expect((metered.backend.createDurable('/memory/x.rows', 'abc'))).toBe(nil)
+    disk.inject(nil)
+    expect(metered.counters().classes.rows.written).toBe(0)
+    expect(metered.counters().files['/memory/x.rows']).toBe(nil)
+  end)
+
+  suite.it('writes samples as comma-separated values with one column per counter', function()
+    local _, metered = sustained(2, 5, 5)
+    local header, row = meter.header(), meter.row('after-run', metered.counters())
+    expect(#string.split(header, ',')).toBe(#string.split(row, ','))
+    expect(string.sub(header, 1, 18)).toBe('label,wal_written,')
+    expect(string.sub(row, 1, 10)).toBe('after-run,')
+    -- A label that would break the line is refused.
+    expect((pcall(meter.row, 'a,b', metered.counters()))).toBe(false)
+  end)
+end)
+
+return suite

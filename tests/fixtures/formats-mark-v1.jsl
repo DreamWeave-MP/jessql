@@ -1,0 +1,9 @@
+--!strict
+-- Golden bytes of the committed-length mark (`@jessql/walmark`), version 1, as written beside the
+-- live log of the database in `formats-v1.jsl` when it is built by this code (base64, by path).
+-- Never edit an entry: a changed format gets a new version and a new fixture.
+local files: { [string]: string } = {
+  ['/memory/g.g00000003.wal.committed'] = 'SlFMQzEKAAAAAAAAFEAAAAAAAHCHQIxOg0oAAAAAAAAAAAAAEEAAAAAAAOCDQAKTF9oAAAAA',
+}
+
+return table.freeze(files)

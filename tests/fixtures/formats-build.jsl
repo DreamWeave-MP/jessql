@@ -1,0 +1,41 @@
+--!strict
+-- Builds, with today's writers, the small database and sidecars whose bytes are pinned in
+-- `formats-v1.jsl`. Deterministic: the same code gives the same bytes.
+local memfs = require('@jessql/memfs')
+local sql = require('@jessql')
+
+type Row = { [string]: unknown }
+
+return function(): { [string]: string }
+  local disk = memfs.new()
+  local on = disk.backend
+  local db = sql.managed.create('/memory/g', { tableName = 'events', columns = { 'id', 'room', 'body' }, primaryKey = 'id', storage = on })
+  db:transaction(function(tx)
+    tx:insert({ id = 1, room = 'a', body = 'one' })
+    tx:insert({ id = 2, room = 'b', body = 'two' })
+  end)
+  db:flush()
+  db:transaction(function(tx)
+    tx:delete(1)
+    tx:insert({ id = 3, room = 'a', body = 'three' })
+  end)
+  db:flush()
+  db:transaction(function(tx) tx:insert({ id = 4, room = 'c', body = 'four' }) end)
+  db:close()
+
+  local cursor = 0
+  sql.paged.create('/memory/s.rows', { 'id', 'room', 'body' }, 'id', function(): Row?
+    cursor += 1
+    if cursor > 3 then return nil end
+    return { id = cursor, room = if cursor == 2 then 'b' else 'a', body = `x{cursor}` }
+  end, { storage = on })
+  sql.secondary.create('/memory/s.index', '/memory/s.rows', 'room', 'body', { format = 'compact', storage = on })
+  sql.secondary.create('/memory/s.legacy', '/memory/s.rows', 'room', 'body', { storage = on })
+
+  local files: { [string]: string } = {}
+  for path, body in disk.visible() do
+    if #body > 0 then files[path] = body end
+  end
+
+  return files
+end

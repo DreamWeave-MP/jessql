@@ -1,0 +1,16 @@
+manifest_version = 1
+
+[package]
+id = "org.dreamweave.jessql.bench.writer-worker"
+version = "0.1.0"
+jess_api = "1"
+include = ["src"]
+default_target = "bench"
+
+[dependencies]
+"org.dreamweave.jessql" = "^0.2"
+
+[targets.bench]
+kind = "application"
+entry = "src/main.jsl"
+capabilities = ["worker.spawn", "filesystem.read", "filesystem.write"]

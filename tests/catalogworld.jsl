@@ -1,0 +1,135 @@
+--!strict
+-- What the tests of a managed database of several tables share: the five tables of a service, one
+-- handled event as a commit over all of them, what a restart finds, and the fault laboratory's
+-- bookkeeping around them. Not a test module: the catalog tests require it.
+local lab = require('@jessql/faultlab')
+local memfs = require('@jessql/memfs')
+local sql = require('@jessql')
+
+export type Row = { [string]: unknown }
+
+local Path = '/memory/service'
+
+local Tables: { sql.CatalogTableSpec } = {
+  { tableName = 'reservations', columns = { 'id', 'effect' }, primaryKey = 'id' },
+  { tableName = 'handled', columns = { 'id' }, primaryKey = 'id' },
+  { tableName = 'conversation', columns = { 'id', 'body' }, primaryKey = 'id' },
+  { tableName = 'outbox', columns = { 'id' }, primaryKey = 'id' },
+  { tableName = 'counters', columns = { 'id', 'value' }, primaryKey = 'id' },
+}
+
+local function create(disk: memfs.Disk): sql.CatalogDatabase
+  return sql.catalog.create(Path, { tables = Tables, storage = disk.backend, cachePages = 2, pageBytes = 512 })
+end
+
+local function reopen(disk: memfs.Disk): sql.CatalogDatabase
+  return sql.catalog.openExisting(Path, { storage = disk.backend, cachePages = 2, pageBytes = 512 })
+end
+
+-- One handled event: five changes over five tables, one commit.
+local function step(tx: sql.CatalogTransaction, number: number)
+  tx:insert('reservations', { id = number, effect = `send-{number}` })
+  tx:insert('handled', { id = number })
+  tx:insert('conversation', { id = number, body = `event {number}` })
+  -- The outbox holds only the latest step: the previous row goes in the same commit.
+  tx:insert('outbox', { id = number })
+  if number > 1 then tx:delete('outbox', number - 1) end
+
+  tx:upsert('counters', { id = 'total', value = number })
+end
+
+-- What a restart finds, per step. It raises if the tables disagree with each other in a way no
+-- sequence of whole commits could produce, whichever of them are hot and whichever cold.
+local function recover(disk: memfs.Disk): lab.Observed
+  local db = reopen(disk)
+  local observed: lab.Observed = {}
+  local highest = 0
+  for _, name in { 'reservations', 'handled', 'conversation' } do
+    for _, row in db:query(`SELECT id FROM {name}`).rows do
+      local number = (row :: Row).id :: number
+      observed[tostring(number)] = (observed[tostring(number)] or 0) + 1
+      highest = math.max(highest, number)
+    end
+  end
+
+  local counter = db:get('counters', 'total')
+  local total = if counter then counter.value :: number else 0
+  local outbox = db:query('SELECT id FROM outbox').rows
+  -- The point read and the scan are different paths over the same rows.
+  local newest = if highest > 0 then db:get('conversation', highest) else nil
+  db:close()
+
+  if total ~= highest then error(`the counter says {total} and the newest step present is {highest}`, 0) end
+
+  if highest > 0 and (#outbox ~= 1 or (outbox[1] :: Row).id ~= highest) then
+    error(`the outbox holds {#outbox} row(s), not exactly the newest step {highest}`, 0)
+  end
+
+  if highest > 0 and (not newest or newest.body ~= `event {highest}`) then
+    error(`step {highest} is in the scan and not in the point read`, 0)
+  end
+
+  for number = 1, highest do
+    if (observed[tostring(number)] or 0) == 0 then error(`step {number} is missing below step {highest}`, 0) end
+  end
+
+  return observed
+end
+
+local function findings(report: lab.Report): string
+  local texts: { string } = {}
+  for index, artifact in report.violations do
+    if index > 3 then break end
+    table.insert(texts, lab.describe(artifact))
+  end
+
+  return table.concat(texts, '\n')
+end
+
+local function commit(db: sql.CatalogDatabase, ledger: lab.Ledger, number: number)
+  ledger.begin(tostring(number), 3)
+  db:transaction(function(tx) step(tx, number) end)
+  ledger.acknowledge(tostring(number))
+end
+
+-- Two steps, a flush, a third step: every table has cold rows and some have hot ones over them.
+local function prepare(disk: memfs.Disk, ledger: lab.Ledger)
+  local db = create(disk)
+  commit(db, ledger, 1)
+  commit(db, ledger, 2)
+  db:flush()
+  commit(db, ledger, 3)
+  db:close()
+end
+
+local function exercised(body: (db: sql.CatalogDatabase, ledger: lab.Ledger) -> ()): (disk: memfs.Disk, ledger: lab.Ledger) -> ()
+  return function(disk: memfs.Disk, ledger: lab.Ledger)
+    local db = reopen(disk)
+    -- A step or a publication may raise at the fault; the database is closed either way.
+    local ok, problem = pcall(function() body(db, ledger) end)
+    -- close can raise on a handle the fault has poisoned; it is closed as far as it can be.
+    pcall(function() db:close() end)
+    if not ok then error(problem, 0) end
+  end
+end
+
+local function names(disk: memfs.Disk): string
+  local found: { string } = {}
+  for path in disk.visible() do table.insert(found, (string.gsub(path, '^/memory/', ''))) end
+
+  table.sort(found)
+  return table.concat(found, ' ')
+end
+
+local Quiet: lab.Ledger = { begin = function(_id: string, _rows: number) end, acknowledge = function(_id: string) end }
+
+
+local function budgeted(disk: memfs.Disk, hook: ((string) -> ())?): sql.CatalogDatabase
+  return sql.catalog.open(Path, { tables = Tables, storage = disk.backend, cachePages = 2, pageBytes = 512,
+    maxHotRows = 12, maxGenerations = 3, testHook = hook })
+end
+
+return {
+  Path = Path, Tables = Tables, Quiet = Quiet, budgeted = budgeted, commit = commit, create = create, exercised = exercised,
+  findings = findings, names = names, prepare = prepare, recover = recover, reopen = reopen, step = step,
+}

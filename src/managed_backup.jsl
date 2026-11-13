@@ -2,8 +2,9 @@
 -- Offline, lock-owned copy of the published managed namespace.
 -- No source mutation, no repair, and no destination overwrites. Callers own
 -- BOTH managed namespace locks for the entire validation/copy operation.
-local fs = require('@dream/fs')
+local vfs = require('@jessql/vfs')
 local manifest = require('@jessql/managed_manifest')
+local publication = require('@jessql/managed_publication')
 local verify = require('@jessql/managed_verification')
 
 export type Result = { version: number, epoch: number, files: number, bytes: number,
@@ -19,7 +20,7 @@ local function generation(base: string, epoch: number, extension: string): strin
   return base .. string.format('.g%08d.', epoch) .. extension
 end
 
-local function emptyDestination(base: string, parent: string)
+local function emptyDestination(fs: vfs.Backend, base: string, parent: string)
   -- The destination lock itself may exist after an interrupted attempt, but
   -- every namespace artifact (including temp manifests) is a hard refusal.
   local names, listError = fs.list(parent)
@@ -33,8 +34,8 @@ local function emptyDestination(base: string, parent: string)
   end
 end
 
-local function copyFile(source: string, destination: string): number
-  local reader, readError = fs.open(source)
+local function copyFile(from: vfs.Backend, source: string, fs: vfs.Backend, destination: string): number
+  local reader, readError = from.open(source)
   if not reader then error('jessql backup: source read: ' .. tostring(readError), 2) end
   local count = reader:size()
   local created, createError = fs.createDurable(destination, '')
@@ -70,22 +71,29 @@ local function copyFile(source: string, destination: string): number
   return count
 end
 
-function backup.copy(source: string, destination: string, parent: string): Result
-  emptyDestination(destination, parent)
+-- INTERNAL, for the multi-table store's copy: one file, chunked, synchronized, never overwriting.
+backup.copyFile = copyFile
+
+-- The source and the destination may sit on different backends: each is resolved once, here.
+function backup.copy(source: string, destination: string, parent: string,
+  sourceStorage: vfs.Backend?, destinationStorage: vfs.Backend?): Result
+  local from = vfs.resolve(sourceStorage)
+  local fs = vfs.resolve(destinationStorage)
+  emptyDestination(fs, destination, parent)
   -- An offline backup is not certified by CRC framing alone: replay every
   -- committed WAL operation through the same storage validators used by open.
-  local report = verify.scan(source, { semantic = true })
+  local report = verify.scan(source, { semantic = true, storage = from })
   if not report.ok or not report.walSemanticReplayChecked then
     error('jessql backup: source verification failed: '
       .. (if report.issues[1] then report.issues[1].code else 'UNKNOWN'), 2)
   end
-  local raw, manifestError = fs.readFileString(source .. '.jql-manifest')
+  local raw, manifestError = from.readFileString(source .. '.jql-manifest')
   if not raw then error('jessql backup: manifest read: ' .. tostring(manifestError), 2) end
   local value = manifest.decode(raw)
   local files, bytes = 0, 0
 
   local function copy(extension: string, epoch: number)
-    bytes += copyFile(generation(source, epoch, extension), generation(destination, epoch, extension))
+    bytes += copyFile(from, generation(source, epoch, extension), fs, generation(destination, epoch, extension))
     files += 1
   end
 
@@ -97,13 +105,15 @@ function backup.copy(source: string, destination: string, parent: string): Resul
 
   -- Publish the manifest LAST. An interrupted backup without its manifest
   -- can never be mistaken for a new empty database, and incomplete artifacts
-  -- are deliberately left in place for an operator to investigate.
-  local created, createError = fs.createDurable(destination .. '.jql-manifest', raw)
-  if created ~= #raw then error('jessql backup: manifest create: ' .. tostring(createError), 2) end
+  -- are deliberately left in place for an operator to investigate. The copies'
+  -- names are made durable first; the manifest is then put in place whole, as
+  -- the live one is (re-review of 2026-11-13: made in place, a crash could
+  -- leave it empty, a copy that has a manifest and cannot be opened).
   local synced, syncError = fs.syncDirectory(parent)
   assertOK(synced, syncError, 'destination directory sync')
+  publication.publishText(destination, parent, raw, nil, { started = false }, fs)
 
-  local result = verify.scan(destination, { semantic = true })
+  local result = verify.scan(destination, { semantic = true, storage = fs })
   if not result.ok or not result.walSemanticReplayChecked then
     error('jessql backup: destination verification failed', 2)
   end

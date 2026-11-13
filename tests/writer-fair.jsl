@@ -1,0 +1,522 @@
+--!strict
+-- #32: fairness between the tenants of one bounded writer. A stand-in writer that answers
+-- requests in the order sent, as many a poll as it is told; a virtual clock; no worker.
+local fair = require('@jessql/writer_fair')
+local test = require('@jess/test')
+local writer = require('@jessql/writer')
+
+local expect = test.expect
+local suite = test.new()
+
+type Behind = {
+  submit: (request: writer.Request) -> fair.Admission,
+  poll: (seconds: number?) -> { writer.Ack },
+  sent: { string },
+  perPoll: number,
+  room: number,
+}
+
+-- Admits up to `room` unanswered, answers `perPoll` a poll, oldest first.
+local function behind(room: number, perPoll: number): Behind
+  local queue: { string } = {}
+  local self = { sent = {}, perPoll = perPoll, room = room } :: Behind
+  self.submit = function(request: writer.Request): fair.Admission
+    if #queue >= self.room then return { admitted = false, reason = 'backpressure', outstanding = #queue } end
+
+    table.insert(queue, request.id)
+    table.insert(self.sent, request.id)
+    return { admitted = true, reason = nil, outstanding = #queue }
+  end
+
+  self.poll = function(_seconds: number?): { writer.Ack }
+    local acks: { writer.Ack } = {}
+    for _ = 1, math.min(self.perPoll, #queue) do
+      table.insert(acks, { id = table.remove(queue, 1) :: string, outcome = 'committed' :: writer.Outcome })
+    end
+
+    return acks
+  end
+
+  return self
+end
+
+local serial = 0
+local function request(): writer.Request
+  serial += 1
+  return { id = `r{serial}`, operations = {} }
+end
+
+suite.describe('fair admission in front of one writer', function()
+  suite.it('gives a tenant alone the whole queue, and its share once another asks', function()
+    local now = 0
+    local back = behind(100, 1)
+    local front = fair.new({ submit = back.submit, poll = back.poll, capacity = 8, now = function(): number return now end })
+    for _ = 1, 8 do expect(front.submit('greedy', request()).admitted).toBe(true) end
+
+    -- Full, and it is alone: this is backpressure, not unfairness.
+    expect(front.submit('greedy', request()).reason).toBe('fair-share')
+    expect(front.status().share).toBe(8)
+
+    -- Another arrives, finds no room, and is owed the next place.
+    local late = front.submit('late', request())
+    expect(late.admitted).toBe(false)
+    expect(late.reason).toBe('backpressure')
+    expect(front.status().tenants.late.waiting).toBe(true)
+    expect(front.status().share).toBe(4)
+
+    -- A place is freed. The one over its share does not get it; the one waiting does.
+    expect(#front.poll(0)).toBe(1)
+    expect(front.submit('greedy', request()).reason).toBe('fair-share')
+    expect(front.submit('late', request()).admitted).toBe(true)
+    expect(front.status().tenants.late.waiting).toBe(false)
+
+    -- So it goes until each holds its share.
+    for _ = 1, 20 do
+      front.poll(0)
+      front.submit('greedy', request())
+      front.submit('late', request())
+    end
+
+    local status = front.status()
+    expect(status.tenants.greedy.outstanding).toBe(4)
+    expect(status.tenants.late.outstanding).toBe(4)
+    expect(status.outstanding).toBe(8)
+  end)
+
+  suite.it('returns a share to the others when its tenant has drained and gone, or stopped waiting', function()
+    local now = 0
+    local back = behind(100, 100)
+    local front = fair.new({ submit = back.submit, poll = back.poll, capacity = 6, waitSeconds = 5, now = function(): number return now end })
+    for _ = 1, 3 do front.submit('one', request()) end
+    for _ = 1, 3 do front.submit('two', request()) end
+
+    expect(front.submit('one', request()).reason).toBe('fair-share')
+    -- Everything is answered; `two` does not come back.
+    front.poll(0)
+    for _ = 1, 6 do expect(front.submit('one', request()).admitted).toBe(true) end
+
+    -- A tenant refused for want of room that never returns is forgotten after its wait.
+    expect(front.submit('three', request()).reason).toBe('backpressure')
+    back.perPoll = 1
+    front.poll(0)
+    expect(front.submit('one', request()).reason).toBe('fair-share')
+    now = 5
+    expect(front.status().tenants.three).toBe(nil)
+    expect(front.submit('one', request()).admitted).toBe(true)
+  end)
+
+  suite.it('keeps a slow tenant from being shut out by a fast one, and every tenant by two of them', function()
+    local now = 0
+    local back = behind(1000, 2)
+    local front = fair.new({ submit = back.submit, poll = back.poll, capacity = 12, now = function(): number return now end })
+    local admitted: { [string]: number } = { fast = 0, faster = 0, slow = 0 }
+    local worstWait, waitingSince = 0, -1
+    for round = 1, 600 do
+      now = round
+      front.poll(0)
+      -- The fast ones ask many times a round; the slow one once.
+      for _ = 1, 10 do
+        if front.submit('fast', request()).admitted then admitted.fast += 1 end
+        if front.submit('faster', request()).admitted then admitted.faster += 1 end
+      end
+
+      if front.submit('slow', request()).admitted then
+        admitted.slow += 1
+        if waitingSince >= 0 then worstWait = math.max(worstWait, round - waitingSince) end
+
+        waitingSince = -1
+      elseif waitingSince < 0 then
+        waitingSince = round
+      end
+    end
+
+    -- Two places free a round among three: the slow one, asking once a round, gets a third of
+    -- them within a little, and is never kept waiting long.
+    expect(admitted.fast + admitted.faster + admitted.slow >= 1190).toBe(true)
+    expect(admitted.slow >= 350).toBe(true)
+    expect(math.abs(admitted.fast - admitted.faster) <= 30).toBe(true)
+    expect(worstWait <= 6).toBe(true)
+
+    -- Without the front the same writer, of the same room, never admits the slow one at all.
+    local bare = behind(12, 2)
+    local got = 0
+    for _ = 1, 600 do
+      bare.poll(0)
+      for _ = 1, 10 do
+        bare.submit(request())
+        bare.submit(request())
+      end
+
+      if bare.submit(request()).admitted then got += 1 end
+    end
+
+    expect(got).toBe(0)
+  end)
+
+  suite.it('keeps count of its tenants as they change, and ends each wait once, whenever it ends', function()
+    local now = 0
+    local back = behind(100000, 100000)
+    local front = fair.new({ submit = back.submit, poll = back.poll, capacity = 4096, maxTenants = 4096, waitSeconds = 5, now = function(): number return now end })
+    -- Two thousand tenants hold one request each.
+    for index = 1, 2000 do expect(front.submit(`tenant{index}`, request()).admitted).toBe(true) end
+
+    expect(front.status().active).toBe(2000)
+    -- One more submits five thousand times: two are within its share, the rest are refused,
+    -- and nothing is gone through to find that out. A wait is the only thing ever looked at,
+    -- and there has been none.
+    local admitted, refused = 0, 0
+    for _ = 1, 5000 do
+      local admission = front.submit('busy', request())
+      if admission.admitted then admitted += 1 elseif admission.reason == 'fair-share' then refused += 1 end
+    end
+
+    expect(`{admitted} {refused}`).toBe('2 4998')
+    local status = front.status()
+    expect(status.active).toBe(2001)
+    expect(status.share).toBe(2)
+    expect(status.examined).toBe(0)
+
+    -- A full queue of ten, and three hundred who find no room: each waits, and counts.
+    local small = fair.new({ submit = back.submit, poll = back.poll, capacity = 10, maxTenants = 4096, waitSeconds = 5, now = function(): number return now end })
+    for index = 1, 10 do small.submit(`holder{index}`, request()) end
+
+    for index = 1, 300 do
+      now = index / 100
+      expect(small.submit(`late{index}`, request()).reason).toBe('backpressure')
+    end
+
+    expect(small.status().active).toBe(310)
+    expect(small.status().share).toBe(1)
+    -- One of them asks again later: its wait is renewed, and the first is not the one that ends it.
+    now = 4
+    expect(small.submit('late1', request()).reason).toBe('backpressure')
+    -- The first two waits began at 0.01 and 0.02 and last five seconds.
+    now = 5.025
+    expect(small.status().tenants.late1.waiting).toBe(true)
+    expect(small.status().tenants.late2).toBe(nil)
+    expect(small.status().active).toBe(309)
+    -- All the first waits have ended by now but that one's second.
+    now = 8.5
+    local later = small.status()
+    expect(later.active).toBe(11)
+    expect(later.tenants.late1.waiting).toBe(true)
+    now = 9
+    local last = small.status()
+    expect(last.active).toBe(10)
+    expect(last.tenants.late1).toBe(nil)
+    -- Three hundred tenants waited, and each wait was looked at once when it ran out: the one
+    -- that was renewed is the same wait, kept as one record, not a second.
+    expect(last.examined).toBe(300)
+    expect(last.share).toBe(1)
+  end)
+
+  suite.it('passes on what the writer behind refuses, counts nothing it did not admit, and refuses what is not a request', function()
+    local now = 0
+    local back = behind(2, 10)
+    local front = fair.new({ submit = back.submit, poll = back.poll, capacity = 10, maxTenants = 2, now = function(): number return now end })
+    local first = request()
+    expect(front.submit('one', first).admitted).toBe(true)
+    expect(front.submit('one', first).reason).toBe('duplicate-id')
+    -- Another tenant with the same id is not refused for it: ids are each tenant's own (see
+    -- "keeps each tenant's ids its own").
+    expect(front.submit('one', request()).admitted).toBe(true)
+    -- The writer behind has room for two: its refusal, and nothing is counted.
+    expect(front.submit('one', request()).reason).toBe('backpressure')
+    expect(front.status().outstanding).toBe(2)
+    expect(front.submit('', request()).reason).toBe('invalid: a request has a tenant of 1 to 64 bytes')
+    expect(front.submit('one', { id = '', operations = {} }).reason).toBe('invalid: a request has an id')
+    expect(front.submit('two', request()).reason).toBe('backpressure')
+    expect(front.submit('three', request()).reason).toBe('too-many-tenants')
+
+    -- An answer for a request this front never admitted changes no count.
+    local acks = front.poll(0)
+    expect(#acks).toBe(2)
+    expect(front.status().outstanding).toBe(0)
+
+    for _, bad in { 0, -1, 1.5, fair.MaxCapacity + 1 } do
+      -- Construction raises on a capacity that is not one.
+      expect((pcall(function(): fair.Fair return fair.new({ submit = back.submit, poll = back.poll, capacity = bad }) end))).toBe(false)
+    end
+  end)
+
+  -- Review J-02: with fewer places than tenants, the places freed go round.
+  suite.it('gives the place freed to whoever has waited longest, however quickly another asks', function()
+    -- One place, two tenants. The fast one asks first every time a place is freed.
+    local back = behind(1, 1)
+    local front = fair.new({ submit = back.submit, poll = back.poll, capacity = 1, waitSeconds = 300, now = function(): number return 0 end })
+    expect(front.submit('fast', request()).admitted).toBe(true)
+    expect(front.submit('slow', request()).reason).toBe('backpressure')
+    local fast, slow = 1, 0
+    for _ = 1, 100 do
+      front.poll(0)
+      if front.submit('fast', request()).admitted then fast += 1 end
+      if front.submit('slow', request()).admitted then slow += 1 end
+    end
+
+    -- They take turns: neither is shut out, and neither has more than its half and one.
+    expect(`{fast} {slow}`).toBe('51 50')
+
+    -- Two places, five tenants, each asking in the same order after every answer: the order
+    -- of asking decides nothing, and every tenant is admitted as often as any other.
+    local wide = behind(2, 1)
+    local shared = fair.new({ submit = wide.submit, poll = wide.poll, capacity = 2, waitSeconds = 300, now = function(): number return 0 end })
+    local names = { 'ann', 'ben', 'cal', 'dee', 'eve' }
+    local won: { [string]: number } = { ann = 0, ben = 0, cal = 0, dee = 0, eve = 0 }
+    for _ = 1, 500 do
+      for _, name in names do
+        if shared.submit(name, request()).admitted then won[name] += 1 end
+      end
+
+      shared.poll(0)
+    end
+
+    local least, most = math.huge, 0
+    for _, name in names do
+      least = math.min(least, won[name])
+      most = math.max(most, won[name])
+    end
+
+    expect(least > 0).toBe(true)
+    expect(most - least <= 1).toBe(true)
+  end)
+
+  suite.it('keeps a place for the tenant that waits, lets it go when that tenant stops asking, and is not held by one at its share', function()
+    local now = 0
+    local back = behind(1, 1)
+    local front = fair.new({ submit = back.submit, poll = back.poll, capacity = 1, waitSeconds = 5, now = function(): number return now end })
+    expect(front.submit('holder', request()).admitted).toBe(true)
+    expect(front.submit('first', request()).reason).toBe('backpressure')
+    now = 1
+    expect(front.submit('second', request()).reason).toBe('backpressure')
+    front.poll(0)
+
+    -- The place is free and kept for `first`: neither the old holder nor `second` may take it.
+    expect(front.submit('holder', request()).reason).toBe('backpressure')
+    expect(front.submit('second', request()).reason).toBe('backpressure')
+    expect(front.status().outstanding).toBe(0)
+    -- `second` asking again did not cost it its turn, and did not move it ahead of `first`.
+    now = 2
+    expect(front.submit('second', request()).reason).toBe('backpressure')
+
+    -- `first` never comes back. Its wait runs out five seconds after it began, and the place
+    -- is the next one's: `second`, who began waiting before the old holder did.
+    now = 5
+    expect(front.status().tenants.first).toBe(nil)
+    expect(front.submit('holder', request()).reason).toBe('backpressure')
+    expect(front.submit('second', request()).admitted).toBe(true)
+    front.poll(0)
+    expect(front.submit('holder', request()).admitted).toBe(true)
+
+    -- A waiting tenant that reaches its share is owed nothing more, and holds no place back.
+    local wide = behind(4, 4)
+    local shared = fair.new({ submit = wide.submit, poll = wide.poll, capacity = 4, waitSeconds = 5, now = function(): number return now end })
+    for _ = 1, 3 do expect(shared.submit('big', request()).admitted).toBe(true) end
+
+    expect(shared.submit('other', request()).admitted).toBe(true)
+    -- Full, and two tenants share four places now: `big` holds three, over its share of two.
+    expect(shared.submit('big', request()).reason).toBe('fair-share')
+    expect(shared.status().tenants.big.waiting).toBe(false)
+  end)
+
+  -- Review J-01: what is remembered is a tenant, not a refusal.
+  suite.it('remembers a tenant refused a hundred thousand times once, and holds no more for it', function()
+    local now = 0
+    local back = behind(1, 1)
+    local front = fair.new({ submit = back.submit, poll = back.poll, capacity = 1, maxTenants = 2, waitSeconds = 300, now = function(): number return now end })
+    expect(front.submit('holder', request()).admitted).toBe(true)
+    local collect = require('@jess/bench').collect
+    local asked: writer.Request = { id = 'again', operations = {} }
+    -- Warm, so that what is measured is what the refusals keep and not what the first one made.
+    for _ = 1, 1000 do front.submit('refused', asked) end
+
+    collect()
+    local before = gcinfo()
+    for step = 1, 100000 do
+      now = step / 10000000
+      expect(front.submit('refused', asked).reason).toBe('backpressure')
+    end
+
+    collect()
+    local grew = gcinfo() - before
+    -- The probe that found this grew by about 17,000 KB. A record a tenant does not grow.
+    expect(`grew under 256 KB: {grew < 256}`).toBe('grew under 256 KB: true')
+    local status = front.status()
+    expect(`{status.active} {status.examined} {status.tenants.refused.refused}`).toBe('2 0 101000')
+
+    -- And it is still one wait: it runs out once, three hundred seconds after it was last renewed.
+    now = 300
+    expect(front.status().tenants.refused.waiting).toBe(true)
+    now = 300.011
+    local ended = front.status()
+    expect(`{ended.active} {ended.examined} {ended.tenants.refused == nil}`).toBe('1 1 true')
+  end)
+
+  -- Re-review of #97: tenants behind one writer shared its ids. One could take an id another
+  -- would use (and have that tenant's request refused as reused), learn which ids another had
+  -- in flight, or be told `committed` for another's request of the same content.
+  suite.it('keeps each tenant\'s ids its own, through a writer and its ledger', function()
+    local ledger = require('@jessql/ledger')
+    local memfs = require('@jessql/memfs')
+    local sql = require('@jessql')
+    local disk = memfs.new()
+    local db = sql.catalog.create('/memory/fair', { storage = disk.backend, tables = {
+      { tableName = 'events', columns = { 'id', 'body' }, primaryKey = 'id' }, ledger.table('requests'),
+    } })
+    local queue = writer.new(db, { ledger = { table = 'requests' } })
+    local front = fair.new({ capacity = 8,
+      submit = function(sent: writer.Request): fair.Admission
+        local admission = queue:submit(sent)
+        return { admitted = admission.admitted, reason = admission.reason, outstanding = admission.queued }
+      end,
+      poll = function(_seconds: number?): { writer.Ack } return queue:drain() end })
+
+    local function insert(id: string, number: number, body: string): writer.Request
+      return { id = id, operations = { { op = 'insert', table = 'events', row = { id = number, body = body } } } }
+    end
+
+    -- Both use `invoice-7`, at once and for different things: neither is refused for the other.
+    expect(front.submit('a', insert('invoice-7', 1, 'A')).admitted).toBe(true)
+    expect(front.submit('b', insert('invoice-7', 2, 'B')).admitted).toBe(true)
+    local told: { string } = {}
+    for _, ack in front.poll(0) do table.insert(told, `{ack.tenant}:{ack.id}={ack.outcome}`) end
+    table.sort(told)
+    expect(table.concat(told, ' ')).toBe('a:invoice-7=committed b:invoice-7=committed')
+
+    -- Later, `b` sends what `a` sent under `a`'s id: that is `b`'s own request, applied as `b`'s
+    -- (and refused here only by the row already being there), never answered with `a`'s commit.
+    expect(front.submit('b', insert('invoice-8', 1, 'A')).admitted).toBe(true)
+    local later = front.poll(0)
+    expect(`{later[1].tenant}:{later[1].id}={later[1].outcome}`).toBe('b:invoice-8=rejected')
+    expect(later[1].alreadyCommitted == true).toBe(false)
+    expect(`{(db:get('events', 1) :: { body: string }).body} {(db:get('events', 2) :: { body: string }).body}`).toBe('A B')
+
+    -- Review of e2d173d: `mallory` writes the ledger entry `b`'s next request would make, its
+    -- scoped id and digest computed in the open. Refused at admission, and `b`'s request runs.
+    local victim = insert('pay', 3, 'b pays')
+    local scoped: writer.Request = { id = fair.scoped('b', 'pay'), operations = victim.operations }
+    local forged = front.submit('mallory', { id = 'x', operations = { { op = 'insert', table = 'requests',
+      row = { key = ledger.key('', scoped.id), scope = '', id = scoped.id, at = 1, digest = writer.digest(scoped) } } } })
+    expect(`{forged.admitted} {forged.reason}`).toBe('false invalid: operation 1 writes the ledger\'s table')
+    expect(front.submit('b', victim).admitted).toBe(true)
+    local paid = front.poll(0)
+    expect(`{paid[1].tenant}:{paid[1].id}={paid[1].outcome}`).toBe('b:pay=committed')
+    expect((db:get('events', 3) :: { body: string }).body).toBe('b pays')
+    db:close()
+  end)
+
+  -- Review of 2026-11-13 (after J-02): tenants refused once and never back held places empty for
+  -- their whole wait, and a stream of them took a writer down to a few per cent.
+  suite.it('keeps a place only for a tenant that keeps asking, so tenants that gave up hold none', function()
+    local function steadyAdmitted(ghostsPerSecond: number): number
+      local now = 0
+      local queue: { string } = {}
+      local front = fair.new({ capacity = 8, waitSeconds = 5, now = function(): number return now end,
+        submit = function(sent: writer.Request): fair.Admission
+          table.insert(queue, sent.id)
+          return { admitted = true, reason = nil, outstanding = #queue }
+        end,
+        poll = function(_seconds: number?): { writer.Ack }
+          -- The writer finishes two a tick.
+          local acks: { writer.Ack } = {}
+          for _ = 1, math.min(2, #queue) do
+            table.insert(acks, { id = table.remove(queue, 1) :: string, outcome = 'committed' :: writer.Outcome })
+          end
+
+          return acks
+        end })
+      -- Six steady tenants ask every tick in an order that changes; a one-shot tenant turns up
+      -- among them at random, is refused, and is never seen again.
+      -- The same draws every run: a small linear congruential generator, seeded.
+      local state = 42
+      local function draw(): number
+        state = (state * 1103515245 + 12345) % 2147483648
+        return state / 2147483648
+      end
+
+      local admitted, ghosts = 0, 0
+      for tick = 1, 6000 do
+        now = tick * 0.01
+        front.poll(0)
+        local order: { string } = {}
+        for index = 1, 6 do table.insert(order, `steady{index}`) end
+
+        for index = #order, 2, -1 do
+          local other = 1 + math.floor(draw() * index)
+          order[index], order[other] = order[other], order[index]
+        end
+
+        if draw() < ghostsPerSecond * 0.01 then
+          ghosts += 1
+          table.insert(order, 1 + math.floor(draw() * (#order + 1)), `ghost{ghosts}`)
+        end
+
+        for _, name in order do
+          local answer = front.submit(name, request())
+          if answer.admitted and string.sub(name, 1, 6) == 'steady' then admitted += 1 end
+        end
+      end
+
+      return admitted
+    end
+
+    local alone = steadyAdmitted(0)
+    for _, rate in { 2, 5, 20 } do
+      local haunted = steadyAdmitted(rate)
+      -- Before: at 5 one-shot tenants a second, under 3% of the steady throughput was left.
+      expect(`{rate}/s: {haunted} of {alone}: {haunted >= alone * 0.9}`).toBe(`{rate}/s: {haunted} of {alone}: true`)
+    end
+  end)
+
+  -- Re-review of #98: a claim that lapsed after a second starved a tenant that asks again every
+  -- two seconds, an ordinary retry. By default a claim lasts the whole wait.
+  suite.it('keeps the turn of a tenant that asks again every two seconds, with fewer places than tenants', function()
+    local now = 0
+    local queue: { string } = {}
+    local front = fair.new({ capacity = 2, now = function(): number return now end,
+      submit = function(sent: writer.Request): fair.Admission
+        table.insert(queue, sent.id)
+        return { admitted = true, reason = nil, outstanding = #queue }
+      end,
+      poll = function(_seconds: number?): { writer.Ack }
+        -- The writer finishes one every 50 ms.
+        local acks: { writer.Ack } = {}
+        if #queue > 0 then table.insert(acks, { id = table.remove(queue, 1) :: string, outcome = 'committed' :: writer.Outcome }) end
+        return acks
+      end })
+    local slow, waited, since = 0, 0, 0
+    for tick = 1, 12000 do
+      now = tick * 0.01
+      if tick % 5 == 0 then front.poll(0) end
+
+      for index = 1, 3 do front.submit(`fast{index}`, request()) end
+      since += 0.01
+      if tick % 200 == 0 then
+        if front.submit('slow', request()).admitted then
+          slow += 1
+          waited = math.max(waited, since)
+          since = 0
+        end
+      end
+    end
+
+    -- 60 asks in 120 s. Before: 25 admitted in 600 s, with waits past a minute.
+    expect(`admitted {slow}, longest wait {math.floor(waited)} s: {slow >= 20 and waited <= 6.5}`)
+      .toBe(`admitted {slow}, longest wait {math.floor(waited)} s: true`)
+  end)
+
+  -- Re-review of #97: the writer behind takes the tenant and the id together as its id. A
+  -- tenant name too long for that could never send anything, and was told its id was too long.
+  suite.it('says plainly when a tenant\'s name, or the name and the id together, are too long', function()
+    local back = behind(100, 100)
+    local front = fair.new({ submit = back.submit, poll = back.poll, capacity = 8 })
+    local tenant = string.rep('t', fair.MaxTenantBytes)
+    expect(front.submit(tenant .. 't', request()).reason).toBe('invalid: a request has a tenant of 1 to 64 bytes')
+    -- `64:` and the name take 67 bytes, so an id of 61 is the most: admitted, and one more is not.
+    expect(front.submit(tenant, { id = string.rep('i', 61), operations = {} }).admitted).toBe(true)
+    expect(front.submit(tenant, { id = string.rep('i', 62), operations = {} }).reason)
+      .toBe('invalid: the tenant and the id together are more than 128 bytes')
+    expect(#back.sent[1]).toBe(fair.MaxScopedBytes)
+  end)
+end)
+
+return suite

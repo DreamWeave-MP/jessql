@@ -1,0 +1,659 @@
+--!strict
+-- The bounded writer as a service in a worker, with a contract on both sides (#32).
+--
+-- `@jessql/writer` is the core: admit, drain, acknowledge. A worker around it needs a protocol
+-- and a client that behaves when the worker is slow, full or dead. Both are here, and neither
+-- starts a worker: the host is a message handler, the client talks to anything with `send` and
+-- `receive`. So everything but the spawning itself runs in a test without a script domain, and
+-- an application spawns with `source` below.
+--
+-- The messages, all plain data:
+--
+--   open    { path, tables, options? }   answers  opened | failed
+--   submit  { request }                  answers  nothing when admitted, or  refused { id, reason }
+--   flush   { serial }                   answers  acks { serial, acks, queued }
+--   close   {}                           answers  closed { acks, status }
+--
+-- The client's contract:
+--
+--   * `submit` answers at once. A request is admitted to the wire or refused here with
+--     `backpressure` (too many unanswered), `duplicate-id`, `closed`, `stopped`, or `transport`
+--     (the worker's mailbox would not take it). Nothing waits inside the client.
+--   * `poll` keeps one flush outstanding, reads what the worker has answered and returns every
+--     outcome it learnt: `committed`, `rejected` (it changed nothing; a refusal by the writer
+--     arrives as this), or `unknown`.
+--   * A worker that fails, or a flush left unanswered past `flushTimeoutSeconds`, stops the
+--     client: every request still unanswered is `unknown`, exactly once, and nothing more is
+--     admitted. `unknown` means what it says: the request may be durable. Reopening the
+--     database, or a retry that carries its own duplicate guard, is how a caller finds out.
+--   * Nothing is ever acknowledged as committed that the worker did not say was synchronized.
+local catalog = require('@jessql/catalog')
+local ledger = require('@jessql/ledger')
+local vfs = require('@jessql/vfs')
+local writer = require('@jessql/writer')
+
+export type Lane = {
+  send: (self: Lane, message: unknown) -> (),
+  receive: (self: Lane, seconds: number?) -> unknown,
+}
+export type HostOptions = {
+  -- For tests: the backend the database is opened on. A worker uses the VM default.
+  storage: vfs.Backend?,
+  -- #31. The one directory this service keeps databases in. When set, `open` does not take a
+  -- path: it takes a database's name (`service.validName`), and the path is the service's own
+  -- affair. A client can then name no file outside the root, whatever it sends.
+  root: string?,
+}
+export type ClientOptions = {
+  -- The most requests sent and not yet answered (default 768, at most 960: a worker's mailbox
+  -- holds 1,024 messages and raises on one more).
+  maxOutstanding: number?,
+  -- How long a flush may go unanswered before the worker is given up on (default 30).
+  flushTimeoutSeconds: number?,
+  -- The most bytes in one request, and in everything sent and not yet answered (defaults and
+  -- limits as the writer's own `maxRequestBytes` and `maxQueuedBytes`). They are held here,
+  -- before a message enters the worker's mailbox: a count of messages does not bound what a
+  -- mailbox holds. Over the first is `too-large`; what would pass the second, `backpressure`.
+  maxRequestBytes: number?,
+  maxOutstandingBytes: number?,
+  -- Seconds, monotonic. Injected in tests.
+  now: (() -> number)?,
+}
+export type Ack = writer.Ack
+export type Admission = { admitted: boolean, reason: string?, outstanding: number }
+export type ClientStatus = { outstanding: number, outstandingBytes: number, stopped: boolean, reason: string?, flushes: number }
+export type Client = {
+  open: (self: Client, path: string, tables: { catalog.TableSpec }, options: writer.Options?, seconds: number?) -> (boolean, string?),
+  submit: (self: Client, request: writer.Request) -> Admission,
+  poll: (self: Client, seconds: number?) -> { Ack },
+  close: (self: Client, seconds: number?) -> { Ack },
+  status: (self: Client) -> ClientStatus,
+}
+
+local service = {}
+
+-- What an application gives `jess.worker.spawn` as `source`.
+service.source = "return require('@jessql/writer_service').host()"
+service.MaxOutstanding = 960
+-- #31. The protocol's version, sent with `open` and answered with `opened`. A host refuses an
+-- `open` of another version; one that names none is taken as this one, which is what clients
+-- before the field sent.
+service.Protocol = 1
+
+-- A database's name under a confined host: a letter or digit, then letters, digits, `_` and
+-- `-`, 64 at most. No separator, no dot, nothing a path could be made of.
+function service.validName(name: unknown): boolean
+  return typeof(name) == 'string' and #(name :: string) <= 64 and string.match(name :: string, '^[%w][%w_%-]*$') ~= nil
+end
+
+-- What an application gives `jess.worker.spawn` for a host confined to `root`.
+function service.sourceFor(root: string): string
+  if typeof(root) ~= 'string' or #root == 0 or string.find(root, '%z') then error('jessql writer service: invalid root', 2) end
+
+  return string.format("return require('@jessql/writer_service').host({ root = %q })", root)
+end
+
+local function field(message: unknown, key: string): unknown
+  return if typeof(message) == 'table' then (message :: { [string]: unknown })[key] else nil
+end
+
+-- The worker's side: a handler of one message at a time. It never raises for a message it does
+-- not understand; a fault in the database itself is the writer's `unknown`, not a crash.
+function service.host(options: HostOptions?): (message: unknown) -> unknown
+  local db: catalog.Database? = nil
+  local actor: writer.Writer? = nil
+  local root = if options then options.root else nil
+  if root ~= nil and (typeof(root) ~= 'string' or #root == 0 or string.find(root, '%z')) then
+    error('jessql writer service: invalid root', 2)
+  end
+
+  return function(message: unknown): unknown
+    local kind = field(message, 'kind')
+    if kind == 'open' then
+      if db then return { kind = 'failed', reason = 'already open' } end
+
+      local path, tables, writerOptions = field(message, 'path'), field(message, 'tables'), field(message, 'options')
+      if typeof(path) ~= 'string' or typeof(tables) ~= 'table' then return { kind = 'failed', reason = 'open needs a path and tables' } end
+
+      local version = field(message, 'version')
+      if version ~= nil and version ~= service.Protocol then return { kind = 'failed', reason = 'unsupported protocol version' } end
+
+      if root then
+        -- Confined: what was sent is a name, and nothing else is ever joined to the root.
+        if not service.validName(path) then return { kind = 'failed', reason = 'not a database name' } end
+
+        path = `{string.gsub(root, '/+$', '')}/{path :: string}`
+      end
+
+      -- A path that cannot be opened, or options the writer refuses, are an answer.
+      local ok, problem = pcall(function()
+        -- Held from the moment it is open, so that a writer that refuses its options does not
+        -- leave the database open, and locked, behind a failed answer.
+        db = catalog.open(path :: string, { tables = tables :: { catalog.TableSpec }, storage = options and options.storage })
+        actor = writer.new(db :: catalog.Database, writerOptions :: writer.Options?)
+      end)
+
+      if not ok then
+        -- Closing can raise as well; the failure already being answered is the one that matters.
+        if db then pcall(function() (db :: catalog.Database):close() end) end
+
+        db, actor = nil, nil
+        return { kind = 'failed', reason = tostring(problem) }
+      end
+
+      -- The writer took its options, so this is the limit it holds requests to: the client is told
+      -- it, rather than trusting what it asked for.
+      local asked = field(writerOptions, 'maxOperations')
+      return { kind = 'opened', version = service.Protocol,
+        maxOperations = if typeof(asked) == 'number' then asked else writer.DefaultOperations }
+    end
+
+    local queue = actor
+    if not queue or not db then return { kind = 'failed', reason = 'not open' } end
+
+    if kind == 'submit' then
+      local request = field(message, 'request')
+      local admission = queue:submit(request :: writer.Request)
+      if admission.admitted then return nil end
+
+      local id = field(request, 'id')
+      return { kind = 'refused', id = if typeof(id) == 'string' then id else '', reason = admission.reason }
+    elseif kind == 'flush' then
+      return { kind = 'acks', serial = field(message, 'serial'), acks = queue:drain(), queued = queue:status().queued }
+    elseif kind == 'close' then
+      local rest = queue:stop('closing')
+      local status = queue:status()
+      -- Closing a database whose last batch was uncertain can raise; the answer is still owed.
+      pcall(function() (db :: catalog.Database):close() end)
+      db, actor = nil, nil
+      return { kind = 'closed', acks = rest, status = status }
+    end
+
+    return { kind = 'failed', reason = 'unknown message' }
+  end
+end
+
+-- The application's side, over a worker handle or anything shaped like one.
+function service.client(lane: Lane, options: ClientOptions?): Client
+  local maxOutstanding = if options and options.maxOutstanding ~= nil then options.maxOutstanding else 768
+  local flushTimeout = if options and options.flushTimeoutSeconds ~= nil then options.flushTimeoutSeconds else 30
+  if typeof(maxOutstanding) ~= 'number' or maxOutstanding ~= math.floor(maxOutstanding) or maxOutstanding < 1 or maxOutstanding > service.MaxOutstanding then
+    error('jessql writer service: invalid maxOutstanding', 2)
+  end
+
+  if typeof(flushTimeout) ~= 'number' or flushTimeout ~= flushTimeout or flushTimeout <= 0 or flushTimeout > 3600 then
+    error('jessql writer service: invalid flushTimeoutSeconds', 2)
+  end
+
+  local maxRequestBytes = if options and options.maxRequestBytes ~= nil then options.maxRequestBytes else writer.DefaultRequestBytes
+  local maxOutstandingBytes = if options and options.maxOutstandingBytes ~= nil then options.maxOutstandingBytes else writer.DefaultQueuedBytes
+  if typeof(maxRequestBytes) ~= 'number' or maxRequestBytes ~= math.floor(maxRequestBytes) or maxRequestBytes < 1 or maxRequestBytes > writer.MaxRequestBytes then
+    error('jessql writer service: invalid maxRequestBytes', 2)
+  end
+
+  if typeof(maxOutstandingBytes) ~= 'number' or maxOutstandingBytes ~= math.floor(maxOutstandingBytes) or maxOutstandingBytes < maxRequestBytes
+    or maxOutstandingBytes > writer.MaxQueuedBytes then
+    error('jessql writer service: invalid maxOutstandingBytes', 2)
+  end
+
+  local now = (options and options.now) or os.clock
+  -- In the order they were sent: an unknown outcome is reported in that order too. What each
+  -- weighs is kept until it is answered.
+  local weights: { [string]: number } = {}
+  local outstandingBytes = 0
+  local pending: { [string]: boolean } = {}
+  local order: { string } = {}
+  local outstanding = 0
+  local opened, closed, stopped = false, false, false
+  -- The most operations the writer behind takes in a request, as its answer to `open` says (re-
+  -- review of 2026-11-13: it was taken from what the client asked for): a request with more is
+  -- not one, and is weighed and refused as such here.
+  local operationLimit = writer.DefaultOperations
+  local reason: string? = nil
+  local serial, flushing, flushedAt, flushes = 0, false, 0, 0
+  local self = {} :: Client
+
+  local function settle(id: string): boolean
+    if not pending[id] then return false end
+
+    pending[id] = nil
+    outstanding -= 1
+    outstandingBytes -= weights[id] or 0
+    weights[id] = nil
+    return true
+  end
+
+  -- Gives up on the worker: everything unanswered is unknown, once.
+  local function abandon(why: string): { Ack }
+    stopped, reason = true, reason or why
+    local acks: { Ack } = {}
+    for _, id in order do
+      if settle(id) then table.insert(acks, { id = id, outcome = 'unknown' :: writer.Outcome, error = why }) end
+    end
+
+    order = {}
+    return acks
+  end
+
+  -- A send that the lane refuses (a full mailbox, a stopped worker) is an answer.
+  local function send(message: unknown): boolean
+    return (pcall(function() lane:send(message) end))
+  end
+
+  -- What one reply teaches: outcomes, appended to `acks`.
+  local function learn(reply: unknown, acks: { Ack })
+    local kind = field(reply, 'kind')
+    if kind == 'refused' then
+      local id = field(reply, 'id')
+      if typeof(id) == 'string' and settle(id) then
+        table.insert(acks, { id = id, outcome = 'rejected' :: writer.Outcome, error = `refused: {tostring(field(reply, 'reason'))}` })
+      end
+    elseif kind == 'acks' or kind == 'closed' then
+      if kind == 'acks' and field(reply, 'serial') == serial then flushing = false end
+
+      local list = field(reply, 'acks')
+      for _, ack in if typeof(list) == 'table' then list :: { unknown } else {} do
+        local id, outcome = field(ack, 'id'), field(ack, 'outcome')
+        -- Only an outcome the writer has, for a request this client sent, once.
+        if typeof(id) ~= 'string' or (outcome ~= 'committed' and outcome ~= 'rejected' and outcome ~= 'unknown') then continue end
+        if not settle(id) then continue end
+
+        local problem = field(ack, 'error')
+        table.insert(acks, { id = id, outcome = outcome :: writer.Outcome, error = if typeof(problem) == 'string' then problem else nil,
+          -- Only on a rejection, and only what the owner said.
+          aborted = if outcome == 'rejected' and field(ack, 'aborted') == true then true else nil,
+          -- Likewise: set by the writer only when its ledger held this very request.
+          alreadyCommitted = if outcome == 'rejected' and field(ack, 'alreadyCommitted') == true then true else nil })
+      end
+    end
+  end
+
+  -- The lane's next reply within `seconds`, or nil; a failed worker raises there, which is told
+  -- apart from silence.
+  local function receive(seconds: number): (unknown, boolean)
+    local ok, reply = pcall(function(): unknown return lane:receive(seconds) end)
+    if not ok then return nil, true end
+    return reply, false
+  end
+
+  function self.open(_self: Client, path: string, tables: { catalog.TableSpec }, writerOptions: writer.Options?, seconds: number?): (boolean, string?)
+    if opened or stopped then return false, 'already opened' end
+
+    if not send({ kind = 'open', version = service.Protocol, path = path, tables = tables, options = writerOptions }) then return false, 'the worker took no message' end
+
+    local reply, failed = receive(seconds or 30)
+    if failed or field(reply, 'kind') ~= 'opened' then
+      stopped, reason = true, 'not opened'
+      return false, if failed then 'the worker failed' elseif reply == nil then 'the worker did not answer' else tostring(field(reply, 'reason'))
+    end
+
+    -- A worker that does not say its limit holds requests to what it was asked for.
+    local limit = field(reply, 'maxOperations')
+    if limit == nil and writerOptions then limit = writerOptions.maxOperations end
+    if typeof(limit) == 'number' and limit >= 1 and limit <= 4096 and limit == math.floor(limit) then operationLimit = limit end
+
+    opened = true
+    return true, nil
+  end
+
+  function self.submit(_self: Client, request: writer.Request): Admission
+    local function refused(why: string): Admission return { admitted = false, reason = why, outstanding = outstanding } end
+
+    if closed or not opened then return refused('closed') end
+    if stopped then return refused('stopped') end
+
+    local id = field(request, 'id')
+    if typeof(id) ~= 'string' or #id == 0 then return refused('invalid: a request has an id') end
+
+    -- Weighed before it goes anywhere, whatever it is. What is a request is sent as the
+    -- writer's own frozen copy, so a lane that does not copy what it is handed cannot be
+    -- changed under; what is not one is sent as it is, small, for the writer to refuse.
+    local taken, _, weighed = writer.snapshot(request, operationLimit)
+    local size = if taken then weighed else writer.weigh(request)
+    if size > maxRequestBytes then return refused('too-large') end
+    if pending[id] then return refused('duplicate-id') end
+    if outstanding >= maxOutstanding or outstandingBytes + size > maxOutstandingBytes then return refused('backpressure') end
+    if not send({ kind = 'submit', request = taken or request }) then return refused('transport') end
+
+    pending[id] = true
+    weights[id] = size
+    outstandingBytes += size
+    table.insert(order, id)
+    outstanding += 1
+    return { admitted = true, reason = nil, outstanding = outstanding }
+  end
+
+  function self.poll(_self: Client, seconds: number?): { Ack }
+    local acks: { Ack } = {}
+    if stopped or not opened or closed then return acks end
+
+    if not flushing and outstanding > 0 then
+      serial += 1
+      if send({ kind = 'flush', serial = serial }) then
+        flushing, flushedAt = true, now()
+        flushes += 1
+      end
+    end
+
+    -- The first read may wait; whatever else has already arrived is read without waiting.
+    local wait = math.max(0, seconds or 0)
+    for _ = 1, 4096 do
+      local reply, failed = receive(wait)
+      if failed then
+        for _, ack in abandon('the worker failed') do table.insert(acks, ack) end
+
+        return acks
+      end
+
+      if reply == nil then break end
+
+      learn(reply, acks)
+      wait = 0
+    end
+
+    if flushing and now() - flushedAt > flushTimeout then
+      for _, ack in abandon('the worker did not answer a flush in time') do table.insert(acks, ack) end
+    elseif #order > 2 * maxOutstanding then
+      -- Keep the order list no longer than what can still be unanswered.
+      local kept: { string } = {}
+      for _, id in order do
+        if pending[id] then table.insert(kept, id) end
+      end
+
+      order = kept
+    end
+
+    return acks
+  end
+
+  function self.close(_self: Client, seconds: number?): { Ack }
+    local acks: { Ack } = {}
+    if closed or not opened then return acks end
+
+    closed = true
+    if stopped then return acks end
+
+    -- One last flush for what is queued, then the close; replies are read until `closed`.
+    serial += 1
+    local sent = send({ kind = 'flush', serial = serial }) and send({ kind = 'close' })
+    local deadline = now() + math.max(0, seconds or 30)
+    local done = false
+    while sent and not done do
+      local reply, failed = receive(math.max(0, math.min(1, deadline - now())))
+      if failed then break end
+
+      if reply ~= nil then
+        learn(reply, acks)
+        done = field(reply, 'kind') == 'closed'
+      elseif now() >= deadline then
+        break
+      end
+    end
+
+    -- Whatever the worker never answered for is not known to be anything.
+    for _, ack in abandon(if done then 'closed' else 'the worker did not close in time') do table.insert(acks, ack) end
+
+    if done then reason = 'closed' end
+    return acks
+  end
+
+  function self.status(_self: Client): ClientStatus
+    return { outstanding = outstanding, outstandingBytes = outstandingBytes, stopped = stopped or closed, reason = reason, flushes = flushes }
+  end
+
+  return self
+end
+export type SupervisorOptions = {
+  path: string,
+  tables: { catalog.TableSpec },
+  -- Must name a ledger: retrying a request whose outcome is unknown is only safe when a request
+  -- that did commit cannot be applied twice.
+  writer: writer.Options,
+  client: ClientOptions?,
+  -- How many times a dead or silent worker is replaced within `restartWindowSeconds` before its
+  -- requests are given up as unknown (default 3, at most 100).
+  maxRestarts: number?,
+  -- The window replacements are counted in (default 3600 s): a worker that died once a day for
+  -- a week is not given up on, one that dies again and again in an hour is.
+  restartWindowSeconds: number?,
+  openSeconds: number?,
+  -- The least time between one replacement and the next: this many seconds after the first,
+  -- doubling each time, up to 30 (default 1; 0 for none). The first replacement is immediate.
+  -- A worker that dies as soon as it is started is then not started in a tight loop.
+  restartBackoffSeconds: number?,
+}
+export type Supervisor = {
+  submit: (self: Supervisor, request: writer.Request) -> Admission,
+  poll: (self: Supervisor, seconds: number?) -> { Ack },
+  close: (self: Supervisor, seconds: number?) -> { Ack },
+  status: (self: Supervisor) -> { outstanding: number, restarts: number, stopped: boolean, reason: string? },
+}
+
+-- A client that replaces its worker. `spawn` starts a worker and answers its lane (for an
+-- application, `jess.worker.spawn { source = service.source }`); it is called once at once and
+-- again each time the worker is given up on. Requests still unanswered then are sent to the new
+-- worker as they were. One that had in fact committed is refused there by the ledger as
+-- already committed, and is reported to the caller as what it is: `committed`. So a caller of a
+-- supervisor sees `unknown` only when the restarts are used up or a worker cannot be opened.
+--
+-- What it holds: a copy of every unanswered request, at most the client's `maxOutstanding`.
+function service.supervisor(spawn: () -> Lane, options: SupervisorOptions): Supervisor
+  local kept = options.writer.ledger
+  if kept == nil or ledger.problem(kept) ~= nil then error('jessql writer service: a supervisor needs a ledger to retry safely', 2) end
+
+  local maxRestarts = if options.maxRestarts ~= nil then options.maxRestarts else 3
+  if typeof(maxRestarts) ~= 'number' or maxRestarts ~= math.floor(maxRestarts) or maxRestarts < 0 or maxRestarts > 100 then
+    error('jessql writer service: invalid maxRestarts', 2)
+  end
+
+  -- Unanswered requests in the order they were first sent, and which of them have been sent to
+  -- more than one worker: only for those does "already committed" mean "committed by us".
+  local held: { [string]: writer.Request } = {}
+  -- Ids in the order they were first sent; one that is answered leaves a hole, and the list is
+  -- compacted once holes are most of it, so it holds at most twice what is unanswered.
+  local order: { string } = {}
+  local holes = 0
+  local retried: { [string]: boolean } = {}
+  -- Where in `order` each unanswered id was last sent.
+  local position: { [string]: number } = {}
+  local outstanding, restarts = 0, 0
+  local window = if options.restartWindowSeconds ~= nil then options.restartWindowSeconds else 3600
+  if typeof(window) ~= 'number' or window ~= window or window < 1 or window > 30 * 24 * 3600 then
+    error('jessql writer service: invalid restartWindowSeconds', 2)
+  end
+
+  -- When each replacement within the window was made: the cap counts these, not all time.
+  local recent: { number } = {}
+  local stopped, reason = false, nil :: string?
+  local client: Client? = nil
+  local self = {} :: Supervisor
+  local backoff = if options.restartBackoffSeconds ~= nil then options.restartBackoffSeconds else 1
+  if typeof(backoff) ~= 'number' or backoff ~= backoff or backoff < 0 or backoff > 3600 then
+    error('jessql writer service: invalid restartBackoffSeconds', 2)
+  end
+
+  local clock = (options.client and options.client.now) or os.clock
+  -- No replacement before this time.
+  local notBefore = 0
+
+  local function start(): (boolean, string?)
+    -- Starting a worker can raise (no capability, no domain); that is an answer.
+    local ok, lane = pcall(spawn)
+    if not ok or lane == nil then return false, 'no worker could be started' end
+
+    local made = service.client(lane :: Lane, options.client)
+    local opened, problem = made:open(options.path, options.tables, options.writer, options.openSeconds)
+    if not opened then return false, problem or 'the worker did not open the database' end
+
+    client = made
+    return true, nil
+  end
+
+  -- Unanswered ids in the order they were sent, each once, where it was sent last: an id that was
+  -- answered and sent again stands where it was sent again, after what was sent before that.
+  local function compacted(): { string }
+    local kept: { string } = {}
+    for index, id in order do
+      if held[id] ~= nil and position[id] == index then
+        table.insert(kept, id)
+        position[id] = #kept
+      end
+    end
+
+    return kept
+  end
+
+  local function settle(id: string)
+    if held[id] == nil then return end
+
+    held[id], retried[id], position[id] = nil, nil, nil
+    outstanding -= 1
+    holes += 1
+    if holes > 64 and holes * 2 > #order then
+      order = compacted()
+      holes = 0
+    end
+  end
+
+  local function giveUp(why: string): { Ack }
+    stopped, reason = true, why
+    local acks: { Ack } = {}
+    -- In the order they were last sent, as everything else here answers them.
+    for _, id in compacted() do
+      table.insert(acks, { id = id, outcome = 'unknown' :: writer.Outcome, error = why })
+      settle(id)
+    end
+
+    order, holes = {}, 0
+    table.clear(position)
+    return acks
+  end
+
+  -- Replacements made within the window, as of now.
+  local function replacedLately(): number
+    local now = clock()
+    local kept: { number } = {}
+    for _, at in recent do
+      if now - at < window then table.insert(kept, at) end
+    end
+
+    recent = kept
+    return #recent
+  end
+
+  -- The worker is gone: another, and everything unanswered sent to it again, in order, each once.
+  local function replace(): string?
+    local lately = replacedLately()
+    if lately >= maxRestarts then return 'the worker was replaced as often as allowed' end
+
+    restarts += 1
+    table.insert(recent, clock())
+    notBefore = clock() + math.min(30, backoff * 2 ^ lately)
+    local started, problem = start()
+    if not started then return problem end
+
+    -- An id answered and then sent again is in the list twice; it is sent once.
+    order, holes = compacted(), 0
+    for _, id in order do
+      retried[id] = true
+      local admission = (client :: Client):submit(held[id])
+      if not admission.admitted then return `a request could not be sent again: {tostring(admission.reason)}` end
+    end
+
+    return nil
+  end
+
+  local first, firstProblem = start()
+  if not first then stopped, reason = true, firstProblem end
+
+  function self.submit(_self: Supervisor, request: writer.Request): Admission
+    local current = client
+    if stopped or not current then return { admitted = false, reason = 'stopped', outstanding = outstanding } end
+
+    -- From here on only the copy is looked at, sent and kept: a worker that dies is sent this
+    -- again, and it must be what was admitted whatever the caller has done to its table since.
+    local taken, invalid = writer.snapshot(request)
+    if not taken then return { admitted = false, reason = 'invalid: ' .. (invalid or 'malformed'), outstanding = outstanding } end
+
+    local id = taken.id
+    if held[id] ~= nil then return { admitted = false, reason = 'duplicate-id', outstanding = outstanding } end
+
+    local admission = current:submit(taken)
+    if admission.admitted then
+      held[id] = taken
+      table.insert(order, id)
+      position[id] = #order
+      outstanding += 1
+    elseif admission.reason == 'stopped' then
+      -- The worker died between two looks: said as backpressure, since the next poll replaces it.
+      return { admitted = false, reason = 'backpressure', outstanding = outstanding }
+    end
+
+    return { admitted = admission.admitted, reason = admission.reason, outstanding = outstanding }
+  end
+
+  function self.poll(_self: Supervisor, seconds: number?): { Ack }
+    local acks: { Ack } = {}
+    local current = client
+    if stopped or not current then return acks end
+
+    local lost = false
+    for _, ack in current:poll(seconds) do
+      if ack.outcome == 'unknown' then
+        lost = true
+      elseif held[ack.id] ~= nil then
+        -- Sent to an earlier worker too, and refused by this one as already there: it committed.
+        local outcome: writer.Outcome = if ack.outcome == 'rejected' and retried[ack.id] and ack.alreadyCommitted == true then 'committed' else ack.outcome
+        table.insert(acks, { id = ack.id, outcome = outcome, error = if outcome == 'committed' then nil else ack.error,
+          aborted = if outcome == 'rejected' then ack.aborted else nil, alreadyCommitted = if outcome == 'rejected' then ack.alreadyCommitted else nil })
+        settle(ack.id)
+      end
+    end
+
+    -- Too soon after the last replacement: the requests stay held, and this is looked at
+    -- again at the next poll. Nothing is admitted meanwhile.
+    if (lost or current:status().stopped) and replacedLately() < maxRestarts and clock() < notBefore then return acks end
+
+    if lost or current:status().stopped then
+      local problem = replace()
+      if problem then
+        for _, ack in giveUp(problem) do table.insert(acks, ack) end
+      end
+    end
+
+    return acks
+  end
+
+  function self.close(_self: Supervisor, seconds: number?): { Ack }
+    local acks: { Ack } = {}
+    local current = client
+    if stopped or not current then return acks end
+
+    for _, ack in current:close(seconds) do
+      if held[ack.id] == nil then continue end
+
+      local outcome: writer.Outcome = if ack.outcome == 'rejected' and retried[ack.id] and ack.alreadyCommitted == true then 'committed' else ack.outcome
+      table.insert(acks, { id = ack.id, outcome = outcome, error = if outcome == 'committed' then nil else ack.error,
+        aborted = if outcome == 'rejected' then ack.aborted else nil, alreadyCommitted = if outcome == 'rejected' then ack.alreadyCommitted else nil })
+      settle(ack.id)
+    end
+
+    -- What the worker never answered (it was dead, waiting to be replaced): every request still
+    -- gets an outcome, and it is the honest one.
+    for _, id in compacted() do
+      table.insert(acks, { id = id, outcome = 'unknown' :: writer.Outcome, error = 'closed before the worker answered' })
+      settle(id)
+    end
+
+    stopped, reason = true, 'closed'
+    return acks
+  end
+
+  function self.status(_self: Supervisor): { outstanding: number, restarts: number, stopped: boolean, reason: string? }
+    return { outstanding = outstanding, restarts = restarts, stopped = stopped, reason = reason }
+  end
+
+  return self
+end
+
+return service

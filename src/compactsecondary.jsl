@@ -3,7 +3,7 @@
 -- Experimental immutable JQLS1 sidecar: sorted, prefix-compressed index keys.
 -- Metadata lives in the checksummed directory. Index primary keys are decoded
 -- from their reversible key component, not stored a second time.
-local fs = require('@dream/fs')
+local vfs = require('@jessql/vfs')
 local bytes = require('@dream/bytes')
 local json = require('@jess/json')
 local engine = require('@jessql/engine')
@@ -101,6 +101,7 @@ end
 
 -- Streaming writer. The final sidecar retains none of its sorted keys in RAM.
 function compact.create(path: string, nextRow: () -> Row?, options: paged.Options?)
+  local fs = vfs.resolve(if options then options.storage else nil)
   local pageBytes = if options and options.pageBytes then options.pageBytes else DefaultPageBytes
   if pageBytes < 512 or pageBytes > 1024 * 1024 or pageBytes % 1 ~= 0 then
     error('jessql compact: invalid page size', 2)
@@ -196,6 +197,7 @@ function compact.create(path: string, nextRow: () -> Row?, options: paged.Option
 end
 
 function compact.open(path: string, options: paged.Options?): paged.Snapshot
+  local fs = vfs.resolve(if options then options.storage else nil)
   local cacheLimit = if options and options.cachePages then options.cachePages else DefaultCachePages
   if cacheLimit < 1 or cacheLimit > 4096 or cacheLimit % 1 ~= 0 then
     error('jessql compact: invalid cache size', 2)

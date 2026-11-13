@@ -1,6 +1,6 @@
 --!strict
 local sql = require('@jessql')
-local fs = require('@dream/fs')
+local fs = require('@jessql/vfs')
 local test = require('@jess/test')
 local expect = test.expect
 local suite = test.new()
@@ -151,6 +151,7 @@ suite.describe('immutable cold composite secondary index', function()
     local wal = cold .. '.wal'
     fs.remove(wal)
     fs.remove(wal .. '.lock')
+    fs.remove(wal .. '.committed')
     local values = { 'a', 'a\\b', 'quote"', 'z', 'é' }
     table.sort(values)
     local cursor = 0
@@ -176,6 +177,7 @@ suite.describe('immutable cold composite secondary index', function()
     fs.remove(sidecar)
     fs.remove(wal)
     fs.remove(wal .. '.lock')
+    fs.remove(wal .. '.committed')
 
     cold, sidecar = fixture('nulls')
     cursor = 0
@@ -200,6 +202,7 @@ suite.describe('immutable cold composite secondary index', function()
     local wal = cold .. '.wal'
     fs.remove(wal)
     fs.remove(wal .. '.lock')
+    fs.remove(wal .. '.committed')
     seed(cold, 600)
     sql.secondary.create(sidecar, cold, 'room', 'stream', { pageBytes = 1024 })
     local plain = sql.hybrid.open(wal, cold, 'events', { cachePages = 2 })
@@ -241,6 +244,7 @@ suite.describe('immutable cold composite secondary index', function()
     fs.remove(sidecar)
     fs.remove(wal)
     fs.remove(wal .. '.lock')
+    fs.remove(wal .. '.committed')
   end)
 
 
@@ -273,6 +277,7 @@ suite.describe('immutable cold composite secondary index', function()
     local wal = cold .. '.wal'
     fs.remove(wal)
     fs.remove(wal .. '.lock')
+    fs.remove(wal .. '.committed')
     local cursor = 0
     sql.paged.create(cold, { 'id', 'room', 'stream', 'body' }, 'id', function()
       cursor += 1
@@ -306,6 +311,7 @@ suite.describe('immutable cold composite secondary index', function()
     fs.remove(sidecar)
     fs.remove(wal)
     fs.remove(wal .. '.lock')
+    fs.remove(wal .. '.committed')
   end)
 
   suite.it('rejects compact corruption, mismatched snapshots, and invalid formats', function()

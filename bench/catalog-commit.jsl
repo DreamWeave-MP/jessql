@@ -1,0 +1,134 @@
+--!strict
+-- #40: what a service step costs on a real disk. One commit over five tables with synchronized
+-- durability, in a multi-table managed database (`sql.catalog`) and, for comparison, in the
+-- WAL-only store (`sql.open`), which has the same atomicity and keeps every row in memory.
+-- Wall time, from the monotonic clock, since what is measured is mostly the device's fsync: run it
+-- on the disk the service would use. On a memory filesystem it measures the engine alone.
+-- Then the publications a catalog adds: a flush and a compaction, and a reopen.
+--
+--   jess run --package . --capability filesystem.read --capability filesystem.write \
+--     bench/catalog-commit.jsl /absolute/empty/directory [commits=300] [bodyBytes=512]
+local fs = require('@dream/fs')
+local net = require('@jess/net')
+local sql = require('@jessql')
+
+local directory, commitsText, bodyText = ...
+local commits = tonumber(commitsText) or 300
+local bodyBytes = tonumber(bodyText) or 512
+if type(directory) ~= 'string' or string.sub(directory, 1, 1) ~= '/' then
+  print('usage: catalog-commit <absolute empty directory> [commits] [bodyBytes]')
+  return 2
+end
+
+local listed = fs.list(directory)
+if not listed or #listed ~= 0 then
+  print('the directory must exist and be empty')
+  return 2
+end
+
+type Writer = { insert: (self: Writer, name: string, row: { [string]: unknown }) -> (), upsert: (self: Writer, name: string, row: { [string]: unknown }) -> (),
+  delete: (self: Writer, name: string, key: unknown) -> boolean }
+
+local body = string.rep('x', bodyBytes)
+
+local function step(tx: Writer, number: number)
+  tx:insert('reservations', { id = number, effect = `send-{number}` })
+  tx:insert('handled', { id = number })
+  tx:insert('conversation', { id = number, body = body })
+  tx:insert('outbox', { id = number })
+  if number > 1 then tx:delete('outbox', number - 1) end
+
+  tx:upsert('counters', { id = 'total', value = number })
+end
+
+local function percentile(sorted: { number }, fraction: number): number
+  return sorted[math.max(1, math.ceil(#sorted * fraction))]
+end
+
+local function report(name: string, samples: { number })
+  table.sort(samples)
+  local total = 0
+  for _, sample in samples do total += sample end
+
+  print(string.format('%s,%d,%.3f,%.3f,%.3f,%.3f,%.3f', name, #samples, percentile(samples, 0.5), percentile(samples, 0.95),
+    percentile(samples, 0.99), samples[#samples], total / #samples))
+end
+
+local function timed(work: () -> ()): number
+  local before = net.now()
+  work()
+  return net.now() - before
+end
+
+print(`commits={commits} bodyBytes={bodyBytes} clock=monotonic-ms durability=sync`)
+print('operation,count,p50_ms,p95_ms,p99_ms,max_ms,mean_ms')
+
+local Tables: { sql.CatalogTableSpec } = {
+  { tableName = 'reservations', columns = { 'id', 'effect' }, primaryKey = 'id' },
+  { tableName = 'handled', columns = { 'id' }, primaryKey = 'id' },
+  { tableName = 'conversation', columns = { 'id', 'body' }, primaryKey = 'id' },
+  { tableName = 'outbox', columns = { 'id' }, primaryKey = 'id' },
+  { tableName = 'counters', columns = { 'id', 'value' }, primaryKey = 'id' },
+}
+
+-- The WAL-only store: several tables, one frame a commit, every row resident.
+local plain = sql.open(directory .. '/plain.wal', { durability = 'sync' })
+for _, spec in Tables do plain:createTable(spec.tableName, spec.columns, spec.primaryKey) end
+
+local plainSamples: { number } = {}
+for number = 1, commits do
+  table.insert(plainSamples, timed(function() plain:transaction(function(tx) step((tx :: unknown) :: Writer, number) end) end))
+end
+
+plain:close()
+report('sql.open five-table commit', plainSamples)
+
+-- The catalog, with no budget: commits only.
+local db = sql.catalog.create(directory .. '/service', { tables = Tables })
+local samples: { number } = {}
+for number = 1, commits do
+  table.insert(samples, timed(function() db:transaction(function(tx) step((tx :: unknown) :: Writer, number) end) end))
+end
+
+report('sql.catalog five-table commit', samples)
+report('sql.catalog flush (all five tables)', { timed(function() db:flush() end) })
+
+-- Commits over cold rows, then a second flush and a compaction of every table.
+local over: { number } = {}
+for number = commits + 1, commits * 2 do
+  table.insert(over, timed(function() db:transaction(function(tx) step((tx :: unknown) :: Writer, number) end) end))
+end
+
+report('sql.catalog commit over cold rows', over)
+report('sql.catalog second flush', { timed(function() db:flush() end) })
+report('sql.catalog compaction', { timed(function() db:compact() end) })
+local stats = db:stats()
+db:close()
+report('sql.catalog reopen', { timed(function() db = sql.catalog.openExisting(directory .. '/service') end) })
+local counted = db:query('SELECT COUNT(*) AS n FROM conversation').rows[1].n
+db:close()
+report('sql.catalog verify', { timed(function() assert(sql.catalog.verify(directory .. '/service').ok) end) })
+if counted ~= commits * 2 then error('rows are missing after the run', 0) end
+
+-- With a budget: the commits that set off a publication pay for it.
+local budgeted = sql.catalog.create(directory .. '/budgeted', { tables = Tables, maxHotRows = 200, maxGenerations = 4 })
+local budgetedSamples: { number } = {}
+for number = 1, commits do
+  table.insert(budgetedSamples, timed(function() budgeted:transaction(function(tx) step((tx :: unknown) :: Writer, number) end) end))
+end
+
+local budgetedStats = budgeted:stats()
+budgeted:close()
+report('sql.catalog commit under maxHotRows=200', budgetedSamples)
+
+local files, bytes = 0, 0
+for _, name in fs.list(directory) or {} do
+  local stat = fs.stat(`{directory}/{name}`)
+  if stat and stat.isFile then
+    files += 1
+    bytes += stat.size
+  end
+end
+
+print(`catalog epoch={stats.epoch} walBytes={stats.walBytes}; budgeted epoch={budgetedStats.epoch} walBytes={budgetedStats.walBytes}; directory files={files} bytes={bytes}`)
+return 0

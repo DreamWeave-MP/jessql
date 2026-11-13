@@ -1,0 +1,237 @@
+--!strict
+-- The committed length of a write-ahead log, recorded beside it.
+--
+-- A log's own end says nothing about where it should end: a log that stops short is exactly what
+-- a crash during the last write leaves, so a reader drops the incomplete tail. Damage that cuts
+-- the tail off later looks the same, and used to cost acknowledged transactions without a word.
+-- This file is the other witness. After a commit is synchronized, the store writes here how long
+-- the log then was and how many transactions it held. A log found shorter than its mark was
+-- damaged (or replaced by an older copy), and is refused instead of quietly shortened.
+--
+-- What the mark promises, exactly: it is written only after the log's own synchronization, so
+-- it never claims more than is durable; a crash can therefore never make a sound log look
+-- damaged. It is not synchronized with every commit (that would add a second synchronization to
+-- each): it is synchronized when the store is closed, and before a checkpoint shortens the log.
+-- So after a clean close every commit is covered, and after a crash every commit up to whatever
+-- mark had reached storage.
+--
+-- What is trusted (decided 2026-11-13): a synchronization the operating system reports as done is
+-- done. An acknowledged commit was synchronized, so it is on the disk whole, and the zeros a
+-- power cut leaves at the end of a log, after its last whole frame, can only be an append that
+-- was never acknowledged; that tail is cut. A disk that reports a synchronization it did not do
+-- can hand back acknowledged frames as zeros past a mark that is behind, and those are cut as
+-- well: that disk is outside what this store defends against. (Holding the mark current with
+-- every commit would catch it, for about one and a half times the cost of a single commit.)
+--
+-- The same holds for a log that is lost whole. A mark claiming commits refuses a log that is gone
+-- or holds none, but only a mark that reached storage claims anything: until the store's first
+-- clean close or checkpoint, a crash can leave a mark that claims none, and a log lost then opens
+-- as new. A store that must not be opened empty over a lost log closes or checkpoints once after
+-- its first commits (re-review of #99).
+--
+-- A record that does not reach storage leaves the mark behind, still true; the store then says it
+-- is unwitnessed (re-review of #99: it went on saying it was witnessed).
+--
+-- The file is `<log>.committed`: a magic and two slots written alternately, each with its own
+-- checksum, so a write torn by a crash leaves the other slot standing.
+--
+-- A mark that is not there is no mark: the log is read as it always was, which is how a log from
+-- before marks, or one whose loss was knowingly accepted, is read. A mark that is there and
+-- cannot be read is another thing, and is not taken for the first: no crash leaves one (the file
+-- is made whole or not at all, and a record goes to the slot that does not hold the latest), so
+-- it is damage, and a witness that was damaged cannot say the log was not. The store refuses to
+-- open until the mark is removed by hand, which is the same knowing acceptance as for a log
+-- found short.
+
+local bytes = require('@dream/bytes')
+local vfs = require('@jessql/vfs')
+
+export type Mark = { sequence: number, length: number }
+-- What is beside a log: no mark, one that can be read, or one that is there and cannot be.
+export type Condition = 'absent' | 'sound' | 'damaged'
+export type Writer = {
+  -- Records that the log holds `sequence` transactions in `length` bytes, all synchronized. False
+  -- when the record could not be written: the mark is behind.
+  record: (sequence: number, length: number) -> boolean,
+  -- Makes "nothing is committed" durable, before the log is replaced by a shorter one. Returns
+  -- whether it is durable; the caller must not shorten the log if it is not.
+  reset: () -> boolean,
+  -- Makes the latest record durable. Best effort: a mark that is behind is still true.
+  sync: () -> (),
+  close: () -> (),
+}
+
+local Magic = 'JQLC1\n'
+local SlotBytes = 24
+local walmark = {}
+
+walmark.Magic = Magic
+walmark.Suffix = '.committed'
+-- Beside the mark while a fresh one is made, then put in its place.
+walmark.CandidateSuffix = '.tmp'
+
+function walmark.path(log: string): string
+  return log .. walmark.Suffix
+end
+
+-- One slot: sequence and length as 64-bit floats (whole numbers below 2^53), then a CRC-32 of
+-- those sixteen bytes and four bytes of zero.
+local function slot(sequence: number, length: number): string
+  local raw = buffer.create(SlotBytes)
+  buffer.writef64(raw, 0, sequence)
+  buffer.writef64(raw, 8, length)
+  buffer.writeu32(raw, 16, bytes.crc32(buffer.readstring(raw, 0, 16)))
+  return buffer.tostring(raw)
+end
+
+local function whole(value: number): boolean
+  return value == value and value >= 0 and value < 2 ^ 53 and value % 1 == 0
+end
+
+local function parse(body: string, at: number): Mark?
+  if #body < at + SlotBytes then return nil end
+
+  local raw = buffer.fromstring(string.sub(body, at + 1, at + SlotBytes))
+  if buffer.readu32(raw, 16) ~= bytes.crc32(buffer.readstring(raw, 0, 16)) or buffer.readu32(raw, 20) ~= 0 then return nil end
+
+  local sequence, length = buffer.readf64(raw, 0), buffer.readf64(raw, 8)
+  if not whole(sequence) or not whole(length) then return nil end
+
+  return { sequence = sequence, length = length }
+end
+
+-- The mark a file's bytes hold: the valid slot with the most transactions, or nil.
+function walmark.decode(body: string): Mark?
+  if string.sub(body, 1, #Magic) ~= Magic then return nil end
+
+  local first, second = parse(body, #Magic), parse(body, #Magic + SlotBytes)
+  if first and second then return if second.sequence > first.sequence then second else first end
+
+  return first or second
+end
+
+-- What is beside `log`, and the mark when it is sound. Damaged: a file that cannot be read, is
+-- not the size of a mark, does not begin as one, or has no slot that checks.
+function walmark.examine(fs: vfs.Backend, log: string): (Condition, Mark?)
+  local path = walmark.path(log)
+  if not fs.exists(path) then return 'absent', nil end
+
+  local body = fs.readFileString(path)
+  if not body or #body ~= #Magic + 2 * SlotBytes then return 'damaged', nil end
+
+  local mark = walmark.decode(body)
+  if not mark then return 'damaged', nil end
+
+  return 'sound', mark
+end
+
+-- The mark recorded beside `log`, or nil when there is none that can be read. It does not say
+-- which: `examine` does, and a caller that must not take damage for absence asks that.
+function walmark.read(fs: vfs.Backend, log: string): Mark?
+  local path = walmark.path(log)
+  if not fs.exists(path) then return nil end
+
+  local body = fs.readFileString(path)
+  return if body then walmark.decode(body) else nil
+end
+
+-- Removes the mark beside `log`: for a log that is being created, whose predecessor of the same
+-- name left one behind.
+function walmark.forget(fs: vfs.Backend, log: string)
+  local path = walmark.path(log)
+  if fs.exists(path) then fs.remove(path) end
+end
+
+-- Opens the mark beside `log` for writing, creating it empty of claims if it is not there. Nil
+-- when it cannot be opened, or is there and damaged: a damaged mark is never written over, since
+-- that would turn damage into a clean witness that claims nothing.
+function walmark.open(fs: vfs.Backend, log: string): Writer?
+  local path = walmark.path(log)
+  local condition, existing = walmark.examine(fs, log)
+  if condition == 'damaged' then return nil end
+
+  if condition == 'absent' then
+    -- A fresh file: the magic and two slots that claim nothing, there whole or not at all, so
+    -- that a crash while it is made cannot leave something that reads as damage. Creating a file
+    -- durably is not whole or nothing (the name comes before the bytes), so it is made under
+    -- another name and then put in place, as a manifest is published.
+    local empty = Magic .. slot(0, 0) .. slot(0, 0)
+    local candidate = path .. walmark.CandidateSuffix
+    if fs.exists(candidate) then
+      -- Only what an interrupted creation leaves is removed: the start of a fresh mark (nothing,
+      -- part of it, or all of it). Anything else under that name is someone's file (another
+      -- store's log, say): it is not this mark's to delete, and the store does not open past it.
+      local left = fs.readFileString(candidate)
+      if left == nil or #left > #empty or string.sub(empty, 1, #left) ~= left then
+        error(`jessql storage: {candidate} is in the way of the committed-length mark and is not one; move it to open the log`, 0)
+      end
+
+      if not fs.remove(candidate) then return nil end
+    end
+
+    if fs.createDurable(candidate, empty) ~= #empty then
+      if fs.exists(candidate) then fs.remove(candidate) end
+      return nil
+    end
+
+    if not fs.replace(candidate, path) then
+      if fs.exists(candidate) then fs.remove(candidate) end
+      return nil
+    end
+
+    local parent = fs.parent(path)
+    if parent and not fs.syncDirectory(parent) then return nil end
+  end
+
+  local writer = fs.openWrite(path, { create = false, truncate = false })
+  if not writer then return nil end
+
+  local handle: dream_fs_Writer = writer
+  -- Which slot the next record goes to: the one that does not hold the current mark, so that a
+  -- write torn by a crash can only cost the older of the two.
+  local held = fs.readFileString(path) or ''
+  local first, second = parse(held, #Magic), parse(held, #Magic + SlotBytes)
+  -- Two slots that say the same claim nothing over each other (a new mark, or one just reset):
+  -- the first is written, as it always was.
+  local turn = if first and (not second or first.sequence > second.sequence) then 1 else 0
+  local latest: Mark = existing or { sequence = 0, length = 0 }
+  local closed = false
+
+  local function put(sequence: number, length: number): boolean
+    local record = slot(sequence, length)
+    if not handle:seek(#Magic + turn * SlotBytes) then return false end
+    if handle:write(record) ~= #record then return false end
+
+    turn = 1 - turn
+    latest = { sequence = sequence, length = length }
+    return true
+  end
+
+  return {
+    record = function(sequence: number, length: number): boolean
+      if closed then return false end
+      if sequence == latest.sequence and length == latest.length then return true end
+
+      return put(sequence, length)
+    end,
+    reset = function(): boolean
+      if closed then return false end
+      -- Both slots, so that neither still claims the longer log, and durably.
+      if not put(0, 0) or not put(0, 0) then return false end
+
+      return handle:syncData() == true
+    end,
+    sync = function()
+      if not closed then handle:syncData() end
+    end,
+    close = function()
+      if closed then return end
+
+      closed = true
+      handle:syncData()
+      handle:close()
+    end,
+  }
+end
+
+return walmark

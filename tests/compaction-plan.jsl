@@ -1,0 +1,198 @@
+--!strict
+-- P3-02: which generations a selective compaction merges, decided by a pure function of their
+-- sizes, explained, and bounded by the fan-in. Then the same decisions inside the managed store:
+-- reads preserved, and what each policy costs in bytes written. In memory.
+local memfs = require('@jessql/memfs')
+local meter = require('@jessql/meter')
+local plan = require('@jessql/compaction_plan')
+local sql = require('@jessql')
+local test = require('@jess/test')
+
+local expect = test.expect
+local suite = test.new()
+
+type Row = { [string]: unknown }
+
+local function sized(...: number): { plan.Generation }
+  local generations: { plan.Generation } = {}
+  for index, bytes in { ... } do generations[index] = { epoch = index, bytes = bytes } end
+
+  return generations
+end
+
+suite.describe('compaction selection, as a pure function', function()
+  suite.it('takes as many generations as the fan-in allows under the widest policy, whatever their sizes', function()
+    expect(plan.select(sized(1000, 10, 10), 3, 'widest').count).toBe(3)
+    expect(plan.select(sized(1000, 10, 10, 10, 10), 3, 'widest').count).toBe(3)
+    expect(plan.select(sized(5, 5), 8, 'widest').count).toBe(2)
+  end)
+
+  suite.it('leaves a large old generation alone under the cheapest policy until merging it is worth it', function()
+    -- 20 bytes to remove one generation, against 1020 to remove two.
+    local decision = plan.select(sized(1000, 10, 10), 3, 'cheapest')
+    expect(decision.count).toBe(2)
+    expect(#decision.candidates).toBe(2)
+    expect(decision.candidates[1].cost).toBe(20)
+    expect(decision.candidates[2].cost).toBe(510)
+    expect(decision.reason).toBe('cheapest: newest 2 of 3 generations, 20 bytes (20 per generation removed, against 510 for the newest 3)')
+    -- Once the newer ones have grown, taking all three is the cheaper way to remove a generation.
+    expect(plan.select(sized(1000, 900, 900), 3, 'cheapest').count).toBe(3)
+  end)
+
+  suite.it('prefers the wider candidate on a tie, and equal generations therefore merge widest', function()
+    expect(plan.select(sized(100, 100, 100, 100), 4, 'cheapest').count).toBe(4)
+    expect(plan.select(sized(0, 0, 0), 3, 'cheapest').count).toBe(3)
+    expect(plan.select(sized(100, 100), 2, 'cheapest').reason).toBe('cheapest: newest 2 of 2 generations, 200 bytes')
+  end)
+
+  suite.it('never exceeds the fan-in, never selects fewer than two, and always the newest run', function()
+    for fanIn = 2, 8 do
+      for count = 2, 8 do
+        local sizes: { number } = {}
+        for index = 1, count do sizes[index] = (index * 7919) % 613 end
+
+        for _, policy in plan.Policies do
+          local decision = plan.select(sized(table.unpack(sizes)), fanIn, policy)
+          expect(decision.count >= 2 and decision.count <= math.min(count, fanIn)).toBe(true)
+          local bytes = 0
+          for index = count - decision.count + 1, count do bytes += sizes[index] end
+
+          -- The bytes of the chosen candidate are those of the newest `count` generations.
+          expect(decision.candidates[decision.count - 1].bytes).toBe(bytes)
+        end
+      end
+    end
+  end)
+
+  suite.it('gives the same decision for the same input, and refuses input it cannot decide on', function()
+    local first, second = plan.select(sized(40, 3, 9, 2), 4, 'cheapest'), plan.select(sized(40, 3, 9, 2), 4, 'cheapest')
+    expect(`{first.count} {first.reason}`).toBe(`{second.count} {second.reason}`)
+    -- Each of these raises; the refusal is the assertion.
+    expect((pcall(plan.select, sized(10), 3, 'widest'))).toBe(false)
+    expect((pcall(plan.select, sized(10, 10), 1, 'widest'))).toBe(false)
+    expect((pcall(plan.select, sized(10, 10), 9, 'widest'))).toBe(false)
+    expect((pcall(plan.select, sized(10, -1), 3, 'widest'))).toBe(false)
+    expect((pcall(plan.select, sized(10, 1.5), 3, 'widest'))).toBe(false)
+    expect((pcall(plan.select, sized(10, 10), 3, ('leveled' :: unknown) :: plan.Policy))).toBe(false)
+  end)
+end)
+
+-- The empty generation a new database starts with, one large generation, then `small` small ones.
+local function skewed(policy: string?, small: number): (sql.ManagedDatabase, memfs.Disk, meter.Metered)
+  local disk = memfs.new()
+  local metered = meter.wrap(disk.backend)
+  local db = sql.managed.create('/memory/skew', { tableName = 'events', columns = { 'id', 'body' }, primaryKey = 'id',
+    cachePages = 1, compactionFanIn = 3, maxGenerations = 8, compactionPolicy = policy, storage = metered.backend })
+
+  db:transaction(function(tx)
+    for index = 1, 400 do tx:insert({ id = index, body = string.rep('b', 80) }) end
+  end)
+  db:flush()
+  for round = 1, small do
+    db:transaction(function(tx)
+      tx:upsert({ id = round, body = `small {round}` })
+      tx:delete(200 + round)
+    end)
+    db:flush()
+  end
+
+  return db, disk, metered
+end
+
+local function contents(db: sql.ManagedDatabase): string
+  local seen: { string } = {}
+  for _, row in db:query('SELECT id, body FROM events ORDER BY id').rows do
+    local record = row :: Row
+    table.insert(seen, `{record.id}={#(record.body :: string)}`)
+  end
+
+  return table.concat(seen, ' ')
+end
+
+suite.describe('compaction selection, inside the managed store', function()
+  suite.it('merges the large generation with the two small ones under the default policy and only the small ones under cheapest, with the same rows', function()
+    local results: { [string]: { generations: number, rowsWritten: number, rows: string, reason: string } } = {}
+    for _, policy in { 'widest', 'cheapest' } do
+      local db, _, metered = skewed(policy, 2)
+      local before = contents(db)
+      expect(db:stats().generations).toBe(4)
+      metered.reset()
+      db:compact()
+      local reason = ''
+      for _, event in db:events().events do
+        if event.kind == 'compaction-selected' then reason = event.detail or '' end
+      end
+
+      results[policy] = { generations = db:stats().generations, rowsWritten = metered.counters().classes.rows.written,
+        rows = contents(db), reason = reason }
+      expect(results[policy].rows).toBe(before)
+      db:close()
+    end
+
+    expect(results.widest.generations).toBe(2)
+    expect(results.cheapest.generations).toBe(3)
+    -- The point of the policy: the large generation was not rewritten.
+    expect(results.cheapest.rowsWritten * 10 < results.widest.rowsWritten).toBe(true)
+    expect(results.cheapest.rows).toBe(results.widest.rows)
+    expect(string.sub(results.widest.reason, 1, 35)).toBe('widest: newest 3 of 4 generations, ')
+    expect(string.sub(results.cheapest.reason, 1, 37)).toBe('cheapest: newest 2 of 4 generations, ')
+  end)
+
+  suite.it('keeps deletions made in the small generations hidden after the large one is left alone', function()
+    local db, disk = skewed('cheapest', 2)
+    db:compact()
+    expect(db:get(201)).toBe(nil)
+    expect(db:get(202)).toBe(nil)
+    expect((db:get(1) :: Row).body).toBe('small 1')
+    expect((db:get(203) :: Row).body).toBe(string.rep('b', 80))
+    db:close()
+    local reopened = sql.managed.openExisting('/memory/skew', { compactionPolicy = 'cheapest', storage = disk.backend })
+    expect(reopened:get(201)).toBe(nil)
+    expect(reopened:query('SELECT COUNT(*) AS n FROM events').rows[1].n).toBe(398)
+    reopened:close()
+    expect(sql.managed.verify('/memory/skew', { semantic = true, storage = disk.backend }).ok).toBe(true)
+  end)
+
+  suite.it('is the default when no policy is given, and refuses a policy it does not know', function()
+    local plain, _, plainMeter = skewed(nil, 2)
+    local widest, _, widestMeter = skewed('widest', 2)
+    plain:compact()
+    widest:compact()
+    expect(plain:stats().generations).toBe(2)
+    expect(plainMeter.counters().classes.rows.written).toBe(widestMeter.counters().classes.rows.written)
+    plain:close()
+    widest:close()
+    -- An unknown policy raises at open; the refusal is the assertion.
+    expect((pcall(function()
+      sql.managed.create('/memory/bad', { tableName = 'events', columns = { 'id' }, primaryKey = 'id',
+        compactionPolicy = 'leveled', storage = memfs.new().backend })
+    end))).toBe(false)
+  end)
+
+  suite.it('writes fewer bytes over a sustained skewed run under cheapest, at the price of more generations', function()
+    local totals: { [string]: { written: number, generations: number, rows: string } } = {}
+    for _, policy in { 'widest', 'cheapest' } do
+      local db, _, metered = skewed(policy, 0)
+      metered.reset()
+      local most = 0
+      for round = 1, 24 do
+        db:transaction(function(tx)
+          for index = 1, 4 do tx:upsert({ id = 1000 + (round * 4 + index) % 40, body = `r{round}` }) end
+        end)
+        db:flush()
+        if db:stats().generations >= 3 then db:compact() end
+        most = math.max(most, db:stats().generations)
+      end
+
+      totals[policy] = { written = metered.counters().classes.rows.written, generations = most, rows = contents(db) }
+      db:close()
+    end
+
+    expect(totals.cheapest.rows).toBe(totals.widest.rows)
+    expect(totals.cheapest.written < totals.widest.written).toBe(true)
+    expect(totals.cheapest.generations >= totals.widest.generations).toBe(true)
+    print(`rows bytes written: widest {totals.widest.written}, cheapest {totals.cheapest.written}; most generations: widest {totals.widest.generations}, cheapest {totals.cheapest.generations}`)
+  end)
+end)
+
+return suite

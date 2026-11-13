@@ -1,0 +1,31 @@
+--!strict
+-- #40.1: a commit over five tables of a managed database, stopped at every storage step and found
+-- whole or absent. In a file of its own because it is long: a test file is one unit of a parallel run.
+local lab = require('@jessql/faultlab')
+local test = require('@jess/test')
+local world = require('./catalogworld')
+
+local expect = test.expect
+local suite = test.new()
+
+local commit, exercised, findings, prepare, recover, step =
+  world.commit, world.exercised, world.findings, world.prepare, world.recover, world.step
+
+suite.describe('a managed database of several tables', function()
+  suite.it('keeps a commit over five tables whole or absent at every storage step, hot over cold', function()
+    local report = lab.run({
+      name = 'catalog service steps',
+      prepare = prepare,
+      exercise = exercised(function(db, ledger)
+        for number = 4, 6 do commit(db, ledger, number) end
+      end),
+      recover = recover,
+    }, { crashRecovery = true })
+    expect(findings(report)).toBe('')
+    expect(report.truncated).toBe(false)
+    expect(#report.schedule >= 10).toBe(true)
+    print(`catalog commits: {#report.schedule} storage steps, {report.runs} stopped runs, {#report.violations} violations`)
+  end)
+end)
+
+return suite

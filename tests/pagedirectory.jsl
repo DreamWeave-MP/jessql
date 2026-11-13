@@ -1,0 +1,254 @@
+--!strict
+-- #19: a two-level directory of cold pages. Every lookup must equal the flat directory's; only
+-- the root and a bounded number of leaves may be held; and damage to one leaf must cost the
+-- lookups that need it and no others. On a disk in memory.
+local directory = require('@jessql/pagedirectory')
+local memfs = require('@jessql/memfs')
+local test = require('@jess/test')
+
+local expect = test.expect
+local suite = test.new()
+
+local Path = '/memory/table.directory'
+
+local function key(index: number): string
+  return string.format('key-%08d', index * 10)
+end
+
+local function pageAt(index: number): directory.Page
+  return { first = key(index), segment = index // 1000, offset = (index % 1000) * 4096, length = 4096 }
+end
+
+type Built = { disk: typeof(memfs.new()), size: number, pages: number }
+
+local function build(pages: number, leafEntries: number): Built
+  local disk = memfs.new()
+  local writer = assert(directory.writer(disk.backend, Path, { leafEntries = leafEntries }))
+  for index = 1, pages do expect(writer.add(pageAt(index))).toBe(nil) end
+
+  expect((writer.finish())).toBe(pages)
+  return { disk = disk, size = #assert((disk.backend.readFileString(Path))), pages = pages }
+end
+
+-- What a flat directory answers: the last page whose first key is not after the key.
+local function flat(pages: number, wanted: string): number
+  local found = 0
+  for index = 1, pages do
+    if key(index) <= wanted then found = index else break end
+  end
+
+  return found
+end
+
+suite.describe('a two-level page directory', function()
+  suite.it('answers every lookup as the flat directory does, at and between and beyond its keys', function()
+    local built = build(1000, 16)
+    local reader = assert(directory.reader(built.disk.backend, Path, built.size, { maxLeaves = 4 }))
+    expect(reader.stats().pages).toBe(1000)
+    expect(reader.stats().leaves).toBe(63)
+
+    local probes: { string } = { '', 'a', key(1), 'key-00000015', key(16), 'key-00000165', key(17), key(500), 'key-00005005', key(1000), 'key-99999999', 'zzz' }
+    for index = 1, 1000, 7 do
+      table.insert(probes, key(index))
+      table.insert(probes, key(index) .. '!')
+    end
+
+    for _, probe in probes do
+      local page, problem = reader.find(probe)
+      expect(problem).toBe(nil)
+      local expected = flat(1000, probe)
+      if expected == 0 then
+        expect(page).toBe(nil)
+      else
+        local found = assert(page)
+        local want = pageAt(expected)
+        expect(`{probe}: {found.first} {found.segment} {found.offset} {found.length}`).toBe(`{probe}: {want.first} {want.segment} {want.offset} {want.length}`)
+      end
+    end
+  end)
+
+  suite.it('holds the root and no more leaves than its cache allows, however many it is asked for', function()
+    local built = build(5000, 32)
+    local reader = assert(directory.reader(built.disk.backend, Path, built.size, { maxLeaves = 3 }))
+    -- Opening read no leaf.
+    expect(reader.stats().leafReads).toBe(0)
+    expect(reader.stats().cached).toBe(0)
+
+    for index = 1, 5000, 11 do assert(reader.find(key(index))) end
+
+    local swept = reader.stats()
+    expect(swept.cached).toBe(3)
+    expect(swept.leaves).toBe(157)
+    -- A sweep in key order reads each leaf once.
+    expect(swept.leafReads).toBe(157)
+
+    -- The same three leaves again and again: no more reads.
+    for _ = 1, 50 do
+      assert(reader.find(key(4995)))
+      assert(reader.find(key(4970)))
+      assert(reader.find(key(4940)))
+    end
+
+    expect(reader.stats().leafReads).toBe(swept.leafReads)
+    expect(reader.stats().hits > swept.hits).toBe(true)
+    -- A fourth pushes out the one used longest ago, which is then read again.
+    assert(reader.find(key(1)))
+    assert(reader.find(key(4995)))
+    expect(reader.stats().leafReads).toBe(swept.leafReads + 2)
+    expect(reader.stats().cached).toBe(3)
+  end)
+
+  suite.it('holds no more bytes of leaves than its budget, whatever their keys weigh, and still answers', function()
+    -- Ten leaves of short keys and ten of long ones. A leaf weighs what it holds in the heap (re-
+    -- view of 2026-11-13): a table, twelve bytes and a slot a page, and each key a string with
+    -- its header: 664 bytes a short leaf, 4,664 a long one.
+    local disk = memfs.new()
+    local writer = assert(directory.writer(disk.backend, Path, { leafEntries = 10 }))
+    local function named(index: number): string
+      return if index <= 100 then string.format('a-%06d', index) else string.format('b-%06d', index) .. string.rep('x', 400)
+    end
+
+    local short, long = 64 + 10 * (12 + 16) + 10 * (24 + 8), 64 + 10 * (12 + 16) + 10 * (24 + 408)
+    expect(`{short} {long}`).toBe('664 4664')
+
+    for index = 1, 200 do
+      expect(writer.add({ first = named(index), segment = 0, offset = index * 4096, length = 4096 })).toBe(nil)
+    end
+
+    expect((writer.finish())).toBe(200)
+    local size = #assert((disk.backend.readFileString(Path)))
+    local function opened(budget: number, most: number?): directory.Reader
+      return assert(directory.reader(disk.backend, Path, size, { maxLeaves = most or 64, maxCacheBytes = budget }))
+    end
+
+    local function found(reader: directory.Reader, index: number)
+      local page = assert(reader.find(named(index)))
+      expect(page.offset).toBe(index * 4096)
+    end
+
+    -- Four short leaves fit 3,000 bytes; the fifth pushes out the one used longest ago.
+    local small = opened(3000)
+    for leaf = 0, 3 do found(small, leaf * 10 + 1) end
+
+    expect(`{small.stats().cached} {small.stats().cachedBytes}`).toBe(`4 {4 * short}`)
+    found(small, 41)
+    expect(`{small.stats().cached} {small.stats().cachedBytes} {small.stats().leafReads}`).toBe(`4 {4 * short} 5`)
+    found(small, 1)
+    expect(small.stats().leafReads).toBe(6)
+
+    -- A leaf heavier than the whole budget answers and is not kept: asked twice, read twice,
+    -- and what was cached stays.
+    found(small, 101)
+    found(small, 105)
+    expect(`{small.stats().cached} {small.stats().cachedBytes} {small.stats().leafReads}`).toBe(`4 {4 * short} 8`)
+
+    -- One long leaf and one short fit 5,500. A second long one needs the first gone, which was
+    -- used longest ago; the short one stays, and the first is read again when next asked for.
+    local medium = opened(5500)
+    found(medium, 101)
+    found(medium, 1)
+    expect(`{medium.stats().cached} {medium.stats().cachedBytes}`).toBe(`2 {long + short}`)
+    found(medium, 111)
+    expect(`{medium.stats().cached} {medium.stats().cachedBytes} {medium.stats().leafReads}`).toBe(`2 {long + short} 3`)
+    found(medium, 1)
+    expect(medium.stats().leafReads).toBe(3)
+    found(medium, 101)
+    expect(`{medium.stats().cached} {medium.stats().cachedBytes} {medium.stats().leafReads}`).toBe(`2 {long + short} 4`)
+
+    -- Whatever is asked, in whatever order, the weight held never passes the budget, and the
+    -- count never passes its own limit when that is the tighter one.
+    -- Any three leaves fit 10,000 (two long and a short: 9,992): the count is the tighter here.
+    local walked = opened(10000, 3)
+    local heaviest, most = 0, 0
+    for step = 1, 2000 do
+      found(walked, (step * 7919) % 200 + 1)
+      heaviest = math.max(heaviest, walked.stats().cachedBytes)
+      most = math.max(most, walked.stats().cached)
+    end
+
+    expect(heaviest <= 10000).toBe(true)
+    expect(heaviest >= long).toBe(true)
+    expect(most).toBe(3)
+
+    -- Without a budget only the count applies, as before.
+    local counted = assert(directory.reader(disk.backend, Path, size, { maxLeaves = 20 }))
+    for index = 1, 200, 10 do found(counted, index) end
+
+    expect(`{counted.stats().cached} {counted.stats().cachedBytes}`).toBe(`20 {10 * short + 10 * long}`)
+
+    -- What is counted is about what the heap holds for the cached leaves (review of 2026-11-13:
+    -- the bytes on disk were about a third of it).
+    local collect = require('@jess/bench').collect
+    collect()
+    local before = gcinfo()
+    local weighed = assert(directory.reader(disk.backend, Path, size, { maxLeaves = 20 }))
+    for index = 1, 200, 10 do found(weighed, index) end
+
+    collect()
+    local ratio = (gcinfo() - before) * 1024 / weighed.stats().cachedBytes
+    expect(`{string.format('%.2f', ratio)} {ratio >= 0.5 and ratio <= 2}`).toBe(`{string.format('%.2f', ratio)} true`)
+
+    for _, bad in { 0, -1, 1.5, 2 ^ 41 } do
+      local refused, why = directory.reader(disk.backend, Path, size, { maxCacheBytes = bad })
+      expect(`{refused == nil} {why}`).toBe('true not a cache budget')
+    end
+  end)
+
+  suite.it('loses only the lookups a damaged leaf serves, and refuses a damaged root or footer outright', function()
+    local built = build(640, 64)
+    local backend = built.disk.backend
+    local whole = assert((backend.readFileString(Path)))
+    local reader = assert(directory.reader(backend, Path, built.size))
+    assert(reader.find(key(1)))
+
+    -- A byte inside the third leaf, read by a reader that has not cached it.
+    local leafBytes = 4 + 64 * (2 + 12 + 12)
+    local inThird = 2 * leafBytes + 40
+    assert((backend.writeFile(Path, string.sub(whole, 1, inThird) .. '~' .. string.sub(whole, inThird + 2))))
+    local fresh = assert(directory.reader(backend, Path, built.size))
+    expect(select('#', fresh.find(key(1)))).toBe(2)
+    expect(assert(fresh.find(key(64))).first).toBe(key(64))
+    local page, problem = fresh.find(key(130))
+    expect(page).toBe(nil)
+    expect(problem).toBe('leaf 3 does not match its checksum')
+    expect(assert(fresh.find(key(200))).first).toBe(key(200))
+    expect(assert(fresh.find(key(640))).first).toBe(key(640))
+
+    -- The root, the footer, the size.
+    local rootAt = 10 * leafBytes + 9
+    assert((backend.writeFile(Path, string.sub(whole, 1, rootAt) .. '~' .. string.sub(whole, rootAt + 2))))
+    expect(select(2, directory.reader(backend, Path, built.size))).toBe('the root does not match its checksum')
+    assert((backend.writeFile(Path, string.sub(whole, 1, #whole - 24) .. 'JQD9' .. string.sub(whole, #whole - 19))))
+    expect(select(2, directory.reader(backend, Path, built.size))).toBe('not a directory file')
+    assert((backend.writeFile(Path, whole)))
+    expect(select(2, directory.reader(backend, Path, built.size - 1))).toBe('not a directory file')
+    expect(select(2, directory.reader(backend, Path, 10))).toBe('not a directory file')
+    assert((backend.writeFile(Path, string.sub(whole, 1, #whole - 20) .. '\2\0\0\0' .. string.sub(whole, #whole - 15))))
+    expect(select(2, directory.reader(backend, Path, built.size))).toBe('a directory of another version')
+  end)
+
+  suite.it('refuses pages out of order, a page that is not one, and a second file at the same path', function()
+    local disk = memfs.new()
+    local writer = assert(directory.writer(disk.backend, Path, { leafEntries = 4 }))
+    expect(writer.add(pageAt(5))).toBe(nil)
+    expect(writer.add(pageAt(5))).toBe('pages out of order')
+    expect(writer.add(pageAt(4))).toBe('pages out of order')
+    expect(writer.add({ first = 'z', segment = -1, offset = 0, length = 1 })).toBe('not a page address')
+    expect(writer.add({ first = 'z', segment = 0, offset = 0, length = 0 })).toBe('not a page address')
+    expect(writer.add({ first = string.rep('k', directory.MaxKeyBytes + 1), segment = 0, offset = 0, length = 1 })).toBe('not a page with a key a directory holds')
+    expect(writer.add(pageAt(6))).toBe(nil)
+    expect((writer.finish())).toBe(2)
+    expect(writer.add(pageAt(7))).toBe('finished')
+    expect((directory.writer(disk.backend, Path))).toBe(nil)
+    expect((directory.writer(disk.backend, '/memory/other', { leafEntries = 1 }))).toBe(nil)
+
+    -- An empty table is a directory too: a root of no leaves, and every lookup finds nothing.
+    local empty = assert(directory.writer(disk.backend, '/memory/empty'))
+    expect((empty.finish())).toBe(0)
+    local reader = assert(directory.reader(disk.backend, '/memory/empty', #assert((disk.backend.readFileString('/memory/empty')))))
+    expect(select('#', reader.find('anything'))).toBe(2)
+    expect((reader.find('anything'))).toBe(nil)
+  end)
+end)
+
+return suite

@@ -10,6 +10,7 @@ local BatchSize = 128
 local path = fs.join(assert((fs.cwd())), '.jessql-ordered-bench.wal')
 fs.remove(path)
 fs.remove(path .. '.lock')
+fs.remove(path .. '.committed')
 
 local db = sql.open(path)
 db:createTable('events', { 'id', 'sequence', 'room' }, 'id')
@@ -66,3 +67,4 @@ print(string.format('count_hash_s=%.4f count_ordered_s=%.4f count_speedup=%.2fx'
 db:close()
 fs.remove(path)
 fs.remove(path .. '.lock')
+fs.remove(path .. '.committed')

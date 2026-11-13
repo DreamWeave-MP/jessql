@@ -1,0 +1,1366 @@
+--!strict
+--!native
+-- A managed database of several tables (#40.1, option B): one log, one manifest, one epoch.
+--
+-- Every table has its own immutable cold generations, read through a bounded page cache, so no
+-- table has to fit in memory. All of them share ONE hot store and its write-ahead log, so a
+-- transaction that touches several tables is one CRC-framed frame with one synchronization: whole
+-- or absent after any crash. A flush or a compaction writes a new generation for every table that
+-- has anything hot, starts a new log bound to the new cold set, and makes all of it current with
+-- ONE manifest replacement. There is no moment at which two tables disagree about what is current.
+--
+-- The publication protocol is the single-table one (`@jessql/managed_publication`): candidates are
+-- sealed, the new log is opened and bound, the manifest is replaced, the directory is
+-- synchronized, and only then is anything retired. A failure before the replacement leaves the old
+-- epoch authoritative; one after it poisons the handle until it is reopened.
+--
+-- All transitions are synchronous under the database's lock. No background work.
+local vfs = require('@jessql/vfs')
+local storage = require('@jessql/storage')
+local paged = require('@jessql/paged')
+local segments = require('@jessql/segments')
+local delta = require('@jessql/delta')
+local tiers = require('@jessql/tiers')
+local engine = require('@jessql/engine')
+local hybrid = require('@jessql/hybrid')
+local manifest = require('@jessql/catalog_manifest')
+local policy = require('@jessql/managed_policy')
+local backupKernel = require('@jessql/managed_backup')
+local publicationKernel = require('@jessql/managed_publication')
+local walmark = require('@jessql/walmark')
+
+export type Row = { [string]: unknown }
+export type TableSpec = manifest.TableSchema
+export type Options = {
+  -- Required to create a database; checked against the database when it is given to reopen one.
+  tables: { TableSpec }?,
+  cachePages: number?, readMode: string?, rowLayout: string?, pageBytes: number?,
+  runRows: number?, mergeFanIn: number?, compactionFanIn: number?,
+  -- Budgets over the whole database: hot rows and tombstones of every table together, their
+  -- payload bytes, and the log's size. Crossing one after a commit publishes a flush, or a
+  -- compaction when some table already has `maxGenerations` (2 to 8, default 8).
+  maxHotRows: number?, maxHotBytes: number?, maxWalBytes: number?, maxGenerations: number?,
+  -- The backend the database lives on; without it, the VM default at the time it is opened.
+  storage: vfs.Backend?,
+  -- Budgets on what a query's joins and aggregates hold, in rows (`engine.Limits`). They apply
+  -- to every query of the database and of its transactions, across flushes and compactions.
+  queryLimits: engine.Limits?,
+  -- Deterministic fault injection for integration tests. Throws at a named stage.
+  testHook: ((string) -> ())?,
+  -- Seconds, monotonic: what a pin's lifetime is measured by. Injected in tests.
+  now: (() -> number)?,
+}
+
+-- #34. A reader's hold on the state of the database as it was published when the pin was
+-- taken. While the pin is held, a flush or a compaction publishes a newer state for everyone
+-- else and leaves this one readable: its cold files are not removed and its readers are not
+-- closed. It is not a snapshot of the hot rows: until the next publication a pinned view sees
+-- what is committed after it was taken, as the database itself does; from that publication on
+-- it sees nothing newer. A pin ends when it is released, when its time is up, or when the
+-- database is closed, and what it kept is reclaimed then.
+export type PinnedView = {
+  epoch: number,
+  get: (self: PinnedView, tableName: string, key: unknown) -> Row?,
+  query: (self: PinnedView, sql: string, params: { unknown }?) -> engine.Result,
+  -- A plan over the pinned state; it may be run or opened as a cursor for as long as the pin is held.
+  prepare: (self: PinnedView, sql: string) -> engine.Plan,
+  release: (self: PinnedView) -> (),
+  held: (self: PinnedView) -> boolean,
+}
+export type PinStatus = { pins: number, superseded: number }
+export type BatchResult = storage.BatchResult
+export type Transaction = {
+  get: (self: Transaction, tableName: string, key: unknown) -> Row?,
+  insert: (self: Transaction, tableName: string, row: Row) -> (),
+  upsert: (self: Transaction, tableName: string, row: Row) -> (),
+  update: (self: Transaction, tableName: string, key: unknown, changes: Row) -> boolean,
+  delete: (self: Transaction, tableName: string, key: unknown) -> boolean,
+  query: (self: Transaction, sql: string, params: { unknown }?) -> engine.Result,
+}
+export type TableStats = { generations: number, coldRows: number, hotRows: number, tombstones: number }
+export type Stats = { epoch: number, walBytes: number, cachedPages: number, hotPayloadBytes: number?,
+  tables: { [string]: TableStats } }
+export type Database = {
+  get: (self: Database, tableName: string, key: unknown) -> Row?,
+  insert: (self: Database, tableName: string, row: Row) -> (),
+  upsert: (self: Database, tableName: string, row: Row) -> (),
+  update: (self: Database, tableName: string, key: unknown, changes: Row) -> boolean,
+  delete: (self: Database, tableName: string, key: unknown) -> boolean,
+  transaction: (self: Database, callback: (Transaction) -> ()) -> (),
+  transactionBatch: (self: Database, callbacks: { (Transaction) -> () }) -> { BatchResult },
+  query: (self: Database, sql: string, params: { unknown }?) -> engine.Result,
+  prepare: (self: Database, sql: string) -> engine.Plan,
+  stats: (self: Database) -> Stats,
+  maintenanceStatus: (self: Database) -> { lastError: string?, poisoned: boolean },
+  -- A new generation for every table with anything hot, and a new log. The epoch afterwards.
+  -- With nothing hot it does nothing, unless the log has reached `maxWalBytes`: then the log
+  -- alone is replaced by an empty one.
+  flush: (self: Database) -> number,
+  -- The same, and every table with more than one generation is merged into one.
+  compact: (self: Database) -> number,
+  -- Holds the published state for a reader for `seconds` (default 60, at most 3600). At most
+  -- `catalog.MaxPins` at once.
+  pin: (self: Database, seconds: number?) -> PinnedView,
+  -- Pins held, and how many published states superseded since are still kept for them.
+  pinStatus: (self: Database) -> PinStatus,
+  close: (self: Database) -> (),
+}
+
+export type VerifyIssue = { stage: string, tableName: string?, message: string }
+export type VerifyTable = { generations: number, rowsScanned: number }
+-- `coldPagesChecked` says every page of every generation of every table was read and decoded.
+-- `walFramesChecked` is always false: the log's frames are checked by opening the database.
+export type VerifyReport = {
+  ok: boolean, epoch: number?, tables: { [string]: VerifyTable }, coldRowsScanned: number, walBytes: number,
+  coldPagesChecked: boolean, walFramesChecked: boolean, issues: { VerifyIssue },
+}
+
+-- `storage` is the backend the source lives on, `destinationStorage` the one the copy goes to:
+-- each defaults to the VM default and to the source's backend respectively.
+export type BackupOptions = { storage: vfs.Backend?, destinationStorage: vfs.Backend? }
+export type BackupResult = { epoch: number, files: number, bytes: number }
+
+type Catalog = manifest.Catalog
+type Table = manifest.Table
+type Generation = manifest.Generation
+type Overlay = { store: storage.Store, colds: { [string]: segments.Snapshot }, view: engine.Database, wal: string }
+
+local Identity = '__jessql_hybrid_identity'
+local TombstonePrefix = '__jessql_deleted__'
+local MaxEpoch = manifest.MaxEpoch
+local catalog = {}
+
+-- #34. The most pins one open database holds at once.
+catalog.MaxPins = 64
+
+local function assertOK(ok: boolean?, message: string?, action: string)
+  if not ok then error('jessql catalog: ' .. action .. ': ' .. tostring(message), 3) end
+end
+
+local function normalize(fs: vfs.Backend, path: string): (string, string)
+  if type(path) ~= 'string' or path == '' then error('jessql catalog: path required', 3) end
+  local absolute, absoluteError = fs.absolute(path)
+  if not absolute then error('jessql catalog: ' .. tostring(absoluteError), 3) end
+  local name = fs.fileName(absolute)
+  if not name or not fs.isFileName(name) then error('jessql catalog: invalid path', 3) end
+  local directory = fs.parent(absolute)
+  if not directory then error('jessql catalog: missing parent directory', 3) end
+  -- Canonical parent prevents aliases to the same database from bypassing its lock.
+  local parent, parentError = fs.canonicalize(directory)
+  if not parent then error('jessql catalog: parent: ' .. tostring(parentError), 3) end
+  if not fs.isDir(parent) then error('jessql catalog: parent is not a directory', 3) end
+  return fs.join(parent, name), parent
+end
+
+local function walPath(base: string, epoch: number): string
+  return base .. string.format('.g%08d.wal', epoch)
+end
+
+local function tableFile(base: string, name: string, epoch: number, extension: string): string
+  return base .. '.t.' .. name .. string.format('.g%08d.', epoch) .. extension
+end
+
+local function tombstones(name: string): string
+  return TombstonePrefix .. name
+end
+
+local function removeIfPresent(fs: vfs.Backend, path: string) publicationKernel.removeIfPresent(path, fs) end
+
+local function seal(fs: vfs.Backend, path: string, parent: string) publicationKernel.seal(path, parent, fs) end
+
+local function clearLog(fs: vfs.Backend, base: string, epoch: number)
+  local wal = walPath(base, epoch)
+  removeIfPresent(fs, wal)
+  removeIfPresent(fs, wal .. '.lock')
+  removeIfPresent(fs, walmark.path(wal))
+end
+
+local function clearTableCandidate(fs: vfs.Backend, base: string, name: string, epoch: number)
+  for _, extension in { 'rows', 'deleted', 'hot-rows', 'hot-deleted' } do
+    removeIfPresent(fs, tableFile(base, name, epoch, extension))
+  end
+end
+
+-- The files of a table's generations, oldest first, and which of them have a deletion sidecar.
+local function generationPaths(base: string, entry: Table): ({ string }, { [number]: string })
+  local sources: { string } = {}
+  local deleted: { [number]: string } = {}
+  for index, generation in entry.generations do
+    sources[index] = tableFile(base, entry.tableName, generation.epoch, 'rows')
+    if generation.deleted then deleted[index] = tableFile(base, entry.tableName, generation.epoch, 'deleted') end
+  end
+
+  return sources, deleted
+end
+
+local function closeAll(colds: { [string]: segments.Snapshot })
+  for _, cold in colds do
+    -- Closing a reader can fail; the others are still closed.
+    pcall(function() cold:close() end)
+  end
+end
+
+-- Every table's cold set, opened and held to the manifest's schema, and the identity of them all.
+-- Nothing stays open if any of them fails.
+local function openColds(fs: vfs.Backend, base: string, value: Catalog, options: Options?,
+  cachePages: number?): ({ [string]: segments.Snapshot }, string)
+  local colds: { [string]: segments.Snapshot } = {}
+  local identities: { [string]: string } = {}
+  local readMode = if options then options.readMode else nil
+  -- A generation that is missing, damaged or of another schema raises; close what was opened.
+  local ok, failure = pcall(function()
+    for _, entry in value.tables do
+      local sources, deleted = generationPaths(base, entry)
+      local cold = segments.open(sources, { cachePages = cachePages, readMode = readMode, deletePaths = deleted, storage = fs })
+      colds[entry.tableName] = cold
+      if cold.primaryKey ~= entry.primaryKey or #cold.columns ~= #entry.columns then
+        error('cold generation schema mismatch in ' .. entry.tableName)
+      end
+
+      for index, column in entry.columns do
+        if cold.columns[index] ~= column then error('cold generation schema mismatch in ' .. entry.tableName) end
+      end
+
+      identities[entry.tableName] = cold.identity
+    end
+  end)
+
+  if not ok then
+    closeAll(colds)
+    error('jessql catalog: ' .. tostring(failure), 3)
+  end
+
+  return colds, manifest.identity(identities)
+end
+
+local function sameColumns(left: { string }, right: { string }): boolean
+  if #left ~= #right then return false end
+
+  for index, column in left do
+    if column ~= right[index] then return false end
+  end
+
+  return true
+end
+
+-- The read path of every table over one hot reader: the store itself, or a transaction on it.
+local function newView(value: Catalog, colds: { [string]: segments.Snapshot },
+  getter: (string, unknown) -> Row?, query: (string, { unknown }?) -> engine.Result,
+  rows: ((string) -> () -> Row?)?, limits: engine.Limits?): engine.Database
+  local view = engine.new()
+  -- A malformed budget raises here, when the database is opened, and not at the first query.
+  view:limits(limits)
+  for _, entry in value.tables do
+    local name = entry.tableName
+    view:register(name, hybrid.provider(colds[name], nil, name, entry.primaryKey, getter, query, rows, tombstones(name)))
+  end
+
+  return view
+end
+
+-- Opens the log of `value`'s epoch over its cold set. With `bound`, the log must exist and already
+-- carry every table and this cold set's identity: a log is never adopted, and never rebuilt.
+-- Without it, the log must be new, and is given the tables and the identity in one transaction.
+local function openOverlay(fs: vfs.Backend, base: string, value: Catalog, options: Options?, bound: boolean): Overlay
+  local wal = walPath(base, value.epoch)
+  if bound then
+    local exists, checkError = fs.exists(wal)
+    if not exists then error('jessql catalog: active WAL missing: ' .. tostring(checkError), 3) end
+  end
+  local colds, identity = openColds(fs, base, value, options, if options then options.cachePages else nil)
+  if identity ~= value.snapshotIdentity then
+    closeAll(colds)
+    error('jessql catalog: cold generation identity mismatch', 3)
+  end
+  local hot: storage.Store? = nil
+  -- A locked or damaged log raises; the cold readers are closed before that is reported.
+  local opened, failure = pcall(function()
+    local store = storage.open(wal, { rowLayout = if options then options.rowLayout else 'packed',
+      durability = 'sync', trackPayloadBytes = options ~= nil and options.maxHotBytes ~= nil, storage = fs,
+      manifestNamesLog = true })
+    hot = store
+    local existing: { [string]: { string } } = {}
+    local count = 0
+    for _, info in store:tables() do
+      existing[info.name] = info.columns
+      count += 1
+    end
+
+    if not bound then
+      if count ~= 0 then error('a new log already holds tables') end
+
+      store:transaction(function(tx)
+        for _, entry in value.tables do
+          tx:createTable(entry.tableName, entry.columns, entry.primaryKey)
+          tx:createTable(tombstones(entry.tableName), { 'id' }, 'id')
+        end
+
+        tx:createTable(Identity, { 'id', 'token', 'name' }, 'id')
+        tx:insert(Identity, { id = 'snapshot', token = identity, name = '*' })
+      end)
+      return
+    end
+
+    if count ~= #value.tables * 2 + 1 then error('the log does not hold exactly this database\'s tables') end
+
+    for _, entry in value.tables do
+      local columns = existing[entry.tableName]
+      if not columns or not sameColumns(columns, entry.columns) then
+        error('the log\'s schema of ' .. entry.tableName .. ' does not match the manifest')
+      end
+      local primaryKey = ''
+      store:transaction(function(tx) primaryKey = tx:primaryKey(entry.tableName) end)
+      if primaryKey ~= entry.primaryKey then error('the log\'s primary key of ' .. entry.tableName .. ' does not match the manifest') end
+
+      local removed = existing[tombstones(entry.tableName)]
+      if not removed or not sameColumns(removed, { 'id' }) then error('the log has no tombstones for ' .. entry.tableName) end
+    end
+
+    if not existing[Identity] or not sameColumns(existing[Identity], { 'id', 'token', 'name' }) then
+      error('the log is not bound to a cold set')
+    end
+    local binding = store:get(Identity, 'snapshot')
+    if not binding or binding.token ~= identity or binding.name ~= '*' then
+      error('the log is bound to another cold set; refuse to replay it over this one')
+    end
+  end)
+
+  if not opened then
+    -- Cleanup must not hide why the log could not be opened.
+    if hot then pcall(function() (hot :: storage.Store):close() end) end
+    closeAll(colds)
+    error('jessql catalog: ' .. tostring(failure), 3)
+  end
+  local store = hot :: storage.Store
+  -- A budget that is not one raises as the view is made. The log and the cold readers are open
+  -- by now and are closed before that is reported, so a refused open leaves nothing locked.
+  local viewed, view = pcall(newView, value, colds, function(name, key) return store:get(name, key) end,
+    function(sql, params) return store:query(sql, params) end,
+    function(name: string) return store:iterateRows(name) end, if options then options.queryLimits else nil)
+  if not viewed then
+    -- Closing can raise as well; the refusal already being reported is the one that matters.
+    pcall(function() store:close() end)
+    closeAll(colds)
+    error('jessql catalog: ' .. tostring(view), 3)
+  end
+
+  return { store = store, colds = colds, view = view :: engine.Database, wal = wal }
+end
+
+local function closeOverlay(overlay: Overlay)
+  -- The log is closed first and its failure reported, but the cold readers are closed either way.
+  local ok, failure = pcall(function() overlay.store:close() end)
+  closeAll(overlay.colds)
+  if not ok then error(failure, 2) end
+end
+
+-- A table's hot rows and tombstones as one candidate generation: a rows file and a deletion
+-- sidecar bound to it. The log stays the authority; nothing is published here.
+local function exportDelta(fs: vfs.Backend, overlay: Overlay, entry: Table, rowsPath: string, deletePath: string,
+  options: Options?)
+  local onDisk: delta.Options = {
+    pageBytes = if options then options.pageBytes else nil, runRows = if options then options.runRows else nil,
+    mergeFanIn = if options then options.mergeFanIn else nil, storage = fs,
+  }
+  delta.create(rowsPath, entry.columns, entry.primaryKey, overlay.store:iterateRows(entry.tableName), onDisk)
+  local snapshot = paged.open(rowsPath, { cachePages = 1, storage = fs })
+  local token = snapshot.identity
+  snapshot:close()
+  local deleted = overlay.store:iterateRows(tombstones(entry.tableName))
+  local marker = false
+  delta.create(deletePath, { 'id', 'token' }, 'id', function(): Row?
+    if not marker then
+      marker = true
+      return { id = '!identity', token = token }
+    end
+    local row = deleted()
+    if not row then return nil end
+    return { id = row.id, token = '' }
+  end, onDisk)
+end
+
+-- Removes what `nextValue` no longer names: the previous log, and generations merged away.
+-- `kept` are published states a reader still holds: nothing they name is removed, nor their logs.
+local function retire(fs: vfs.Backend, base: string, parent: string, prior: Catalog, nextValue: Catalog, kept: { Catalog }?)
+  local keptLog = false
+  for _, held in kept or {} do
+    if held.epoch == prior.epoch then keptLog = true end
+  end
+
+  for _, entry in prior.tables do
+    local retained: { [number]: boolean } = {}
+    for _, generation in (manifest.table(nextValue, entry.tableName) :: Table).generations do
+      retained[generation.epoch] = true
+    end
+
+    for _, held in kept or {} do
+      local theirs = manifest.table(held, entry.tableName)
+      for _, generation in if theirs then theirs.generations else {} do retained[generation.epoch] = true end
+    end
+
+    for _, generation in entry.generations do
+      if not retained[generation.epoch] then
+        removeIfPresent(fs, tableFile(base, entry.tableName, generation.epoch, 'rows'))
+        removeIfPresent(fs, tableFile(base, entry.tableName, generation.epoch, 'deleted'))
+      end
+    end
+  end
+
+  if not keptLog then clearLog(fs, base, prior.epoch) end
+
+  local ok, err = fs.syncDirectory(parent)
+  assertOK(ok, err, 'retirement directory')
+end
+
+-- Restart-only: removes files of this database's naming that the verified manifest does not name.
+-- The manifest is the sole authority; a generation is never retired merely for being old.
+local function collectOrphans(fs: vfs.Backend, base: string, parent: string, value: Catalog)
+  local names, listError = fs.list(parent)
+  if not names then error('jessql catalog: directory list: ' .. tostring(listError), 3) end
+  local file = fs.fileName(base) :: string
+  local logPrefix, tablePrefix = file .. '.g', file .. '.t.'
+  local removed = false
+
+  for _, name in names do
+    local orphan = false
+    if string.sub(name, 1, #logPrefix) == logPrefix then
+      local number, extension = string.match(string.sub(name, #logPrefix + 1), '^(%d%d%d%d%d%d%d%d)%.([%a%.]+)$')
+      orphan = number ~= nil and (extension == 'wal' or extension == 'wal.lock' or extension == 'wal.committed'
+        or extension == 'wal.committed.tmp') and tonumber(number) ~= value.epoch
+    elseif string.sub(name, 1, #tablePrefix) == tablePrefix then
+      local tableName, number, extension = string.match(string.sub(name, #tablePrefix + 1),
+        '^([%l_][%l%d_]*)%.g(%d%d%d%d%d%d%d%d)%.(.+)$')
+      if tableName and number and extension then
+        local entry = manifest.table(value, tableName)
+        local generation: Generation? = nil
+        for _, candidate in if entry then entry.generations else {} do
+          if candidate.epoch == tonumber(number) then generation = candidate end
+        end
+
+        if extension == 'rows' then
+          orphan = generation == nil
+        elseif extension == 'deleted' then
+          orphan = generation == nil or not generation.deleted
+        else
+          -- Scratch of an export or a merge that did not finish.
+          orphan = string.sub(extension, 1, 4) == 'hot-' or string.sub(extension, 1, 15) == 'rows.jql-tiers-'
+        end
+      end
+    end
+
+    if orphan then
+      removeIfPresent(fs, fs.join(parent, name))
+      removed = true
+    end
+  end
+
+  if removed then
+    local ok, err = fs.syncDirectory(parent)
+    assertOK(ok, err, 'orphan cleanup directory')
+  end
+end
+
+-- An absent manifest is not proof that this name never held a database: a lost manifest must
+-- never let startup begin again empty over a log that still has commits in it.
+local function requireFreshNamespace(fs: vfs.Backend, base: string, parent: string)
+  local names, listError = fs.list(parent)
+  if not names then error('jessql catalog: initialization directory: ' .. tostring(listError), 3) end
+  local file = fs.fileName(base) :: string
+  local logPrefix, tablePrefix = file .. '.g', file .. '.t.'
+  for _, entry in names do
+    -- A committed-length mark beside no log describes nothing and is discarded by a new log.
+    if string.sub(entry, -#walmark.Suffix) == walmark.Suffix then continue end
+
+    if entry == file .. '.jql-manifest.tmp' or string.sub(entry, 1, #tablePrefix) == tablePrefix
+      or (string.sub(entry, 1, #logPrefix) == logPrefix
+        and string.match(string.sub(entry, #logPrefix + 1), '^%d%d%d%d%d%d%d%d')) then
+      error('jessql catalog: manifest missing but database artifacts remain (' .. entry
+        .. '); refuse initialization until the manifest is recovered or files explicitly removed', 3)
+    end
+  end
+end
+
+local function readManifest(fs: vfs.Backend, path: string): Catalog
+  local raw, failure = fs.readFileString(path)
+  if not raw then error('jessql catalog: read manifest: ' .. tostring(failure), 3) end
+  local version = manifest.versionOf(raw)
+  if version == 1 or version == 2 then
+    error('jessql catalog: this is a single-table managed database; open it with sql.managed', 3)
+  end
+
+  return manifest.decode(raw)
+end
+
+local function openCatalog(path: string, options: Options?, intent: string): Database
+  -- Resolved once: everything this database does while it is open goes to this backend.
+  local fs = vfs.resolve(if options then options.storage else nil)
+  local base, parent = normalize(fs, path)
+  local hook = if options then options.testHook else nil
+  local compactionFanIn = if options and options.compactionFanIn then options.compactionFanIn else 8
+  local pageBytes = if options then options.pageBytes else nil
+  local mergeCachePages = if options and options.cachePages then options.cachePages else 1
+  local specs = if options then options.tables else nil
+  local limits = policy.limits(if options then { maxHotRows = options.maxHotRows, maxHotBytes = options.maxHotBytes,
+    maxWalBytes = options.maxWalBytes, maxGenerations = options.maxGenerations } else nil)
+  local budgeted = limits.maxHotRows ~= nil or limits.maxHotBytes ~= nil or limits.maxWalBytes ~= nil
+  local lock, lockError = fs.lock(base .. '.jql-lock')
+  if not lock then error('jessql catalog: database locked: ' .. tostring(lockError), 2) end
+  local manifestPath = base .. '.jql-manifest'
+  local value: Catalog? = nil
+  local current: Overlay? = nil
+  -- Open and initialization may fail at any I/O boundary; release the lock.
+  local opened, failure = pcall(function()
+    local exists, existsError = fs.exists(manifestPath)
+    if exists == nil then error('manifest stat: ' .. tostring(existsError)) end
+
+    if exists then
+      if intent == 'create' then error('database already exists; use openExisting to reopen it') end
+      local found = readManifest(fs, manifestPath)
+      value = found
+      if specs then manifest.sameSchema(found, specs) end
+      current = openOverlay(fs, base, found, options, true)
+      -- After an interrupted publication the new manifest may be visible before its directory
+      -- barrier. Refuse writes until it has one: otherwise an uncertain replacement could roll
+      -- back across another power loss, after commits acknowledged on the new log.
+      local synced, syncError = fs.syncDirectory(parent)
+      assertOK(synced, syncError, 'recovery manifest directory')
+      -- Failed orphan removal only leaks unused files, never active data.
+      pcall(function() collectOrphans(fs, base, parent, found) end)
+      return
+    end
+
+    if intent == 'existing' then error('database does not exist; use create to initialize it') end
+    if not specs then error('first open requires tables') end
+
+    requireFreshNamespace(fs, base, parent)
+    local identities: { [string]: string } = {}
+    for _, spec in specs do
+      if not manifest.validName(spec.tableName) then error('invalid table name') end
+      if identities[spec.tableName] then error('table ' .. spec.tableName .. ' is named twice') end
+
+      local rows = tableFile(base, spec.tableName, 1, 'rows')
+      paged.create(rows, spec.columns, spec.primaryKey, function(): Row? return nil end,
+        { pageBytes = pageBytes, storage = fs })
+      seal(fs, rows, parent)
+      local snapshot = segments.open({ rows }, { cachePages = 1, storage = fs })
+      identities[spec.tableName] = snapshot.identity
+      snapshot:close()
+    end
+    local initial = manifest.initial(specs, manifest.identity(identities))
+    value = initial
+    current = openOverlay(fs, base, initial, options, false)
+    publicationKernel.publishText(base, parent, manifest.encode(initial), hook, { started = false }, fs)
+  end)
+
+  if not opened then
+    -- A half-open overlay must not leave its log locked.
+    if current then pcall(function() closeOverlay(current :: Overlay) end) end
+    lock:unlock()
+    error('jessql catalog: open: ' .. tostring(failure), 2)
+  end
+
+  local live = current :: Overlay
+  local active = value :: Catalog
+  local closed, poisoned, busy, batchActive, activeTransaction = false, false, false, false, false
+  local lastMaintenanceError: string? = nil
+  local db = {} :: Database
+
+  -- #34. Pins, and the published states that were superseded while one of them held it.
+  type Pin = { overlay: Overlay, value: Catalog, expires: number, held: boolean }
+  local clock = (options and options.now) or os.clock
+  local pins: { Pin } = {}
+  local superseded: { { overlay: Overlay, value: Catalog } } = {}
+
+  local function holders(overlay: Overlay): number
+    local count = 0
+    for _, pin in pins do
+      if pin.held and pin.overlay == overlay then count += 1 end
+    end
+
+    return count
+  end
+
+  -- Closes and retires every superseded state no pin holds any longer. Nothing here can make a
+  -- commit or a publication fail: what is not removed now is removed at the next open.
+  local function reclaim()
+    local remaining: { { overlay: Overlay, value: Catalog } } = {}
+    local freed: { Catalog } = {}
+    for _, state in superseded do
+      if holders(state.overlay) > 0 then
+        table.insert(remaining, state)
+      else
+        -- A reader that fails to close leaves its files for the next open.
+        pcall(function() closeOverlay(state.overlay) end)
+        table.insert(freed, state.value)
+      end
+    end
+
+    superseded = remaining
+    local kept: { Catalog } = {}
+    for _, state in remaining do table.insert(kept, state.value) end
+
+    for _, value in freed do
+      -- Retirement can fail; unreferenced files are safe to leave for the next open.
+      pcall(function() retire(fs, base, parent, value, active, kept) end)
+    end
+
+    local still: { Pin } = {}
+    for _, pin in pins do
+      if pin.held then table.insert(still, pin) end
+    end
+
+    pins = still
+  end
+
+  local function expire()
+    local at = clock()
+    for _, pin in pins do
+      if pin.held and at >= pin.expires then pin.held = false end
+    end
+  end
+
+  local function ready()
+    if batchActive then error('jessql catalog: batched commit in progress', 3) end
+    if closed then error('jessql catalog: closed', 3) end
+    if poisoned then error('jessql catalog: uncertain publication; close and reopen', 3) end
+    if busy then error('jessql catalog: generation transition in progress', 3) end
+  end
+
+  -- The table a caller named, or an error that says it is not one of this database's.
+  local function entryOf(name: unknown): Table
+    local entry = if type(name) == 'string' then manifest.table(active, name) else nil
+    if not entry then error('jessql catalog: unknown table ' .. tostring(name), 3) end
+    return entry :: Table
+  end
+
+  function db.get(_self: Database, tableName: string, key: unknown): Row?
+    ready()
+    local name = entryOf(tableName).tableName
+    local row = live.store:get(name, key)
+    if row then return row end
+    if live.store:get(tombstones(name), hybrid.encodeKey(key)) then return nil end
+    return live.colds[name]:get(key)
+  end
+
+  function db.query(_self: Database, sql: string, params: { unknown }?): engine.Result
+    ready()
+    return live.view:query(sql, params)
+  end
+
+  -- A plan is bound to the epoch it was prepared in: a flush or a compaction replaces the cold
+  -- readers under it, so it must be prepared again afterwards.
+  function db.prepare(_self: Database, sql: string): engine.Plan
+    ready()
+    local prepared = active.epoch
+    local plan = live.view:prepare(sql)
+    local run, explain = plan.run, plan.explain
+    function plan.run(params)
+      ready()
+      if active.epoch ~= prepared then error('jessql catalog: plan prepared in an earlier epoch; prepare it again', 2) end
+      return run(params)
+    end
+
+    function plan.explain()
+      ready()
+      if active.epoch ~= prepared then error('jessql catalog: plan prepared in an earlier epoch; prepare it again', 2) end
+      return explain()
+    end
+
+    return plan
+  end
+
+  -- One facade for a single transaction and for each independently framed callback of a batch.
+  local function wrap(callback: (Transaction) -> ()): (storage.Transaction) -> ()
+    return function(tx: storage.Transaction)
+      local transaction = {} :: Transaction
+      local overlay = live
+      local txView: engine.Database? = nil
+      local plans: { [string]: engine.Plan } = {}
+
+      local function get(entry: Table, key: unknown): Row?
+        local row = tx:get(entry.tableName, key)
+        if row then return row end
+        if tx:get(tombstones(entry.tableName), hybrid.encodeKey(key)) then return nil end
+        return overlay.colds[entry.tableName]:get(key)
+      end
+
+      local function upsert(entry: Table, row: Row)
+        local encoded = hybrid.encodeKey(row[entry.primaryKey])
+        tx:upsert(entry.tableName, row)
+        tx:delete(tombstones(entry.tableName), encoded)
+      end
+
+      function transaction.get(_self: Transaction, tableName: string, key: unknown): Row?
+        return get(entryOf(tableName), key)
+      end
+
+      function transaction.upsert(_self: Transaction, tableName: string, row: Row)
+        upsert(entryOf(tableName), row)
+      end
+
+      function transaction.insert(_self: Transaction, tableName: string, row: Row)
+        local entry = entryOf(tableName)
+        if get(entry, row[entry.primaryKey]) then error('jessql catalog: duplicate primary key', 2) end
+        upsert(entry, row)
+      end
+
+      function transaction.update(_self: Transaction, tableName: string, key: unknown, changes: Row): boolean
+        local entry = entryOf(tableName)
+        local original = get(entry, key)
+        if not original then return false end
+        local updated: Row = {}
+        for column, held in original do updated[column] = held end
+
+        for column, changed in changes do
+          if column ~= entry.primaryKey then
+            updated[column] = changed
+          elseif changed ~= key then
+            error('jessql catalog: primary key cannot change', 2)
+          end
+        end
+
+        upsert(entry, updated)
+        return true
+      end
+
+      function transaction.delete(_self: Transaction, tableName: string, key: unknown): boolean
+        local entry = entryOf(tableName)
+        if not get(entry, key) then return false end
+        tx:delete(entry.tableName, key)
+        if overlay.colds[entry.tableName]:get(key) then
+          tx:upsert(tombstones(entry.tableName), { id = hybrid.encodeKey(key) })
+        end
+
+        return true
+      end
+
+      -- Reads what this transaction has staged, in every table.
+      function transaction.query(_self: Transaction, sql: string, params: { unknown }?): engine.Result
+        local view = txView
+        if not view then
+          view = newView(active, overlay.colds, function(name, key) return tx:get(name, key) end,
+            function(text, values) return tx:query(text, values) end, nil, if options then options.queryLimits else nil)
+          txView = view
+        end
+        local plan = plans[sql]
+        if not plan then
+          plan = (view :: engine.Database):prepare(sql)
+          plans[sql] = plan
+        end
+
+        return plan.run(params)
+      end
+
+      callback(transaction)
+    end
+  end
+
+  -- With a budget configured, a write is refused while the last maintenance stands failed:
+  -- otherwise an error there would let the log and the hot rows grow without bound.
+  local function readyToWrite()
+    ready()
+    if budgeted and lastMaintenanceError then
+      error('jessql catalog: maintenance failed under configured budget; flush or compact', 3)
+    end
+  end
+
+  local autoMaintain: () -> () = function() end
+
+  function db.transaction(_self: Database, callback: (Transaction) -> ())
+    readyToWrite()
+    if activeTransaction then error('jessql catalog: nested transaction', 2) end
+    activeTransaction = true
+    -- A callback or the commit can raise; the guard is released either way.
+    local succeeded, problem = pcall(function() live.store:transaction(wrap(callback)) end)
+    activeTransaction = false
+    if not succeeded then error(problem, 2) end
+    autoMaintain()
+  end
+
+  -- Independent frames behind one synchronization: each callback is whole or absent on its own.
+  function db.transactionBatch(_self: Database, callbacks: { (Transaction) -> () }): { BatchResult }
+    readyToWrite()
+    if activeTransaction then error('jessql catalog: nested transaction', 2) end
+
+    if type(callbacks) ~= 'table' or #callbacks == 0 or #callbacks > 256 then
+      error('jessql catalog: transactionBatch requires 1..256 callbacks', 2)
+    end
+    local wrapped: { (storage.Transaction) -> () } = {}
+    for index, callback in callbacks do
+      if type(index) ~= 'number' or index % 1 ~= 0 or index < 1 or index > #callbacks
+        or type(callback) ~= 'function' then
+        error('jessql catalog: invalid transactionBatch callback', 2)
+      end
+      wrapped[index] = wrap(callback)
+    end
+
+    activeTransaction = true
+    batchActive = true
+    -- The log can raise after an uncertain append; the guards are released either way.
+    local succeeded, result = pcall(function() return live.store:transactionBatch(wrapped) end)
+    batchActive = false
+    activeTransaction = false
+    if not succeeded then error(result, 2) end
+    -- Only once the whole batch is durable, and never as a failure of it.
+    autoMaintain()
+    return result :: { BatchResult }
+  end
+
+  function db.insert(self: Database, tableName: string, row: Row)
+    self:transaction(function(tx) tx:insert(tableName, row) end)
+  end
+
+  function db.upsert(self: Database, tableName: string, row: Row)
+    self:transaction(function(tx) tx:upsert(tableName, row) end)
+  end
+
+  function db.update(self: Database, tableName: string, key: unknown, changes: Row): boolean
+    local changed = false
+    self:transaction(function(tx) changed = tx:update(tableName, key, changes) end)
+    return changed
+  end
+
+  function db.delete(self: Database, tableName: string, key: unknown): boolean
+    local deleted = false
+    self:transaction(function(tx) deleted = tx:delete(tableName, key) end)
+    return deleted
+  end
+
+  -- What a table has in the log: rows, and tombstones over its cold rows.
+  local function hotOf(name: string): (number, number)
+    return live.store:tableFootprint(name).rows, live.store:tableFootprint(tombstones(name)).rows
+  end
+
+  local function walBytes(): number
+    local journal, journalError = fs.stat(live.wal)
+    if not journal or not journal.isFile then error('jessql catalog: active WAL stat failed: ' .. tostring(journalError), 2) end
+    return journal.size
+  end
+
+  -- Everything the log holds, over every table: rows and tombstones, their payload bytes when
+  -- those are tracked, and the most generations any one table has.
+  local function pressure(): (number, number?, number)
+    local held, payload, generations = 0, 0, 0
+    for _, entry in active.tables do
+      local rows = live.store:tableFootprint(entry.tableName)
+      local removed = live.store:tableFootprint(tombstones(entry.tableName))
+      held += rows.rows + removed.rows
+      payload += (rows.payloadBytes or 0) + (removed.payloadBytes or 0)
+      generations = math.max(generations, #entry.generations)
+    end
+
+    return held, if limits.maxHotBytes then payload else nil, generations
+  end
+
+  function db.stats(_self: Database): Stats
+    ready()
+    local tables: { [string]: TableStats } = {}
+    local cachedPages = 0
+    for _, entry in active.tables do
+      local hotRows, removed = hotOf(entry.tableName)
+      local cold = live.colds[entry.tableName]
+      cachedPages += cold:stats().cachedPages
+      tables[entry.tableName] = { generations = #entry.generations, coldRows = cold.count, hotRows = hotRows, tombstones = removed }
+    end
+    local _, payload = pressure()
+    return { epoch = active.epoch, walBytes = walBytes(), cachedPages = cachedPages, hotPayloadBytes = payload, tables = tables }
+  end
+
+  function db.maintenanceStatus(_self: Database): { lastError: string?, poisoned: boolean }
+    if batchActive then error('jessql catalog: batched commit in progress', 2) end
+    if closed then error('jessql catalog: closed', 2) end
+    return { lastError = lastMaintenanceError, poisoned = poisoned }
+  end
+
+  -- Publishes the next epoch. `merge` also folds every table that has more than one generation
+  -- (counting what it has hot) into a single one. Either way every table with anything hot gets
+  -- a generation, because the log that held it is replaced by an empty one.
+  local function transition(merge: boolean, rotate: boolean): number
+    ready()
+    if activeTransaction then error('jessql catalog: cannot publish inside a transaction', 2) end
+    if active.epoch >= MaxEpoch then error('jessql catalog: generation limit', 2) end
+    local planned: { [string]: string } = {}
+    local any = false
+    for _, entry in active.tables do
+      local hotRows, removed = hotOf(entry.tableName)
+      local hot = hotRows + removed > 0
+      if merge and #entry.generations + (if hot then 1 else 0) >= 2 then
+        planned[entry.tableName] = if hot then 'merge-hot' else 'merge'
+        any = true
+      elseif hot then
+        if #entry.generations >= limits.maxGenerations then
+          error('jessql catalog: generation budget reached for ' .. entry.tableName .. '; compact first', 2)
+        end
+        planned[entry.tableName] = 'delta'
+        any = true
+      end
+    end
+
+    -- With nothing to write, the epoch still moves when the log itself is what must go: the next
+    -- manifest names the same generations and a new, empty log is bound to the same cold set.
+    if not any and not rotate then
+      if merge then error('jessql catalog: nothing to compact', 2) end
+      return active.epoch
+    end
+
+    busy = true
+    local nextEpoch = active.epoch + 1
+    local candidate: Overlay? = nil
+    local publication = { started = false }
+    -- Export, merge and publication may fail; the old log stays the authority until the replacement.
+    local completed, transitionFailure = pcall(function()
+      clearLog(fs, base, nextEpoch)
+      local generations: { [string]: { Generation } } = {}
+      for _, entry in active.tables do
+        local name = entry.tableName
+        local kind = planned[name]
+        if not kind then continue end
+
+        clearTableCandidate(fs, base, name, nextEpoch)
+        local rows, deletes = tableFile(base, name, nextEpoch, 'rows'), tableFile(base, name, nextEpoch, 'deleted')
+        if kind == 'delta' then
+          exportDelta(fs, live, entry, rows, deletes, options)
+          local list: { Generation } = {}
+          for index, generation in entry.generations do list[index] = { epoch = generation.epoch, deleted = generation.deleted } end
+
+          list[#list + 1] = { epoch = nextEpoch, deleted = true }
+          generations[name] = list
+        else
+          local inputs, inputDeletes = generationPaths(base, entry)
+          if kind == 'merge-hot' then
+            local hotRows, hotDeletes = tableFile(base, name, nextEpoch, 'hot-rows'), tableFile(base, name, nextEpoch, 'hot-deleted')
+            exportDelta(fs, live, entry, hotRows, hotDeletes, options)
+            inputs[#inputs + 1] = hotRows
+            inputDeletes[#inputs] = hotDeletes
+          end
+
+          tiers.compact(rows, deletes, inputs, {
+            fanIn = compactionFanIn, cachePages = mergeCachePages, pageBytes = pageBytes, deletePaths = inputDeletes, storage = fs,
+          })
+          generations[name] = { { epoch = nextEpoch, deleted = true } }
+        end
+
+        seal(fs, deletes, parent)
+        seal(fs, rows, parent)
+      end
+
+      -- The identity of the next cold set is read from the sealed files themselves.
+      local provisional = manifest.next(active, nextEpoch, active.snapshotIdentity, generations)
+      local colds, identity = openColds(fs, base, provisional, options, 1)
+      closeAll(colds)
+      local nextValue = manifest.next(active, nextEpoch, identity, generations)
+      local text = manifest.encode(nextValue)
+      if hook then hook('candidate-sealed') end
+      candidate = openOverlay(fs, base, nextValue, options, false)
+      if hook then hook('wal-ready') end
+      publicationKernel.publishText(base, parent, text, hook, publication, fs)
+      local previous, prior = live, active
+      live = candidate :: Overlay
+      candidate = nil
+      active = nextValue
+      -- #34. A state a reader still holds is kept whole, readers open, until its pins end.
+      expire()
+      local kept: { Catalog } = {}
+      if holders(previous) > 0 then
+        table.insert(superseded, { overlay = previous, value = prior })
+      else
+        -- The old log holds nothing the new generations lack; a failed close of it loses nothing.
+        pcall(function() closeOverlay(previous) end)
+      end
+
+      for _, state in superseded do table.insert(kept, state.value) end
+
+      if hook then hook('before-retire') end
+      -- Retirement can fail; unreferenced files are safe to leave for the next open.
+      pcall(function() retire(fs, base, parent, prior, nextValue, kept) end)
+      -- Pins whose time ran out before this publication give up what they kept.
+      pcall(reclaim)
+      for name in planned do
+        -- Scratch is unpublished and safe to leave for the next open if this fails.
+        pcall(function()
+          removeIfPresent(fs, tableFile(base, name, nextEpoch, 'hot-rows'))
+          removeIfPresent(fs, tableFile(base, name, nextEpoch, 'hot-deleted'))
+        end)
+      end
+    end)
+    busy = false
+    if not completed then
+      -- Closing an unpublished candidate may fail; the first error is the one reported.
+      if candidate then pcall(function() closeOverlay(candidate :: Overlay) end) end
+
+      if publication.started then
+        poisoned = true
+      else
+        -- Cleanup after a safe pre-publication fault must not hide that fault.
+        pcall(function()
+          clearLog(fs, base, nextEpoch)
+          for name in planned do clearTableCandidate(fs, base, name, nextEpoch) end
+
+          removeIfPresent(fs, base .. '.jql-manifest.tmp')
+        end)
+      end
+
+      error('jessql catalog: transition failed: ' .. tostring(transitionFailure), 2)
+    end
+
+    lastMaintenanceError = nil
+    return active.epoch
+  end
+
+  function db.flush(_self: Database): number
+    ready()
+    return transition(false, limits.maxWalBytes ~= nil and walBytes() >= limits.maxWalBytes)
+  end
+
+  function db.compact(_self: Database): number
+    return transition(true, false)
+  end
+
+  function db.pin(_self: Database, seconds: number?): PinnedView
+    ready()
+    local lifetime = seconds or 60
+    if type(lifetime) ~= 'number' or lifetime ~= lifetime or lifetime <= 0 or lifetime > 3600 then
+      error('jessql catalog: a pin is held for more than 0 and at most 3600 seconds', 2)
+    end
+
+    expire()
+    reclaim()
+    if #pins >= catalog.MaxPins then error('jessql catalog: too many pins', 2) end
+
+    local pin: Pin = { overlay = live, value = active, expires = clock() + lifetime, held = true }
+    table.insert(pins, pin)
+    local view = { epoch = active.epoch } :: PinnedView
+
+    -- The pinned state, or an error that says why it is no longer there.
+    local function state(): Overlay
+      if closed then error('jessql catalog: closed', 3) end
+
+      if pin.held and clock() >= pin.expires then
+        pin.held = false
+        -- Reclaiming cannot fail the caller, who is about to be told the pin is gone.
+        pcall(reclaim)
+        error('jessql catalog: pin expired', 3)
+      end
+
+      if not pin.held then error('jessql catalog: pin released', 3) end
+      -- While it is still the published state it is used as the database itself is.
+      if pin.overlay == live then ready() end
+
+      return pin.overlay
+    end
+
+    function view.get(_view: PinnedView, tableName: string, key: unknown): Row?
+      local overlay = state()
+      local entry = if type(tableName) == 'string' then manifest.table(pin.value, tableName) else nil
+      if not entry then error('jessql catalog: unknown table ' .. tostring(tableName), 2) end
+
+      local name = entry.tableName
+      local row = overlay.store:get(name, key)
+      if row then return row end
+      if overlay.store:get(tombstones(name), hybrid.encodeKey(key)) then return nil end
+      return overlay.colds[name]:get(key)
+    end
+
+    function view.query(_view: PinnedView, sql: string, params: { unknown }?): engine.Result
+      return state().view:query(sql, params)
+    end
+
+    function view.prepare(_view: PinnedView, sql: string): engine.Plan
+      local plan = state().view:prepare(sql)
+      local run, open = plan.run, plan.open
+      function plan.run(params)
+        state()
+        return run(params)
+      end
+
+      function plan.open(params)
+        state()
+        return open(params)
+      end
+
+      return plan
+    end
+
+    function view.release(_view: PinnedView)
+      if not pin.held then return end
+
+      pin.held = false
+      -- Nothing a release cannot remove is lost: it is removed at the next open.
+      pcall(reclaim)
+    end
+
+    function view.held(_view: PinnedView): boolean
+      return pin.held and not closed and clock() < pin.expires
+    end
+
+    return view
+  end
+
+  function db.pinStatus(_self: Database): PinStatus
+    local count = 0
+    local at = clock()
+    for _, pin in pins do
+      if pin.held and at < pin.expires then count += 1 end
+    end
+
+    return { pins = count, superseded = #superseded }
+  end
+
+  -- A commit that returned is synchronized. Maintenance after it must never turn that into an
+  -- apparent failure: what goes wrong here is kept, and refuses the next write instead.
+  autoMaintain = function()
+    if not budgeted then return end
+
+    -- Accounting and publication can both raise after the commit was acknowledged.
+    local ok, problem = pcall(function()
+      local held, payload, generations = 0, nil :: number?, 0
+      if limits.maxHotRows or limits.maxHotBytes then held, payload, generations = pressure() end
+
+      local mode = policy.plan(limits, generations, held, 0, payload, if limits.maxWalBytes then walBytes() else nil)
+      if mode == 'compact' then
+        transition(true, true)
+      elseif mode == 'flush' then
+        -- A table can be at its limit of generations without the log having said so.
+        local _, _, most = pressure()
+        transition(most >= limits.maxGenerations, true)
+      end
+    end)
+    lastMaintenanceError = if ok then nil else tostring(problem)
+  end
+
+  -- A restart must not forget a budget the last process had already crossed: it may have died
+  -- after an acknowledged commit and before the flush that commit called for. Nothing is
+  -- published during open; writes wait for the caller to flush or compact.
+  if budgeted then
+    -- Accounting over a recovered log can raise; the database then accepts nothing.
+    local counted, problem = pcall(function()
+      local held, payload, generations = pressure()
+      if policy.plan(limits, generations, held, 0, payload, if limits.maxWalBytes then walBytes() else nil) then
+        lastMaintenanceError = 'recovered state exceeds a configured budget; flush or compact'
+      end
+    end)
+
+    if not counted then
+      poisoned = true
+      lastMaintenanceError = 'recovered accounting failed: ' .. tostring(problem)
+    end
+  end
+
+  function db.close(_self: Database)
+    if batchActive then error('jessql catalog: cannot close during batched commit', 2) end
+    if closed then return end
+    if busy then error('jessql catalog: cannot close during publication', 2) end
+    if activeTransaction then error('jessql catalog: cannot close during transaction', 2) end
+    -- #34. Closing ends every pin and gives up what they kept.
+    for _, pin in pins do pin.held = false end
+
+    -- Reclaiming closes readers and removes files, and either can fail; the close goes on, and
+    -- what is left on the disk is removed at the next open.
+    pcall(reclaim)
+    closed = true
+    -- Closing a poisoned handle can fail, but the database's lock is still released.
+    local ok, err = pcall(function() closeOverlay(live) end)
+    lock:unlock()
+    if not ok then error(err, 2) end
+  end
+
+  return db
+end
+
+-- Offline integrity scan of what the manifest names. It takes the database's lock, so it sees one
+-- published state for the whole scan; it opens no log for writing, repairs nothing and removes
+-- nothing. Damage is an issue in the report, not an error: only a held lock raises.
+local function scan(fs: vfs.Backend, base: string): VerifyReport
+  local report: VerifyReport = { ok = true, epoch = nil, tables = {}, coldRowsScanned = 0, walBytes = 0,
+    coldPagesChecked = false, walFramesChecked = false, issues = {} }
+
+  local function issue(stage: string, tableName: string?, message: string)
+    report.ok = false
+    report.issues[#report.issues + 1] = { stage = stage, tableName = tableName, message = message }
+  end
+
+  -- A manifest that cannot be read or decoded is the first and only finding.
+  local decoded, value = pcall(function() return readManifest(fs, base .. '.jql-manifest') end)
+
+  if not decoded then
+    issue('manifest', nil, tostring(value))
+    return report
+  end
+  local found = value :: Catalog
+  report.epoch = found.epoch
+  local whole = true
+
+  for _, entry in found.tables do
+    local scanned = 0
+    local sources, deleted = generationPaths(base, entry)
+    local files: { string } = table.clone(sources)
+    for _, sidecar in deleted do files[#files + 1] = sidecar end
+
+    -- Every physical file, shadowed rows included: a merged read would skip a damaged older page.
+    for _, file in files do
+      -- A missing or damaged file raises on open or on the page that is damaged.
+      local read, problem = pcall(function()
+        local reader = paged.open(file, { cachePages = 1, storage = fs })
+        -- Decoding can raise part way; the reader is closed either way.
+        local ok, failure = pcall(function()
+          local nextRow = reader:iterateRows()
+          while nextRow() do scanned += 1 end
+        end)
+        reader:close()
+        if not ok then error(failure, 0) end
+      end)
+
+      if not read then
+        whole = false
+        issue('cold', entry.tableName, tostring(problem))
+      end
+    end
+
+    report.tables[entry.tableName] = { generations = #entry.generations, rowsScanned = scanned }
+    report.coldRowsScanned += scanned
+  end
+
+  -- The generations as one set: each table's schema, and the identity the log is bound to.
+  local opened, colds, identity = pcall(function() return openColds(fs, base, found, nil, 1) end)
+  if not opened then
+    whole = false
+    issue('cold', nil, tostring(colds))
+  else
+    closeAll(colds)
+    if identity ~= found.snapshotIdentity then
+      whole = false
+      issue('cold', nil, 'the generations are not the set the manifest was published for')
+    end
+  end
+
+  report.coldPagesChecked = whole
+  local journal, journalError = fs.stat(walPath(base, found.epoch))
+  if not journal or not journal.isFile then
+    issue('wal', nil, 'active WAL missing: ' .. tostring(journalError))
+  else
+    report.walBytes = journal.size
+  end
+
+  return report
+end
+
+function catalog.verify(path: string, options: { storage: vfs.Backend? }?): VerifyReport
+  local fs = vfs.resolve(if options then options.storage else nil)
+  local base = normalize(fs, path)
+  local lock, lockError = fs.lock(base .. '.jql-lock')
+  if not lock then error('jessql catalog: verification locked: ' .. tostring(lockError), 2) end
+  -- The scan reports damage as issues; anything it raises is not damage, and the lock still goes.
+  local ok, report = pcall(scan, fs, base)
+  lock:unlock()
+  if not ok then error('jessql catalog: verification I/O failure: ' .. tostring(report), 2) end
+  return report :: VerifyReport
+end
+
+-- Offline backup, and restore, into an EMPTY destination name only. Both databases are locked
+-- for the whole copy. The source is scanned first and never changed; the destination's manifest
+-- is written last, so an interrupted copy is never a database; and the copy is then opened as a
+-- database would be, which replays its log, before the call returns.
+function catalog.backup(sourcePath: string, destinationPath: string, options: BackupOptions?): BackupResult
+  local from = vfs.resolve(if options then options.storage else nil)
+  local onto = vfs.resolve(if options and options.destinationStorage then options.destinationStorage else from)
+  local source = normalize(from, sourcePath)
+  local destination, parent = normalize(onto, destinationPath)
+  if from == onto and source == destination then error('jessql catalog: backup source and destination must differ', 2) end
+
+  -- One order for both locks, so that two opposite copies cannot wait on each other.
+  local first, second, firstDisk, secondDisk = source, destination, from, onto
+  if second < first then first, second, firstDisk, secondDisk = second, first, onto, from end
+
+  local firstLock, firstError = firstDisk.lock(first .. '.jql-lock')
+  if not firstLock then error('jessql catalog: backup locked: ' .. tostring(firstError), 2) end
+  local secondLock, secondError = secondDisk.lock(second .. '.jql-lock')
+  if not secondLock then
+    firstLock:unlock()
+    error('jessql catalog: backup locked: ' .. tostring(secondError), 2)
+  end
+  local sourceLock, destinationLock = firstLock, secondLock
+  if first ~= source or firstDisk ~= from then sourceLock, destinationLock = secondLock, firstLock end
+
+  local destinationHeld = true
+  -- Scanning and copying can fail at any file; both locks are released whatever happened.
+  local ok, result = pcall(function(): BackupResult
+    local names, listError = onto.list(parent)
+    if not names then error('destination list: ' .. tostring(listError)) end
+    local file = onto.fileName(destination) :: string
+    for _, name in names do
+      if name == file .. '.jql-manifest' or name == file .. '.jql-manifest.tmp'
+        or string.sub(name, 1, #file + 2) == file .. '.g' or string.sub(name, 1, #file + 3) == file .. '.t.' then
+        error('destination contains existing artifacts: ' .. name)
+      end
+    end
+
+    local report = scan(from, source)
+    if not report.ok then
+      local found = report.issues[1]
+      error('source verification failed at ' .. found.stage .. (if found.tableName then ' of ' .. found.tableName else ''))
+    end
+    local raw, manifestError = from.readFileString(source .. '.jql-manifest')
+    if not raw then error('manifest read: ' .. tostring(manifestError)) end
+    local value = manifest.decode(raw)
+    local files, bytes = 0, 0
+
+    local function copy(suffix: string)
+      bytes += backupKernel.copyFile(from, source .. suffix, onto, destination .. suffix)
+      files += 1
+    end
+
+    for _, entry in value.tables do
+      for _, generation in entry.generations do
+        copy(tableFile('', entry.tableName, generation.epoch, 'rows'))
+        if generation.deleted then copy(tableFile('', entry.tableName, generation.epoch, 'deleted')) end
+      end
+    end
+
+    local wal = walPath('', value.epoch)
+    copy(wal)
+    -- The log's committed-length mark travels with the log it describes.
+    if from.exists(walmark.path(source .. wal)) then copy(walmark.path(wal)) end
+
+    -- The manifest LAST: without it nothing here can be mistaken for a database. The copies'
+    -- names are made durable first; the manifest is then put in place whole, as the live one is
+    -- (re-review of 2026-11-13: made in place, a crash could leave it empty).
+    local synced, syncError = onto.syncDirectory(parent)
+    if not synced then error('destination directory sync: ' .. tostring(syncError)) end
+    publicationKernel.publishText(destination, parent, raw, nil, { started = false }, onto)
+
+    -- Open the copy as a database: this replays its log and checks its binding, which the scan
+    -- does not. It takes the destination's lock itself, so that one is handed over here.
+    destinationLock:unlock()
+    destinationHeld = false
+    local copied = catalog.openExisting(destinationPath, { storage = onto })
+    copied:close()
+    local after = catalog.verify(destinationPath, { storage = onto })
+    if not after.ok then error('destination verification failed') end
+    return { epoch = value.epoch, files = files + 1, bytes = bytes + #raw }
+  end)
+
+  if destinationHeld then destinationLock:unlock() end
+
+  sourceLock:unlock()
+  if not ok then error('jessql catalog: backup: ' .. tostring(result), 2) end
+  return result :: BackupResult
+end
+
+-- A restore is the same copy the other way: it never overwrites a database.
+catalog.restore = catalog.backup
+
+-- Explicit intents, decided inside the database's lock, so that pointing at the wrong name never
+-- creates an empty database by accident.
+function catalog.open(path: string, options: Options?): Database
+  return openCatalog(path, options, 'either')
+end
+
+function catalog.openExisting(path: string, options: Options?): Database
+  return openCatalog(path, options, 'existing')
+end
+
+function catalog.create(path: string, options: Options): Database
+  return openCatalog(path, options, 'create')
+end
+
+return catalog

@@ -1,0 +1,278 @@
+--!strict
+-- P3-03: a disk that fills and stays full. Unlike a single injected fault, every later write
+-- fails too, until space is given back. What must hold: nothing acknowledged is lost, nothing
+-- half-made is published, the refusal says what it is, and the database works again once there
+-- is room. In memory.
+local memfs = require('@jessql/memfs')
+local sql = require('@jessql')
+local test = require('@jess/test')
+
+local expect = test.expect
+local suite = test.new()
+
+type Row = { [string]: unknown }
+
+local Base = '/memory/full'
+local Body = string.rep('d', 120)
+
+local function options(disk: memfs.Disk, extra: { [string]: number }?): sql.ManagedOptions
+  local chosen: sql.ManagedOptions = { tableName = 'events', columns = { 'id', 'batch', 'body' }, primaryKey = 'id',
+    cachePages = 1, compactionFanIn = 2, storage = disk.backend }
+
+  if extra then chosen.maxHotRows = extra.maxHotRows end
+
+  return chosen
+end
+
+-- One commit of four rows. Returns whether it was acknowledged, and what it said if not.
+local function commit(db: sql.ManagedDatabase, batch: number): (boolean, string)
+  -- A commit on a full disk raises; that is one of the two outcomes this reports.
+  local ok, problem = pcall(function()
+    db:transaction(function(tx)
+      for offset = 1, 4 do tx:insert({ id = batch * 10 + offset, batch = batch, body = Body }) end
+    end)
+  end)
+  return ok, if ok then '' else tostring(problem)
+end
+
+-- Rows found per batch after a restart, and whether the offline scan passes.
+local function recovered(disk: memfs.Disk): ({ [number]: number }, boolean)
+  local db = sql.managed.openExisting(Base, options(disk))
+  local found: { [number]: number } = {}
+  for _, row in db:query('SELECT batch FROM events').rows do
+    local batch = (row :: Row).batch :: number
+    found[batch] = (found[batch] or 0) + 1
+  end
+
+  db:close()
+  return found, sql.managed.verify(Base, { semantic = true, storage = disk.backend }).ok
+end
+
+local function leftovers(disk: memfs.Disk): string
+  local found: { string } = {}
+  for path in disk.visible() do
+    if string.find(path, '.jql-tiers-', 1, true) or string.find(path, '.hot-', 1, true) or string.find(path, '.tmp', 1, true) then
+      table.insert(found, path)
+    end
+  end
+
+  table.sort(found)
+  return table.concat(found, ' ')
+end
+
+suite.describe('a disk with a capacity', function()
+  suite.it('refuses the write that would pass it, writes nothing of it, and takes it once there is room', function()
+    local disk = memfs.new()
+    local on = disk.backend
+    assert((on.createDurable('/memory/a', string.rep('a', 60))))
+    disk.capacity(100)
+    expect(disk.used()).toBe(60)
+    local count, message = on.createDurable('/memory/b', string.rep('b', 41))
+    expect(count).toBe(nil)
+    expect(message).toBe('no space left on device')
+    expect((on.exists('/memory/b'))).toBe(false)
+    expect((on.createDurable('/memory/b', string.rep('b', 40)))).toBe(40)
+
+    -- An append and a buffered write are refused the same way; replacing a file gives its bytes back.
+    expect((on.writeFile('/memory/a', 'x', { append = true }))).toBe(nil)
+    local writer = assert((on.openWrite('/memory/a', { append = true, create = false })))
+    expect((writer:write('y'))).toBe(nil)
+    writer:close()
+    expect((on.writeFile('/memory/a', string.rep('c', 60)))).toBe(60)
+    expect(disk.used()).toBe(100)
+
+    assert((on.remove('/memory/b')))
+    expect(disk.used()).toBe(60)
+    expect((on.writeFile('/memory/a', 'x', { append = true }))).toBe(1)
+    disk.capacity(nil)
+    expect((on.createDurable('/memory/c', string.rep('c', 5000)))).toBe(5000)
+  end)
+end)
+
+suite.describe('a managed database on a disk that fills', function()
+  suite.it('acknowledges nothing it could not write, keeps what it acknowledged, and works again with room', function()
+    local disk = memfs.new()
+    local db = sql.managed.create(Base, options(disk))
+    expect((commit(db, 1))).toBe(true)
+    expect((commit(db, 2))).toBe(true)
+    disk.capacity(disk.used() + 100)
+
+    local acknowledged, problem = commit(db, 3)
+    expect(acknowledged).toBe(false)
+    expect((string.find(problem, 'no space left on device', 1, true)) ~= nil).toBe(true)
+    -- Still full: the next one is refused as well, not silently dropped.
+    expect((commit(db, 4))).toBe(false)
+    -- close can raise on a database the full disk has poisoned; it is closed as far as it can be.
+    pcall(function() db:close() end)
+
+    -- The process dies with the disk still full.
+    disk.crash()
+    local found, verified = recovered(disk)
+    expect(`{found[1]} {found[2]} {tostring(found[3])} {tostring(found[4])}`).toBe('4 4 nil nil')
+    expect(verified).toBe(true)
+
+    disk.capacity(nil)
+    local again = sql.managed.openExisting(Base, options(disk))
+    expect((commit(again, 5))).toBe(true)
+    again:flush()
+    again:close()
+    local after = recovered(disk)
+    expect(`{after[1]} {after[2]} {after[5]}`).toBe('4 4 4')
+  end)
+
+  suite.it('publishes no generation from a flush, checkpoint or compaction that ran out of room, and leaves no scratch behind', function()
+    for _, stage in { 'flush', 'checkpoint', 'compact' } do
+      local disk = memfs.new()
+      local db = sql.managed.create(Base, options(disk))
+      commit(db, 1)
+      db:flush()
+      commit(db, 2)
+      db:flush()
+      commit(db, 3)
+      local before = db:stats()
+      -- Room for less than the transition needs.
+      disk.capacity(disk.used() + 300)
+      -- The transition raises on the full disk; that refusal is the assertion.
+      local done = pcall(function()
+        if stage == 'flush' then
+          db:flush()
+        elseif stage == 'checkpoint' then
+          db:checkpoint()
+        else
+          db:compact()
+        end
+      end)
+      expect(`{stage} done={tostring(done)}`).toBe(`{stage} done=false`)
+      -- close can raise on a database the full disk has poisoned; it is closed as far as it can be.
+      pcall(function() db:close() end)
+
+      local found, verified = recovered(disk)
+      expect(`{stage} {found[1]} {found[2]} {found[3]} verified={tostring(verified)}`).toBe(`{stage} 4 4 4 verified=true`)
+      local reopened = sql.managed.openExisting(Base, options(disk))
+      expect(`{stage} epoch={reopened:stats().epoch}`).toBe(`{stage} epoch={before.epoch}`)
+      reopened:close()
+      expect(`{stage} leftovers={leftovers(disk)}`).toBe(`{stage} leftovers=`)
+
+      -- With room, the same transition goes through.
+      disk.capacity(nil)
+      local roomy = sql.managed.openExisting(Base, options(disk))
+      if stage == 'flush' then
+        roomy:flush()
+      elseif stage == 'checkpoint' then
+        roomy:checkpoint()
+      else
+        roomy:compact()
+      end
+
+      expect(roomy:stats().epoch > before.epoch).toBe(true)
+      roomy:close()
+      expect((select(2, recovered(disk)))).toBe(true)
+    end
+  end)
+
+  suite.it('says the budget could not be kept, in so many words, when maintenance has no room', function()
+    local disk = memfs.new()
+    local db = sql.managed.create(Base, options(disk, { maxHotRows = 8 }))
+    expect((commit(db, 1))).toBe(true)
+    disk.capacity(disk.used() + 900)
+    -- Room for the second commit, which reaches the hot-row budget, and not for the flush it then needs.
+    local refusals: { string } = {}
+    for batch = 2, 6 do
+      local acknowledged, problem = commit(db, batch)
+      if not acknowledged then table.insert(refusals, problem) end
+    end
+
+    expect(#refusals > 0).toBe(true)
+    local status = db:maintenanceStatus()
+    expect(status.lastError ~= nil).toBe(true)
+    expect((string.find(refusals[#refusals], 'budget', 1, true)) ~= nil or (string.find(refusals[#refusals], 'no space left', 1, true)) ~= nil).toBe(true)
+    -- close can raise on a database the full disk has poisoned; it is closed as far as it can be.
+    pcall(function() db:close() end)
+    local found, verified = recovered(disk)
+    expect(found[1]).toBe(4)
+    expect(verified).toBe(true)
+    -- Whatever else is there is whole.
+    for batch, rows in found do expect(`{batch} {rows}`).toBe(`{batch} 4`) end
+  end)
+
+  suite.it('publishes no backup onto a disk without room for it, and leaves the source as it was', function()
+    local source, target = memfs.new(), memfs.new()
+    local db = sql.managed.create(Base, options(source))
+    for batch = 1, 6 do commit(db, batch) end
+
+    db:checkpoint()
+    db:close()
+    local before = source.visible()
+    target.capacity(600)
+    -- The copy raises when the target fills; that refusal is the assertion.
+    local copied = pcall(function()
+      sql.managed.backup(Base, '/memory/copy', { storage = source.backend, destinationStorage = target.backend })
+    end)
+    expect(copied).toBe(false)
+    expect(target.visible()['/memory/copy.jql-manifest']).toBe(nil)
+    for path, body in before do
+      if string.sub(path, -5) ~= '-lock' then expect(`{path} {source.visible()[path] == body}`).toBe(`{path} true`) end
+    end
+
+    expect((select(2, recovered(source)))).toBe(true)
+  end)
+
+  suite.it('loses nothing acknowledged at any capacity between barely enough and plenty', function()
+    -- How much the whole workload needs with no limit.
+    local function workload(disk: memfs.Disk, acknowledged: { [number]: boolean })
+      local db = sql.managed.create(Base, options(disk))
+      for batch = 1, 12 do
+        if commit(db, batch) then acknowledged[batch] = true end
+
+        if batch % 3 == 0 then
+          -- flush raises once the disk is full; the workload carries on to the next commit.
+          pcall(function() db:flush() end)
+        end
+
+        if batch % 6 == 0 then
+          -- compact raises once the disk is full; the workload carries on.
+          pcall(function() db:compact() end)
+        end
+      end
+
+      -- checkpoint raises once the disk is full; what was acknowledged is what is checked.
+      pcall(function() db:checkpoint() end)
+      -- close can raise on a database the full disk has poisoned; it is closed as far as it can be.
+      pcall(function() db:close() end)
+    end
+
+    local roomy = memfs.new()
+    workload(roomy, {})
+    local need = roomy.used()
+    local runs, refused = 0, 0
+    for capacity = 400, need + 800, 257 do
+      local disk = memfs.new()
+      disk.capacity(capacity)
+      local acknowledged: { [number]: boolean } = {}
+      -- Creating the database may itself not fit; then there is nothing to check.
+      local started = pcall(workload, disk, acknowledged)
+      if not started or not disk.backend.exists(Base .. '.jql-manifest') then continue end
+
+      runs += 1
+      disk.crash()
+      disk.capacity(nil)
+      local found, verified = recovered(disk)
+      expect(`capacity {capacity} verified={tostring(verified)}`).toBe(`capacity {capacity} verified=true`)
+      for batch = 1, 12 do
+        local rows = found[batch] or 0
+        if acknowledged[batch] then
+          expect(`capacity {capacity} batch {batch} rows={rows}`).toBe(`capacity {capacity} batch {batch} rows=4`)
+        else
+          refused += 1
+          -- Not acknowledged: whole or absent, never part.
+          expect(rows == 0 or rows == 4).toBe(true)
+        end
+      end
+    end
+
+    expect(runs > 10).toBe(true)
+    expect(refused > 10).toBe(true)
+  end)
+end)
+
+return suite

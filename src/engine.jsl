@@ -98,16 +98,35 @@ export type Provider = {
 
 --- A query's answer: the result columns in SELECT order, and one row per result, keyed by them.
 --- A cell that is NULL is absent from its row.
-export type Result = { columns: { string }, rows: { Row } }
+export type Result = { columns: { string }, rows: { Row }, streamed: boolean? }
+
+--- A query result read a row or a page at a time. `streaming` says whether rows are produced as
+--- they are asked for (a single source with no aggregate and no sort left to do), or were all
+--- computed when the cursor was opened and are only handed out in pieces. `close` stops the
+--- query where it is; a cursor is also closed by being read to its end. After either, `next`
+--- answers nil and `page` an empty list. A cursor left open across a write to its source may
+--- raise at the next read rather than mix two states.
+export type Cursor = {
+  columns: { string },
+  streaming: () -> boolean,
+  next: () -> Row?,
+  page: (count: number) -> { Row },
+  done: () -> boolean,
+  close: () -> (),
+}
 
 --- One table of a prepared query, and the columns it is scanned for.
-export type ExplainedScan = { table: string, alias: string, columns: { string } }
+--- `rows` is the table's exact row count when its provider can give one without scanning, and
+--- absent otherwise: it is never an estimate.
+export type ExplainedScan = { table: string, alias: string, columns: { string }, rows: number? }
 
 export type ExplainedJoin = {
   kind: 'inner' | 'left',
   table: string,
   alias: string,
   strategy: 'nested-loop' | 'hash' | 'index-left' | 'index-right',
+  --- Why that strategy, in words: the rule that chose it and what it looked at.
+  reason: string,
 }
 
 --- How a prepared query will run: the columns each table is scanned for, each join's strategy,
@@ -122,12 +141,17 @@ export type Explanation = {
   aggregateCount: number,
   providerCount: boolean,
   parameterCount: number,
+  --- Always false today: no choice here was made from an estimate. Every strategy is a rule
+  --- over what the query says and what the providers declare (#17), and the answer is the same
+  --- whichever is chosen.
+  estimated: boolean,
 }
 
 --- A prepared query. `run` takes the values for its `?` placeholders, in order, and may be called
 --- any number of times; `run` and `explain` are called with a dot.
 export type Plan = {
   run: (params: { unknown }?) -> Result,
+  open: (params: { unknown }?) -> Cursor,
   explain: () -> Explanation,
   ast: parser.Select,
   columns: { string },
@@ -139,8 +163,26 @@ export type TableInfo = { name: string, columns: { string } }
 
 --- A database: named providers, and queries over them. `_tables` is the engine's own registry,
 --- by lower-cased name.
+--- What one query's operators may hold, in rows. Nothing spills yet: an operator that would pass
+--- its budget stops the query with an error that names the budget, before memory decides.
+--- A field left out is not bounded.
+export type Limits = {
+  -- Rows of the table a hash join builds its table from.
+  joinBuildRows: number?,
+  -- Rows a join hands on to the next step.
+  joinRows: number?,
+  -- Groups a GROUP BY or an aggregate holds.
+  groups: number?,
+  -- Rows a query without aggregates holds at once, to sort them or to return them all. A
+  -- query read through a cursor, or one whose ORDER BY and LIMIT let it keep only the best,
+  -- holds fewer or none and is counted for what it holds.
+  heldRows: number?,
+}
 export type Database = {
   _tables: { [string]: Provider },
+  _limits: Limits?,
+  -- Sets, or with nil removes, the budgets every query of this database runs under.
+  limits: (self: Database, limits: Limits?) -> Database,
   register: (self: Database, name: string, provider: Provider) -> Database,
   table: (self: Database, name: string, rows: SourceRows, columns: { string }?) -> Database,
   prepare: (self: Database, sql: string) -> Plan,
@@ -186,6 +228,7 @@ type OrderFn = {evaluate: Evaluator, desc: boolean}
 type Unit = {context: unknown, group: Group?, orderKey: unknown?, order: {unknown}?}
 type JoinPlan = {
   strategy: 'nested-loop' | 'hash' | 'index-left' | 'index-right',
+  reason: string,
   leftSourceIndex: number?,
   leftColumn: string?,
   rightColumn: string?,
@@ -1550,7 +1593,8 @@ local function prepare(db: Database, sql: string): Plan
     joinFns[index] = compileExpr(join.on, sources, directSingle, nil)
     local rightIndex = index + 1
     local node = join.on
-    local plan: JoinPlan = { strategy = 'nested-loop' }
+    local plan: JoinPlan = { strategy = 'nested-loop',
+      reason = 'the join condition is not an equality between one column of each side, so every pair of rows is tested' }
 
     if node.tag == 'binary' and node.op == '=' and node.left.tag == 'column' and node.right.tag == 'column' then
       local leftCol, rightCol = node.left, node.right
@@ -1558,6 +1602,9 @@ local function prepare(db: Database, sql: string): Plan
 
       if (leftCol.sourceIndex :: number) < rightIndex and rightCol.sourceIndex == rightIndex then
         plan.strategy = 'hash'
+        plan.reason = if #sources == 2 and #ast.joins == 1 and join.kind == 'inner'
+          then 'an equality between columns, and neither side offers an index lookup on its column'
+          else 'an equality between columns; index lookups are only considered for a single inner join of two tables'
         plan.leftSourceIndex = leftCol.sourceIndex
         plan.leftColumn = leftCol.boundName
         plan.rightColumn = rightCol.boundName
@@ -1574,10 +1621,18 @@ local function prepare(db: Database, sql: string): Plan
             local leftScore = sourceFilterScore(leftCol.sourceIndex :: number)
             local rightScore = sourceFilterScore(rightIndex)
             plan.strategy = (if leftScore > rightScore then 'index-right' else 'index-left') :: ('index-right' | 'index-left')
+            -- The side the WHERE narrows more is read, and the other is looked up row by row.
+            plan.reason = 'both sides are indexed on the join column; '
+              .. (if leftScore > rightScore then 'the WHERE narrows the left side more, so it is read and the right looked up'
+                elseif leftScore < rightScore then 'the WHERE narrows the right side more, so it is read and the left looked up'
+                else 'the WHERE narrows neither more, so the right is read and the left looked up')
+              .. `: a score of each side's conditions ({leftScore} left, {rightScore} right), not an estimate of rows`
           elseif leftIndexed then
             plan.strategy = 'index-left' :: 'index-left'
+            plan.reason = 'only the left side offers an index lookup on the join column'
           elseif rightIndexed then
             plan.strategy = 'index-right' :: 'index-right'
+            plan.reason = 'only the right side offers an index lookup on the join column'
           end
         end
       end
@@ -1909,9 +1964,19 @@ local function prepare(db: Database, sql: string): Plan
 
   local plan: Plan = {} :: Plan
 
-  function plan.run(params: {unknown}?): Result
+  local function execute(params: {unknown}?, sink: ((Row) -> boolean?)?): Result
     local values: {unknown} = params or {}
     if #values < ast.params then error(string.format('jessql: query expects %d parameters, got %d', ast.params, #values), 0) end
+
+    -- Read when the query runs, so a prepared plan obeys the budgets of the moment.
+    local limits = db._limits
+    local buildLimit = if limits then limits.joinBuildRows else nil
+    local joinLimit = if limits then limits.joinRows else nil
+    local groupLimit = if limits then limits.groups else nil
+    local heldLimit = if limits then limits.heldRows else nil
+    local function overBudget(what: string, rows: number, limit: number)
+      error(string.format('jessql: query exceeds its budget: %s, %d rows (limit %d)', what, rows, limit), 0)
+    end
 
     if directProviderCount then
       local row: Row = {}
@@ -2154,6 +2219,8 @@ local function prepare(db: Database, sql: string): Plan
           local function consumeRight(right: SourceRow)
             local key = right[joinPlan.rightColumn :: string]
             if key == nil then return end
+            if joinLimit and #nextContexts > joinLimit then overBudget('the rows a join hands on', #nextContexts, joinLimit) end
+
             local leftRows = cache[key]
 
             if leftRows == nil and not missing[key] then
@@ -2218,6 +2285,8 @@ local function prepare(db: Database, sql: string): Plan
           local function consumeLeft(leftRow: SourceRow)
             local key = leftRow[joinPlan.leftColumn :: string]
             if key == nil then return end
+            if joinLimit and #nextContexts > joinLimit then overBudget('the rows a join hands on', #nextContexts, joinLimit) end
+
             local rightRows = cache[key]
 
             if rightRows == nil and not missing[key] then
@@ -2271,6 +2340,8 @@ local function prepare(db: Database, sql: string): Plan
           residualWhere = nil
           if #orderFns > 0 and driverOrdered then orderHandled = true end
         elseif joinIndex == 1 and not directSingle and joinPlan.strategy == 'hash' then
+          if buildLimit and #(rhs :: SourceRows) > buildLimit then overBudget('the build side of a hash join', #(rhs :: SourceRows), buildLimit) end
+
           local buckets: {[unknown]: SourceRow} = {}
           local duplicateBuckets: {[unknown]: {SourceRow}} = {}
 
@@ -2296,6 +2367,8 @@ local function prepare(db: Database, sql: string): Plan
           end
 
           for _, leftRow in rowsBySource[1] :: SourceRows do
+            if joinLimit and #nextContexts > joinLimit then overBudget('the rows a join hands on', #nextContexts, joinLimit) end
+
             local key = leftRow[joinPlan.leftColumn :: string]
             local first = if key == nil then nil else buckets[key]
 
@@ -2313,6 +2386,8 @@ local function prepare(db: Database, sql: string): Plan
           end
         elseif joinIndex == 1 and not directSingle then
           for _, leftRow in rowsBySource[1] :: SourceRows do
+            if joinLimit and #nextContexts > joinLimit then overBudget('the rows a join hands on', #nextContexts, joinLimit) end
+
             local matched = false
 
             for _, right in rhs :: SourceRows do
@@ -2327,6 +2402,8 @@ local function prepare(db: Database, sql: string): Plan
             if not matched and join.kind == 'left' then nextContexts[#nextContexts + 1] = { leftRow } end
           end
         elseif joinPlan.strategy == 'hash' then
+          if buildLimit and #(rhs :: SourceRows) > buildLimit then overBudget('the build side of a hash join', #(rhs :: SourceRows), buildLimit) end
+
           local buckets: {[unknown]: SourceRow} = {}
           local duplicateBuckets: {[unknown]: {SourceRow}} = {}
 
@@ -2352,6 +2429,8 @@ local function prepare(db: Database, sql: string): Plan
           end
 
           for _, left in contexts :: {JoinContext} do
+            if joinLimit and #nextContexts > joinLimit then overBudget('the rows a join hands on', #nextContexts, joinLimit) end
+
             local sourceRow = (left :: JoinContext)[joinPlan.leftSourceIndex :: number]
             local key = if sourceRow == nil then nil else sourceRow[joinPlan.leftColumn :: string]
             local first = if key == nil then nil else buckets[key]
@@ -2379,6 +2458,8 @@ local function prepare(db: Database, sql: string): Plan
           end
         else
           for _, left in contexts :: {JoinContext} do
+            if joinLimit and #nextContexts > joinLimit then overBudget('the rows a join hands on', #nextContexts, joinLimit) end
+
             local matched = false
 
             for _, right in rhs :: SourceRows do
@@ -2400,6 +2481,7 @@ local function prepare(db: Database, sql: string): Plan
         end
 
         contexts = nextContexts :: {unknown}
+        if joinLimit and #contexts > joinLimit then overBudget('the rows a join hands on', #contexts, joinLimit) end
       end
     end
 
@@ -2441,7 +2523,11 @@ local function prepare(db: Database, sql: string): Plan
       local nilKey = {}
       local order: {Group} = {}
 
+      local groupCount = 0
       local function newGroup(first: unknown, groupKey: unknown?): Group
+        groupCount += 1
+        if groupLimit and groupCount > groupLimit then overBudget('the groups of an aggregate', groupCount, groupLimit) end
+
         if not compactGroupColumn and first then first = retainContext(first) end
         local group: Group = table.create(#aggregateSpecs) :: Group
         group.first = if not compactGroupColumn then first else nil
@@ -2605,10 +2691,40 @@ local function prepare(db: Database, sql: string): Plan
       local stopAfter = if ast.limit ~= nil then ast.offset + ast.limit else nil
 
       if #orderFns == 0 or orderHandled then
+        if sink then
+          -- Nothing left to sort or group: each row is built and handed over as its source
+          -- yields it, and the source is asked for no more once the consumer or the LIMIT stops.
+          local skipped, emitted = 0, 0
+          if stopAfter ~= 0 then
+            eachContext(function(context)
+              if residualWhere and not sqlTruthy(residualWhere(context, nil, values)) then return nil end
+
+              if skipped < ast.offset then
+                skipped += 1
+                return nil
+              end
+
+              local row: Row = {}
+              for index, selector in selectors do
+                local value = selector(context, nil, values)
+                if value ~= nil then row[resultColumns[index]] = value end
+              end
+
+              emitted += 1
+              if sink(row) == false then return false end
+              if ast.limit ~= nil and emitted >= ast.limit then return false end
+              return nil
+            end)
+          end
+
+          return { columns = resultColumns, rows = {}, streamed = true }
+        end
+
         if stopAfter ~= 0 then
           eachContext(function(context)
             if not residualWhere or sqlTruthy(residualWhere(context, nil, values)) then
               units[#units + 1] = { context = retainContext(context), group = nil }
+              if heldLimit and #units > heldLimit then overBudget('the rows a query holds to sort or return', #units, heldLimit) end
               if stopAfter ~= nil and #units >= stopAfter then return false end
             end
             return nil
@@ -2637,6 +2753,7 @@ local function prepare(db: Database, sql: string): Plan
         eachContext(function(context)
           if not residualWhere or sqlTruthy(residualWhere(context, nil, values)) then
             units[#units + 1] = { context = retainContext(context), group = nil }
+            if heldLimit and #units > heldLimit then overBudget('the rows a query holds to sort or return', #units, heldLimit) end
           end
           return nil
         end)
@@ -2698,6 +2815,91 @@ local function prepare(db: Database, sql: string): Plan
     return { columns = resultColumns, rows = resultRows }
   end
 
+  function plan.run(params: {unknown}?): Result
+    return execute(params, nil)
+  end
+
+  function plan.open(params: {unknown}?): Cursor
+    local values: {unknown} = params or {}
+    if #values < ast.params then error(string.format('jessql: query expects %d parameters, got %d', ast.params, #values), 0) end
+
+    local finished, streaming = false, false
+    local producer: thread? = nil
+    -- The query runs in its own coroutine and pauses each time it has a row to hand over. It is
+    -- resumed with `true` for another row and `false` to stop where it is.
+    local function produce()
+      local result = execute(values, function(row: Row): boolean?
+        streaming = true
+        return coroutine.yield(row) :: boolean
+      end)
+
+      if not result.streamed then
+        for _, row in result.rows do
+          if coroutine.yield(row) == false then break end
+        end
+      end
+
+      return nil
+    end
+
+    local function advance(continue: boolean): Row?
+      if finished then return nil end
+
+      if not producer then producer = coroutine.create(produce) end
+
+      local running = producer :: thread
+      local ok, row = coroutine.resume(running, continue)
+      if not ok then
+        finished = true
+        error(row, 0)
+      end
+
+      if coroutine.status(running) == 'dead' then finished = true end
+
+      return row :: Row?
+    end
+
+    local cursor = {} :: Cursor
+    cursor.columns = resultColumns
+
+    function cursor.streaming(): boolean return streaming end
+
+    function cursor.done(): boolean return finished end
+
+    function cursor.next(): Row?
+      return advance(true)
+    end
+
+    function cursor.page(count: number): { Row }
+      if type(count) ~= 'number' or count < 1 or count % 1 ~= 0 then error('jessql: a page holds a whole number of rows, at least one', 2) end
+
+      local rows: { Row } = {}
+      while #rows < count do
+        local row = advance(true)
+        if not row then break end
+
+        rows[#rows + 1] = row
+      end
+
+      return rows
+    end
+
+    function cursor.close()
+      if finished then return end
+
+      -- A query that never started has nothing to stop. One that is paused is told to stop,
+      -- so its source is released by the query itself rather than abandoned.
+      if producer and coroutine.status(producer) == 'suspended' then
+        -- The stopped query may raise while unwinding; the cursor is closed regardless.
+        pcall(advance, false)
+      end
+
+      finished = true
+    end
+
+    return cursor
+  end
+
   plan.ast = ast
   plan.columns = resultColumns
   plan.parameterCount = ast.params
@@ -2709,10 +2911,17 @@ local function prepare(db: Database, sql: string): Plan
         table = join.source.name,
         alias = join.source.alias,
         strategy = joinPlans[index].strategy,
+        reason = joinPlans[index].reason,
       }
     ]
 
-    local scans = [for index, source in enumerate(sources) => { table = source.name, alias = source.alias, columns = neededColumns[index] }]
+    local scans = [
+      for index, source in enumerate(sources) => {
+        table = source.name, alias = source.alias, columns = neededColumns[index],
+        -- Exact, from the provider, or not given at all.
+        rows = if type(source.provider.count) == 'function' then (source.provider.count :: () -> number)() else nil,
+      }
+    ]
 
     return {
       scans = scans,
@@ -2722,6 +2931,7 @@ local function prepare(db: Database, sql: string): Plan
       aggregateCount = #aggregateSpecs,
       providerCount = directProviderCount or directFilteredCount,
       parameterCount = ast.params,
+      estimated = false,
     }
   end
 
@@ -2729,13 +2939,29 @@ local function prepare(db: Database, sql: string): Plan
 end
 
 function engine.new(): Database
-  local db = { _tables = {} :: { [string]: Provider } }
+  local db = { _tables = {} :: { [string]: Provider }, _limits = nil :: Limits? }
 
   function db.register(self: Database, name: string, provider: Provider): Database
     if type(name) ~= 'string' or name == '' then error('jessql: table name must be a string', 2) end
     if type(provider) ~= 'table' or type(provider.scan) ~= 'function' then error('jessql: provider needs scan(request)', 2) end
     if type(provider.columns) ~= 'table' then error('jessql: provider needs columns', 2) end
     self._tables[lower(name)] = provider
+    return self
+  end
+
+  function db.limits(self: Database, limits: Limits?): Database
+    if limits then
+      if type(limits) ~= 'table' then error('jessql: limits are a table', 2) end
+
+      for _, name in { 'joinBuildRows', 'joinRows', 'groups', 'heldRows' } do
+        local value = (limits :: { [string]: unknown })[name]
+        if value ~= nil and (type(value) ~= 'number' or value ~= math.floor(value :: number) or (value :: number) < 1) then
+          error(`jessql: limit {name} is a whole number of rows, at least 1`, 2)
+        end
+      end
+    end
+
+    self._limits = if limits then table.clone(limits) else nil
     return self
   end
 

@@ -1,0 +1,354 @@
+--!strict
+-- A two-level directory of cold pages (#19): prototype.
+--
+-- A cold file's directory says, for each page, the first key it holds and where it is. Held
+-- flat, it is one allocation as large as the table has pages, made when the file is opened.
+-- Here it is two levels: leaves of a fixed number of page entries, written as the pages are,
+-- and a root with one entry a leaf. Opening reads the root and nothing else. A lookup finds the
+-- leaf in the root, loads that one leaf (checked against its CRC-32) and finds the page in it.
+-- Leaves are kept in a cache bounded by count, least recently used out first. So what is held
+-- is the root (pages / leafEntries entries) and at most `maxLeaves` leaves, whatever the table.
+-- With `maxCacheBytes` those leaves are also bounded by what they weigh, since a leaf of long
+-- keys is many times one of short keys: the least recently used go until the next fits, and a
+-- leaf heavier than the whole budget answers its lookup and is not kept.
+--
+-- The file: the leaves one after another, then the root, then a 24-byte footer.
+--
+--   leaf    u32 count, then count times: u16 key length, key, u32 segment, u32 offset, u32 length
+--   root    u32 count, then count times: u16 key length, first key of the leaf,
+--           u32 leaf offset, u32 leaf length, u32 leaf CRC-32, u32 entries in the leaf
+--   footer  'JQD2', u32 version (1), u32 root offset, u32 root length, u32 root CRC-32, u32 pages
+--
+-- Integers are low byte first. Offsets in the directory file are 32-bit: a directory of more
+-- than 4 GiB is outside this prototype. A page is named as `@jessql/coldaddress` names it.
+local bytes = require('@dream/bytes')
+local vfs = require('@jessql/vfs')
+
+export type Page = { first: string, segment: number, offset: number, length: number }
+export type Writer = {
+  -- Pages in strictly ascending order of their first key. Nil, or why it was refused.
+  add: (page: Page) -> string?,
+  -- Writes the root and the footer. The number of pages, or nil and why.
+  finish: () -> (number?, string?),
+}
+export type Stats = {
+  pages: number, leaves: number, rootBytes: number, cached: number, leafReads: number, hits: number,
+  -- What the cached leaves weigh in the heap: each key a string with its header, a slot for it,
+  -- and twelve bytes a page (not the bytes each is on disk, about a third of that).
+  cachedBytes: number,
+}
+export type Reader = {
+  -- The page whose range holds `key`: the last page whose first key is not after it. Nil with
+  -- no reason when `key` is before every page; nil and a reason when the directory is damaged.
+  find: (key: string) -> (Page?, string?),
+  stats: () -> Stats,
+}
+-- `maxCacheBytes` bounds the cached leaves by weight as `maxLeaves` bounds them by number: a
+-- directory of long keys has leaves many times the size of one of short keys, and a count alone
+-- does not say what a reader holds. Without it only the count applies.
+export type Options = { leafEntries: number?, maxLeaves: number?, maxCacheBytes: number? }
+
+local directory = {}
+
+directory.Magic = 'JQD2'
+directory.Version = 1
+directory.FooterBytes = 24
+directory.MaxKeyBytes = 4096
+directory.MaxRootBytes = 64 * 1024 * 1024
+directory.MaxLeafBytes = 8 * 1024 * 1024
+
+local function whole(value: unknown, least: number, most: number): boolean
+  return type(value) == 'number' and value == value and value == math.floor(value :: number)
+    and (value :: number) >= least and (value :: number) <= most
+end
+
+local function u32(value: number): string
+  local out = buffer.create(4)
+  buffer.writeu32(out, 0, value)
+  return buffer.tostring(out)
+end
+
+local function u16(value: number): string
+  local out = buffer.create(2)
+  buffer.writeu16(out, 0, value)
+  return buffer.tostring(out)
+end
+
+-- A writer of a new directory file at `path`. Leaves go to the file as they fill.
+function directory.writer(storage: vfs.Backend, path: string, options: Options?): (Writer?, string?)
+  local leafEntries = if options and options.leafEntries then options.leafEntries else 256
+  if not whole(leafEntries, 2, 65536) then return nil, 'not a leaf size' end
+
+  local created, problem = storage.writeFile(path, '', { exclusive = true })
+  if not created then return nil, problem or 'not created' end
+
+  local leaf: { string } = {}
+  local leafCount, leafFirst = 0, ''
+  local root: { string } = {}
+  local leaves, pages, written, rootBytes = 0, 0, 0, 4
+  local previous: string? = nil
+  local finished, failed = false, false
+
+  local function flush(): string?
+    if leafCount == 0 then return nil end
+
+    local body = u32(leafCount) .. table.concat(leaf)
+    if #body > directory.MaxLeafBytes then return 'a leaf larger than a leaf may be' end
+    if written + #body > 2 ^ 32 - 1 then return 'a directory file past 4 GiB' end
+
+    local appended, why = storage.writeFile(path, body, { append = true })
+    if not appended then return why or 'not written' end
+
+    local entry = u16(#leafFirst) .. leafFirst .. u32(written) .. u32(#body) .. u32(bytes.crc32(body)) .. u32(leafCount)
+    rootBytes += #entry
+    if rootBytes > directory.MaxRootBytes then return 'a root larger than a root may be' end
+
+    table.insert(root, entry)
+    written += #body
+    leaves += 1
+    leaf, leafCount = {}, 0
+    return nil
+  end
+
+  local self = {} :: Writer
+
+  function self.add(page: Page): string?
+    if finished or failed then return 'finished' end
+    if type(page) ~= 'table' or type(page.first) ~= 'string' or #page.first > directory.MaxKeyBytes then return 'not a page with a key a directory holds' end
+    if not whole(page.segment, 0, 2 ^ 32 - 1) or not whole(page.offset, 0, 2 ^ 32 - 1) or not whole(page.length, 1, 2 ^ 32 - 1) then return 'not a page address' end
+    if previous and not (previous < page.first) then return 'pages out of order' end
+
+    previous = page.first
+    if leafCount == 0 then leafFirst = page.first end
+
+    table.insert(leaf, u16(#page.first) .. page.first .. u32(page.segment) .. u32(page.offset) .. u32(page.length))
+    leafCount += 1
+    pages += 1
+    if leafCount >= leafEntries then
+      local why = flush()
+      if why then
+        failed = true
+        return why
+      end
+    end
+
+    return nil
+  end
+
+  function self.finish(): (number?, string?)
+    if finished or failed then return nil, 'finished' end
+
+    local why = flush()
+    if why then return nil, why end
+
+    local body = u32(leaves) .. table.concat(root)
+    if written + #body + directory.FooterBytes > 2 ^ 32 - 1 then return nil, 'a directory file past 4 GiB' end
+
+    local footer = directory.Magic .. u32(directory.Version) .. u32(written) .. u32(#body) .. u32(bytes.crc32(body)) .. u32(pages)
+    local appended, problem = storage.writeFile(path, body .. footer, { append = true })
+    if not appended then return nil, problem or 'not written' end
+
+    finished = true
+    return pages, nil
+  end
+
+  return self, nil
+end
+
+-- A cached leaf is a link in a list kept in order of use, so that the one to drop is at its
+-- end and is found without looking at the others.
+type Leaf = { index: number, firsts: { string }, places: buffer, bytes: number, newer: Leaf?, older: Leaf? }
+
+-- Opens a directory file of `size` bytes: the footer and the root are read, checked, and held.
+function directory.reader(storage: vfs.Backend, path: string, size: number, options: Options?): (Reader?, string?)
+  local maxLeaves = if options and options.maxLeaves then options.maxLeaves else 64
+  if not whole(maxLeaves, 1, 1000000) then return nil, 'not a cache size' end
+
+  local maxCacheBytes = if options then options.maxCacheBytes else nil
+  if maxCacheBytes ~= nil and not whole(maxCacheBytes, 1, 2 ^ 40) then return nil, 'not a cache budget' end
+  if not whole(size, directory.FooterBytes + 4, 2 ^ 32 - 1) then return nil, 'not a directory file' end
+
+  local function read(offset: number, length: number): string?
+    local got = storage.readAt(path, offset, length)
+    if not got or buffer.len(got) ~= length then return nil end
+
+    return buffer.tostring(got)
+  end
+
+  local footer = read(size - directory.FooterBytes, directory.FooterBytes)
+  if not footer or string.sub(footer, 1, 4) ~= directory.Magic then return nil, 'not a directory file' end
+
+  local tail = buffer.fromstring(footer)
+  if buffer.readu32(tail, 4) ~= directory.Version then return nil, 'a directory of another version' end
+
+  local rootOffset, rootLength, rootCrc, pages = buffer.readu32(tail, 8), buffer.readu32(tail, 12), buffer.readu32(tail, 16), buffer.readu32(tail, 20)
+  if rootLength < 4 or rootLength > directory.MaxRootBytes or rootOffset + rootLength + directory.FooterBytes ~= size then return nil, 'a root that is not where the footer says' end
+
+  local rootBody = read(rootOffset, rootLength)
+  if not rootBody or bytes.crc32(rootBody) ~= rootCrc then return nil, 'the root does not match its checksum' end
+
+  -- The root, kept packed: the first key of each leaf in one list, and sixteen bytes a leaf in
+  -- one buffer (its offset, length, CRC-32 and entries). A table a leaf is several times that,
+  -- and at a hundred million pages the root is what a reader holds.
+  local raw = buffer.fromstring(rootBody)
+  local count = buffer.readu32(raw, 0)
+  if count * 18 + 4 > rootLength then return nil, 'a root cut short' end
+
+  local firsts: { string } = {}
+  local places = buffer.create(count * 16)
+  local at, described, expected = 4, 0, 0
+  for index = 1, count do
+    if at + 2 > rootLength then return nil, 'a root cut short' end
+
+    local keyLength = buffer.readu16(raw, at)
+    if at + 2 + keyLength + 16 > rootLength then return nil, 'a root cut short' end
+
+    local first = buffer.readstring(raw, at + 2, keyLength)
+    at += 2 + keyLength
+    local offset, length, entries = buffer.readu32(raw, at), buffer.readu32(raw, at + 4), buffer.readu32(raw, at + 12)
+    -- Leaves are laid end to end from the start of the file, in key order.
+    if offset ~= expected or length < 4 or length > directory.MaxLeafBytes or entries < 1
+      or (index > 1 and not (firsts[index - 1] < first)) then return nil, 'a root whose leaves are not in order' end
+
+    buffer.copy(places, (index - 1) * 16, raw, at, 16)
+    at += 16
+    expected += length
+    described += entries
+    firsts[index] = first
+  end
+
+  if at ~= rootLength or expected ~= rootOffset or described ~= pages then return nil, 'a root that does not describe the file' end
+
+  local cache: { [number]: Leaf } = {}
+  local cached, leafReads, hits = 0, 0, 0
+  local cachedBytes = 0
+  local newest: Leaf?, oldest: Leaf? = nil, nil
+
+  local function unlink(leaf: Leaf)
+    local newer, older = leaf.newer, leaf.older
+    if newer then newer.older = older else newest = older end
+
+    if older then older.newer = newer else oldest = newer end
+
+    leaf.newer, leaf.older = nil, nil
+  end
+
+  local function front(leaf: Leaf)
+    leaf.older = newest
+    local was = newest
+    if was then was.newer = leaf end
+
+    newest = leaf
+    if not oldest then oldest = leaf end
+  end
+
+  local function load(index: number): (Leaf?, string?)
+    local held = cache[index]
+    if held then
+      if newest ~= held then
+        unlink(held)
+        front(held)
+      end
+
+      hits += 1
+      return held, nil
+    end
+
+    local place = (index - 1) * 16
+    local leafOffset, leafLength = buffer.readu32(places, place), buffer.readu32(places, place + 4)
+    local leafCrc, leafEntries = buffer.readu32(places, place + 8), buffer.readu32(places, place + 12)
+    local body = read(leafOffset, leafLength)
+    leafReads += 1
+    if not body or bytes.crc32(body) ~= leafCrc then return nil, `leaf {index} does not match its checksum` end
+
+    local data = buffer.fromstring(body)
+    if buffer.readu32(data, 0) ~= leafEntries then return nil, `leaf {index} is not the leaf the root describes` end
+
+    -- A cached leaf is packed as the root is: its keys, and twelve bytes a page.
+    local leafFirsts: { string } = {}
+    local leafPlaces = buffer.create(leafEntries * 12)
+    -- What the leaf holds in the heap, not on disk (review of 2026-11-13: the disk's bytes were
+    -- about a third of it): a table, its places, a slot in the list and a string a key.
+    local held = 64 + leafEntries * (12 + 16)
+    local cursor = 4
+    for position = 1, leafEntries do
+      if cursor + 2 > leafLength then return nil, `leaf {index} is cut short` end
+
+      local keyLength = buffer.readu16(data, cursor)
+      if cursor + 2 + keyLength + 12 > leafLength then return nil, `leaf {index} is cut short` end
+
+      held += 24 + keyLength
+      leafFirsts[position] = buffer.readstring(data, cursor + 2, keyLength)
+      cursor += 2 + keyLength
+      buffer.copy(leafPlaces, (position - 1) * 12, data, cursor, 12)
+      cursor += 12
+    end
+
+    if cursor ~= leafLength or leafFirsts[1] ~= firsts[index] then return nil, `leaf {index} is not the leaf the root describes` end
+
+    local leaf: Leaf = { index = index, firsts = leafFirsts, places = leafPlaces, bytes = held, newer = nil, older = nil }
+    -- A leaf that is over the budget by itself answers this lookup and is not kept: the budget
+    -- is what the reader holds between lookups, and one leaf cannot be let to break it.
+    if maxCacheBytes and held > maxCacheBytes then return leaf, nil end
+
+    -- Room is made before the leaf is kept: the least recently used go, until it fits by number
+    -- and by weight.
+    local dropped = oldest
+    while dropped and (cached >= maxLeaves or (maxCacheBytes ~= nil and cachedBytes + held > maxCacheBytes)) do
+      unlink(dropped)
+      cache[dropped.index] = nil
+      cached -= 1
+      cachedBytes -= dropped.bytes
+      dropped = oldest
+    end
+
+    cache[index] = leaf
+    front(leaf)
+    cached += 1
+    cachedBytes += held
+    return leaf, nil
+  end
+
+  -- The last position whose key is not after `key`, or 0.
+  local function floor(keys: { string }, key: string): number
+    local low, high = 1, #keys
+    local found = 0
+    while low <= high do
+      local middle = (low + high) // 2
+      if keys[middle] <= key then
+        found = middle
+        low = middle + 1
+      else
+        high = middle - 1
+      end
+    end
+
+    return found
+  end
+
+  local self = {} :: Reader
+
+  function self.find(key: string): (Page?, string?)
+    if type(key) ~= 'string' then return nil, 'not a key' end
+
+    local index = floor(firsts, key)
+    if index == 0 then return nil, nil end
+
+    local leaf, problem = load(index)
+    if not leaf then return nil, problem end
+
+    local position = floor(leaf.firsts, key)
+    local place = (position - 1) * 12
+    return { first = leaf.firsts[position], segment = buffer.readu32(leaf.places, place), offset = buffer.readu32(leaf.places, place + 4),
+      length = buffer.readu32(leaf.places, place + 8) }, nil
+  end
+
+  function self.stats(): Stats
+    return { pages = pages, leaves = count, rootBytes = rootLength, cached = cached, leafReads = leafReads, hits = hits,
+      cachedBytes = cachedBytes }
+  end
+
+  return self, nil
+end
+
+return directory

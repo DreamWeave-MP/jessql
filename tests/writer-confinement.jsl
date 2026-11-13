@@ -1,0 +1,117 @@
+--!strict
+-- #31: a writer service that owns its paths. A host given a root opens databases by name and
+-- by nothing else, and speaks one version of the protocol. The host is driven directly: these
+-- are the messages a client, or anything pretending to be one, could send.
+local ledger = require('@jessql/ledger')
+local memfs = require('@jessql/memfs')
+local service = require('@jessql/writer_service')
+local sql = require('@jessql')
+local test = require('@jess/test')
+
+local expect = test.expect
+local suite = test.new()
+
+local Root = '/memory/databases'
+local Tables: { sql.CatalogTableSpec } = {
+  { tableName = 'events', columns = { 'id', 'body' }, primaryKey = 'id' },
+  ledger.table('requests'),
+}
+
+local function reason(reply: unknown): string
+  local answer = reply :: { kind: string, reason: string? }
+  return if answer.kind == 'failed' then `failed: {answer.reason or ''}` else answer.kind
+end
+
+-- Every name the disk holds anywhere under `/memory`.
+local function everything(disk: typeof(memfs.new()), path: string, found: { string })
+  for _, name in disk.backend.list(path) or {} do
+    local inside = `{path}/{name}`
+    table.insert(found, inside)
+    if disk.backend.isDir(inside) then everything(disk, inside, found) end
+  end
+end
+
+suite.describe('a confined writer service', function()
+  suite.it('opens a database by name under its root, and commits there', function()
+    local disk = memfs.new()
+    disk.backend.mkdir(Root, { recursive = true })
+    local host = service.host({ storage = disk.backend, root = Root })
+    local opened = host({ kind = 'open', version = service.Protocol, path = 'orders', tables = Tables }) :: { kind: string, version: number? }
+    expect(opened.kind).toBe('opened')
+    expect(opened.version).toBe(1)
+
+    expect(host({ kind = 'submit', request = { id = 'a', operations = { { op = 'insert', table = 'events', row = { id = 1, body = 'one' } } } } })).toBe(nil)
+    local acks = host({ kind = 'flush', serial = 1 }) :: { acks: { { id: string, outcome: string } } }
+    expect(acks.acks[1].outcome).toBe('committed')
+    expect((host({ kind = 'close' }) :: { kind: string }).kind).toBe('closed')
+
+    local found: { string } = {}
+    everything(disk, '/memory', found)
+    expect(#found > 1).toBe(true)
+    for _, path in found do
+      -- Nothing but the root and what is under it, named for the database.
+      expect(path == Root or string.sub(path, 1, #Root + 7) == `{Root}/orders`).toBe(true)
+    end
+  end)
+
+  suite.it('refuses anything that is not a name, and creates nothing for it', function()
+    local disk = memfs.new()
+    disk.backend.mkdir(Root, { recursive = true })
+    disk.backend.mkdir('/memory/elsewhere', { recursive = true })
+    local host = service.host({ storage = disk.backend, root = Root })
+    local attempts = {
+      '../elsewhere/stolen', '..', '.', '/memory/elsewhere/stolen', 'a/b', 'a\\b', '', ' orders', 'orders ', 'or ders',
+      'orders.wal', '.hidden', '-flag', '_under', 'a\0b', 'orders/../../elsewhere/x', string.rep('a', 65), 'ünïcode', '~', '$HOME', 'C:orders',
+    }
+
+    for _, attempt in attempts do
+      expect(`{string.format('%q', attempt)}: {reason(host({ kind = 'open', path = attempt, tables = Tables }))}`)
+        .toBe(`{string.format('%q', attempt)}: failed: not a database name`)
+    end
+
+    -- A path that is not a string at all is the older refusal.
+    expect(reason(host({ kind = 'open', path = { 'orders' }, tables = Tables }))).toBe('failed: open needs a path and tables')
+
+    local found: { string } = {}
+    everything(disk, '/memory', found)
+    table.sort(found)
+    expect(table.concat(found, ' ')).toBe(`{Root} /memory/elsewhere`)
+
+    -- The longest name and the plainest are taken; the host was left able to open after all that.
+    expect(service.validName(string.rep('a', 64))).toBe(true)
+    expect(service.validName('Orders_2026-11')).toBe(true)
+    expect(reason(host({ kind = 'open', path = 'orders', tables = Tables }))).toBe('opened')
+  end)
+
+  suite.it('speaks one version, takes a client that names none, and refuses another', function()
+    local disk = memfs.new()
+    disk.backend.mkdir(Root, { recursive = true })
+    local host = service.host({ storage = disk.backend, root = Root })
+    expect(reason(host({ kind = 'open', version = 2, path = 'orders', tables = Tables }))).toBe('failed: unsupported protocol version')
+    expect(reason(host({ kind = 'open', version = '1', path = 'orders', tables = Tables }))).toBe('failed: unsupported protocol version')
+    expect(reason(host({ kind = 'open', version = 0, path = 'orders', tables = Tables }))).toBe('failed: unsupported protocol version')
+    -- Refused before anything was opened: the same host still opens.
+    expect(reason(host({ kind = 'open', path = 'orders', tables = Tables }))).toBe('opened')
+    expect(reason(host({ kind = 'open', path = 'orders', tables = Tables }))).toBe('failed: already open')
+  end)
+
+  suite.it('leaves a host with no root as it was, and refuses a root that is not one', function()
+    local disk = memfs.new()
+    disk.backend.mkdir('/memory/anywhere', { recursive = true })
+    local host = service.host({ storage = disk.backend })
+    expect(reason(host({ kind = 'open', path = '/memory/anywhere/at-all', tables = Tables }))).toBe('opened')
+
+    for _, bad in { '', 'a\0b' } do
+      -- Construction raises on a root that is not a directory's path.
+      expect((pcall(function() return service.host({ root = bad }) end))).toBe(false)
+      expect((pcall(function() return service.sourceFor(bad) end))).toBe(false)
+    end
+
+    -- The source for a worker carries the root as a quoted literal, whatever is in it.
+    local source = service.sourceFor('/srv/data/"quoted"\\dir')
+    expect(string.find(source, 'host%(%{ root = "', 1) ~= nil).toBe(true)
+    expect(string.find(source, '\\"quoted\\"', 1, true) ~= nil).toBe(true)
+  end)
+end)
+
+return suite

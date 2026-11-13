@@ -1,6 +1,6 @@
 --!strict
 local sql = require('@jessql')
-local fs = require('@dream/fs')
+local fs = require('@jessql/vfs')
 local test = require('@jess/test')
 local expect = test.expect
 local suite = test.new()
@@ -11,6 +11,7 @@ local function paths(name: string): (string, string, string)
   fs.remove(base .. '.idx')
   fs.remove(base .. '.wal')
   fs.remove(base .. '.wal.lock')
+  fs.remove(base .. '.wal.committed')
   return base .. '.cold', base .. '.idx', base .. '.wal'
 end
 
@@ -19,6 +20,7 @@ local function clean(cold: string, sidecar: string, wal: string)
   fs.remove(sidecar)
   fs.remove(wal)
   fs.remove(wal .. '.lock')
+  fs.remove(wal .. '.committed')
 end
 
 suite.describe('retained positional snapshot I/O', function()

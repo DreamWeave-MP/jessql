@@ -2,13 +2,14 @@
 -- Read-only, offline verification of published managed generations and WAL.
 -- Does not repair torn tails, initialize journals, or publish a manifest.
 -- Caller MUST own the exclusive managed namespace lock.
-local fs = require('@dream/fs')
+local vfs = require('@jessql/vfs')
 local bytes = require('@dream/bytes')
 local json = require('@jess/json')
 local paged = require('@jessql/paged')
 local segments = require('@jessql/segments')
 local manifest = require('@jessql/managed_manifest')
 local storage = require('@jessql/storage')
+local walmark = require('@jessql/walmark')
 
 export type Issue = { code: string, stage: string, message: string, recovery: string }
 type Failure = { code: string, message: string }
@@ -26,7 +27,7 @@ export type Report = {
 local Magic = 'JQLW1\n'
 local HeaderBytes = 8
 local MaxFrameBytes = 16 * 1024 * 1024
-export type Options = { semantic: boolean? }
+export type Options = { semantic: boolean?, storage: vfs.Backend? }
 local verification = {}
 
 local function generation(base: string, epoch: number, extension: string): string
@@ -44,7 +45,7 @@ local function problem(result: Report, stage: string, code: string, message: str
   }
 end
 
-local function cold(base: string, value: manifest.Manifest): (number, string)
+local function cold(fs: vfs.Backend, base: string, value: manifest.Manifest): (number, string)
   local rows = {} :: { string }
   local deleted = {} :: { [number]: string }
   for index, item in manifest.generations(value) do
@@ -54,9 +55,9 @@ local function cold(base: string, value: manifest.Manifest): (number, string)
 
   local snapshot: paged.Snapshot
   if value.version == 1 then
-    snapshot = paged.open(rows[1], { cachePages = 1 })
+    snapshot = paged.open(rows[1], { cachePages = 1, storage = fs })
   else
-    snapshot = segments.open(rows, { cachePages = 1, deletePaths = deleted })
+    snapshot = segments.open(rows, { cachePages = 1, deletePaths = deleted, storage = fs })
   end
   local identity = snapshot.identity
   -- Metadata validators may throw on corruption; always close the reader before reporting.
@@ -77,7 +78,7 @@ local function cold(base: string, value: manifest.Manifest): (number, string)
   local scanned = 0
   for index, name in rows do
     local function scan(path: string)
-      local reader = paged.open(path, { cachePages = 1 })
+      local reader = paged.open(path, { cachePages = 1, storage = fs })
       -- Decoding a damaged page may throw; close the page reader and report the fault.
       local ok, failure = pcall(function()
         local nextRow = reader:iterateRows()
@@ -99,7 +100,7 @@ end
 -- WAL frame format is the exact JQLW1 storage framing: little-endian
 -- length/CRC32 followed by JSON with sequential transaction numbers.
 -- Structural verification intentionally DOES NOT claim full semantic replay.
-local function wal(base: string, value: manifest.Manifest, identity: string,
+local function wal(fs: vfs.Backend, base: string, value: manifest.Manifest, identity: string,
   report: Report)
   local path = generation(base, value.epoch, 'wal')
   local reader, openError = fs.open(path)
@@ -173,6 +174,17 @@ local function wal(base: string, value: manifest.Manifest, identity: string,
       offset += HeaderBytes + length
       report.walFrames += 1
     end
+    -- A log that ends cleanly on a frame can still be short: cut at a boundary, or an older copy.
+    -- Its committed-length mark is the witness.
+    local witness, committed = walmark.examine(fs, path)
+    if witness == 'damaged' then
+      defect('WAL_COMMITTED_MARK_DAMAGED', 'the committed-length mark is there and cannot be read: the log cannot be vouched for')
+    end
+
+    if committed and (committed.length > offset or committed.sequence > sequence) then
+      defect('WAL_SHORTER_THAN_COMMITTED', `WAL holds {sequence} transactions in {offset} bytes; {committed.sequence} in {committed.length} were committed`)
+    end
+
     report.walFramesChecked = true
     if not bound then defect('WAL_IDENTITY_MISSING', 'WAL snapshot binding absent') end
     report.walIdentityChecked = true
@@ -182,6 +194,7 @@ local function wal(base: string, value: manifest.Manifest, identity: string,
 end
 
 function verification.scan(base: string, options: Options?): Report
+  local fs = vfs.resolve(if options then options.storage else nil)
   local report: Report = { version = 1, ok = true, epoch = nil, manifestVersion = nil,
     disposition = 'structurally-verified', coldRowsScanned = 0, walBytes = 0, walFrames = 0,
     coldPagesChecked = false, walFramesChecked = false,
@@ -201,7 +214,7 @@ function verification.scan(base: string, options: Options?): Report
   report.epoch, report.manifestVersion = value.epoch, value.version
 
   -- Missing or corrupt cold pages are reported without modifying them.
-  local coldOK, count, identity = pcall(function() return cold(base, value) end)
+  local coldOK, count, identity = pcall(function() return cold(fs, base, value) end)
   if not coldOK then
     problem(report, 'cold', 'COLD_INVALID', tostring(count))
     return report
@@ -209,7 +222,7 @@ function verification.scan(base: string, options: Options?): Report
   report.coldRowsScanned = count :: number
   report.coldPagesChecked = true
   -- Malformed WAL frames are reported without attempting replay or repair.
-  local walOK, walError = pcall(function() wal(base, value, identity :: string, report) end)
+  local walOK, walError = pcall(function() wal(fs, base, value, identity :: string, report) end)
   if not walOK then
     local code, detail = 'WAL_DECODE_OR_IO_FAILED', tostring(walError)
     if type(walError) == 'table' then
@@ -223,7 +236,7 @@ function verification.scan(base: string, options: Options?): Report
     -- Exact storage replay validation, after immutable pages and WAL framing
     -- have already passed. A semantic error is never an excuse to repair data.
     local replayOK, replayResult = pcall(function()
-      return storage.verifyReplay(generation(base, value.epoch, 'wal'))
+      return storage.verifyReplay(generation(base, value.epoch, 'wal'), fs)
     end)
 
     if not replayOK then

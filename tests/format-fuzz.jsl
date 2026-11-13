@@ -1,0 +1,181 @@
+--!strict
+-- P2-04: damage to a known format. Every golden file is mutated, one seeded change at a time
+-- (a flipped byte, a zeroed run, a truncation, appended bytes), and the database is opened on
+-- the result. There are two acceptable outcomes: a refusal, or exactly the rows that were written.
+-- Rows that differ, with nothing said, is the failure this looks for. In memory; deterministic.
+local bytes = require('@dream/bytes')
+local golden = require('./fixtures/formats-v1')
+local memfs = require('@jessql/memfs')
+local sql = require('@jessql')
+local test = require('@jess/test')
+
+local expect = test.expect
+local suite = test.new()
+
+type Row = { [string]: unknown }
+
+local Expected = '2:b:two 3:a:three 4:c:four'
+
+local function generator(seed: number): (bound: number) -> number
+  local state = seed % 2147483646 + 1
+  return function(bound: number): number
+    state = state * 48271 % 2147483647
+    return state % bound + 1
+  end
+end
+
+local function original(path: string): string
+  return buffer.tostring(assert((bytes.fromBase64(golden[path]))))
+end
+
+-- One seeded change to `body`, and what it was.
+local function mutate(body: string, pick: (number) -> number): (string, string)
+  local kind = pick(10)
+  local at = pick(#body)
+  if kind <= 6 then
+    local old = string.byte(body, at)
+    local new = (old + pick(255)) % 256
+    return string.sub(body, 1, at - 1) .. string.char(new) .. string.sub(body, at + 1), `byte {at} {old}->{new}`
+  elseif kind <= 7 then
+    local length = math.min(pick(16), #body - at + 1)
+    return string.sub(body, 1, at - 1) .. string.rep('\0', length) .. string.sub(body, at + length), `zero {length} at {at}`
+  elseif kind <= 9 then
+    return string.sub(body, 1, at - 1), `truncate to {at - 1}`
+  end
+
+  return body .. string.rep(string.char(pick(256) - 1), pick(24)), 'append'
+end
+
+local function disk(target: string, body: string): memfs.Disk
+  local restored = memfs.new()
+  for path in golden do
+    assert((restored.backend.createDurable(path, if path == target then body else original(path))))
+  end
+
+  return restored
+end
+
+-- What a reader of the managed database gets: 'refused', or the rows it read.
+local function managedOutcome(subject: memfs.Disk): string
+  -- Opening or reading a damaged database may raise; that is a refusal, the outcome wanted.
+  local ok, rows = pcall(function(): string
+    local db = sql.managed.openExisting('/memory/g', { storage = subject.backend })
+    local seen: { string } = {}
+    for _, row in db:query('SELECT id, room, body FROM events ORDER BY id').rows do
+      local record = row :: Row
+      table.insert(seen, `{tostring(record.id)}:{tostring(record.room)}:{tostring(record.body)}`)
+    end
+
+    -- Point reads go through another path than the scan: they must agree with it.
+    for key = 1, 4 do
+      local found = db:get(key)
+      local line = if found then `{tostring(found.id)}:{tostring(found.room)}:{tostring(found.body)}` else nil
+      local scanned: string? = nil
+      for _, item in seen do
+        if string.match(item, '^(%d+):') == tostring(key) then scanned = item end
+      end
+
+      if line ~= scanned then error(`get({key}) disagrees with the scan`) end
+    end
+
+    db:close()
+    return table.concat(seen, ' ')
+  end)
+  return if ok then rows :: string else 'refused'
+end
+
+-- `shortened`: read as an earlier committed state (the write-ahead log only; see below).
+type Tally = { runs: number, refused: number, intact: number, shortened: number, wrong: { string } }
+
+local function sweep(target: string, runs: number, seed: number, outcome: (memfs.Disk) -> string, expected: string,
+  earlier: string?): Tally
+  local pick = generator(seed)
+  local tally: Tally = { runs = 0, refused = 0, intact = 0, shortened = 0, wrong = {} }
+  local body = original(target)
+  for _ = 1, runs do
+    local changed, what = mutate(body, pick)
+    if changed == body then continue end
+
+    tally.runs += 1
+    local result = outcome(disk(target, changed))
+    if result == 'refused' then
+      tally.refused += 1
+    elseif result == expected then
+      tally.intact += 1
+    elseif earlier and result == earlier then
+      tally.shortened += 1
+    elseif #tally.wrong < 5 then
+      table.insert(tally.wrong, `{target}: {what}: read "{result}"`)
+    end
+  end
+
+  return tally
+end
+
+suite.describe('damage to a managed database is refused or harmless, never silently wrong', function()
+  local totals = { runs = 0, refused = 0, intact = 0 }
+  for _, target in { '/memory/g.jql-manifest', '/memory/g.g00000001.rows', '/memory/g.g00000002.rows',
+    '/memory/g.g00000003.rows', '/memory/g.g00000002.deleted', '/memory/g.g00000003.deleted' } do
+    suite.it(`{string.sub(target, 9)}: 400 seeded mutations`, function()
+      local tally = sweep(target, 400, #target * 7919, managedOutcome, Expected)
+      expect(table.concat(tally.wrong, '\n')).toBe('')
+      expect(tally.runs > 300).toBe(true)
+      totals.runs += tally.runs
+      totals.refused += tally.refused
+      totals.intact += tally.intact
+      print(`FUZZ {string.sub(target, 9)} runs={tally.runs} refused={tally.refused} intact={tally.intact}`)
+    end)
+  end
+
+  -- The write-ahead log is the one format whose end is not committed to anywhere else: a log that
+  -- stops short, or whose last frame fails its checksum, is what a crash during the last write
+  -- leaves, and is read as that. So damage to the tail of the log can cost the last transaction
+  -- without a refusal. It may never yield anything but a state that was once committed.
+  suite.it('g.g00000003.wal: 400 seeded mutations give the written rows, a refusal, or the state before the last transaction', function()
+    local tally = sweep('/memory/g.g00000003.wal', 400, 90001, managedOutcome, Expected, '2:b:two 3:a:three')
+    expect(table.concat(tally.wrong, '\n')).toBe('')
+    expect(tally.runs > 300).toBe(true)
+    expect(tally.refused > 0).toBe(true)
+    print(`FUZZ g.g00000003.wal runs={tally.runs} refused={tally.refused} intact={tally.intact} shortened={tally.shortened}`)
+  end)
+
+  suite.it('the unmutated files read exactly what was written', function()
+    expect(managedOutcome(disk('', ''))).toBe(Expected)
+  end)
+end)
+
+-- A snapshot and its secondary index, read through the index.
+local function indexOutcome(sidecar: string): (memfs.Disk) -> string
+  return function(subject: memfs.Disk): string
+    -- Opening or reading a damaged snapshot or sidecar may raise; that is a refusal.
+    local ok, rows = pcall(function(): string
+      local on = subject.backend
+      local snapshot = sql.paged.open('/memory/s.rows', { storage = on })
+      local index = sql.secondary.open(sidecar, snapshot, { storage = on })
+      local found: { string } = {}
+      for _, room in { 'a', 'b' } do
+        for row in index:iterate(room) do table.insert(found, `{room}/{tostring(row.id)}:{tostring(row.body)}`) end
+      end
+
+      index:close()
+      snapshot:close()
+      return table.concat(found, ' ')
+    end)
+    return if ok then rows :: string else 'refused'
+  end
+end
+
+suite.describe('damage to a snapshot or its secondary index', function()
+  local wanted = 'a/1:x1 a/3:x3 b/2:x2'
+  for _, case in { { '/memory/s.rows', '/memory/s.index' }, { '/memory/s.index', '/memory/s.index' }, { '/memory/s.legacy', '/memory/s.legacy' } } do
+    suite.it(`{string.sub(case[1], 9)} read through {string.sub(case[2], 9)}: 400 seeded mutations`, function()
+      expect(indexOutcome(case[2])(disk('', ''))).toBe(wanted)
+      local tally = sweep(case[1], 400, #case[1] * 104729, indexOutcome(case[2]), wanted)
+      expect(table.concat(tally.wrong, '\n')).toBe('')
+      expect(tally.runs > 300).toBe(true)
+      print(`FUZZ {string.sub(case[1], 9)} runs={tally.runs} refused={tally.refused} intact={tally.intact}`)
+    end)
+  end
+end)
+
+return suite

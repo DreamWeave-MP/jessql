@@ -1,0 +1,853 @@
+--!strict
+-- #32: the writer as a service in a worker. The host and the client are driven here through a
+-- lane that stands in for a worker's handle: messages wait in a mailbox and are handled when
+-- the client next reads, which is the order a real worker would give them. What is held to:
+-- many requests behind one synchronization; refusals that are answers; a client that never
+-- waits; and a worker that is slow, full or dead leaving every unanswered request `unknown`,
+-- once, and none of them called committed.
+local ledger = require('@jessql/ledger')
+local memfs = require('@jessql/memfs')
+local meter = require('@jessql/meter')
+local service = require('@jessql/writer_service')
+local sql = require('@jessql')
+local test = require('@jess/test')
+local writer = require('@jessql/writer')
+
+local expect = test.expect
+local suite = test.new()
+
+local Path = '/memory/service'
+local Tables: { sql.CatalogTableSpec } = {
+  { tableName = 'events', columns = { 'id', 'body' }, primaryKey = 'id' },
+  { tableName = 'counters', columns = { 'id', 'value' }, primaryKey = 'id' },
+  ledger.table('requests'),
+}
+
+local function event(number: number): writer.Request
+  return { id = `e{number}`, operations = {
+    { op = 'insert', table = 'events', row = { id = number, body = `event {number}` } },
+    { op = 'upsert', table = 'counters', row = { id = 'last', value = number } },
+  } }
+end
+
+type Disk = typeof(memfs.new())
+type World = {
+  disk: Disk, lane: service.Lane, syncs: () -> number, clock: { now: number },
+  -- The mailbox's limit, messages the worker has not handled, and switches for misbehaviour.
+  capacity: number, mailbox: { unknown }, dead: boolean, silent: boolean, handled: { string },
+  -- The worker handles what is waiting, synchronization and all, and dies before any reply
+  -- of it is delivered.
+  dieAfterHandling: boolean,
+  client: service.Client,
+}
+
+local function world(options: service.ClientOptions?, existing: Disk?): World
+  local disk = existing or memfs.new()
+  local metered = meter.wrap(disk.backend)
+  local host = service.host({ storage = metered.backend })
+  local subject = { disk = disk, clock = { now = 0 }, capacity = 1024, mailbox = {}, dead = false, silent = false, handled = {}, dieAfterHandling = false } :: World
+  local replies: { unknown } = {}
+  subject.syncs = function(): number return metered.counters().classes.wal.syncs end
+  subject.lane = {
+    send = function(_self: service.Lane, message: unknown)
+      if subject.dead then error('the worker is stopped; it takes no more messages', 0) end
+      if #subject.mailbox >= subject.capacity then error('the worker\'s queue is full', 0) end
+
+      table.insert(subject.mailbox, message)
+    end,
+    receive = function(_self: service.Lane, seconds: number?): unknown
+      if subject.dead then error('worker failed at handle: invented', 0) end
+
+      -- The worker runs when the application looks: every waiting message, in order.
+      if not subject.silent then
+        for _, message in subject.mailbox do
+          table.insert(subject.handled, tostring((message :: { kind: string }).kind))
+          local reply = host(message)
+          if reply ~= nil then table.insert(replies, reply) end
+        end
+
+        table.clear(subject.mailbox)
+        if subject.dieAfterHandling then
+          table.clear(replies)
+          subject.dead = true
+          error('worker failed at handle: invented, after its work was done', 0)
+        end
+      end
+
+      if #replies == 0 then
+        -- Waiting is what moves the clock.
+        subject.clock.now += seconds or 0
+        return nil
+      end
+
+      return table.remove(replies, 1)
+    end,
+  }
+
+  local given = table.clone(options or {} :: service.ClientOptions)
+  given.now = function(): number return subject.clock.now end
+  subject.client = service.client(subject.lane, given)
+  return subject
+end
+
+local function outcomes(acks: { service.Ack }): string
+  local parts: { string } = {}
+  for _, ack in acks do table.insert(parts, `{ack.id}={ack.outcome}`) end
+
+  return table.concat(parts, ' ')
+end
+
+local function rows(disk: Disk): number
+  local db = sql.catalog.openExisting(Path, { storage = disk.backend })
+  local counted = db:query('SELECT COUNT(*) AS n FROM events').rows[1].n :: number
+  db:close()
+  return counted
+end
+
+suite.describe('the writer as a service in a worker', function()
+  suite.it('commits what was sent between two looks behind one synchronization, and answers each request', function()
+    local subject = world()
+    expect((subject.client:open(Path, Tables))).toBe(true)
+    local before = subject.syncs()
+    for number = 1, 40 do expect(subject.client:submit(event(number)).admitted).toBe(true) end
+
+    -- The same event again under another id, and a request the writer will not take.
+    expect(subject.client:submit({ id = 'again', operations = event(7).operations }).admitted).toBe(true)
+    expect(subject.client:submit({ id = 'empty', operations = {} }).admitted).toBe(true)
+    expect(subject.client:status().outstanding).toBe(42)
+    local acks = subject.client:poll(0)
+    expect(#acks).toBe(42)
+    expect(subject.syncs() - before).toBe(1)
+    local byId: { [string]: service.Ack } = {}
+    for _, ack in acks do byId[ack.id] = ack end
+
+    expect(byId.e1.outcome).toBe('committed')
+    expect(byId.e40.outcome).toBe('committed')
+    expect(byId.again.outcome).toBe('rejected')
+    expect(byId.empty.outcome).toBe('rejected')
+    expect(string.find(byId.empty.error or '', 'refused: invalid', 1, true) ~= nil).toBe(true)
+    expect(subject.client:status().outstanding).toBe(0)
+    -- Nothing to flush: nothing is sent, nothing is synchronized.
+    expect(#subject.client:poll(0)).toBe(0)
+    expect(subject.client:status().flushes).toBe(1)
+
+    expect(subject.client:submit(event(41)).admitted).toBe(true)
+    expect(outcomes(subject.client:close(5))).toBe('e41=committed')
+    expect(subject.client:status().reason).toBe('closed')
+    expect(subject.client:submit(event(42)).reason).toBe('closed')
+    expect(rows(subject.disk)).toBe(41)
+  end)
+
+  suite.it('refuses at once what it cannot take, and never waits to do it', function()
+    local subject = world({ maxOutstanding = 5 })
+    expect(subject.client:submit(event(1)).reason).toBe('closed')
+    assert(subject.client:open(Path, Tables))
+    for number = 1, 5 do expect(subject.client:submit(event(number)).admitted).toBe(true) end
+
+    local full = subject.client:submit(event(6))
+    expect(`{tostring(full.admitted)} {tostring(full.reason)} {full.outstanding}`).toBe('false backpressure 5')
+    expect(subject.client:submit(event(3)).reason).toBe('duplicate-id')
+    expect(subject.client:submit({ id = '', operations = {} }).reason).toBe('invalid: a request has an id')
+    -- Refused here means never sent: the worker saw five submits and no more.
+    expect(#subject.mailbox).toBe(5)
+    expect(#subject.client:poll(0)).toBe(5)
+    expect(subject.client:submit(event(6)).admitted).toBe(true)
+
+    -- A mailbox that will not take a message is an answer too, and the request is not counted.
+    subject.capacity = 0
+    local refused = subject.client:submit(event(7))
+    expect(`{tostring(refused.reason)} {refused.outstanding}`).toBe('transport 1')
+    subject.capacity = 1024
+    expect(outcomes(subject.client:poll(0))).toBe('e6=committed')
+
+    -- Options that are not bounds are refused when the client is made.
+    for _, bad in { { maxOutstanding = 0 }, { maxOutstanding = 961 }, { maxOutstanding = 1.5 }, { flushTimeoutSeconds = 0 }, { flushTimeoutSeconds = 0 / 0 } } :: { service.ClientOptions } do
+      expect((pcall(service.client, subject.lane, bad))).toBe(false)
+    end
+  end)
+
+  suite.it('calls every unanswered request unknown, once, when the worker dies, and commits none of them itself', function()
+    local subject = world()
+    assert(subject.client:open(Path, Tables))
+    for number = 1, 3 do subject.client:submit(event(number)) end
+
+    expect(outcomes(subject.client:poll(0))).toBe('e1=committed e2=committed e3=committed')
+    for number = 4, 6 do subject.client:submit(event(number)) end
+
+    subject.dead = true
+    local acks = subject.client:poll(0)
+    expect(outcomes(acks)).toBe('e4=unknown e5=unknown e6=unknown')
+    expect(acks[1].error).toBe('the worker failed')
+    local status = subject.client:status()
+    expect(`{tostring(status.stopped)} {tostring(status.reason)} {status.outstanding}`).toBe('true the worker failed 0')
+    -- Once: nothing is reported twice, and nothing more is taken.
+    expect(#subject.client:poll(0)).toBe(0)
+    expect(subject.client:submit(event(7)).reason).toBe('stopped')
+    expect(#subject.client:close(1)).toBe(0)
+    -- The three unknown ones never left the mailbox here: the worker handled three submits
+    -- and one flush before it died, and the client did not invent an outcome for the rest.
+    expect(table.concat(subject.handled, ' ')).toBe('open submit submit submit flush')
+    expect(#subject.mailbox).toBe(3)
+  end)
+
+  suite.it('survives a worker that dies after the synchronization and before its reply: unknown, then exactly once', function()
+    local kept: ledger.Options = { table = 'requests', scope = 'client-1' }
+    local options: writer.Options = { ledger = kept }
+    local subject = world()
+    assert(subject.client:open(Path, Tables, options))
+    local function credit(number: number): writer.Request
+      -- One row a request; the ledger, not the row's key, is what is being relied on below.
+      return { id = `c{number}`, operations = { { op = 'insert', table = 'events', row = { id = number, body = 'credit' } } } }
+    end
+
+    for number = 1, 6 do subject.client:submit(credit(number)) end
+
+    -- The worker commits all six behind one synchronization, and dies with the answer unsent.
+    subject.dieAfterHandling = true
+    local acks = subject.client:poll(0)
+    expect(outcomes(acks)).toBe('c1=unknown c2=unknown c3=unknown c4=unknown c5=unknown c6=unknown')
+    expect(subject.client:status().stopped).toBe(true)
+
+    -- The process is gone and so is its lock; what it synchronized is on the disk.
+    subject.disk.crash()
+    expect(rows(subject.disk)).toBe(6)
+
+    -- A new worker over the same database, and every unknown request sent again, blind.
+    local again = world(nil, subject.disk)
+    assert(again.client:open(Path, Tables, options))
+    for number = 1, 6 do expect(again.client:submit(credit(number)).admitted).toBe(true) end
+
+    -- One more that never reached the first worker at all.
+    again.client:submit(credit(7))
+    local second = again.client:poll(0)
+    local already, fresh = 0, 0
+    for _, ack in second do
+      if ack.outcome == 'committed' then
+        fresh += 1
+      elseif ack.outcome == 'rejected' and ack.alreadyCommitted then
+        already += 1
+      end
+    end
+
+    expect(`already={already} fresh={fresh} of {#second}`).toBe('already=6 fresh=1 of 7')
+    expect(#again.client:close(5)).toBe(0)
+    -- Each applied once: seven rows, seven ledger entries, though thirteen requests were sent.
+    expect(rows(again.disk)).toBe(7)
+    local db = sql.catalog.openExisting(Path, { storage = again.disk.backend })
+    expect(db:query('SELECT COUNT(*) AS n FROM requests').rows[1].n).toBe(7)
+    local state = ledger.lookup(db, kept, { 'c1', 'c7', 'c8' })
+    expect(`{state.c1} {state.c7} {state.c8}`).toBe('committed committed absent')
+    db:close()
+  end)
+
+  suite.it('replaces a dead worker by itself and reports what its requests really became', function()
+    local kept: ledger.Options = { table = 'requests', scope = 'supervised' }
+    local disk = memfs.new()
+    local worlds: { World } = {}
+    -- Each worker after the first starts where a dead one left off: its lock is gone with it.
+    local function spawn(): service.Lane
+      if #worlds > 0 then disk.crash() end
+
+      local made = world(nil, disk)
+      table.insert(worlds, made)
+      return made.lane
+    end
+
+    local function credit(number: number): writer.Request
+      return { id = `s{number}`, operations = { { op = 'insert', table = 'events', row = { id = number, body = 'credit' } } } }
+    end
+
+    -- No wait between replacements here: the waiting has a test of its own.
+    local supervised = service.supervisor(spawn, { path = Path, tables = Tables, writer = { ledger = kept }, restartBackoffSeconds = 0 })
+    for number = 1, 5 do expect(supervised:submit(credit(number)).admitted).toBe(true) end
+
+    -- The hard moment: all five synchronized, the worker gone before its reply.
+    worlds[1].dieAfterHandling = true
+    expect(#supervised:poll(0)).toBe(0)
+    local status = supervised:status()
+    expect(`{status.restarts} {status.outstanding} {tostring(status.stopped)}`).toBe('1 5 false')
+    expect(#worlds).toBe(2)
+    -- The new worker refuses each as already there, and the caller is told the truth: committed.
+    expect(outcomes(supervised:poll(0))).toBe('s1=committed s2=committed s3=committed s4=committed s5=committed')
+    expect(supervised:status().outstanding).toBe(0)
+
+    -- The easy moment: the worker dies with the requests still in its mailbox. They commit in
+    -- the next one, for the first time.
+    for number = 6, 8 do supervised:submit(credit(number)) end
+
+    worlds[2].dead = true
+    expect(#supervised:poll(0)).toBe(0)
+    expect(outcomes(supervised:poll(0))).toBe('s6=committed s7=committed s8=committed')
+    expect(supervised:status().restarts).toBe(2)
+
+    -- A refusal that is not a retry stays a refusal: an id the caller itself sends twice, and a
+    -- row that is really already there.
+    supervised:submit(credit(1))
+    supervised:submit({ id = 'other', operations = credit(2).operations })
+    local refused = supervised:poll(0)
+    expect(outcomes(refused)).toBe('s1=rejected other=rejected')
+    expect(refused[1].alreadyCommitted == true).toBe(true)
+    expect(refused[2].alreadyCommitted == true).toBe(false)
+    expect(supervised:submit(credit(9)).admitted).toBe(true)
+    expect(supervised:submit(credit(9)).reason).toBe('duplicate-id')
+    expect(outcomes(supervised:close(5))).toBe('s9=committed')
+    expect(supervised:submit(credit(10)).reason).toBe('stopped')
+
+    -- Each applied once, whatever was sent how often.
+    expect(rows(disk)).toBe(9)
+  end)
+
+  suite.it('sends a dead worker\'s requests again as they were admitted, whatever the caller has done to them since', function()
+    local kept: ledger.Options = { table = 'requests', scope = 'frozen' }
+    local disk = memfs.new()
+    local worlds: { World } = {}
+    local function spawn(): service.Lane
+      if #worlds > 0 then disk.crash() end
+
+      local made = world(nil, disk)
+      table.insert(worlds, made)
+      return made.lane
+    end
+
+    local supervised = service.supervisor(spawn, { path = Path, tables = Tables, writer = { ledger = kept }, restartBackoffSeconds = 0 })
+    local requests: { writer.Request } = {}
+    for number = 1, 4 do
+      requests[number] = { id = `m{number}`, operations = {
+        { op = 'insert', table = 'events', row = { id = number, body = 'ORIGINAL' } },
+        { op = 'upsert', table = 'counters', row = { id = 'last', value = number } },
+      } }
+      expect(supervised:submit(requests[number]).admitted).toBe(true)
+    end
+
+    -- Admitted. Now everything a caller can reach is changed: a value in a row, a row itself,
+    -- an operation, the list of operations, the id.
+    local function meddle()
+      local first = requests[1].operations[1].row :: { [string]: unknown }
+      first.body = 'MUTATED'
+      first.id = 901
+      requests[2].operations[1].row = { id = 902, body = 'MUTATED' }
+      requests[3].operations[1] = { op = 'insert', table = 'events', row = { id = 903, body = 'MUTATED' } }
+      table.insert(requests[3].operations, { op = 'insert', table = 'events', row = { id = 913, body = 'MUTATED' } })
+      requests[4].operations = { { op = 'insert', table = 'events', row = { id = 904, body = 'MUTATED' } } }
+      requests[4].id = 'm4-renamed'
+    end
+
+    meddle()
+    -- The first worker dies with all four still in its mailbox: none was committed, so what
+    -- the second is sent is what will be.
+    worlds[1].dead = true
+    expect(#supervised:poll(0)).toBe(0)
+    expect(#worlds).toBe(2)
+    -- Changed again while they wait in the second worker's mailbox.
+    meddle()
+    expect(outcomes(supervised:poll(0))).toBe('m1=committed m2=committed m3=committed m4=committed')
+    expect(#supervised:close(5)).toBe(0)
+
+    local db = sql.catalog.openExisting(Path, { storage = disk.backend })
+    local stored = db:query('SELECT id, body FROM events ORDER BY id').rows
+    expect(#stored).toBe(4)
+    for number, row in stored do expect(`{tostring(row.id)} {tostring(row.body)}`).toBe(`{number} ORIGINAL`) end
+
+    expect(db:query('SELECT value FROM counters').rows[1].value).toBe(4)
+    local state = ledger.lookup(db, kept, { 'm1', 'm4', 'm4-renamed' })
+    expect(`{state.m1} {state.m4} {state['m4-renamed']}`).toBe('committed committed absent')
+    db:close()
+
+    -- What is not a request is refused where it is offered, and nothing of it is kept.
+    local late = service.supervisor(spawn, { path = Path, tables = Tables, writer = { ledger = kept }, restartBackoffSeconds = 0 })
+    expect(late:submit({ id = 'bad', operations = { { op = 'insert', table = 'events', row = { id = 5, body = { 'a table' } } } } } :: any).reason)
+      .toBe('invalid: operation 1: a value is a string, a number, a boolean or NULL')
+    expect(late:submit({ id = '', operations = {} } :: any).admitted).toBe(false)
+    expect(late:status().outstanding).toBe(0)
+    late:close(5)
+  end)
+
+  suite.it('gives its requests up as unknown when workers keep dying, and will not retry without a ledger', function()
+    local kept: ledger.Options = { table = 'requests' }
+    local disk = memfs.new()
+    local started = 0
+    -- Every worker opens the database, handles what it is sent, and dies before replying.
+    local function spawn(): service.Lane
+      if started > 0 then disk.crash() end
+
+      started += 1
+      local made = world(nil, disk)
+      local lane = table.clone(made.lane)
+      local opened = false
+      lane.receive = function(_self: service.Lane, seconds: number?): unknown
+        local reply = made.lane:receive(seconds)
+        if not opened then
+          opened = true
+          made.dieAfterHandling = true
+        end
+
+        return reply
+      end
+      return lane
+    end
+
+    local supervised = service.supervisor(spawn, { path = Path, tables = Tables, writer = { ledger = kept }, maxRestarts = 2, restartBackoffSeconds = 0 })
+    for number = 1, 3 do
+      supervised:submit({ id = `u{number}`, operations = { { op = 'insert', table = 'events', row = { id = number, body = 'x' } } } })
+    end
+
+    expect(#supervised:poll(0)).toBe(0)
+    expect(#supervised:poll(0)).toBe(0)
+    local acks = supervised:poll(0)
+    expect(outcomes(acks)).toBe('u1=unknown u2=unknown u3=unknown')
+    expect(acks[1].error).toBe('the worker was replaced as often as allowed')
+    local status = supervised:status()
+    expect(`{status.restarts} {tostring(status.stopped)} {started}`).toBe('2 true 3')
+    expect(#supervised:poll(0)).toBe(0)
+    -- Unknown is honest: the first worker had in fact committed them.
+    disk.crash()
+    expect(rows(disk)).toBe(3)
+
+    -- Without a ledger a retry could apply a request twice, so there is no supervisor.
+    local bare: service.SupervisorOptions = { path = Path, tables = Tables, writer = {} }
+    local negative: service.SupervisorOptions = { path = Path, tables = Tables, writer = { ledger = kept }, maxRestarts = -1 }
+    -- Making a supervisor with no ledger raises: that refusal is what is being tested.
+    expect((pcall(service.supervisor, spawn, bare))).toBe(false)
+    -- And so does a number of restarts that is not one.
+    expect((pcall(service.supervisor, spawn, negative))).toBe(false)
+    -- A worker that cannot be started is a supervisor that is stopped, not an error.
+    local none = service.supervisor(function(): service.Lane error('no script domain', 0) end, { path = Path, tables = Tables, writer = { ledger = kept } })
+    expect(none:status().reason).toBe('no worker could be started')
+    expect(none:submit({ id = 'x', operations = {} }).reason).toBe('stopped')
+  end)
+
+  suite.it('waits between one replacement and the next, longer each time, and admits nothing while it waits', function()
+    local kept: ledger.Options = { table = 'requests' }
+    local disk = memfs.new()
+    local now = 100
+    local started = 0
+    local latest: World? = nil
+    local function spawn(): service.Lane
+      if started > 0 then disk.crash() end
+
+      started += 1
+      local made = world(nil, disk)
+      latest = made
+      return made.lane
+    end
+
+    local supervised = service.supervisor(spawn, { path = Path, tables = Tables, writer = { ledger = kept }, maxRestarts = 5,
+      restartBackoffSeconds = 2, client = { now = function(): number return now end } })
+
+    local function send(number: number): service.Admission
+      return supervised:submit({ id = `b{number}`, operations = { { op = 'insert', table = 'events', row = { id = number, body = 'x' } } } })
+    end
+
+    -- The first death is answered at once.
+    send(1);
+    (latest :: World).dead = true
+    expect(#supervised:poll(0)).toBe(0)
+    expect(started).toBe(2)
+    expect(outcomes(supervised:poll(0))).toBe('b1=committed')
+
+    -- The second, straight after: no new worker until two seconds have passed, and nothing is
+    -- admitted in the meantime, as backpressure.
+    send(2);
+    (latest :: World).dead = true
+    expect(#supervised:poll(0)).toBe(0)
+    expect(started).toBe(2)
+    expect(send(3).reason).toBe('backpressure')
+    now = 101.9
+    expect(#supervised:poll(0)).toBe(0)
+    expect(started).toBe(2)
+    now = 102
+    expect(#supervised:poll(0)).toBe(0)
+    expect(started).toBe(3)
+    expect(outcomes(supervised:poll(0))).toBe('b2=committed')
+
+    -- The third waits twice as long, counted from the replacement before it.
+    send(4);
+    (latest :: World).dead = true
+    now = 105.9
+    expect(#supervised:poll(0)).toBe(0)
+    expect(started).toBe(3)
+    now = 106
+    supervised:poll(0)
+    expect(started).toBe(4)
+    expect(outcomes(supervised:poll(0))).toBe('b4=committed')
+    expect(supervised:status().restarts).toBe(3)
+
+    -- A wait that is not a number of seconds is refused when the supervisor is made.
+    local negative: service.SupervisorOptions = { path = Path, tables = Tables, writer = { ledger = kept }, restartBackoffSeconds = -1 }
+    -- Making it raises: that refusal is what is being tested.
+    expect((pcall(service.supervisor, spawn, negative))).toBe(false)
+  end)
+
+  suite.it('gives up on a worker that does not answer a flush in time, and on one that does not close', function()
+    local subject = world({ flushTimeoutSeconds = 10 })
+    assert(subject.client:open(Path, Tables))
+    subject.client:submit(event(1))
+    subject.silent = true
+    -- Looked at for nine seconds: still waiting, nothing claimed.
+    expect(#subject.client:poll(9)).toBe(0)
+    expect(subject.client:status().stopped).toBe(false)
+    -- One flush is outstanding, and no second one is sent on top of it.
+    expect(#subject.client:poll(0)).toBe(0)
+    expect(subject.client:status().flushes).toBe(1)
+    local acks = subject.client:poll(2)
+    expect(outcomes(acks)).toBe('e1=unknown')
+    expect(acks[1].error).toBe('the worker did not answer a flush in time')
+    expect(subject.client:status().stopped).toBe(true)
+
+    -- The request was in the worker's mailbox all along. A worker that then wakes may commit
+    -- it: that is exactly what unknown means, and why the client never said rejected.
+    local late = world()
+    assert(late.client:open(Path, Tables))
+    late.client:submit(event(1))
+    late.silent = true
+    local unanswered = late.client:close(3)
+    expect(outcomes(unanswered)).toBe('e1=unknown')
+    expect(unanswered[1].error).toBe('the worker did not close in time')
+    late.silent = false
+    late.lane:receive(0)
+    expect(rows(late.disk)).toBe(1)
+  end)
+
+  suite.it('answers every malformed or untimely message at the host without raising', function()
+    local host = service.host({ storage = memfs.new().backend })
+    local function kindOf(reply: unknown): string
+      local fields = reply :: { kind: string, reason: string? }
+      return `{fields.kind}:{tostring(fields.reason)}`
+    end
+
+    expect(kindOf(host({ kind = 'submit', request = event(1) }))).toBe('failed:not open')
+    expect(kindOf(host({ kind = 'flush', serial = 1 }))).toBe('failed:not open')
+    expect(kindOf(host('not a table'))).toBe('failed:not open')
+    expect(kindOf(host({ kind = 'open' }))).toBe('failed:open needs a path and tables')
+    expect(string.find(kindOf(host({ kind = 'open', path = Path, tables = Tables, options = { maxBatch = 100000 } })), 'jessql writer: invalid maxBatch', 1, true) ~= nil).toBe(true)
+    -- A failed open leaves the host able to open: the database it had opened was closed again.
+    expect(kindOf(host({ kind = 'open', path = Path, tables = Tables }))).toBe('opened:nil')
+    expect(kindOf(host({ kind = 'open', path = Path, tables = Tables }))).toBe('failed:already open')
+    expect(kindOf(host({ kind = 'nonsense' }))).toBe('failed:unknown message')
+    expect(kindOf(host({ kind = 'submit', request = 'not a request' }))).toBe('refused:invalid: a request is a table')
+    expect(kindOf(host({ kind = 'close' }))).toBe('closed:nil')
+    expect(kindOf(host({ kind = 'flush', serial = 2 }))).toBe('failed:not open')
+  end)
+end)
+
+-- The review of 2026-11-13 (after #95): the supervisor's own bookkeeping.
+suite.describe('a supervisor\'s requests over time', function()
+  -- A supervisor whose workers each start where the dead one left off.
+  local function supervised(disk: Disk, extra: { [string]: unknown }?): (service.Supervisor, { World }, { now: number })
+    local worlds: { World } = {}
+    local clock = { now = 0 }
+    local function spawn(): service.Lane
+      if #worlds > 0 then disk.crash() end
+
+      local made = world(nil, disk)
+      table.insert(worlds, made)
+      return made.lane
+    end
+
+    local options: service.SupervisorOptions = { path = Path, tables = Tables, writer = { ledger = { table = 'requests', scope = 'shared' } },
+      restartBackoffSeconds = 0, client = { now = function(): number return clock.now end } }
+
+    for name, value in extra or {} do (options :: { [string]: unknown })[name] = value end
+
+    return service.supervisor(spawn, options), worlds, clock
+  end
+
+  local function insert(id: string, number: number, body: string): writer.Request
+    return { id = id, operations = { { op = 'insert', table = 'events', row = { id = number, body = body } } } }
+  end
+
+  suite.it('never calls a request committed because another request with its id committed before', function()
+    local disk = memfs.new()
+    -- One process: a request `order-1` commits, and the supervisor closes.
+    local first = supervised(disk)
+    first:submit(insert('order-1', 1, 'A: pay 10'))
+    expect(outcomes(first:poll(0))).toBe('order-1=committed')
+    first:close(5)
+
+    -- The next, over the same database and ledger: another request with the same id, whose
+    -- worker dies before it is handled. Sent again, the ledger refuses it as an id reused.
+    local second, worlds = supervised(disk)
+    expect(second:submit(insert('order-1', 2, 'B: pay 99')).admitted).toBe(true)
+    worlds[#worlds].dead = true
+    local acks: { service.Ack } = {}
+    for _ = 1, 4 do
+      for _, ack in second:poll(0) do table.insert(acks, ack) end
+    end
+
+    expect(outcomes(acks)).toBe('order-1=rejected')
+    expect(acks[1].error).toBe(ledger.Reused)
+    expect(acks[1].alreadyCommitted == true).toBe(false)
+    second:close(5)
+    local db = sql.catalog.openExisting(Path, { storage = disk.backend })
+    expect(`{db:get('events', 1) ~= nil} {db:get('events', 2) ~= nil}`).toBe('true false')
+    db:close()
+
+    -- The same request again, the same content in another column order: a retry, committed.
+    local third, again = supervised(disk)
+    third:submit({ id = 'order-1', operations = { { op = 'insert', table = 'events', row = { body = 'A: pay 10', id = 1 } } } })
+    again[#again].dead = true
+    local retried: { service.Ack } = {}
+    for _ = 1, 4 do
+      for _, ack in third:poll(0) do table.insert(retried, ack) end
+    end
+
+    expect(outcomes(retried)).toBe('order-1=committed')
+    third:close(5)
+  end)
+
+  suite.it('keeps no more of the requests it has answered than it must', function()
+    local collect = require('@jess/bench').collect
+    local disk = memfs.new()
+    local subject, worlds = supervised(disk)
+    -- Each request deletes a row that is not there: it is answered (rejected) and the database
+    -- keeps nothing of it, so what grows is the supervisor's own.
+    local function absent(id: string, number: number): writer.Request
+      return { id = id, operations = { { op = 'delete', table = 'events', key = number } } }
+    end
+
+    -- Warm: the database open, the first batches done.
+    for number = 1, 200 do subject:submit(absent(`w{number}`, number)) end
+
+    subject:poll(0)
+    collect()
+    local before = gcinfo()
+    for round = 1, 200 do
+      for slot = 1, 100 do
+        local number = 1000 + round * 100 + slot
+        subject:submit(absent(`request-{number}`, number))
+      end
+
+      local looks = 0
+      while subject:status().outstanding > 0 and looks < 20 do
+        subject:poll(0)
+        looks += 1
+      end
+
+      -- The stand-in worker's record of what it handled is the test's, not the supervisor's.
+      table.clear(worlds[#worlds].handled)
+    end
+
+    collect()
+    local grown = gcinfo() - before
+    expect(subject:status().outstanding).toBe(0)
+    -- 20,000 answered requests kept forever would be about 1,500 KB.
+    expect(`grew {grown} KB: {grown < 256}`).toBe(`grew {grown} KB: true`)
+    subject:close(5)
+  end)
+
+  suite.it('sends an id answered and then sent again once, when the worker dies, and keeps going', function()
+    local disk = memfs.new()
+    local subject, worlds = supervised(disk)
+    subject:submit(insert('x', 1, 'first'))
+    expect(outcomes(subject:poll(0))).toBe('x=committed')
+    -- The same id again (refused by the ledger, as it should be), and another request; then the
+    -- worker dies with both waiting.
+    subject:submit(insert('x', 1, 'first'))
+    subject:submit(insert('c1', 2, 'other'))
+    worlds[#worlds].dead = true
+    local acks: { service.Ack } = {}
+    for _ = 1, 4 do
+      for _, ack in subject:poll(0) do table.insert(acks, ack) end
+    end
+
+    table.sort(acks, function(left: service.Ack, right: service.Ack): boolean return left.id < right.id end)
+    expect(outcomes(acks)).toBe('c1=committed x=committed')
+    local status = subject:status()
+    expect(`{status.stopped} {status.restarts}`).toBe('false 1')
+    expect(subject:submit(insert('c2', 3, 'later')).admitted).toBe(true)
+    subject:close(5)
+  end)
+
+  -- Re-review of #97: an id answered and sent again goes again where it was sent again.
+  suite.it('sends unanswered requests again in the order they were last sent, an id used again included', function()
+    local disk = memfs.new()
+    local subject, worlds = supervised(disk)
+    local function remove(id: string): writer.Request
+      return { id = id, operations = { { op = 'delete', table = 'events', key = 1 } } }
+    end
+
+    -- `x` deletes a row that is not there: answered, rejected.
+    subject:submit(remove('x'))
+    expect(outcomes(subject:poll(0))).toBe('x=rejected')
+    -- Then `y` makes the row and `x` again deletes it; the worker dies before either is handled.
+    subject:submit(insert('y', 1, 'made'))
+    subject:submit(remove('x'))
+    worlds[#worlds].dead = true
+    local acks: { service.Ack } = {}
+    for _ = 1, 4 do
+      for _, ack in subject:poll(0) do table.insert(acks, ack) end
+    end
+
+    expect(outcomes(acks)).toBe('y=committed x=committed')
+    subject:close(5)
+    -- Applied as they were sent: made, then deleted.
+    expect(rows(disk)).toBe(0)
+  end)
+
+  suite.it('takes a retry built again with -0 for 0, or another NaN, as the same request', function()
+    local function with(value: number): writer.Request
+      return { id = 'same', operations = { { op = 'upsert', table = 'counters', row = { id = 'n', value = value } } } }
+    end
+
+    expect(writer.digest(with(0)) == writer.digest(with(-0))).toBe(true)
+    expect(writer.digest(with(0 / 0)) == writer.digest(with(-(0 / 0)))).toBe(true)
+    expect(writer.digest(with(1)) == writer.digest(with(1.0))).toBe(true)
+    expect(writer.digest(with(1)) == writer.digest(with(2))).toBe(false)
+    expect(writer.digest({ id = 'same', operations = { { op = 'delete', table = 'events', key = '1' } } })
+      == writer.digest({ id = 'same', operations = { { op = 'delete', table = 'events', key = 1 } } })).toBe(false)
+  end)
+
+  suite.it('counts replacements within a window, and answers every held request when closed while it waits', function()
+    local disk = memfs.new()
+    local subject, worlds, clock = supervised(disk, { maxRestarts = 3, restartWindowSeconds = 3600 })
+    -- Four deaths a day apart, each recovered: never given up on.
+    for day = 1, 4 do
+      clock.now = day * 86400
+      subject:submit(insert(`d{day}`, day, 'x'))
+      worlds[#worlds].dead = true
+      local acks: { service.Ack } = {}
+      for _ = 1, 4 do
+        for _, ack in subject:poll(0) do table.insert(acks, ack) end
+      end
+
+      expect(`{day}: {outcomes(acks)} {subject:status().stopped}`).toBe(`{day}: d{day}=committed false`)
+    end
+
+    expect(subject:status().restarts).toBe(4)
+
+    -- Closed while a dead worker waits to be replaced: the request held gets an outcome.
+    local waiting, lanes = supervised(memfs.new(), { restartBackoffSeconds = 10 })
+    waiting:submit(insert('a', 1, 'x'))
+    expect(outcomes(waiting:poll(0))).toBe('a=committed')
+    waiting:submit(insert('b', 2, 'x'))
+    lanes[#lanes].dead = true
+    local answered: { service.Ack } = {}
+    for _ = 1, 4 do
+      for _, ack in waiting:poll(0) do table.insert(answered, ack) end
+    end
+
+    expect(outcomes(answered)).toBe('b=committed')
+    waiting:submit(insert('c', 3, 'x'))
+    lanes[#lanes].dead = true
+    -- The second death comes within the backoff: nothing replaces the worker yet.
+    expect(#waiting:poll(0)).toBe(0)
+    local closed = waiting:close(5)
+    local said: { string } = {}
+    for _, ack in closed do table.insert(said, `{ack.id}={ack.outcome}`) end
+    table.sort(said)
+    expect(table.concat(said, ' ')).toBe('c=unknown')
+    expect(waiting:status().outstanding).toBe(0)
+  end)
+
+  -- J-FINAL-02 (hostile review, 2026-11-13): the supervisor read "committed before" out of an
+  -- error's text, and a request's own table name is in its error's text. A request against a
+  -- table named like the ledger's refusal, sent again to a new worker, was called committed
+  -- though it never ran. Only the ledger itself may say so, in a field, not in words.
+  local function forged(id: string): writer.Request
+    return { id = id, operations = { { op = 'insert', table = ledger.AlreadyCommitted, row = { id = 1, body = 'x' } } } }
+  end
+
+  -- Neither the request nor its id is in the database: it never ran.
+  local function absent(disk: Disk, id: string)
+    local db = sql.catalog.openExisting(Path, { storage = disk.backend })
+    expect(ledger.lookup(db, { table = 'requests', scope = 'shared' }, { id })[id]).toBe('absent')
+    expect(db:query('SELECT COUNT(*) AS n FROM requests').rows[1].n).toBe(0)
+    db:close()
+  end
+
+  suite.it('never calls a request committed because its error says the ledger\'s words, answered by poll', function()
+    local disk = memfs.new()
+    local polled, worlds = supervised(disk)
+    expect(polled:submit(forged('forged-poll')).admitted).toBe(true)
+    -- The worker dies before it handles the request; the next one runs it, and it fails.
+    worlds[#worlds].dead = true
+    local acks: { service.Ack } = {}
+    for _ = 1, 4 do
+      for _, ack in polled:poll(0) do table.insert(acks, ack) end
+    end
+
+    expect(polled:status().restarts).toBe(1)
+    expect(outcomes(acks)).toBe('forged-poll=rejected')
+    expect(acks[1].aborted).toBe(true)
+    expect(acks[1].alreadyCommitted).toBe(nil)
+    expect(#polled:close(5)).toBe(0)
+    absent(disk, 'forged-poll')
+  end)
+
+  suite.it('never calls a request committed because its error says the ledger\'s words, answered by close', function()
+    local disk = memfs.new()
+    local closing, lanes = supervised(disk)
+    expect(closing:submit(forged('forged-close')).admitted).toBe(true)
+    -- The worker dies; the next poll replaces it and sends the request again; the close answers.
+    lanes[#lanes].dead = true
+    expect(#closing:poll(0)).toBe(0)
+    expect(closing:status().restarts).toBe(1)
+    local closed = closing:close(5)
+    expect(outcomes(closed)).toBe('forged-close=rejected')
+    expect(closed[1].aborted).toBe(true)
+    expect(closed[1].alreadyCommitted).toBe(nil)
+    absent(disk, 'forged-close')
+
+    -- A request that did commit, replayed and answered by close, is still told the truth.
+    local again, more = supervised(disk)
+    again:submit(insert('real', 5, 'x'))
+    more[#more].dieAfterHandling = true
+    expect(#again:poll(0)).toBe(0)
+    expect(outcomes(again:close(5))).toBe('real=committed')
+    expect(rows(disk)).toBe(1)
+  end)
+
+  -- Review of e2d173d: a request that writes the ledger's table enters another request's id and
+  -- digest, both computable by anyone, and that other is refused as committed without running;
+  -- after a replacement the supervisor called it committed. The writer takes no such request.
+  local function forger(victim: writer.Request): writer.Request
+    return { id = 'attacker', operations = { { op = 'insert', table = 'requests',
+      row = { key = ledger.key('shared', victim.id), scope = 'shared', id = victim.id, at = 1, digest = writer.digest(victim) } } } }
+  end
+
+  -- The victim's own row, and its ledger entry is its own.
+  local function ranItself(disk: Disk, number: number): string
+    local db = sql.catalog.openExisting(Path, { storage = disk.backend })
+    local said = `{db:get('events', number) ~= nil} {db:query('SELECT COUNT(*) AS n FROM requests').rows[1].n}`
+    db:close()
+    return said
+  end
+
+  suite.it('refuses a request that writes the ledger\'s table, and its victim runs, answered by poll', function()
+    local disk = memfs.new()
+    local polled, worlds = supervised(disk)
+    local victim = insert('victim', 42, 'v')
+    expect(polled:submit(forger(victim)).admitted).toBe(true)
+    expect(polled:submit(victim).admitted).toBe(true)
+    worlds[#worlds].dead = true
+    local acks: { service.Ack } = {}
+    for _ = 1, 4 do
+      for _, ack in polled:poll(0) do table.insert(acks, ack) end
+    end
+
+    expect(polled:status().restarts).toBe(1)
+    expect(outcomes(acks)).toBe('attacker=rejected victim=committed')
+    expect(acks[1].error).toBe('refused: invalid: operation 1 writes the ledger\'s table')
+    expect(#polled:close(5)).toBe(0)
+    expect(ranItself(disk, 42)).toBe('true 1')
+  end)
+
+  suite.it('refuses a request that writes the ledger\'s table, and its victim runs, answered by close', function()
+    local disk = memfs.new()
+    local closing, lanes = supervised(disk)
+    local victim = insert('victim', 43, 'v')
+    expect(closing:submit(forger(victim)).admitted).toBe(true)
+    expect(closing:submit(victim).admitted).toBe(true)
+    lanes[#lanes].dead = true
+    expect(#closing:poll(0)).toBe(0)
+    expect(closing:status().restarts).toBe(1)
+    local closed = closing:close(5)
+    local said: { string } = {}
+    for _, ack in closed do table.insert(said, `{ack.id}={ack.outcome}`) end
+    table.sort(said)
+    expect(table.concat(said, ' ')).toBe('attacker=rejected victim=committed')
+    expect(ranItself(disk, 43)).toBe('true 1')
+  end)
+end)
+
+return suite

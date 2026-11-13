@@ -7,6 +7,7 @@ local cycles = tonumber((...)) or 20000
 local path = fs.join(assert((fs.cwd())), '.jessql-churn-bench.wal')
 fs.remove(path)
 fs.remove(path .. '.lock')
+fs.remove(path .. '.committed')
 
 local db = sql.open(path)
 db:createTable('state', { 'id', 'bucket', 'value' }, 'id')
@@ -38,3 +39,4 @@ print(string.format('live_rows=%d row_slots=%d index_live=%d index_slots=%d',
 db:close()
 fs.remove(path)
 fs.remove(path .. '.lock')
+fs.remove(path .. '.committed')

@@ -1,0 +1,177 @@
+--!strict
+-- P1-01: a hybrid scan that does not copy the hot overlay. The streamed path must answer every
+-- query exactly as the materializing one does: same rows, same precedence of hot over cold, same
+-- deletions. Seeded random databases, both paths side by side. In memory.
+local memfs = require('@jessql/memfs')
+local sql = require('@jessql')
+local test = require('@jess/test')
+
+local expect = test.expect
+local suite = test.new()
+
+type Row = { [string]: unknown }
+
+local function generator(seed: number): (bound: number) -> number
+  local state = seed % 2147483646 + 1
+  return function(bound: number): number
+    state = state * 48271 % 2147483647
+    return state % bound + 1
+  end
+end
+
+local Rooms = { 'north', 'south', 'east', 'west' }
+
+-- A cold snapshot of `cold` rows and a hot overlay of seeded inserts, overwrites and deletions,
+-- opened with the given scan mode. The same seed gives the same database.
+local function build(seed: number, cold: number, changes: number, hotScan: string): sql.HybridDatabase
+  local pick = generator(seed)
+  local on = memfs.new().backend
+  local cursor = 0
+  sql.paged.create('/memory/cold.rows', { 'id', 'room', 'score', 'body' }, 'id', function(): Row?
+    cursor += 1
+    if cursor > cold then return nil end
+    return { id = cursor * 2, room = Rooms[pick(#Rooms)], score = pick(50), body = `cold{cursor}` }
+  end, { pageBytes = 1024, storage = on })
+
+  local db = sql.hybrid.open('/memory/hot.wal', '/memory/cold.rows', 'events', { cachePages = 2, storage = on, hotScan = hotScan })
+  db:transaction(function(tx)
+    local gone: { [number]: boolean } = {}
+    for change = 1, changes do
+      local key = pick(cold * 2 + 20)
+      local action = pick(10)
+      if action <= 3 and not gone[key] then
+        tx:delete(key)
+        gone[key] = true
+      else
+        tx:upsert({ id = key, room = Rooms[pick(#Rooms)], score = pick(50), body = `hot{change}` })
+        gone[key] = nil
+      end
+    end
+  end)
+  return db
+end
+
+local Queries: { { sql: string, params: { unknown }?, ordered: boolean } } = {
+  { sql = 'SELECT id, room, score, body FROM events', ordered = false },
+  { sql = 'SELECT id, body FROM events WHERE room = ?', params = { 'north' }, ordered = false },
+  { sql = 'SELECT id, score FROM events WHERE score > ? AND room = ?', params = { 25, 'east' }, ordered = false },
+  { sql = 'SELECT id, score, body FROM events ORDER BY score, id', ordered = true },
+  { sql = 'SELECT id, score FROM events WHERE room = ? ORDER BY score DESC, id LIMIT 7', params = { 'south' }, ordered = true },
+  { sql = 'SELECT id, body FROM events ORDER BY id', ordered = true },
+  { sql = 'SELECT id, body FROM events ORDER BY id DESC LIMIT 9', ordered = true },
+  { sql = 'SELECT id, body FROM events WHERE id >= ? AND id < ? ORDER BY id', params = { 20, 90 }, ordered = true },
+  { sql = 'SELECT id, room FROM events WHERE id = ?', params = { 40 }, ordered = true },
+  { sql = 'SELECT COUNT(*) AS n FROM events', ordered = true },
+  { sql = 'SELECT COUNT(*) AS n FROM events WHERE room = ?', params = { 'west' }, ordered = true },
+  { sql = 'SELECT room, COUNT(*) AS n FROM events GROUP BY room ORDER BY room', ordered = true },
+}
+
+local function answer(db: sql.HybridDatabase, query: { sql: string, params: { unknown }?, ordered: boolean }): string
+  local result = db:query(query.sql, query.params)
+  local lines: { string } = {}
+  for _, row in result.rows do
+    local cells: { string } = {}
+    for _, column in result.columns do table.insert(cells, tostring((row :: Row)[column])) end
+
+    table.insert(lines, table.concat(cells, '|'))
+  end
+
+  -- Without an ORDER BY the rows are a set: compared in a fixed order.
+  if not query.ordered then table.sort(lines) end
+
+  return table.concat(lines, '\n')
+end
+
+suite.describe('a streamed hybrid scan answers as the materializing one does', function()
+  suite.it('gives identical results for 12 queries over 30 seeded databases', function()
+    local compared, rows = 0, 0
+    for seed = 1, 30 do
+      local streamed, copied = build(seed, 60, 80, 'stream'), build(seed, 60, 80, 'materialize')
+      for _, query in Queries do
+        local got, want = answer(streamed, query), answer(copied, query)
+        expect(`seed {seed}: {query.sql}\n{got}`).toBe(`seed {seed}: {query.sql}\n{want}`)
+        compared += 1
+        rows += #string.split(want, '\n')
+      end
+
+      streamed:close()
+      copied:close()
+    end
+
+    expect(compared).toBe(360)
+    expect(rows > 5000).toBe(true)
+  end)
+
+  suite.it('reads a hot row over the cold one, hides a deleted cold row, and shows a row written again', function()
+    local db = build(3, 10, 0, 'stream')
+    db:transaction(function(tx)
+      tx:upsert({ id = 2, room = 'north', score = 1, body = 'overwritten' })
+      tx:delete(4)
+      tx:delete(6)
+      tx:upsert({ id = 6, room = 'south', score = 2, body = 'back' })
+      tx:insert({ id = 1001, room = 'east', score = 3, body = 'new' })
+    end)
+    local seen: { [number]: string } = {}
+    local count = 0
+    for _, row in db:query('SELECT id, body FROM events').rows do
+      local record = row :: Row
+      -- No key appears twice: a shadowed cold row is not also returned.
+      expect(seen[record.id :: number]).toBe(nil)
+      seen[record.id :: number] = record.body :: string
+      count += 1
+    end
+
+    expect(count).toBe(10)
+    expect(seen[2]).toBe('overwritten')
+    expect(seen[4]).toBe(nil)
+    expect(seen[6]).toBe('back')
+    expect(seen[1001]).toBe('new')
+    db:close()
+  end)
+
+  suite.it('still answers a scan made inside a transaction, where the store allows no cursor', function()
+    local db = build(5, 20, 10, 'stream')
+    local before = db:query('SELECT COUNT(*) AS n FROM events').rows[1].n :: number
+    local inside = -1
+    db:transaction(function(tx)
+      tx:insert({ id = 5001, room = 'west', score = 9, body = 'pending' })
+      inside = tx:query('SELECT COUNT(*) AS n FROM events').rows[1].n :: number
+    end)
+    expect(inside).toBe(before + 1)
+    expect(db:query('SELECT COUNT(*) AS n FROM events').rows[1].n).toBe(before + 1)
+    db:close()
+  end)
+
+  suite.it('refuses a scan mode it does not know', function()
+    -- hybrid.open raises on the unknown mode; the refusal is the assertion.
+    expect((pcall(build, 1, 4, 0, 'lazy'))).toBe(false)
+  end)
+
+  suite.it('allocates less for a scan of a large overlay than the copying path does', function()
+    -- Heap growth across one query, the largest of five tries: allocation, not residency.
+    local function growth(hotScan: string): number
+      local on = memfs.new().backend
+      sql.paged.create('/memory/cold.rows', { 'id', 'room', 'score', 'body' }, 'id', function(): Row? return nil end, { storage = on })
+      local db = sql.hybrid.open('/memory/hot.wal', '/memory/cold.rows', 'events', { storage = on, hotScan = hotScan })
+      db:transaction(function(tx)
+        for index = 1, 6000 do tx:insert({ id = index, room = 'north', score = index % 50, body = string.rep('b', 40) }) end
+      end)
+      local most = 0
+      for _ = 1, 5 do
+        local before = gcinfo()
+        local found = db:query('SELECT COUNT(*) AS n FROM events WHERE score = ?', { 7 }).rows[1].n
+        most = math.max(most, gcinfo() - before)
+        expect(found).toBe(120)
+      end
+
+      db:close()
+      return most
+    end
+
+    local streamed, copied = growth('stream'), growth('materialize')
+    print(`heap growth for one scan of 6000 hot rows: streamed {streamed} KB, copied {copied} KB`)
+    expect(streamed < copied).toBe(true)
+  end)
+end)
+
+return suite

@@ -3,7 +3,8 @@
 -- JessQL's native append-only store. No external database or FFI dependency.
 -- Records are length-delimited and CRC-protected; one record contains one transaction.
 -- A torn trailing record is discarded. A corrupt complete record fails closed.
-local fs = require('@dream/fs')
+local vfs = require('@jessql/vfs')
+local walmark = require('@jessql/walmark')
 local bytes = require('@dream/bytes')
 local json = require('@jess/json')
 local queryEngine = require('@jessql/engine')
@@ -13,6 +14,13 @@ local mutations = require('@jessql/mutations')
 
 export type Row = { [string]: unknown }
 export type Options = { maxFrameBytes: number?, recoverTail: boolean?, queryCacheEntries: number?, rowLayout: string?, durability: string?, trackPayloadBytes: boolean?,
+  -- The backend the database lives on; without it, the VM default at the time it is opened.
+  storage: vfs.Backend?,
+  -- For a database whose manifest names its logs (managed, catalog): a log that is not there is
+  -- one the manifest has just named, and a mark of that name left beside no log says nothing
+  -- about it. Without this, a mark that says transactions were committed to a log that is gone
+  -- refuses the open.
+  manifestNamesLog: boolean?,
   -- Fault injection for deterministic tests of uncertain batch acknowledgments.
   batchTestHook: ((string) -> ())? }
 export type BatchResult = { ok: boolean, error: string? }
@@ -39,6 +47,10 @@ export type Store = {
   stats: (self: Store) -> { [string]: TableMetrics },
   tableFootprint: (self: Store, name: string) -> { rows: number, payloadBytes: number? },
   cacheStats: (self: Store) -> CacheMetrics,
+  -- Whether the log's committed length is being witnessed: `witnessed` (a synchronized log with
+  -- its mark), `unwitnessed` (synchronized, but the mark could not be made: a log found short
+  -- will not be caught), or `not-synchronized`.
+  witness: ((self: Store) -> string)?,
   checkpoint: (self: Store) -> (),
   close: (self: Store) -> (),
 }
@@ -101,6 +113,8 @@ type Operation = { kind: string, table: string, columns: { string }?, primaryKey
 type Pending = { [string]: { [string]: Row | boolean } }
 type DatabaseState = {
   path: string,
+  -- The disk this database lives on, fixed when it was opened.
+  fs: vfs.Backend,
   lock: dream_fs_Lock,
   engine: queryEngine.Database,
   tables: { [string]: TableState },
@@ -114,10 +128,18 @@ type DatabaseState = {
   trackPayloadBytes: boolean,
   durability: string,
   walWriter: dream_fs_Writer?,
+  -- The log's committed-length mark, and how long the log is now. See `@jessql/walmark`.
+  mark: walmark.Writer?,
+  -- A record of the mark could not be written: it is behind, still true, and the store no longer
+  -- says it is witnessed. The writer is kept, to withdraw the mark before a checkpoint.
+  markLapsed: boolean,
+  walLength: number,
 }
 
 local Magic = 'JQLW1\n'
 local HeaderBytes = 8
+-- The most transactions one batch frames behind a single synchronization.
+local MaxBatchEntries = 256
 local DefaultMaxFrame = 16 * 1024 * 1024
 local Deleted = false
 
@@ -1527,7 +1549,7 @@ local function replay(state: DatabaseState, operations: { Operation })
 end
 
 local function load(state: DatabaseState, recoverTail: boolean)
-  local reader, err = fs.open(state.path)
+  local reader, err = state.fs.open(state.path)
   if not reader then error('jessql storage: ' .. tostring(err), 2) end
   local size = reader:size()
   local magic = reader:readAt(0, #Magic)
@@ -1537,6 +1559,85 @@ local function load(state: DatabaseState, recoverTail: boolean)
   end
   local offset = #Magic
   local limit = state.maxFrameBytes
+  -- The other witness to where the log ends, read before the log is: it also says which broken
+  -- frame at the end can only be a write a power cut tore.
+  local witness, committed = walmark.examine(state.fs, state.path)
+  if witness == 'damaged' then
+    reader:close()
+    -- Not the same as no mark: something wrote one and it cannot be read now, so whether the
+    -- log beside it is whole cannot be said. Refused, as a log found short is.
+    error(`jessql storage: the committed-length mark beside the log is damaged, so it cannot be said whether the log is whole (remove {walmark.path(state.path)} to accept the log as it is)`, 2)
+  end
+
+  -- Whether every byte from `from` to the end is zero.
+  local function zeroFrom(from: number): boolean
+    local at = from
+    while at < size do
+      local piece = reader:readAt(at, math.min(1048576, size - at))
+      if not piece or buffer.len(piece) == 0 then return false end
+      if string.find(buffer.tostring(piece), '[^\0]') then return false end
+      at += buffer.len(piece)
+    end
+
+    return true
+  end
+
+  -- Whether the bytes from `from` to the end begin with a whole JSON object. Every payload is
+  -- one (`json.encodeTable`, which escapes quotes, backslashes and control bytes in strings), so
+  -- the start of one never holds a whole one: the object closes at the payload's last byte.
+  local function wholeObjectFrom(from: number): boolean
+    local depth, quoted, escaped = 0, false, false
+    local at = from
+    while at < size do
+      local piece = reader:readAt(at, math.min(1048576, size - at))
+      if not piece or buffer.len(piece) == 0 then
+        reader:close()
+        error('jessql storage: read failed', 3)
+      end
+
+      local text = buffer.tostring(piece)
+      if at == from and string.byte(text, 1) ~= 123 then return false end
+      local index = if escaped then 2 else 1
+      escaped = false
+      while true do
+        local found = string.find(text, if quoted then '["\\]' else '[{}%[%]"]', index)
+        if not found then break end
+        local byte = string.byte(text, found)
+        index = found + 1
+        if byte == 34 then
+          quoted = not quoted
+        elseif byte == 92 then
+          -- Inside a string, a backslash escapes the byte after it, perhaps in the next piece.
+          if found == #text then escaped = true end
+          index = found + 2
+        elseif byte == 123 or byte == 91 then
+          depth += 1
+        else
+          depth -= 1
+          if depth == 0 then return true end
+        end
+      end
+
+      at += buffer.len(piece)
+    end
+
+    return false
+  end
+
+  -- At most what one append left unsynchronized when the power went: one batch of frames.
+  local inFlight = MaxBatchEntries * (HeaderBytes + limit)
+
+  -- A frame that cannot be read is a torn tail, to be cut, only when it lies wholly past what
+  -- the mark says was committed, no further from the end than one append can reach, and every
+  -- byte from `zerosFrom` on is zero: blocks a power cut left allocated and never written. A
+  -- synchronization reported done is trusted (decided 2026-11-13, see `@jessql/walmark`), so
+  -- zeros after the last whole frame were never acknowledged. Anything else is refused as before
+  -- (review of 2026-11-13: such a tail made a sound store refuse to open).
+  local function tornTail(zerosFrom: number): boolean
+    return recoverTail and committed ~= nil and offset >= committed.length and state.sequence >= committed.sequence
+      and size - offset <= inFlight and zeroFrom(zerosFrom)
+  end
+
   while offset < size do
     if size - offset < HeaderBytes then break end
     local header = reader:readAt(offset, HeaderBytes)
@@ -1547,11 +1648,23 @@ local function load(state: DatabaseState, recoverTail: boolean)
     local length = buffer.readu32(header, 0)
     local checksum = buffer.readu32(header, 4)
     if length == 0 or length > limit then
+      if tornTail(offset) then break end
+
       reader:close()
       error('jessql storage: invalid frame length', 2)
     end
 
-    if size - offset - HeaderBytes < length then break end
+    if size - offset - HeaderBytes < length then
+      -- A frame cut short by a crash holds only the start of its payload, never a whole object.
+      -- One whose payload is all there, whatever follows it (frames after it, or zeros), has a
+      -- damaged length, and is refused, not cut (J-FINAL-01, re-review).
+      if wholeObjectFrom(offset + HeaderBytes) then
+        reader:close()
+        error('jessql storage: invalid frame length', 2)
+      end
+
+      break
+    end
     local body = reader:readAt(offset + HeaderBytes, length)
     if not body or buffer.len(body) ~= length then
       reader:close()
@@ -1559,6 +1672,21 @@ local function load(state: DatabaseState, recoverTail: boolean)
     end
     local payload = buffer.tostring(body)
     if bytes.crc32(payload) ~= checksum then
+      -- Writeback a page at a time can keep the start of the last frame and lose the rest: it is
+      -- torn when its own last byte is a zero, which no payload ends in, and nothing but zeros
+      -- follows where it claims to end. A frame that is all there and does not check is damage,
+      -- refused: zeros after it, or none, say nothing of it (J-FINAL-01: a changed byte in an
+      -- acknowledged last frame past a mark behind it was cut as a tear). Nor is one whose bytes
+      -- hold a whole object before the zeros: the start of a payload never does, so its payload
+      -- is all there and its length was raised into zeros after it (re-review). The scan is
+      -- bounded: `tornTail` has held what is left of the log to one batch.
+      if buffer.readu8(body, length - 1) == 0 and tornTail(offset + HeaderBytes + length) then
+        if not wholeObjectFrom(offset + HeaderBytes) then break end
+
+        reader:close()
+        error('jessql storage: invalid frame length', 2)
+      end
+
       reader:close()
       error('jessql storage: checksum mismatch', 2)
     end
@@ -1573,9 +1701,16 @@ local function load(state: DatabaseState, recoverTail: boolean)
     offset += HeaderBytes + length
   end
   reader:close()
+  -- A log shorter than its mark did not get that way by a crash: it was damaged or replaced, and
+  -- is refused before anything is truncated.
+  if committed and (committed.length > offset or committed.sequence > state.sequence) then
+    error(`jessql storage: the log holds {state.sequence} transactions in {offset} bytes, fewer than the {committed.sequence} in {committed.length} bytes it was recorded to hold: it was damaged or replaced by an older copy (remove {walmark.path(state.path)} only to accept that loss)`, 2)
+  end
+
+  state.walLength = offset
   if offset ~= size then
     if not recoverTail then error('jessql storage: incomplete trailing transaction', 2) end
-    local writer, err = fs.openWrite(state.path, { create = false, truncate = false })
+    local writer, err = state.fs.openWrite(state.path, { create = false, truncate = false })
     if not writer then error('jessql storage: ' .. tostring(err), 2) end
     local ok, truncateError = writer:truncate(offset)
     local synced, syncError = true, nil
@@ -1587,6 +1722,16 @@ local function load(state: DatabaseState, recoverTail: boolean)
   end
 end
 
+-- Records the commits synchronized so far in the mark. A record that cannot be written leaves the
+-- mark behind, still true: the store goes on unwitnessed, and says so (re-review of #99: it went
+-- on saying it was witnessed). The writer is not let go: the file is still there, and a
+-- checkpoint must still withdraw it before the log it describes is replaced by a shorter one.
+local function recordMark(state: DatabaseState)
+  local mark = state.mark
+  if not mark or state.markLapsed then return end
+  if not mark.record(state.sequence, state.walLength) then state.markLapsed = true end
+end
+
 local function write(state: DatabaseState, ops: { Operation }, deferSync: boolean?)
   if #ops == 0 then return end
   local payload = json.encodeTable({ version = 1, sequence = state.sequence + 1, ops = ops })
@@ -1595,13 +1740,15 @@ local function write(state: DatabaseState, ops: { Operation }, deferSync: boolea
   if state.durability == 'sync' then
     count, err = (state.walWriter :: dream_fs_Writer):write(record)
   else
-    count, err = fs.writeFile(state.path, record, { append = true, create = false })
+    count, err = state.fs.writeFile(state.path, record, { append = true, create = false })
   end
 
   if count ~= #record then
     state.poisoned = true
     error('jessql storage: append failed (reopen required): ' .. tostring(err), 2)
   end
+
+  state.walLength += #record
 
   if state.durability == 'sync' and deferSync ~= true then
     local synced, syncError = (state.walWriter :: dream_fs_Writer):syncData()
@@ -1618,11 +1765,14 @@ local function write(state: DatabaseState, ops: { Operation }, deferSync: boolea
     error('jessql storage: post-append apply failed (reopen required): ' .. tostring(applyError), 2)
   end
   state.sequence += 1
+  -- Only once this transaction is synchronized is it recorded as committed.
+  if deferSync ~= true then recordMark(state) end
 end
 
 local storage = {}
 
 function storage.open(path: string, options: Options?): Store
+  local fs = vfs.resolve(if options then options.storage else nil)
   if type(path) ~= 'string' or path == '' then error('jessql storage: path is required', 2) end
   local max = if options then options.maxFrameBytes else nil
   if max ~= nil and (max < 1024 or max > 256 * 1024 * 1024 or max % 1 ~= 0) then
@@ -1652,19 +1802,73 @@ function storage.open(path: string, options: Options?): Store
     error('jessql storage: durability must be buffered or sync', 2)
   end
 
+  -- The folders the log is in, outermost first. A new folder is durable only once the folder that
+  -- holds it is synchronized (re-review of 2026-11-13: a synchronized store made in a new folder
+  -- lost the folder, and every acknowledged commit in it, at a crash). Every one is synchronized at
+  -- every open, not only those this open makes: one whose synchronization failed is there on the
+  -- next try and looks like any other (re-review of #101: a retry then took commits into a folder
+  -- a crash could lose).
+  local made: { string } = {}
+  if durability == 'sync' then
+    local folder = fs.parent(path)
+    while folder and folder ~= '' do
+      table.insert(made, 1, folder)
+      local above = fs.parent(folder)
+      if above == folder then break end
+
+      folder = above
+    end
+  end
+
   local lock, err = fs.lock(path .. '.lock', { createParents = true })
   if not lock then error('jessql storage: database locked: ' .. tostring(err), 2) end
 
   local state: DatabaseState = {
-    path = path, lock = lock, engine = queryEngine.new(), tables = {}, sequence = 0, schemaVersion = 0,
+    path = path, fs = fs, lock = lock, engine = queryEngine.new(), tables = {}, sequence = 0, schemaVersion = 0,
     maxFrameBytes = max or DefaultMaxFrame, closed = false, busy = false, poisoned = false,
     rowLayout = rowLayout or 'row', trackPayloadBytes = options ~= nil and options.trackPayloadBytes == true,
-    durability = durability, walWriter = nil,
+    durability = durability, walWriter = nil, mark = nil, markLapsed = false, walLength = 0,
   }
 
   -- Opening can fail on invalid frames; release the advisory lock on failure.
   local ok, failure = pcall(function()
+    for _, folder in made do
+      -- The top of a backend that is not a whole filesystem (an in-memory one) holds nothing.
+      local holder = fs.parent(folder)
+      if not holder or not fs.exists(holder) then continue end
+
+      local fenced, fenceError = fs.syncDirectory(holder)
+      if not fenced then error('jessql storage: new folder synchronization: ' .. tostring(fenceError)) end
+    end
+
+    -- A synchronized log made by a process killed before its first bytes were whole: nothing
+    -- or part of the header. It can hold no transaction, and is made again rather than refused,
+    -- unless its mark says transactions were committed to it: then it is what is left of a log
+    -- that was damaged, and is refused with nothing changed, the mark kept as the evidence
+    -- (review of 2026-11-13: it was remade, and the mark with it).
+    if durability == 'sync' and fs.exists(path) then
+      local held = fs.readFileString(path)
+      if held ~= nil and #held < #Magic and string.sub(Magic, 1, #held) == held then
+        local witness, recorded = walmark.examine(fs, path)
+        if witness == 'damaged' or (recorded and recorded.sequence > 0) then
+          error(`jessql storage: the log holds no transaction, and the committed-length mark beside it says {if recorded then recorded.sequence else 'some'} were committed to it: it was damaged (remove {walmark.path(path)} only to accept that loss and start an empty log)`)
+        end
+
+        local removed, removeError = fs.remove(path)
+        if not removed then error('jessql storage: an unfinished log could not be removed: ' .. tostring(removeError)) end
+      end
+    end
+
     if not fs.exists(path) then
+      -- A log that is gone while its mark says transactions were committed to it was lost, not
+      -- never made: refused, as a log found short is (review of 2026-11-13: it was opened empty
+      -- and the mark, the only evidence, deleted). A mark that cannot be read is refused too.
+      local witness, recorded = walmark.examine(fs, path)
+      local named = options ~= nil and options.manifestNamesLog == true
+      if not named and (witness == 'damaged' or (recorded and recorded.sequence > 0)) then
+        error(`jessql storage: the log is gone, and the committed-length mark beside it says {if recorded then recorded.sequence else 'some'} transactions were committed to it: it was lost or moved (remove {walmark.path(path)} only to accept that loss and start an empty log)`)
+      end
+
       local count, writeError: string?
       if durability == 'sync' then
         count, writeError = fs.createDurable(path, Magic)
@@ -1673,12 +1877,37 @@ function storage.open(path: string, options: Options?): Store
       end
 
       if count ~= #Magic then error('jessql storage: ' .. tostring(writeError)) end
+      -- A new log: a mark left by an earlier log of this name says nothing about it.
+      walmark.forget(fs, path)
     end
+
+    if durability == 'sync' then
+      -- A checkpoint may have been interrupted between replacing the log and making its name
+      -- durable. Whichever log is here now is whole; make this name durable before anything is
+      -- appended to it, and drop a compacted log that never took the name.
+      local stale = path .. '.checkpoint.tmp'
+      if fs.exists(stale) then fs.remove(stale) end
+
+      local parent = fs.parent(path)
+      if parent then
+        local fenced, fenceError = fs.syncDirectory(parent)
+        if not fenced then error('jessql storage: log directory synchronization: ' .. tostring(fenceError)) end
+      end
+    end
+
     load(state, options == nil or options.recoverTail ~= false)
     if durability == 'sync' then
       local writer, openError = fs.openWrite(path, { append = true, create = false })
       if not writer then error('jessql storage: sync writer: ' .. tostring(openError)) end
       state.walWriter = writer
+      state.mark = walmark.open(fs, path)
+      -- A mark that is there and cannot be written would go stale the moment the log is
+      -- shortened, and a stale mark makes a sound log look damaged. Better not to open at all.
+      if not state.mark and fs.exists(walmark.path(path)) then
+        writer:close()
+        state.walWriter = nil
+        error('jessql storage: the committed-length mark could not be opened for writing')
+      end
     end
   end)
 
@@ -1733,7 +1962,7 @@ function storage.open(path: string, options: Options?): Store
 
     if state.busy then error('jessql storage: nested or concurrent transaction', 2) end
 
-    if type(callbacks) ~= 'table' or #callbacks == 0 or #callbacks > 256 then
+    if type(callbacks) ~= 'table' or #callbacks == 0 or #callbacks > MaxBatchEntries then
       error('jessql storage: transactionBatch requires 1..256 callbacks', 2)
     end
 
@@ -1788,6 +2017,8 @@ function storage.open(path: string, options: Options?): Store
         end
 
         if batchTestHook then batchTestHook('after-sync') end
+        -- The whole batch is synchronized: it is recorded as committed in one mark.
+        recordMark(state)
       end
       return results
     end)
@@ -2007,6 +2238,12 @@ function storage.open(path: string, options: Options?): Store
   end
 
   -- Snapshot-only counters for verifying memory growth and index maintenance.
+  function db.witness(_self: Store): string
+    if state.durability ~= 'sync' then return 'not-synchronized' end
+
+    return if state.mark and not state.markLapsed then 'witnessed' else 'unwitnessed'
+  end
+
   function db.stats(_self: Store): { [string]: TableMetrics }
     ready()
     local output: { [string]: TableMetrics } = {}
@@ -2042,11 +2279,13 @@ function storage.open(path: string, options: Options?): Store
 
   function db.checkpoint(_self: Store)
     ready()
-    -- The legacy checkpoint replaces the active WAL without a generation
-    -- manifest. Refuse to claim a durable commit contract for that operation.
-    if state.durability == 'sync' then
-      error('jessql storage: synced checkpoint requires durable generation publication', 2)
-    end
+    -- A synchronized store publishes its compacted log durably: the new log is synchronized
+    -- before it takes the name, the name is made durable by a directory synchronization, and
+    -- the store accepts no commit until both have happened. An unsynchronized store keeps the
+    -- plain rename it always had and promises nothing about it.
+    local durable = state.durability == 'sync'
+    local directory = if durable then fs.parent(state.path) else nil
+    if durable and not directory then error('jessql storage: checkpoint needs the log\'s directory', 2) end
 
     if state.busy then error('jessql storage: checkpoint inside transaction', 2) end
     -- Write a new compact log beside the live log; rename only after a complete close.
@@ -2059,9 +2298,13 @@ function storage.open(path: string, options: Options?): Store
     local estimate = 0
     local maximum = state.maxFrameBytes
 
+    local compacted = 0
+
     local function writeBytes(contents: string)
       local count, err = writer:write(contents)
       if count ~= #contents then error('jessql storage: checkpoint write: ' .. tostring(err), 2) end
+
+      compacted += #contents
     end
 
     local function flushBatch()
@@ -2115,6 +2358,11 @@ function storage.open(path: string, options: Options?): Store
         end
       end
       flushBatch()
+      if durable then
+        -- Every byte of the new log is on storage before it can become the log.
+        local synced, syncError = writer:syncAll()
+        if not synced then error('checkpoint sync: ' .. tostring(syncError)) end
+      end
     end)
     local closed, closeError = writer:close()
     if not ok or not closed then
@@ -2122,12 +2370,57 @@ function storage.open(path: string, options: Options?): Store
       error('jessql storage: checkpoint failed: ' .. tostring(failure or closeError), 2)
     end
 
-    local renamed, renameError = fs.rename(temp, state.path)
-    if not renamed then
-      state.poisoned = true
-      error('jessql storage: checkpoint rename uncertain: ' .. tostring(renameError), 2)
+    if durable then
+      -- From the replacement until the directory is synchronized, which log a crash leaves is
+      -- not known. Both hold exactly the committed rows, so either is correct; but a commit
+      -- appended now could be lost with the name. Any failure in this window therefore poisons
+      -- the store: it must be closed and opened again, and opening re-fences the name.
+      -- The mark still describes the longer log. It is withdrawn, durably, before the shorter
+      -- log can take the name: a crash must never find a sound log shorter than its mark.
+      if state.mark and not state.mark.reset() then
+        fs.remove(temp)
+        error('jessql storage: checkpoint could not withdraw the committed-length mark', 2)
+      end
+
+      local replaced, replaceError = fs.replace(temp, state.path)
+      if not replaced then
+        state.poisoned = true
+        error('jessql storage: checkpoint replacement uncertain: ' .. tostring(replaceError), 2)
+      end
+
+      local fenced, fenceError = fs.syncDirectory(directory :: string)
+      if not fenced then
+        state.poisoned = true
+        error('jessql storage: checkpoint directory synchronization uncertain: ' .. tostring(fenceError), 2)
+      end
+
+      -- The append handle still refers to the log that was replaced.
+      local previous = state.walWriter
+      state.walWriter = nil
+      if previous then previous:close() end
+
+      local appender, appendError = fs.openWrite(state.path, { append = true, create = false })
+      if not appender then
+        state.poisoned = true
+        error('jessql storage: checkpoint could not reopen the log: ' .. tostring(appendError), 2)
+      end
+
+      state.walWriter = appender
+    else
+      -- An unsynchronized store keeps no mark, but one left by a synchronized use of this log
+      -- would describe the longer log that is about to be replaced.
+      walmark.forget(fs, state.path)
+      local renamed, renameError = fs.rename(temp, state.path)
+      if not renamed then
+        state.poisoned = true
+        error('jessql storage: checkpoint rename uncertain: ' .. tostring(renameError), 2)
+      end
     end
     state.sequence = sequence
+    if durable then
+      state.walLength = compacted
+      recordMark(state)
+    end
 
     -- Discard dead key slots and stale secondary postings after compaction.
     for _, current in state.tables do
@@ -2184,6 +2477,14 @@ function storage.open(path: string, options: Options?): Store
       closed, closeError = state.walWriter:close()
       state.walWriter = nil
     end
+
+    if state.mark then
+      -- Closing makes durable what the commits of this session recorded, and records nothing of
+      -- its own: a log that was only opened and closed has not been vouched for by anyone.
+      state.mark.close()
+      state.mark = nil
+    end
+
     state.lock:unlock()
     if not closed then error('jessql storage: close: ' .. tostring(closeError), 2) end
   end
@@ -2196,17 +2497,18 @@ end
 -- truncating a torn tail, or acknowledging any transaction. The transient
 -- row/index state is discarded after validation; this is intentionally a
 -- memory-intensive audit, not the regular database-open fast path.
-function storage.verifyReplay(path: string): number
+function storage.verifyReplay(path: string, backend: vfs.Backend?): number
+  local fs = vfs.resolve(backend)
   local exists, statError = fs.exists(path)
   if exists ~= true then error('jessql storage: read-only replay requires existing WAL: ' .. tostring(statError), 2) end
   local lock, lockError = fs.lock(path .. '.lock')
   if not lock then error('jessql storage: read-only replay locked: ' .. tostring(lockError), 2) end
 
   local state: DatabaseState = {
-    path = path, lock = lock, engine = queryEngine.new(), tables = {},
+    path = path, fs = fs, lock = lock, engine = queryEngine.new(), tables = {},
     sequence = 0, schemaVersion = 0, maxFrameBytes = DefaultMaxFrame,
     closed = false, busy = false, poisoned = false, rowLayout = 'row',
-    trackPayloadBytes = false, durability = 'buffered', walWriter = nil,
+    trackPayloadBytes = false, durability = 'buffered', walWriter = nil, mark = nil, markLapsed = false, walLength = 0,
   }
   -- recoverTail=false prohibits the only write-capable branch in load().
   local ok, failure = pcall(function() load(state, false) end)

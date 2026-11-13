@@ -1,0 +1,481 @@
+--!strict
+-- A bounded writer for a multi-table managed database (#32, #40.3): the core of a writer actor.
+--
+-- Requests are plain data, a list of operations with an id, so that they can cross a worker
+-- boundary; nothing here is a closure a caller supplies. A request is admitted into a bounded
+-- queue or refused at once with the reason, which is the backpressure a caller can observe.
+-- `drain` takes the oldest requests, commits each as its own frame behind ONE synchronization
+-- (`transactionBatch`), and answers one acknowledgement for each:
+--
+--   committed  the request's frame is synchronized, whole.
+--   rejected   the request changed nothing: an operation of it failed (a duplicate key, a row
+--              that is not there), or the writer stopped before attempting it.
+--   unknown    the batch failed at or after the append. The request may or may not be durable;
+--              the writer accepts nothing more and the database must be reopened to find out.
+--
+-- An admitted request is the writer's own: `submit` copies it, operations and rows and all,
+-- and what is queued, committed and acknowledged is that copy. A caller that changes or reuses
+-- its table afterwards changes nothing here. The copy is taken without running anything of the
+-- caller's (no metamethod is consulted), validated as the copy, and frozen.
+--
+-- This module has no worker in it and starts none: a worker's loop is receive, `submit`, `drain`,
+-- send. That keeps it testable without a script domain, and keeps the policy here: the order is
+-- first in, first out; one request cannot hold another's outcome hostage; and nothing is
+-- acknowledged before the synchronization that covers it.
+--
+-- What a caller does about `unknown`, or about a worker that died after the synchronization and
+-- before its reply, is reconciliation by id: put a row keyed by the request's id in a table of
+-- the same request (an `insert` refuses a duplicate), and a retry of a request that did commit is
+-- `rejected` with a duplicate key instead of being applied twice.
+local bytes = require('@dream/bytes')
+local catalog = require('@jessql/catalog')
+local ledger = require('@jessql/ledger')
+local mutations = require('@jessql/mutations')
+
+export type Row = { [string]: unknown }
+export type Operation = {
+  op: string,
+  table: string,
+  -- `insert` and `upsert`.
+  row: Row?,
+  -- `update` and `delete`.
+  key: unknown?,
+  -- `update`.
+  changes: Row?,
+}
+export type Request = { id: string, operations: { Operation } }
+export type Outcome = 'committed' | 'rejected' | 'unknown'
+-- `aborted` is only ever on a `rejected` outcome, and only ever true: the request's
+-- transaction ran, raised, and was rolled back whole. A `rejected` without it never ran (it was
+-- refused at admission, or the writer stopped first). Either way it changed nothing; the field
+-- says which, for a caller who wants to know whether its own operations were at fault.
+-- `alreadyCommitted` is likewise only ever on a `rejected` outcome and only ever true: the
+-- writer's ledger found this very request (its id and digest) already committed, and so it was
+-- refused having changed nothing. Only the ledger's answer sets it, never an error's text: it is
+-- what a retry is told, and what a supervisor reads as `committed` (J-FINAL-02).
+export type Ack = { id: string, outcome: Outcome, error: string?, aborted: boolean?, alreadyCommitted: boolean? }
+export type Admission = { admitted: boolean, reason: string?, queued: number }
+export type Options = {
+  -- The most requests waiting at once (default 1024, at most 65536). One more is refused.
+  maxQueued: number?,
+  -- The most requests one synchronization covers (default 64, at most 256).
+  maxBatch: number?,
+  -- The most operations in one request (default 256, at most 4096).
+  maxOperations: number?,
+  -- The most bytes in one request (default 1 MiB, at most 64 MiB), and in all the requests
+  -- waiting together (default 64 MiB, at most 1 GiB). A count of requests bounds how many
+  -- there are and says nothing of how large: these bound what the queue holds. A request's
+  -- bytes are those of its id and of every table name, column name, key and value in it, a
+  -- number counted as eight and a boolean or NULL as one. One over the first is refused with
+  -- `too-large`; one that would pass the second, with `queue-full`.
+  maxRequestBytes: number?,
+  maxQueuedBytes: number?,
+  -- A durable ledger of request ids in the same database (`@jessql/ledger`): every request's id
+  -- is written in the request's own frame, and a request whose id is already there is rejected
+  -- with `ledger: already committed`, having changed nothing. Without it, a caller that retries
+  -- must carry its own duplicate guard in the request.
+  ledger: ledger.Options?,
+}
+export type Status = { queued: number, queuedBytes: number, committed: number, rejected: number, unknown: number, batches: number, stopped: boolean, reason: string? }
+export type Writer = {
+  -- Admits a request or refuses it with `queue-full`, `duplicate-id`, `invalid: ...` or `stopped`.
+  submit: (self: Writer, request: Request) -> Admission,
+  -- Commits up to `maxBatch` of the oldest requests behind one synchronization.
+  drain: (self: Writer) -> { Ack },
+  -- Refuses everything from now on and answers `rejected` for what was still waiting.
+  stop: (self: Writer, reason: string?) -> { Ack },
+  status: (self: Writer) -> Status,
+}
+
+local writer = {}
+
+writer.DefaultRequestBytes = 1024 * 1024
+writer.DefaultOperations = 256
+writer.MaxRequestBytes = 64 * 1024 * 1024
+writer.DefaultQueuedBytes = 64 * 1024 * 1024
+writer.MaxQueuedBytes = 1024 * 1024 * 1024
+
+local function whole(value: unknown, least: number, most: number): boolean
+  return type(value) == 'number' and (value :: number) % 1 == 0 and (value :: number) >= least and (value :: number) <= most
+end
+
+-- Why a request is not one this writer will queue, or nil.
+local function invalid(request: unknown, maxOperations: number): string?
+  if type(request) ~= 'table' then return 'a request is a table' end
+  local value = request :: Request
+  if type(value.id) ~= 'string' or #value.id == 0 or #value.id > 128 then return 'id is a string of 1 to 128 bytes' end
+
+  if type(value.operations) ~= 'table' or #value.operations == 0 or #value.operations > maxOperations then
+    return `1 to {maxOperations} operations`
+  end
+
+  for index, operation in value.operations do
+    if type(operation) ~= 'table' or type(operation.table) ~= 'string' then return `operation {index} names no table` end
+    if type(operation.op) ~= 'string' then return `operation {index} is not insert, upsert, update or delete` end
+
+    if operation.op == 'insert' or operation.op == 'upsert' then
+      if type(operation.row) ~= 'table' then return `operation {index} has no row` end
+    elseif operation.op == 'update' then
+      if operation.key == nil or type(operation.changes) ~= 'table' then return `operation {index} needs a key and changes` end
+    elseif operation.op == 'delete' then
+      if operation.key == nil then return `operation {index} needs a key` end
+    else
+      return `operation {index} is not insert, upsert, update or delete`
+    end
+  end
+
+  return nil
+end
+
+-- Freezes a table in place. Typed loosely on purpose: the checker's own signature for
+-- `table.freeze` does not fit a table that is then used under its declared type.
+local freeze = table.freeze :: (value: unknown) -> unknown
+
+-- A row or a set of changes, copied: string keys to scalars. A value that is itself a table could
+-- be changed under the writer after admission, so none is taken, but for the NULL sentinel.
+-- What a request costs where it is kept, as the Luau heap holds it, not only its bytes of text
+-- (review of 2026-11-13: counting text alone let a 64 MiB ceiling hold about 1.3 GB). A string
+-- has a header; a table has a header and a slot for every entry; an operation is a table of its
+-- own, and has a slot in the request's list. Measured, not exact: rounded up. An operation is a
+-- frozen table of five fields with its slot in the list: about 320 bytes a delete measured
+-- (re-review of 2026-11-13: 160 counted 1.4 times too little).
+local StringBytes, TableBytes, EntryBytes, OperationBytes = 24, 64, 40, 320
+writer.Weights = table.freeze({ string = StringBytes, table = TableBytes, entry = EntryBytes, operation = OperationBytes })
+
+-- What a scalar weighs in a request's byte count. Only what a request can hold has a weight: a
+-- buffer, a vector, a function or userdata outweighs every limit, so it is refused before it is
+-- sent anywhere (re-review of 2026-11-13: a 64 MiB buffer weighed 1).
+local function weight(value: unknown): number
+  local kind = type(value)
+  if kind == 'string' then return StringBytes + #(value :: string) end
+  if kind == 'number' then return 8 end
+  if value == nil then return 0 end
+  if kind == 'boolean' or value == mutations.NULL then return 1 end
+
+  return math.huge
+end
+
+-- The third value is what the row weighs.
+local function copyRow(value: unknown): (Row?, string?, number)
+  if type(value) ~= 'table' then return nil, nil, 0 end
+  local copy: Row = {}
+  local size = TableBytes
+  for name, held in next, value :: { [unknown]: unknown } do
+    if type(name) ~= 'string' then return nil, 'a column name is a string', 0 end
+    local kind = type(held)
+    if kind ~= 'string' and kind ~= 'number' and kind ~= 'boolean' and held ~= mutations.NULL then
+      return nil, 'a value is a string, a number, a boolean or NULL', 0
+    end
+
+    copy[name :: string] = held
+    size += EntryBytes + weight(name) + weight(held)
+  end
+
+  freeze(copy)
+  return copy, nil, size
+end
+
+-- The writer's own copy of what a caller submitted, with only the fields a request has, or why it
+-- is not a request. Read with `rawget` and `next`: nothing of the caller's runs here.
+-- The third value is what the request weighs (see `Options.maxRequestBytes`).
+local function snapshot(request: unknown, maxOperations: number): (Request?, string?, number)
+  if type(request) ~= 'table' then return nil, 'a request is a table', 0 end
+  local given = request :: { [unknown]: unknown }
+  local listed = rawget(given, 'operations')
+  if type(listed) ~= 'table' then return nil, `1 to {maxOperations} operations`, 0 end
+  local count = rawlen(listed :: { unknown })
+  if count == 0 or count > maxOperations then return nil, `1 to {maxOperations} operations`, 0 end
+
+  local operations: { Operation } = {}
+  local size = 2 * TableBytes + weight(rawget(given, 'id'))
+  for index = 1, count do
+    local operation = rawget(listed :: { unknown }, index)
+    if type(operation) ~= 'table' then return nil, `operation {index} names no table`, 0 end
+    local fields = operation :: { [unknown]: unknown }
+    local key = rawget(fields, 'key')
+    if key ~= nil and type(key) ~= 'string' and type(key) ~= 'number' and type(key) ~= 'boolean' then
+      return nil, `operation {index}: a key is a string, a number or a boolean`, 0
+    end
+
+    local row, rowProblem, rowSize = copyRow(rawget(fields, 'row'))
+    if rowProblem then return nil, `operation {index}: {rowProblem}`, 0 end
+    local changes, changesProblem, changesSize = copyRow(rawget(fields, 'changes'))
+    if changesProblem then return nil, `operation {index}: {changesProblem}`, 0 end
+
+    local copied: Operation = { op = rawget(fields, 'op') :: string, table = rawget(fields, 'table') :: string,
+      row = row, key = key, changes = changes }
+    size += OperationBytes + weight(copied.op) + weight(copied.table) + weight(key) + rowSize + changesSize
+    freeze(copied)
+    operations[index] = copied
+  end
+
+  freeze(operations)
+  local taken: Request = { id = rawget(given, 'id') :: string, operations = operations }
+  local problem = invalid(taken, maxOperations)
+  if problem then return nil, problem, 0 end
+
+  freeze(taken)
+  return taken, nil, size
+end
+
+-- What anything offered as a request weighs, whether or not it is one: every string, number
+-- and boolean in it, keys and values, as deep as a request goes and no deeper, and no more
+-- than a request has parts. Past either it weighs more than any limit. For a layer that must
+-- bound what it forwards before the writer has had its say about what it is.
+function writer.weigh(value: unknown): number
+  local seen = 0
+  local function walk(node: unknown, depth: number): number
+    if type(node) ~= 'table' then return weight(node) end
+    if depth > 4 then return math.huge end
+
+    local size = TableBytes
+    for key, held in next, node :: { [unknown]: unknown } do
+      seen += 1
+      if seen > 4096 * 64 then return math.huge end
+
+      size += EntryBytes + weight(key) + walk(held, depth + 1)
+    end
+
+    return size
+  end
+
+  return walk(value, 1)
+end
+
+-- For every layer that keeps a request beyond the call that handed it over (a writer's queue,
+-- and a supervisor that sends it again after a worker dies): the same copy, validated and
+-- frozen all the way down, or nil and why it is not a request. What is kept must be this and
+-- never the caller's table, which the caller is free to change the moment the call returns.
+function writer.snapshot(request: unknown, maxOperations: number?): (Request?, string?, number)
+  local most = maxOperations or 4096
+  if not whole(most, 1, 4096) then error('jessql writer: invalid maxOperations', 2) end
+
+  return snapshot(request, most)
+end
+
+-- One value of a request, framed and tagged by kind: no two different values encode alike, and
+-- values the store takes as the same (-0 and 0; every NaN) encode alike, so a retry a caller
+-- builds again is still the same request.
+local function encoded(value: unknown): string
+  if value == nil then return '-' end
+  if value == mutations.NULL then return 'N' end
+  if type(value) == 'string' then return `s{#(value :: string)}:{value :: string}` end
+
+  if type(value) == 'number' then
+    local number = value :: number
+    if number ~= number then return 'nNaN' end
+    if number == 0 then number = 0 end
+
+    return 'n' .. string.pack('<d', number)
+  end
+
+  if value == true then return 'T' end
+  if value == false then return 'F' end
+  error('jessql writer: a request value that is not one', 2)
+end
+
+local function encodedRow(row: Row?): string
+  if not row then return '-' end
+  local names: { string } = {}
+  for name in row do table.insert(names, name) end
+  table.sort(names)
+  local parts = { `r{#names}` }
+  for _, name in names do
+    table.insert(parts, encoded(name))
+    table.insert(parts, encoded(row[name]))
+  end
+
+  return table.concat(parts)
+end
+
+-- What a request says, as a SHA-256: the same for the same id and operations, in whatever order
+-- a row's columns were given, and different for anything else. The ledger keeps it beside the
+-- id, so an id used again for another request is told apart from a retry of the same one.
+function writer.digest(request: Request): string
+  local parts = { encoded(request.id), `o{#request.operations}` }
+  for _, operation in request.operations do
+    table.insert(parts, encoded(operation.op))
+    table.insert(parts, encoded(operation.table))
+    table.insert(parts, encoded(operation.key))
+    table.insert(parts, encodedRow(operation.row))
+    table.insert(parts, encodedRow(operation.changes))
+  end
+
+  return bytes.sha256(table.concat(parts))
+end
+
+-- Which operation of `request`, if any, names the ledger's table: only the ledger writes there.
+-- An entry's key and digest are computable by anyone, so a request that could write one could
+-- have another request refused as committed without running (review of e2d173d). The catalog
+-- matches table names exactly and holds them lowercase; every case of the name is refused here
+-- all the same, so no spelling the name could be resolved from gets through.
+local function writesLedger(request: Request, kept: ledger.Options): string?
+  local guarded = string.lower(kept.table)
+  for index, operation in request.operations do
+    if string.lower(operation.table) == guarded then return `operation {index} writes the ledger's table` end
+  end
+
+  return nil
+end
+
+-- One request as one transaction: every operation, or an error that leaves none of them. A
+-- request the ledger holds as committed already is refused, and `replayed` is called first: that
+-- call, not the refusal's text, is how the writer knows.
+local function apply(tx: catalog.Transaction, request: Request, kept: ledger.Options?, replayed: () -> ())
+  if kept and ledger.claim(tx, kept, request.id, writer.digest(request)) == 'committed' then
+    replayed()
+    error(ledger.AlreadyCommitted, 0)
+  end
+
+  for index, operation in request.operations do
+    if operation.op == 'insert' then
+      tx:insert(operation.table, operation.row :: Row)
+    elseif operation.op == 'upsert' then
+      tx:upsert(operation.table, operation.row :: Row)
+    elseif operation.op == 'update' then
+      if not tx:update(operation.table, operation.key, operation.changes :: Row) then
+        error(`operation {index}: no row to update in {operation.table}`, 0)
+      end
+    elseif not tx:delete(operation.table, operation.key) then
+      error(`operation {index}: no row to delete in {operation.table}`, 0)
+    end
+  end
+end
+
+function writer.new(db: catalog.Database, options: Options?): Writer
+  local maxQueued = if options and options.maxQueued ~= nil then options.maxQueued else 1024
+  local maxBatch = if options and options.maxBatch ~= nil then options.maxBatch else 64
+  local maxOperations = if options and options.maxOperations ~= nil then options.maxOperations else writer.DefaultOperations
+  if not whole(maxQueued, 1, 65536) then error('jessql writer: invalid maxQueued', 2) end
+  if not whole(maxBatch, 1, 256) then error('jessql writer: invalid maxBatch', 2) end
+  if not whole(maxOperations, 1, 4096) then error('jessql writer: invalid maxOperations', 2) end
+
+  local maxRequestBytes = if options and options.maxRequestBytes ~= nil then options.maxRequestBytes else writer.DefaultRequestBytes
+  local maxQueuedBytes = if options and options.maxQueuedBytes ~= nil then options.maxQueuedBytes else writer.DefaultQueuedBytes
+  if not whole(maxRequestBytes, 1, writer.MaxRequestBytes) then error('jessql writer: invalid maxRequestBytes', 2) end
+  if not whole(maxQueuedBytes, maxRequestBytes, writer.MaxQueuedBytes) then error('jessql writer: invalid maxQueuedBytes', 2) end
+
+  local kept = if options then options.ledger else nil
+  local ledgerProblem = if kept ~= nil then ledger.problem(kept) else nil
+  if ledgerProblem then error('jessql writer: ' .. ledgerProblem, 2) end
+
+  -- A queue that never moves its entries: `head` is the oldest, `tail` the newest.
+  local queue: { [number]: Request } = {}
+  local head, tail = 1, 0
+  local waiting: { [string]: boolean } = {}
+  local sizes: { [string]: number } = {}
+  local status: Status = { queued = 0, queuedBytes = 0, committed = 0, rejected = 0, unknown = 0, batches = 0, stopped = false, reason = nil }
+  local self = {} :: Writer
+
+  local function take(count: number): { Request }
+    local taken: { Request } = {}
+    for _ = 1, math.min(count, status.queued) do
+      local request = queue[head]
+      queue[head] = nil
+      head += 1
+      waiting[request.id] = nil
+      status.queuedBytes -= sizes[request.id] or 0
+      sizes[request.id] = nil
+      taken[#taken + 1] = request
+    end
+
+    status.queued -= #taken
+    return taken
+  end
+
+  function self.submit(_self: Writer, request: Request): Admission
+    if status.stopped then return { admitted = false, reason = 'stopped', queued = status.queued } end
+    -- From here on only the copy is looked at: the caller's table is not read again, now or later.
+    local taken, problem, size = snapshot(request, maxOperations)
+    if not taken then return { admitted = false, reason = 'invalid: ' .. (problem or 'malformed'), queued = status.queued } end
+    local trespass = if kept then writesLedger(taken, kept) else nil
+    if trespass then return { admitted = false, reason = 'invalid: ' .. trespass, queued = status.queued } end
+    if size > maxRequestBytes then return { admitted = false, reason = 'too-large', queued = status.queued } end
+    if waiting[taken.id] then return { admitted = false, reason = 'duplicate-id', queued = status.queued } end
+
+    if status.queued >= maxQueued or status.queuedBytes + size > maxQueuedBytes then
+      return { admitted = false, reason = 'queue-full', queued = status.queued }
+    end
+
+    tail += 1
+    queue[tail] = taken
+    waiting[taken.id] = true
+    sizes[taken.id] = size
+    status.queuedBytes += size
+    status.queued += 1
+    return { admitted = true, reason = nil, queued = status.queued }
+  end
+
+  local function refuseRest(reason: string): { Ack }
+    local acks: { Ack } = {}
+    for _, request in take(status.queued) do
+      acks[#acks + 1] = { id = request.id, outcome = 'rejected', error = reason }
+      status.rejected += 1
+    end
+
+    return acks
+  end
+
+  function self.drain(_self: Writer): { Ack }
+    if status.stopped then return refuseRest('writer stopped: not attempted') end
+
+    local batch = take(maxBatch)
+    if #batch == 0 then return {} end
+
+    local callbacks: { (catalog.Transaction) -> () } = {}
+    -- Which requests of this batch the ledger refused as committed before.
+    local replays: { [number]: boolean } = {}
+    for index, request in batch do
+      callbacks[index] = function(tx: catalog.Transaction)
+        apply(tx, request, kept, function() replays[index] = true end)
+      end
+    end
+
+    status.batches += 1
+    -- The batch raises when the append or its synchronization is uncertain: nothing in it may be
+    -- called committed, and nothing in it may be called absent.
+    local ran, results = pcall(function() return db:transactionBatch(callbacks) end)
+    local acks: { Ack } = {}
+    if not ran then
+      status.stopped = true
+      status.reason = 'batch outcome unknown: ' .. tostring(results)
+      for _, request in batch do
+        acks[#acks + 1] = { id = request.id, outcome = 'unknown', error = tostring(results) }
+        status.unknown += 1
+      end
+
+      return acks
+    end
+
+    for index, request in batch do
+      local result = (results :: { catalog.BatchResult })[index]
+      if result.ok then
+        acks[#acks + 1] = { id = request.id, outcome = 'committed', error = nil }
+        status.committed += 1
+      else
+        acks[#acks + 1] = { id = request.id, outcome = 'rejected', error = result.error, aborted = true,
+          alreadyCommitted = if replays[index] then true else nil }
+        status.rejected += 1
+      end
+    end
+
+    return acks
+  end
+
+  function self.stop(_self: Writer, reason: string?): { Ack }
+    if not status.stopped then
+      status.stopped = true
+      status.reason = reason or 'stopped'
+    end
+
+    return refuseRest('writer stopped: not attempted')
+  end
+
+  function self.status(_self: Writer): Status
+    return table.clone(status)
+  end
+
+  return self
+end
+
+return writer

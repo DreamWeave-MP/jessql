@@ -1,0 +1,86 @@
+--!strict
+-- #16: what a budget on an operator saves, measured. One case and one budget a process, because
+-- the peak resident size of a process only ever grows:
+--
+--   jess run --trusted --package . bench/operator-budgets.jsl <case> <rows> [limit]
+--
+--   skewed-join   `rows` orders joined to `rows` lines, a tenth of the lines on one hot order
+--                 and that order repeated a hundred times: the join hands on about ten times
+--                 `rows`. The limit is `joinRows`.
+--   wide-groups   GROUP BY over `rows` rows, every row its own group. The limit is `groups`.
+--   held-rows     `rows` rows returned at once, unsorted. The limit is `heldRows`.
+--
+-- With no limit the query runs to its end and the peak is what it cost. With a limit the query
+-- is refused when it passes it and the peak is what it cost to find that out. Linux only for
+-- the sizes (procfs); the tables are in memory, so nothing here measures a disk.
+local fs = require('@dream/fs')
+local sql = require('@jessql')
+
+local arguments = { ... } :: { string }
+local case, rowsText, limitText = arguments[1], arguments[2], arguments[3]
+local rows = tonumber(rowsText) or 200000
+local limit = tonumber(limitText)
+
+local function resident(): (number, number)
+  local data = fs.readFileString('/proc/self/status')
+  if not data then return -1, -1 end
+
+  return tonumber(string.match(data, 'VmRSS:%s*(%d+)')) or 0, tonumber(string.match(data, 'VmHWM:%s*(%d+)')) or 0
+end
+
+local db = sql.new()
+local query: string
+local limits: sql.Limits = {}
+if case == 'skewed-join' then
+  local orders: { sql.SourceRow }, lines: { sql.SourceRow } = {}, {}
+  for id = 1, rows do
+    -- A hundred orders share the hot id's key.
+    local order: sql.SourceRow = { id = id, key = if id <= 100 then 0 else id }
+    orders[id] = order
+    local line: sql.SourceRow = { id = id, order_key = if id % 10 == 0 then 0 else id, amount = id % 7 }
+    lines[id] = line
+  end
+
+  db:table('orders', orders, { 'id', 'key' })
+  db:table('lines', lines, { 'id', 'order_key', 'amount' })
+  query = 'SELECT o.id, l.amount FROM orders o JOIN lines l ON l.order_key = o.key'
+  limits.joinRows = limit
+elseif case == 'wide-groups' then
+  local events: { sql.SourceRow } = {}
+  for id = 1, rows do
+    local event: sql.SourceRow = { id = id, code = 'code-' .. tostring(id), amount = id % 11 }
+    events[id] = event
+  end
+
+  db:table('events', events, { 'id', 'code', 'amount' })
+  query = 'SELECT code, COUNT(*) AS n, SUM(amount) AS total FROM events GROUP BY code'
+  limits.groups = limit
+elseif case == 'held-rows' then
+  local events: { sql.SourceRow } = {}
+  for id = 1, rows do
+    local event: sql.SourceRow = { id = id, code = 'code-' .. tostring(id), amount = id % 11 }
+    events[id] = event
+  end
+
+  db:table('events', events, { 'id', 'code', 'amount' })
+  query = 'SELECT id, code, amount FROM events WHERE amount < 100'
+  limits.heldRows = limit
+else
+  print('usage: operator-budgets <skewed-join|wide-groups|held-rows> <rows> [limit]')
+  return 2
+end
+
+if limit then db:limits(limits) end
+
+local loaded = resident()
+local began = os.clock()
+-- A query over its budget raises; the error is the result being measured.
+local answered, result = pcall(function(): number return #db:query(query).rows end)
+local seconds = os.clock() - began
+local after, peak = resident()
+print(string.format('case=%s rows=%d limit=%s outcome=%s result_rows=%s seconds=%.3f rss_loaded_kb=%d rss_after_kb=%d peak_kb=%d query_cost_kb=%d',
+  case, rows, if limit then tostring(limit) else 'none', if answered then 'answered' else 'refused',
+  if answered then tostring(result) else '-', seconds, loaded, after, peak, peak - loaded))
+if not answered then print('refusal: ' .. tostring(result)) end
+
+return 0

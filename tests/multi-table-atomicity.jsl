@@ -1,0 +1,278 @@
+--!strict
+-- #40.1, as far as it holds today: one synchronized transaction of the persistent store spans
+-- several tables in one WAL frame. A service step that reserves a side effect, marks an event
+-- handled, appends to a conversation, moves an outbox row and charges a counter is stopped at
+-- every storage step and must be there whole or not at all. This is `sql.open`, the WAL-only
+-- store. Its log is shortened by a checkpoint that is published durably and swept the same way.
+-- A *managed* database is still single-table.
+local lab = require('@jessql/faultlab')
+local memfs = require('@jessql/memfs')
+local sql = require('@jessql')
+local test = require('@jess/test')
+
+local expect = test.expect
+local suite = test.new()
+
+type Row = { [string]: unknown }
+
+local Path = '/memory/service.wal'
+
+local function open(disk: memfs.Disk): sql.PersistentDatabase
+  return sql.open(Path, { durability = 'sync', storage = disk.backend })
+end
+
+-- One handled event: five changes over five tables, one commit.
+local function step(tx: sql.Transaction, number: number)
+  tx:insert('reservations', { id = number, effect = `send-{number}` })
+  tx:insert('handled', { id = number })
+  tx:insert('conversation', { id = number, body = `event {number}` })
+  -- The outbox holds only the latest step: the previous row goes in the same commit.
+  tx:insert('outbox', { id = number })
+  if number > 1 then tx:delete('outbox', number - 1) end
+
+  tx:upsert('counters', { id = 'total', value = number })
+end
+
+-- What a restart finds, per step: rows across the three append-only tables. It raises if the
+-- tables disagree with each other in a way no sequence of whole commits could produce.
+local function recover(disk: memfs.Disk): lab.Observed
+  local db = open(disk)
+  local observed: lab.Observed = {}
+  local highest = 0
+  for _, name in { 'reservations', 'handled', 'conversation' } do
+    for _, row in db:query(`SELECT id FROM {name}`).rows do
+      local number = (row :: Row).id :: number
+      observed[tostring(number)] = (observed[tostring(number)] or 0) + 1
+      highest = math.max(highest, number)
+    end
+  end
+
+  local counter = db:get('counters', 'total')
+  local total = if counter then counter.value :: number else 0
+  local outbox = db:query('SELECT id FROM outbox').rows
+  db:close()
+
+  if total ~= highest then error(`the counter says {total} and the newest step present is {highest}`, 0) end
+
+  if highest > 0 and (#outbox ~= 1 or (outbox[1] :: Row).id ~= highest) then
+    error(`the outbox holds {#outbox} row(s), not exactly the newest step {highest}`, 0)
+  end
+
+  -- Steps are consecutive: a whole later step with an earlier one missing is not a prefix.
+  for number = 1, highest do
+    if (observed[tostring(number)] or 0) == 0 then error(`step {number} is missing below step {highest}`, 0) end
+  end
+
+  return observed
+end
+
+local function findings(report: lab.Report): string
+  local texts: { string } = {}
+  for index, artifact in report.violations do
+    if index > 3 then break end
+    table.insert(texts, lab.describe(artifact))
+  end
+
+  return table.concat(texts, '\n')
+end
+
+local function prepare(disk: memfs.Disk, ledger: lab.Ledger)
+  local db = open(disk)
+  db:createTable('reservations', { 'id', 'effect' }, 'id')
+  db:createTable('handled', { 'id' }, 'id')
+  db:createTable('conversation', { 'id', 'body' }, 'id')
+  db:createTable('outbox', { 'id' }, 'id')
+  db:createTable('counters', { 'id', 'value' }, 'id')
+  for number = 1, 2 do
+    ledger.begin(tostring(number), 3)
+    db:transaction(function(tx) step(tx, number) end)
+    ledger.acknowledge(tostring(number))
+  end
+
+  db:close()
+end
+
+suite.describe('one commit over several tables of the persistent store', function()
+  suite.it('is whole or absent at every storage step, and after a crashed recovery', function()
+    local report = lab.run({
+      name = 'service steps',
+      prepare = prepare,
+      exercise = function(disk: memfs.Disk, ledger: lab.Ledger)
+        local db = open(disk)
+        -- A step may raise at the fault; the store is closed either way.
+        local ok, problem = pcall(function()
+          for number = 3, 5 do
+            ledger.begin(tostring(number), 3)
+            db:transaction(function(tx) step(tx, number) end)
+            ledger.acknowledge(tostring(number))
+          end
+        end)
+        -- close can raise on a store the fault has poisoned; it is closed as far as it can be.
+        pcall(function() db:close() end)
+        if not ok then error(problem, 0) end
+      end,
+      recover = recover,
+    }, { crashRecovery = true })
+    expect(findings(report)).toBe('')
+    expect(report.truncated).toBe(false)
+    -- Three commits: a write and a sync each, between opening and closing the log.
+    expect(#report.schedule >= 10).toBe(true)
+    print(`multi-table: {#report.schedule} storage steps, {report.runs} stopped runs, {#report.violations} violations`)
+  end)
+
+  suite.it('keeps each callback of a batch whole or absent on its own', function()
+    local report = lab.run({
+      name = 'batched service steps',
+      prepare = prepare,
+      exercise = function(disk: memfs.Disk, ledger: lab.Ledger)
+        local db = open(disk)
+        -- The batch may raise at the fault; the store is closed either way.
+        local ok, problem = pcall(function()
+          ledger.begin('3', 3)
+          ledger.begin('4', 3)
+          local results = db:transactionBatch({
+            function(tx) step(tx, 3) end,
+            function(tx) step(tx, 4) end,
+          })
+
+          for index, result in results do
+            if result.ok then ledger.acknowledge(tostring(index + 2)) end
+          end
+        end)
+        -- close can raise on a store the fault has poisoned; it is closed as far as it can be.
+        pcall(function() db:close() end)
+        if not ok then error(problem, 0) end
+      end,
+      recover = recover,
+    })
+    expect(findings(report)).toBe('')
+    expect(report.truncated).toBe(false)
+  end)
+
+  suite.it('shortens its log by a checkpoint that is whole at every storage step, with commits before and after', function()
+    local report = lab.run({
+      name = 'checkpoint between service steps',
+      prepare = prepare,
+      exercise = function(disk: memfs.Disk, ledger: lab.Ledger)
+        local db = open(disk)
+        -- A step or the checkpoint may raise at the fault; the store is closed either way.
+        local ok, problem = pcall(function()
+          for number = 3, 4 do
+            ledger.begin(tostring(number), 3)
+            db:transaction(function(tx) step(tx, number) end)
+            ledger.acknowledge(tostring(number))
+          end
+
+          db:checkpoint()
+          ledger.begin('5', 3)
+          db:transaction(function(tx) step(tx, 5) end)
+          ledger.acknowledge('5')
+        end)
+        -- close can raise on a store the fault has poisoned; it is closed as far as it can be.
+        pcall(function() db:close() end)
+        if not ok then error(problem, 0) end
+      end,
+      recover = recover,
+    }, { crashRecovery = true })
+    expect(findings(report)).toBe('')
+    expect(report.truncated).toBe(false)
+    -- The schedule holds the publication: the new log synchronized, the replacement, the directory.
+    local seen: { [string]: number } = {}
+    for _, taken in report.schedule do
+      local kind = string.match(taken, '^(%S+)') :: string
+      seen[kind] = (seen[kind] or 0) + 1
+    end
+
+    expect(seen.syncAll).toBe(1)
+    expect(seen.replace).toBe(1)
+    expect((seen.syncDirectory or 0) >= 2).toBe(true)
+    print(`checkpoint: {#report.schedule} storage steps, {report.runs} stopped runs, {#report.violations} violations`)
+  end)
+
+  suite.it('really shortens the log, keeps every row, and leaves no compacted log behind', function()
+    local disk = memfs.new()
+    local ledger: lab.Ledger = { begin = function(_id: string, _rows: number) end, acknowledge = function(_id: string) end }
+    prepare(disk, ledger)
+    local db = open(disk)
+    for number = 3, 40 do db:transaction(function(tx) step(tx, number) end) end
+
+    local before = #disk.visible()[Path]
+    db:checkpoint()
+    local after = #disk.visible()[Path]
+    -- Forty rewrites of one counter and forty outbox moves collapse to their last state.
+    expect(after < before).toBe(true)
+    expect(disk.visible()[Path .. '.checkpoint.tmp']).toBe(nil)
+    -- What a crash would find is the shortened log, not the old one.
+    expect(#disk.surviving()[Path]).toBe(after)
+    db:transaction(function(tx) step(tx, 41) end)
+    db:close()
+    disk.crash()
+    local observed = recover(disk)
+    for number = 1, 41 do expect(`{number} {observed[tostring(number)]}`).toBe(`{number} 3`) end
+  end)
+
+  suite.it('accepts no commit after a checkpoint whose name could not be made durable, until it is reopened', function()
+    local disk = memfs.new()
+    local ledger: lab.Ledger = { begin = function(_id: string, _rows: number) end, acknowledge = function(_id: string) end }
+    prepare(disk, ledger)
+    local db = open(disk)
+    db:transaction(function(tx) step(tx, 3) end)
+    local directorySyncs = 0
+    disk.inject(function(taken: string, _path: string, _occurrence: number): memfs.Fault?
+      if taken ~= 'syncDirectory' then return nil end
+      directorySyncs += 1
+      return { message = 'injected: directory could not be synchronized' }
+    end)
+    -- The checkpoint raises when the directory cannot be synchronized; the refusal is the assertion.
+    local done, problem = pcall(function() db:checkpoint() end)
+    disk.inject(nil)
+    expect(done).toBe(false)
+    expect(directorySyncs).toBe(1)
+    expect((string.find(tostring(problem), 'directory synchronization uncertain', 1, true)) ~= nil).toBe(true)
+    -- A commit now could be lost with the name: it is refused, not acknowledged.
+    expect((pcall(function() db:transaction(function(tx) step(tx, 4) end) end))).toBe(false)
+    -- close can raise on the poisoned store; it is closed as far as it can be.
+    pcall(function() db:close() end)
+
+    -- Opening again makes the name durable before anything is appended.
+    local reopened = open(disk)
+    reopened:transaction(function(tx) step(tx, 4) end)
+    reopened:close()
+    disk.crash()
+    local observed = recover(disk)
+    expect(`{observed['3']} {observed['4']}`).toBe('3 3')
+  end)
+
+  suite.it('drops a compacted log that never took the name when the store is next opened', function()
+    local disk = memfs.new()
+    local ledger: lab.Ledger = { begin = function(_id: string, _rows: number) end, acknowledge = function(_id: string) end }
+    prepare(disk, ledger)
+    assert((disk.backend.createDurable(Path .. '.checkpoint.tmp', 'half a compacted log')))
+    local db = open(disk)
+    expect(disk.visible()[Path .. '.checkpoint.tmp']).toBe(nil)
+    db:close()
+    expect(recover(disk)['2']).toBe(3)
+  end)
+
+  suite.it('rolls every table back when the callback raises after touching all of them', function()
+    local disk = memfs.new()
+    local ledger: lab.Ledger = { begin = function(_id: string, _rows: number) end, acknowledge = function(_id: string) end }
+    prepare(disk, ledger)
+    local db = open(disk)
+    -- The callback raises on purpose after its writes; the refusal is the assertion.
+    expect((pcall(function()
+      db:transaction(function(tx)
+        step(tx, 3)
+        error('the side effect could not be reserved')
+      end)
+    end))).toBe(false)
+    expect(db:get('reservations', 3)).toBe(nil)
+    expect(db:get('handled', 3)).toBe(nil)
+    expect((db:get('counters', 'total') :: Row).value).toBe(2)
+    expect(db:query('SELECT id FROM outbox').rows[1].id).toBe(2)
+    db:close()
+    expect(recover(disk)['3']).toBe(nil)
+  end)
+end)
+
+return suite

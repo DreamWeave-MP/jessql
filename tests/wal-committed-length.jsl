@@ -1,0 +1,849 @@
+--!strict
+-- A log found shorter than it was committed to be is refused, not quietly shortened. The mark
+-- beside the log (`@jessql/walmark`) is the witness; these tests hold it to what it promises:
+-- damage after the fact is caught, a crash never makes a sound log look damaged, and a log
+-- nobody committed to is not vouched for. In memory.
+local bytes = require('@dream/bytes')
+local golden = require('./fixtures/formats-v1')
+local marks = require('./fixtures/formats-mark-v1')
+local memfs = require('@jessql/memfs')
+local sql = require('@jessql')
+local test = require('@jess/test')
+local walmark = require('@jessql/walmark')
+
+local expect = test.expect
+local suite = test.new()
+
+type Row = { [string]: unknown }
+
+local Log = '/memory/events.wal'
+
+local function open(disk: memfs.Disk): sql.PersistentDatabase
+  return sql.open(Log, { durability = 'sync', storage = disk.backend })
+end
+
+-- A store with `commits` synchronized transactions of one row each, closed cleanly.
+local function closedStore(commits: number): memfs.Disk
+  local disk = memfs.new()
+  local db = open(disk)
+  db:createTable('events', { 'id', 'body' }, 'id')
+  for index = 1, commits do db:insert('events', { id = index, body = `row {index}` }) end
+
+  db:close()
+  return disk
+end
+
+local function rows(disk: memfs.Disk): number
+  local db = open(disk)
+  local count = db:query('SELECT COUNT(*) AS n FROM events').rows[1].n :: number
+  db:close()
+  return count
+end
+
+-- Where each frame of the log ends, from the log's own framing.
+local function frameEnds(body: string): { number }
+  local ends: { number } = {}
+  local offset = 6
+  while offset + 8 <= #body do
+    local length = buffer.readu32(buffer.fromstring(string.sub(body, offset + 1, offset + 4)), 0)
+    offset += 8 + length
+    if offset <= #body then table.insert(ends, offset) end
+  end
+
+  return ends
+end
+
+local function overwrite(disk: memfs.Disk, path: string, body: string)
+  assert((disk.backend.remove(path)))
+  assert((disk.backend.createDurable(path, body)))
+end
+
+suite.describe('a log shorter than its committed length', function()
+  suite.it('is refused when it was cut after a clean close, at a frame boundary or inside a frame', function()
+    local body = closedStore(5).visible()[Log]
+    local ends = frameEnds(body)
+    -- One create and five inserts.
+    expect(#ends).toBe(6)
+    for _, cut in { ends[5], ends[5] + 3, ends[3], 6 } do
+      local disk = closedStore(5)
+      overwrite(disk, Log, string.sub(body, 1, cut))
+      -- The open raises on the short log; the refusal is the assertion.
+      local opened, problem = pcall(open, disk)
+      expect(`cut at {cut}: opened={tostring(opened)}`).toBe(`cut at {cut}: opened=false`)
+      expect((string.find(tostring(problem), 'damaged or replaced by an older copy', 1, true)) ~= nil).toBe(true)
+      -- Nothing was truncated or rewritten by the refusal.
+      expect(#disk.visible()[Log]).toBe(cut)
+    end
+  end)
+
+  suite.it('is refused when the log was replaced by an older copy of itself', function()
+    local disk = memfs.new()
+    local db = open(disk)
+    db:createTable('events', { 'id', 'body' }, 'id')
+    db:insert('events', { id = 1, body = 'kept' })
+    local older = disk.visible()[Log]
+    db:insert('events', { id = 2, body = 'later' })
+    db:close()
+    overwrite(disk, Log, older)
+    -- The open raises on the older copy; the refusal is the assertion.
+    expect((pcall(open, disk))).toBe(false)
+  end)
+
+  suite.it('is accepted only when its mark is removed, which is how a loss is knowingly accepted', function()
+    local disk = closedStore(5)
+    local body = disk.visible()[Log]
+    overwrite(disk, Log, string.sub(body, 1, frameEnds(body)[4]))
+    -- The short log is refused while its mark stands.
+    expect((pcall(open, disk))).toBe(false)
+    assert((disk.backend.remove(walmark.path(Log))))
+    expect(rows(disk)).toBe(3)
+  end)
+
+  suite.it('leaves an intact log alone, and a longer one: only shorter is damage', function()
+    local disk = closedStore(5)
+    expect(rows(disk)).toBe(5)
+    -- Bytes past the last frame are a torn write, dropped as they always were.
+    local body = disk.visible()[Log]
+    overwrite(disk, Log, body .. string.rep('\0', 5))
+    expect(rows(disk)).toBe(5)
+  end)
+end)
+
+suite.describe('what the mark does not claim', function()
+  suite.it('never makes a sound log look damaged after a crash, whenever the crash comes', function()
+    -- Every commit is acknowledged; the mark is behind or level, never ahead.
+    for crashAfter = 1, 6 do
+      local disk = memfs.new()
+      local db = open(disk)
+      db:createTable('events', { 'id', 'body' }, 'id')
+      for index = 1, crashAfter do db:insert('events', { id = index, body = `row {index}` }) end
+
+      disk.crash()
+      expect(`{crashAfter} {rows(disk)}`).toBe(`{crashAfter} {crashAfter}`)
+      -- And again after the recovery itself is cut off.
+      local again = open(disk)
+      again:insert('events', { id = 100, body = 'after' })
+      disk.crash()
+      expect(rows(disk)).toBe(crashAfter + 1)
+    end
+  end)
+
+  suite.it('does not vouch for a log that was only opened and closed', function()
+    local disk = closedStore(3)
+    local full = disk.visible()[Log]
+    local shorter = string.sub(full, 1, frameEnds(full)[3])
+    -- A different, longer log is put in place and merely opened and closed.
+    local other = closedStore(6).visible()[Log]
+    assert((disk.backend.remove(walmark.path(Log))))
+    overwrite(disk, Log, other)
+    expect(rows(disk)).toBe(6)
+    -- Opening it committed nothing, so nothing says it must be that long.
+    expect((walmark.read(disk.backend, Log) :: walmark.Mark).sequence).toBe(0)
+    overwrite(disk, Log, shorter)
+    expect(rows(disk)).toBe(2)
+  end)
+
+  suite.it('is not kept by a store that is not synchronized, and a stale one is discarded with a new log', function()
+    local disk = memfs.new()
+    local db = sql.open(Log, { storage = disk.backend })
+    db:createTable('events', { 'id' }, 'id')
+    db:insert('events', { id = 1 })
+    db:close()
+    expect(disk.visible()[walmark.path(Log)]).toBe(nil)
+
+    -- A mark left behind by a log that is gone says transactions were committed to a log that is
+    -- no longer there: the open is refused (review of 2026-11-13; this used to start an empty log
+    -- and delete the mark). Removing the mark is accepting that, and the new log is witnessed.
+    local stale = closedStore(5)
+    assert((stale.backend.remove(Log)))
+    assert((stale.backend.remove(Log .. '.lock')))
+    -- The open raises; the refusal is the assertion.
+    expect((pcall(open, stale))).toBe(false)
+    assert((stale.backend.remove(walmark.path(Log))))
+    local fresh = open(stale)
+    fresh:createTable('events', { 'id', 'body' }, 'id')
+    fresh:insert('events', { id = 1, body = 'new' })
+    fresh:close()
+    expect(rows(stale)).toBe(1)
+  end)
+
+  suite.it('refuses to open when the mark is there and cannot be written, rather than let it go stale', function()
+    local disk = closedStore(2)
+    disk.inject(function(step: string, path: string, _occurrence: number): memfs.Fault?
+      return if step == 'openWrite' and path == walmark.path(Log) then { message = 'injected: read-only' } else nil
+    end)
+    -- The open raises because the mark cannot be kept true; the refusal is the assertion.
+    expect((pcall(open, disk))).toBe(false)
+    disk.inject(nil)
+    expect(rows(disk)).toBe(2)
+  end)
+
+  suite.it('survives a slot torn by a crash: the other slot still stands', function()
+    local disk = closedStore(4)
+    local mark = disk.visible()[walmark.path(Log)]
+    expect(#mark).toBe(6 + 2 * 24)
+    for _, slot in { 0, 1 } do
+      local damaged = string.sub(mark, 1, 6 + slot * 24) .. string.rep('\255', 24) .. string.sub(mark, 6 + (slot + 1) * 24 + 1)
+      local decoded = walmark.decode(damaged)
+      -- One slot is gone; what is read is a true lower bound, never more than was committed.
+      expect(decoded ~= nil).toBe(true)
+      expect((decoded :: walmark.Mark).sequence <= 5).toBe(true)
+    end
+
+    expect(walmark.decode(string.rep('\255', #mark))).toBe(nil)
+    expect(walmark.decode('JQLC1\n')).toBe(nil)
+  end)
+
+  -- Review of #95: creating a file durably names it before it has bytes. A process killed, or a
+  -- disk that filled, while the mark was first made must not leave a mark that reads as damage:
+  -- that would refuse a sound log for good.
+  suite.it('never leaves a damaged mark when making the first one is cut off, on a new log or one from before marks', function()
+    for _, case in { 'new', 'before-marks' } do
+      local disk = if case == 'new' then memfs.new() else closedStore(5)
+      if case == 'before-marks' then assert((disk.backend.remove(walmark.path(Log)))) end
+      local torn = 0
+      -- The mark's own name or any other it is made under: the creation is cut after the name.
+      disk.inject(function(step: string, path: string, _occurrence: number): memfs.Fault?
+        if step ~= 'createDurable' or not string.find(path, walmark.Suffix, 1, true) then return nil end
+        torn += 1
+        return { message = 'killed while the mark was made', kind = 'torn' }
+      end)
+      -- A mark that could not be made is no mark: the store opens unwitnessed, as a log from
+      -- before marks does, and the process is then killed.
+      local opened = pcall(open, disk)
+      expect(`{case}: {opened} {torn}`).toBe(`{case}: true 1`)
+      disk.inject(nil)
+      disk.crash()
+      -- Nothing that reads as a damaged mark is left; the next open makes the mark and is sound.
+      expect(`{case}: {walmark.examine(disk.backend, Log)}`).toBe(`{case}: absent`)
+      local db = open(disk)
+      if case == 'new' then
+        db:createTable('events', { 'id', 'body' }, 'id')
+        db:insert('events', { id = 1, body = 'row 1' })
+      end
+      db:close()
+      expect(`{case}: {walmark.examine(disk.backend, Log)}`).toBe(`{case}: sound`)
+      expect(`{case}: {rows(disk)}`).toBe(`{case}: {if case == 'new' then 1 else 5}`)
+      expect(`{case}: {disk.visible()[walmark.path(Log) .. walmark.CandidateSuffix]}`).toBe(`{case}: nil`)
+    end
+  end)
+
+  -- Re-review of #96: what is left where the mark is made is removed only when it is the start of
+  -- a fresh mark. Another store's log under that name keeps its rows, and this log does not open.
+  suite.it('removes only what an interrupted creation of the mark leaves, never another file of that name', function()
+    local disk = memfs.new()
+    local candidate = walmark.path(Log) .. walmark.CandidateSuffix
+    local other = sql.open(candidate, { durability = 'sync', storage = disk.backend })
+    other:createTable('events', { 'id', 'body' }, 'id')
+    for index = 1, 5 do other:insert('events', { id = index, body = `row {index}` }) end
+    other:close()
+
+    -- The open raises on the file in the way; the refusal is the assertion.
+    local opened, problem = pcall(open, disk)
+    expect(opened).toBe(false)
+    expect((string.find(tostring(problem), 'is in the way of the committed-length mark', 1, true)) ~= nil).toBe(true)
+    local again = sql.open(candidate, { durability = 'sync', storage = disk.backend })
+    expect(again:query('SELECT COUNT(*) AS n FROM events').rows[1].n).toBe(5)
+    again:close()
+
+    -- Part of a fresh mark, as a full disk can leave: removed, and the mark made. A fresh mark is
+    -- what a store only opened and closed leaves.
+    local blank = memfs.new()
+    open(blank):close()
+    local whole = blank.visible()[walmark.path(Log)]
+    expect(#whole).toBe(6 + 48)
+    for _, length in { 0, 3, 6 + 24, 6 + 48 } do
+      local fresh = closedStore(2)
+      assert((fresh.backend.remove(walmark.path(Log))))
+      assert((fresh.backend.createDurable(candidate, string.sub(whole, 1, length))))
+      expect(`{length}: {rows(fresh)} {walmark.examine(fresh.backend, Log)}`).toBe(`{length}: 2 sound`)
+      expect(`{length}: {fresh.visible()[candidate]}`).toBe(`{length}: nil`)
+    end
+  end)
+
+  -- Review J-03: a mark that is there and cannot be read is not the same as no mark.
+  suite.it('refuses a log whose mark is damaged, cut or not, until the mark is removed by hand', function()
+    -- A sound log beside a mark that cannot be read: whether the log is whole cannot be said.
+    local disk = closedStore(5)
+    local mark = disk.visible()[walmark.path(Log)]
+    overwrite(disk, walmark.path(Log), string.rep('\255', #mark))
+    expect((walmark.examine(disk.backend, Log))).toBe('damaged')
+    -- The open raises on the damaged mark; the refusal and what it says are the assertion.
+    local opened, refusal = pcall(open, disk)
+    expect(opened).toBe(false)
+    expect(string.find(tostring(refusal), 'committed-length mark beside the log is damaged', 1, true) ~= nil).toBe(true)
+    -- The refusal wrote nothing: the damage is still there to be looked at.
+    expect(disk.visible()[walmark.path(Log)]).toBe(string.rep('\255', #mark))
+
+    -- The same with the log cut as well, which is what a damaged mark used to let through.
+    local body = disk.visible()[Log]
+    overwrite(disk, Log, string.sub(body, 1, frameEnds(body)[4]))
+    -- The open raises again, and a second time: a refusal repairs nothing by being repeated.
+    local first = pcall(open, disk)
+    -- The same open, raising for the same reason.
+    local second = pcall(open, disk)
+    expect(`{first} {second}`).toBe('false false')
+
+    -- Accepted knowingly, as a short log is: the mark is removed, and what is there is read.
+    assert((disk.backend.remove(walmark.path(Log))))
+    expect((walmark.examine(disk.backend, Log))).toBe('absent')
+    expect(rows(disk)).toBe(3)
+    -- And from then on the log has a sound mark again.
+    expect((walmark.examine(disk.backend, Log))).toBe('sound')
+  end)
+
+  suite.it('tells a mark that is absent, sound, or damaged in any of the ways a file can be', function()
+    local disk = closedStore(4)
+    local path = walmark.path(Log)
+    local mark = disk.visible()[path]
+    local condition, held = walmark.examine(disk.backend, Log)
+    expect(`{condition} {(held :: walmark.Mark).sequence}`).toBe('sound 5')
+
+    local damaged: { [string]: string } = {
+      ['both slots'] = string.sub(mark, 1, 6) .. string.rep('\255', 48),
+      ['the magic'] = 'JQLX1\n' .. string.sub(mark, 7),
+      ['cut short'] = string.sub(mark, 1, 30),
+      ['only its magic'] = 'JQLC1\n',
+      ['empty'] = '',
+      ['too long'] = mark .. '\0',
+      ['one bit in each slot'] = string.sub(mark, 1, 6) .. string.char(bit32.bxor(string.byte(mark, 7), 1)) .. string.sub(mark, 8, 30)
+        .. string.char(bit32.bxor(string.byte(mark, 31), 1)) .. string.sub(mark, 32),
+    }
+
+    for name, body in damaged do
+      overwrite(disk, path, body)
+      expect(`{name}: {(walmark.examine(disk.backend, Log))}`).toBe(`{name}: damaged`)
+      -- The open raises on every kind of damage; the refusal is the assertion.
+      local opened = pcall(open, disk)
+      expect(`{name}: {opened}`).toBe(`{name}: false`)
+      -- A damaged mark is never written over: that would make a clean witness of it.
+      expect(`{name}: {disk.visible()[path] == body}`).toBe(`{name}: true`)
+    end
+
+    -- One slot gone is what a crash can leave: the other stands, and the store opens.
+    for _, slot in { 0, 1 } do
+      overwrite(disk, path, string.sub(mark, 1, 6 + slot * 24) .. string.rep('\255', 24) .. string.sub(mark, 6 + (slot + 1) * 24 + 1))
+      expect(`slot {slot}: {(walmark.examine(disk.backend, Log))}`).toBe(`slot {slot}: sound`)
+      expect(rows(disk)).toBe(4)
+    end
+
+    -- No mark at all is a log from before marks: read as it always was.
+    assert((disk.backend.remove(path)))
+    expect(rows(disk)).toBe(4)
+  end)
+
+  suite.it('writes each record to the slot that does not hold the latest, across a reopen', function()
+    -- Reopened again and again with one commit each time. If a reopened writer began at the
+    -- first slot whatever it held, some reopen would overwrite the latest mark, and a write torn
+    -- there would leave only the older one's neighbour: here, after every reopen, tearing the
+    -- slot just written must leave the mark of the commit before it, never anything older.
+    local disk = memfs.new()
+    local db = open(disk)
+    db:createTable('events', { 'id', 'body' }, 'id')
+    db:close()
+    local path = walmark.path(Log)
+    for index = 1, 6 do
+      local before = assert(walmark.decode(disk.visible()[path]))
+      db = open(disk)
+      db:insert('events', { id = index, body = `row {index}` })
+      db:close()
+      local body = disk.visible()[path]
+      local after = assert(walmark.decode(body))
+      expect(after.sequence).toBe(before.sequence + 1)
+      -- Exactly one slot changed, and the other still holds the mark from before.
+      local survivors: { number } = {}
+      for _, slot in { 0, 1 } do
+        local torn = string.sub(body, 1, 6 + slot * 24) .. string.rep('\255', 24) .. string.sub(body, 6 + (slot + 1) * 24 + 1)
+        table.insert(survivors, assert(walmark.decode(torn)).sequence)
+      end
+
+      table.sort(survivors)
+      expect(`{index}: {survivors[1]} {survivors[2]}`).toBe(`{index}: {before.sequence} {after.sequence}`)
+    end
+  end)
+end)
+
+suite.describe('a managed database', function()
+  local function restored(change: (path: string, body: string) -> string): memfs.Disk
+    local disk = memfs.new()
+    for _, fixture in { golden, marks } do
+      for path, encoded in fixture do
+        local body = buffer.tostring(assert((bytes.fromBase64(encoded))))
+        assert((disk.backend.createDurable(path, change(path, body))))
+      end
+    end
+
+    return disk
+  end
+
+  local liveLog = '/memory/g.g00000003.wal'
+
+  suite.it('refuses a log cut at a frame boundary, and the offline scan names it', function()
+    local disk = restored(function(path: string, body: string): string
+      if path ~= liveLog then return body end
+      local ends = frameEnds(body)
+      return string.sub(body, 1, ends[#ends - 1])
+    end)
+    -- The open raises on the short log; the refusal is the assertion.
+    expect((pcall(function() return sql.managed.openExisting('/memory/g', { storage = disk.backend }) end))).toBe(false)
+    local report = sql.managed.verify('/memory/g', { storage = disk.backend })
+    expect(report.ok).toBe(false)
+    expect(report.issues[1].code).toBe('WAL_SHORTER_THAN_COMMITTED')
+  end)
+
+  suite.it('refuses a managed database whose log has a damaged mark, and the offline scan names it', function()
+    local disk = restored(function(path: string, body: string): string
+      return if path == walmark.path(liveLog) then string.rep('\255', #body) else body
+    end)
+    -- The open raises on the damaged mark; the refusal is the assertion.
+    expect((pcall(function() return sql.managed.openExisting('/memory/g', { storage = disk.backend }) end))).toBe(false)
+    local report = sql.managed.verify('/memory/g', { storage = disk.backend })
+    expect(report.ok).toBe(false)
+    local named = false
+    for _, issue in report.issues do
+      if issue.code == 'WAL_COMMITTED_MARK_DAMAGED' then named = true end
+    end
+
+    expect(named).toBe(true)
+  end)
+
+  suite.it('reads every seeded mutation of its log as the written rows or a refusal, never as an earlier state', function()
+    local state = 987654321
+    local function pick(bound: number): number
+      state = state * 48271 % 2147483647
+      return state % bound + 1
+    end
+
+    local refused, intact, tried = 0, 0, 0
+    for _ = 1, 400 do
+      local disk = restored(function(path: string, body: string): string
+        if path ~= liveLog then return body end
+        local at = pick(#body)
+        local kind = pick(10)
+        if kind <= 6 then
+          return string.sub(body, 1, at - 1) .. string.char((string.byte(body, at) + pick(255)) % 256) .. string.sub(body, at + 1)
+        elseif kind <= 9 then
+          return string.sub(body, 1, at - 1)
+        end
+
+        return body .. string.rep(string.char(pick(256) - 1), pick(24))
+      end)
+      tried += 1
+      -- Opening or reading a damaged database may raise; that is a refusal.
+      local ok, found = pcall(function(): string
+        local db = sql.managed.openExisting('/memory/g', { storage = disk.backend })
+        local seen: { string } = {}
+        for _, row in db:query('SELECT id FROM events ORDER BY id').rows do table.insert(seen, tostring((row :: Row).id)) end
+
+        db:close()
+        return table.concat(seen, ' ')
+      end)
+
+      if not ok then
+        refused += 1
+      else
+        expect(found).toBe('2 3 4')
+        intact += 1
+      end
+    end
+
+    expect(tried).toBe(400)
+    expect(refused > 300).toBe(true)
+    print(`log mutations with a mark: refused {refused}, intact {intact}, read as an earlier state 0`)
+  end)
+
+  suite.it('retires the mark with its log, and does not take a leftover mark for a database', function()
+    local disk = memfs.new()
+    local options: sql.ManagedOptions = { tableName = 'events', columns = { 'id' }, primaryKey = 'id', storage = disk.backend }
+    local db = sql.managed.create('/memory/m', options)
+    db:insert({ id = 1 })
+    expect(disk.visible()['/memory/m.g00000001.wal.committed'] ~= nil).toBe(true)
+    db:checkpoint()
+    db:insert({ id = 2 })
+    db:close()
+    expect(disk.visible()['/memory/m.g00000001.wal.committed']).toBe(nil)
+    expect(disk.visible()['/memory/m.g00000002.wal.committed'] ~= nil).toBe(true)
+
+    -- A mark beside no log, in a namespace with no manifest, is not a database.
+    local leftover = memfs.new()
+    assert((leftover.backend.createDurable('/memory/n.g00000001.wal.committed', disk.visible()['/memory/m.g00000002.wal.committed'])))
+    local fresh = sql.managed.create('/memory/n', { tableName = 'events', columns = { 'id' }, primaryKey = 'id', storage = leftover.backend })
+    fresh:insert({ id = 1 })
+    fresh:close()
+  end)
+
+  -- Review of 2026-11-13: a log that was lost while its mark survived was opened empty, and the
+  -- mark (the only evidence of the loss) deleted.
+  suite.it('refuses to start an empty log where a lost one had committed transactions, until the mark is removed', function()
+    local disk = closedStore(5)
+    local mark = disk.visible()[walmark.path(Log)]
+    assert((disk.backend.remove(Log)))
+    assert((disk.backend.remove(Log .. '.lock')))
+    -- The open raises; the refusal is the assertion.
+    local opened, problem = pcall(open, disk)
+    expect(opened).toBe(false)
+    expect((string.find(tostring(problem), 'the log is gone', 1, true)) ~= nil).toBe(true)
+    expect(disk.visible()[walmark.path(Log)]).toBe(mark)
+    -- Removing the mark is accepting the loss: an empty log, witnessed from nothing again.
+    assert((disk.backend.remove(walmark.path(Log))))
+    local db = open(disk)
+    expect(#db:tables()).toBe(0)
+    db:close()
+  end)
+
+  -- Review of 2026-11-13: a power cut can leave a log's end allocated and never written. Past
+  -- what the mark says was committed, that is a tail nobody was told of: cut, not refused.
+  suite.it('cuts a tail of zeros past the committed length, and refuses anything else there', function()
+    -- A last frame whose bytes do not check is torn too, when it ends in zeros and only zeros
+    -- follow it (re-review of 2026-11-13: writeback a page at a time leaves that). A frame that
+    -- is all there and does not check is damage, zeros after it or not (J-FINAL-01). Bytes past
+    -- where it claims to end that are not zeros are something else, and refused.
+    local tails: { [string]: string } = {
+      zeros = string.rep('\0', 64),
+      ['header-then-zeros'] = string.pack('<I4I4', 40, 12345) .. string.rep('\0', 40),
+      ['garbage-as-a-whole-last-frame'] = string.pack('<I4I4', 40, 12345) .. string.rep('x', 40),
+      ['garbage-as-a-whole-frame-before-zeros'] = string.pack('<I4I4', 40, 12345) .. string.rep('x', 40) .. string.rep('\0', 16),
+      ['garbage-past-a-frame'] = string.pack('<I4I4', 40, 12345) .. string.rep('x', 40) .. 'x',
+      ['garbage-as-a-header'] = string.rep('x', 48),
+    }
+
+    for _, case in { 'zeros', 'header-then-zeros', 'garbage-as-a-whole-last-frame', 'garbage-as-a-whole-frame-before-zeros',
+      'garbage-past-a-frame', 'garbage-as-a-header' } do
+      local disk = closedStore(5)
+      local body = disk.visible()[Log]
+      overwrite(disk, Log, body .. tails[case])
+      -- The open raises for the tail that is refused; whether it opened is the assertion.
+      local opened, db = pcall(open, disk)
+      expect(`{case}: {opened}`).toBe(`{case}: {string.sub(case, 1, 7) ~= 'garbage'}`)
+      if opened then
+        (db :: sql.PersistentDatabase):close()
+        expect(`{case}: {rows(disk)}`).toBe(`{case}: 5`)
+        expect(`{case}: {#disk.visible()[Log]}`).toBe(`{case}: {#body}`)
+      end
+    end
+
+    -- Zeros where the mark says committed transactions were are damage, and refused as before.
+    local disk = closedStore(5)
+    local body = disk.visible()[Log]
+    local ends = frameEnds(body)
+    overwrite(disk, Log, string.sub(body, 1, ends[4]) .. string.rep('\0', #body - ends[4]))
+    -- The open raises; the refusal is the assertion.
+    expect((pcall(open, disk))).toBe(false)
+  end)
+
+  -- Not tested, by decision (2026-11-13): acknowledged commits that come back as zeros past a
+  -- mark that is behind. The re-review of #99 showed them cut as a torn tail when the mark is
+  -- synchronized only at close and before a checkpoint, and #99 first answered by synchronizing
+  -- the mark with every commit, at about one and a half times the cost of a single commit. The
+  -- decision was to trust instead a synchronization the operating system reports as done: an
+  -- acknowledged commit was synchronized, so it is on the disk whole, and only a disk that
+  -- reports a synchronization it did not do can give it back as zeros. Such a disk is outside
+  -- what the store defends against (see `@jessql/walmark`). What the mark does still catch is
+  -- above: zeros where it says committed transactions were are refused.
+
+  suite.it('cuts a last frame that page-at-a-time writeback kept only the start of', function()
+    local disk = closedStore(5)
+    local whole = disk.visible()[Log]
+    -- The frame a sixth commit of a long row appends, made on a copy and never acknowledged here.
+    local scratch = memfs.new()
+    assert((scratch.backend.createDurable(Log, whole)))
+    assert((scratch.backend.createDurable(walmark.path(Log), disk.visible()[walmark.path(Log)])))
+    local other = sql.open(Log, { durability = 'sync', storage = scratch.backend })
+    other:insert('events', { id = 6, body = string.rep('y', 10000) })
+    other:close()
+    local frame = string.sub(scratch.visible()[Log], #whole + 1)
+    local kept = 4096 - #whole % 4096
+    for _, tail in { string.sub(frame, 1, kept) .. string.rep('\0', #frame - kept),
+      string.sub(frame, 1, kept) .. string.rep('\0', #frame - kept + 100) } do
+      local torn = closedStore(5)
+      overwrite(torn, Log, whole .. tail)
+      expect(rows(torn)).toBe(5)
+      expect(#torn.visible()[Log]).toBe(#whole)
+    end
+
+    -- The same frame with anything but zeros after where it claims to end is not a torn tail.
+    local garbled = closedStore(5)
+    overwrite(garbled, Log, whole .. string.sub(frame, 1, kept) .. string.rep('\0', #frame - kept) .. 'x')
+    -- The open raises; the refusal is the assertion.
+    expect((pcall(open, garbled))).toBe(false)
+  end)
+
+  -- J-FINAL-01: a last frame whose bytes are all there, past a mark that is behind, was cut as
+  -- torn when it did not check, since no zeros followed it. A process killed after a commit was
+  -- acknowledged leaves just that, so a changed byte in it lost an acknowledged transaction.
+  suite.it('refuses a whole last frame past an older mark that does not check, and leaves it be', function()
+    local disk = closedStore(5)
+    local whole = disk.visible()[Log]
+    local mark = disk.visible()[walmark.path(Log)]
+    -- A sixth commit, synchronized and acknowledged, whose process was killed before the mark
+    -- was brought up to it: made on a copy, and only its log is kept.
+    local scratch = memfs.new()
+    assert((scratch.backend.createDurable(Log, whole)))
+    assert((scratch.backend.createDurable(walmark.path(Log), mark)))
+    local other = sql.open(Log, { durability = 'sync', storage = scratch.backend })
+    other:insert('events', { id = 6, body = string.rep('y', 10000) })
+    other:close()
+    local frame = string.sub(scratch.visible()[Log], #whole + 1)
+    -- The mark is older than the log: it witnesses the create and five inserts, not the sixth.
+    expect((walmark.read(disk.backend, Log) :: walmark.Mark).sequence).toBe(6)
+    expect((walmark.read(disk.backend, Log) :: walmark.Mark).length).toBe(#whole)
+
+    -- Unaltered, the sixth commit is there.
+    local kept = closedStore(5)
+    overwrite(kept, Log, whole .. frame)
+    expect(rows(kept)).toBe(6)
+
+    -- One byte of its payload changed to another that is not zero: damage, not a tear.
+    local at = #frame - 10
+    local flipped = bit32.bxor(string.byte(frame, at), 1)
+    expect(flipped ~= 0).toBe(true)
+    local damaged = whole .. string.sub(frame, 1, at - 1) .. string.char(flipped) .. string.sub(frame, at + 1)
+    local refused = closedStore(5)
+    overwrite(refused, Log, damaged)
+    -- The open raises; the refusal is the assertion.
+    local opened, problem = pcall(open, refused)
+    expect(opened).toBe(false)
+    expect((string.find(tostring(problem), 'checksum mismatch', 1, true)) ~= nil).toBe(true)
+    -- Nothing was cut: the log and its mark are as they were.
+    expect(refused.visible()[Log] == damaged).toBe(true)
+    expect(refused.visible()[walmark.path(Log)] == mark).toBe(true)
+
+    -- Its length raised by one bit, still within the limit, so the frame looks cut short: its
+    -- payload is all there and checks, so the length is damaged, and that is refused too, with
+    -- the log alone or with zeros a later torn append left after it; and raised less, so that it
+    -- ends inside those zeros, where a torn frame would end too (re-review of J-FINAL-01).
+    local length = buffer.readu32(buffer.fromstring(frame), 0)
+    expect(bit32.band(length, 0x100000)).toBe(0)
+    local zeros = string.rep('\0', 64)
+    local raisings = { { bit32.bor(length, 0x100000), '' }, { bit32.bor(length, 0x100000), zeros }, { length + 1, zeros },
+      { length + 60, zeros } }
+
+    for _, raising in raisings do
+      local raised, after = raising[1] :: number, raising[2] :: string
+      local overlong = whole .. string.pack('<I4', raised) .. string.sub(frame, 5) .. after
+      local stretched = closedStore(5)
+      overwrite(stretched, Log, overlong)
+      -- The open raises; the refusal is the assertion.
+      local stretchedOpened, stretchedProblem = pcall(open, stretched)
+      expect(`{raised} {#after}: {stretchedOpened}`).toBe(`{raised} {#after}: false`)
+      expect((string.find(tostring(stretchedProblem), 'invalid frame length', 1, true)) ~= nil).toBe(true)
+      expect(stretched.visible()[Log] == overlong).toBe(true)
+      expect(stretched.visible()[walmark.path(Log)] == mark).toBe(true)
+    end
+
+    -- The same append torn by a power cut, its later pages never written, is still cut, whether
+    -- the log was left as long as the frame or as long as what was written, wherever it stops.
+    local cut = 4096 - #whole % 4096
+    local tears = { string.sub(frame, 1, cut) .. string.rep('\0', #frame - cut), string.sub(frame, 1, 100) .. string.rep('\0', 100) }
+    for _, kept in { 9, 100, cut, #frame - 1 } do table.insert(tears, string.sub(frame, 1, kept)) end
+
+    for index, tear in tears do
+      local torn = closedStore(5)
+      overwrite(torn, Log, whole .. tear)
+      expect(`{index}: {rows(torn)}`).toBe(`{index}: 5`)
+      expect(`{index}: {#torn.visible()[Log]}`).toBe(`{index}: {#whole}`)
+    end
+  end)
+
+  -- The log of `closedStore(5)`, the frames `extra` appends to it, and the mark that witnesses
+  -- only the first: the process that made them, synchronized and acknowledged, was killed before
+  -- the mark was brought up to them.
+  local function appended(extra: (sql.PersistentDatabase) -> ()): (string, string, string)
+    local disk = closedStore(5)
+    local whole, mark = disk.visible()[Log], disk.visible()[walmark.path(Log)]
+    local scratch = memfs.new()
+    assert((scratch.backend.createDurable(Log, whole)))
+    assert((scratch.backend.createDurable(walmark.path(Log), mark)))
+    local other = sql.open(Log, { durability = 'sync', storage = scratch.backend })
+    extra(other)
+    other:close()
+    return whole, string.sub(scratch.visible()[Log], #whole + 1), mark
+  end
+
+  -- Re-review of J-FINAL-01: with frames after it, a frame whose length was raised past the end
+  -- of the log was cut as short, and every acknowledged frame after it with it.
+  suite.it('refuses a frame past an older mark whose length runs past whole frames after it', function()
+    local whole, frames, mark = appended(function(db)
+      db:insert('events', { id = 6, body = string.rep('p', 3000) })
+      db:insert('events', { id = 7, body = string.rep('q', 3000) })
+    end)
+    local intact = closedStore(5)
+    overwrite(intact, Log, whole .. frames)
+    expect(rows(intact)).toBe(7)
+
+    -- Raised past the end of the log, with and without zeros after it, and raised to end inside
+    -- zeros after the frame that follows it, where a torn frame would end too.
+    local length = buffer.readu32(buffer.fromstring(frames), 0)
+    local zeros = string.rep('\0', 64)
+    local raisings = { { bit32.bor(length, 0x100000), '' }, { bit32.bor(length, 0x100000), zeros },
+      { bit32.bxor(length, 0x2000), '' }, { bit32.bxor(length, 0x2000), zeros }, { #frames - 8 + 32, zeros } }
+
+    for _, raising in raisings do
+      local raised, after = raising[1] :: number, raising[2] :: string
+      expect(raised > #frames - 8).toBe(true)
+      local overlong = whole .. string.pack('<I4', raised) .. string.sub(frames, 5) .. after
+      local disk = closedStore(5)
+      overwrite(disk, Log, overlong)
+      -- The open raises; the refusal is the assertion.
+      local opened, problem = pcall(open, disk)
+      expect(`{raised} {#after}: {opened}`).toBe(`{raised} {#after}: false`)
+      expect((string.find(tostring(problem), 'invalid frame length', 1, true)) ~= nil).toBe(true)
+      expect(disk.visible()[Log] == overlong).toBe(true)
+      expect(disk.visible()[walmark.path(Log)] == mark).toBe(true)
+    end
+  end)
+
+  suite.it('still cuts a batch of frames that a power cut tore a page in', function()
+    local whole, frames = appended(function(db)
+      db:transactionBatch({
+        function(tx) tx:insert('events', { id = 6, body = string.rep('a', 3000) }) end,
+        function(tx) tx:insert('events', { id = 7, body = string.rep('b', 3000) }) end,
+        function(tx) tx:insert('events', { id = 8, body = string.rep('c', 3000) }) end,
+      })
+    end)
+    local page = 4096 - #whole % 4096
+    -- Kept up to the end of the first page, then the second: as long as the batch with zeros,
+    -- or as long as what was written. What is left is the frames wholly inside what was kept.
+    local ends = frameEnds(whole .. frames)
+    expect(#ends).toBe(9)
+    for _, kept in { page, page + 4096 } do
+      local whole6, whole7 = ends[7] <= #whole + kept, ends[8] <= #whole + kept
+      expect(`{kept}: {whole6} {whole7} {ends[9] <= #whole + kept}`).toBe(`{kept}: {whole6} {whole7} false`)
+      local left = 5 + (if whole6 then 1 else 0) + (if whole7 then 1 else 0)
+      for _, rest in { string.rep('\0', #frames - kept), '' } do
+        local disk = closedStore(5)
+        overwrite(disk, Log, whole .. string.sub(frames, 1, kept) .. rest)
+        expect(`{kept} {#rest}: {rows(disk)}`).toBe(`{kept} {#rest}: {left}`)
+      end
+    end
+  end)
+
+  suite.it('cuts no more zeros than one batch of frames can leave unsynchronized', function()
+    -- 256 frames of at most 1024 bytes, each behind its 8-byte header.
+    local reach = 256 * (8 + 1024)
+    for _, case in { { zeros = reach, opens = true }, { zeros = reach + 1, opens = false } } do
+      local disk = memfs.new()
+      local function openSmall(): sql.PersistentDatabase
+        return sql.open(Log, { durability = 'sync', maxFrameBytes = 1024, storage = disk.backend })
+      end
+
+      local db = openSmall()
+      db:createTable('events', { 'id' }, 'id')
+      db:insert('events', { id = 1 })
+      db:close()
+      local body = disk.visible()[Log]
+      overwrite(disk, Log, body .. string.rep('\0', case.zeros))
+      -- The open raises for the tail that is refused; whether it opened is the assertion.
+      local opened, reopened = pcall(openSmall)
+      expect(`{case.zeros}: {opened}`).toBe(`{case.zeros}: {case.opens}`)
+      if opened then (reopened :: sql.PersistentDatabase):close() end
+    end
+  end)
+
+  -- A process killed while a new log's first bytes were written left nothing, or part of its
+  -- header, which was refused for good as a header that is not one.
+  suite.it('makes a new log again whose making was cut off before its header was whole', function()
+    for _, left in { '', 'JQL' } do
+      local disk = memfs.new()
+      assert((disk.backend.createDurable(Log, left)))
+      local db = open(disk)
+      db:createTable('events', { 'id', 'body' }, 'id')
+      db:insert('events', { id = 1, body = 'row 1' })
+      db:close()
+      expect(`"{left}": {rows(disk)}`).toBe(`"{left}": 1`)
+    end
+  end)
+
+  -- Re-review of 2026-11-13: a log damaged to nothing, or to part of its header, was taken for
+  -- an unfinished new one and remade, and its mark with it.
+  suite.it('does not remake a log whose mark says transactions were committed to it', function()
+    for _, left in { '', 'JQL' } do
+      local disk = closedStore(9)
+      local mark = disk.visible()[walmark.path(Log)]
+      expect((walmark.read(disk.backend, Log) :: walmark.Mark).sequence).toBe(10)
+      overwrite(disk, Log, left)
+      -- The open raises; the refusal is the assertion.
+      local opened, problem = pcall(open, disk)
+      expect(`"{left}": {opened}`).toBe(`"{left}": false`)
+      expect((string.find(tostring(problem), 'it was damaged', 1, true)) ~= nil).toBe(true)
+      expect(disk.visible()[Log]).toBe(left)
+      expect(disk.visible()[walmark.path(Log)]).toBe(mark)
+    end
+  end)
+
+  -- Re-review of 2026-11-13: a hybrid opened on its own, with no manifest, took its own log for
+  -- one a manifest had just named, and opened empty over a lost one.
+  suite.it('refuses a hybrid opened on its own over a log that was lost', function()
+    local disk = memfs.new()
+    local count = 0
+    sql.paged.create('/memory/h.base', { 'id', 'value' }, 'id', function(): Row?
+      count += 1
+      if count > 10 then return nil end
+      return { id = count, value = count }
+    end, { storage = disk.backend })
+
+    local function openHybrid(): sql.HybridDatabase
+      return sql.hybrid.open('/memory/h.wal', '/memory/h.base', 'events', { durability = 'sync', storage = disk.backend })
+    end
+
+    local db = openHybrid()
+    for id = 11, 15 do db:transaction(function(tx) tx:insert({ id = id, value = id }) end) end
+
+    db:close()
+    local mark = disk.visible()['/memory/h.wal.committed']
+    assert((disk.backend.remove('/memory/h.wal')))
+    -- The open raises; the refusal is the assertion.
+    local opened, problem = pcall(openHybrid)
+    expect(opened).toBe(false)
+    expect((string.find(tostring(problem), 'the log is gone', 1, true)) ~= nil).toBe(true)
+    expect(disk.visible()['/memory/h.wal.committed']).toBe(mark)
+  end)
+
+  suite.it('says whether a log is witnessed, so one running without its mark is seen', function()
+    local disk = memfs.new()
+    local db = open(disk)
+    expect((db :: any):witness()).toBe('witnessed')
+    db:close()
+
+    -- The mark cannot be made: the store runs, and says it is unwitnessed.
+    local bare = memfs.new()
+    bare.inject(function(step: string, path: string, _occurrence: number): memfs.Fault?
+      if step == 'createDurable' and string.find(path, walmark.Suffix, 1, true) then return { message = 'no space' } end
+      return nil
+    end)
+    local running = open(bare)
+    expect((running :: any):witness()).toBe('unwitnessed')
+    running:close()
+  end)
+
+  -- Re-review of #99: a mark that could not be written stayed behind for the rest of the session,
+  -- and the store went on saying it was witnessed.
+  suite.it('says it is unwitnessed once its mark cannot be written, and keeps every commit it acknowledges', function()
+    local disk = memfs.new()
+    local db = open(disk)
+    db:createTable('events', { 'id' }, 'id')
+    for index = 1, 5 do db:insert('events', { id = index }) end
+
+    local failed = false
+    disk.inject(function(step: string, path: string, _occurrence: number): memfs.Fault?
+      if failed or step ~= 'write' or path ~= walmark.path(Log) then return nil end
+
+      failed = true
+      return { message = 'EIO', kind = 'other' }
+    end)
+
+    for index = 6, 20 do db:insert('events', { id = index }) end
+    disk.inject(nil)
+    expect(`{failed} {(db :: any):witness()}`).toBe('true unwitnessed')
+
+    -- Every commit was acknowledged, and is there after a crash; reopened, the mark is kept again.
+    disk.crash()
+    local again = open(disk)
+    expect(again:query('SELECT COUNT(*) AS n FROM events').rows[1].n).toBe(20)
+    expect((again :: any):witness()).toBe('witnessed')
+    again:insert('events', { id = 21 })
+    again:close()
+  end)
+end)
+
+return suite

@@ -1,0 +1,212 @@
+--!strict
+-- #40.1, option B: the manifest of a multi-table managed database (record version 3). The codec is
+-- pure, so this needs no disk: what it writes, what it refuses, and that neither it nor the
+-- single-table codec will read the other's record.
+local bytes = require('@dream/bytes')
+local catalog = require('@jessql/catalog_manifest')
+local formats = require('@jessql/formats')
+local single = require('@jessql/managed_manifest')
+local test = require('@jess/test')
+
+local expect = test.expect
+local suite = test.new()
+
+local Identity = catalog.identity({ events = 'JQLM1|a', counters = 'JQLM1|b' })
+
+local function sample(): catalog.Catalog
+  return {
+    version = 3, epoch = 4, snapshotIdentity = Identity,
+    tables = {
+      { tableName = 'counters', columns = { 'name', 'value' }, primaryKey = 'name',
+        generations = { { epoch = 1, deleted = false } } },
+      { tableName = 'events', columns = { 'id', 'room', 'body' }, primaryKey = 'id',
+        generations = { { epoch = 1, deleted = false }, { epoch = 2, deleted = true }, { epoch = 4, deleted = false } } },
+    },
+  }
+end
+
+-- The bytes this build writes for `sample()`. Pinned: a change here is a format change.
+local Golden = 'JQLM1\n{"epoch":4,"snapshotIdentity":"' .. Identity .. '","tables":[{"columns":["name","value"],'
+  .. '"generations":[{"deleted":false,"epoch":1}],"primaryKey":"name","tableName":"counters"},{"columns":["id","room","body"],'
+  .. '"generations":[{"deleted":false,"epoch":1},{"deleted":true,"epoch":2},{"deleted":false,"epoch":4}],"primaryKey":"id",'
+  .. '"tableName":"events"}],"version":3}\n'
+
+local function refused(change: (catalog.Catalog) -> ()): string
+  local value = sample()
+  change(value)
+  -- Encoding validates, and a refusal is an error.
+  local ok, problem = pcall(catalog.encode, value)
+  expect(ok).toBe(false)
+  return tostring(problem)
+end
+
+-- A whole manifest with this body, checksummed, as a writer that skipped validation would leave.
+local function framed(body: string): string
+  return 'JQLM1\n' .. body .. '\n' .. tostring(bytes.crc32(body)) .. '\n'
+end
+
+suite.describe('catalog manifest (record version 3)', function()
+  suite.it('writes one pinned encoding and reads it back', function()
+    local encoded = catalog.encode(sample())
+    local body = string.match(Golden, '^JQLM1\n(.*)\n$') :: string
+    expect(encoded).toBe(framed(body))
+    local decoded = catalog.decode(encoded)
+    expect(decoded.epoch).toBe(4)
+    expect(#decoded.tables).toBe(2)
+    expect(decoded.tables[2].tableName).toBe('events')
+    expect(decoded.tables[2].generations[2].deleted).toBe(true)
+    expect(catalog.encode(decoded)).toBe(encoded)
+    expect(catalog.versionOf(encoded)).toBe(3)
+    expect((formats.identify(encoded) :: formats.Format).id).toBe('manifest')
+    expect(table.find((formats.identify(encoded) :: formats.Format).reads, 3) ~= nil).toBe(true)
+  end)
+
+  suite.it('refuses a catalog that breaks an invariant, saying which', function()
+    expect(string.find(refused(function(value) value.version = 2 end), 'not a multi-table manifest', 1, true) ~= nil).toBe(true)
+    expect(string.find(refused(function(value) value.epoch = 0 end), 'invalid epoch', 1, true) ~= nil).toBe(true)
+    expect(string.find(refused(function(value) value.epoch = 4.5 end), 'invalid epoch', 1, true) ~= nil).toBe(true)
+    expect(string.find(refused(function(value) value.snapshotIdentity = 'JQLM1|x' end), 'invalid cold identity', 1, true) ~= nil).toBe(true)
+    expect(string.find(refused(function(value) value.tables = {} end), 'invalid table list', 1, true) ~= nil).toBe(true)
+    -- Out of name order, and the same table twice.
+    expect(string.find(refused(function(value) value.tables[1], value.tables[2] = value.tables[2], value.tables[1] end),
+      'name order', 1, true) ~= nil).toBe(true)
+    expect(string.find(refused(function(value) value.tables[2].tableName = 'counters' end), 'name order', 1, true) ~= nil).toBe(true)
+    -- Names the overlay keeps, names a file or the engine cannot carry.
+    for _, name in { '__jessql_deleted_x', 'Events', 'a-b', '', '9lives', string.rep('a', 49), 'a/b', 'a.b' } do
+      expect(string.find(refused(function(value) value.tables[1].tableName = name end), 'invalid table name', 1, true) ~= nil).toBe(true)
+    end
+
+    expect(string.find(refused(function(value) value.tables[1].primaryKey = 'missing' end), 'missing primary key', 1, true) ~= nil).toBe(true)
+    expect(string.find(refused(function(value) value.tables[1].columns = { 'name', 'name' } end), 'invalid table columns', 1, true) ~= nil).toBe(true)
+    expect(string.find(refused(function(value) value.tables[1].columns = {} end), 'invalid table schema', 1, true) ~= nil).toBe(true)
+    expect(string.find(refused(function(value) value.tables[1].generations = {} end), 'invalid generations', 1, true) ~= nil).toBe(true)
+    -- Generations out of order or past the publication epoch.
+    expect(string.find(refused(function(value) value.tables[2].generations[2].epoch = 1 end), 'invalid generation entry', 1, true) ~= nil).toBe(true)
+    expect(string.find(refused(function(value) value.tables[2].generations[3].epoch = 5 end), 'invalid generation entry', 1, true) ~= nil).toBe(true)
+    local many: { catalog.Generation } = {}
+    for epoch = 1, 9 do many[epoch] = { epoch = epoch, deleted = false } end
+
+    expect(string.find(refused(function(value) value.epoch = 9; value.tables[2].generations = many end), 'invalid generations', 1, true) ~= nil).toBe(true)
+  end)
+
+  suite.it('refuses damaged, foreign and non-canonical bytes at decode', function()
+    local encoded = catalog.encode(sample())
+    -- Every single-byte change is refused: the checksum, the header or the frame catches it.
+    for position = 1, #encoded do
+      local original = string.byte(encoded, position)
+      local changed = string.sub(encoded, 1, position - 1) .. string.char(bit32.bxor(original, 1)) .. string.sub(encoded, position + 1)
+      -- A refusal is an error.
+      local ok = pcall(catalog.decode, changed)
+      expect(ok).toBe(false)
+    end
+
+    -- Every truncation too.
+    for length = 0, #encoded - 1 do
+      -- A refusal is an error.
+      local ok = pcall(catalog.decode, string.sub(encoded, 1, length))
+      expect(ok).toBe(false)
+    end
+
+    local body = string.match(encoded, '^JQLM1\n(.*)\n%d+\n$') :: string
+    -- A correct checksum over a body with a key this version does not have, or in another order.
+    local extra = string.gsub(body, '"version":3}$', '"version":3,"zebra":1}')
+    local reordered = '{"version":3,' .. string.sub(string.gsub(body, ',"version":3}$', '}'), 2)
+    local unknownGeneration = string.gsub(body, '{"deleted":true,"epoch":2}', '{"deleted":true,"epoch":2,"note":"x"}')
+    for _, altered in { extra, reordered, unknownGeneration, 'not json', '[]', '{"version":3}' } do
+      -- A refusal is an error.
+      local ok = pcall(catalog.decode, framed(altered))
+      expect(ok).toBe(false)
+    end
+
+    expect(catalog.versionOf(framed(extra))).toBe(3)
+    expect(catalog.versionOf(framed('not json'))).toBe(nil)
+    expect(catalog.versionOf(string.sub(encoded, 1, #encoded - 2))).toBe(nil)
+    expect(catalog.versionOf(string.rep('x', 70000))).toBe(nil)
+  end)
+
+  suite.it('is not read by the single-table codec, nor reads its records', function()
+    local encoded = catalog.encode(sample())
+    -- A refusal is an error.
+    local singleRead, singleProblem = pcall(single.decode, encoded)
+    expect(singleRead).toBe(false)
+    expect(string.find(tostring(singleProblem), 'invalid manifest schema', 1, true) ~= nil).toBe(true)
+
+    local second = single.encode({ version = 2, epoch = 2, tableName = 'events', columns = { 'id' }, primaryKey = 'id',
+      snapshotIdentity = 'JQLM1|x', generations = { { epoch = 1, deleted = false }, { epoch = 2, deleted = false } } })
+    -- A refusal is an error.
+    local catalogRead, catalogProblem = pcall(catalog.decode, second)
+    expect(catalogRead).toBe(false)
+    expect(string.find(tostring(catalogProblem), 'not a multi-table manifest (record version 2)', 1, true) ~= nil).toBe(true)
+    expect(catalog.versionOf(second)).toBe(2)
+  end)
+
+  suite.it('binds the log to every table and every generation set', function()
+    local base = catalog.identity({ events = 'JQLM1|a', counters = 'JQLM1|b' })
+    expect(base).toBe(Identity)
+    expect(#base).toBe(6 + 64)
+    expect(catalog.identity({ counters = 'JQLM1|b', events = 'JQLM1|a' })).toBe(base)
+    -- Swapped between tables, changed, a table more or fewer, and boundaries that could run together.
+    expect(catalog.identity({ events = 'JQLM1|b', counters = 'JQLM1|a' }) ~= base).toBe(true)
+    expect(catalog.identity({ events = 'JQLM1|a', counters = 'JQLM1|c' }) ~= base).toBe(true)
+    expect(catalog.identity({ events = 'JQLM1|a' }) ~= base).toBe(true)
+    expect(catalog.identity({ events = 'JQLM1|a', counters = 'JQLM1|b', outbox = '' }) ~= base).toBe(true)
+    expect(catalog.identity({ leftright = 'x' }) ~= catalog.identity({ left = 'rightx' })).toBe(true)
+    expect(catalog.identity({ first = 'b\nsecond\0001\0d' }) ~= catalog.identity({ first = 'b', second = 'd' })).toBe(true)
+  end)
+
+  suite.it('starts every table at epoch 1 and moves the whole database one epoch at a time', function()
+    local first = catalog.initial({
+      { tableName = 'events', columns = { 'id', 'room', 'body' }, primaryKey = 'id' },
+      { tableName = 'counters', columns = { 'name', 'value' }, primaryKey = 'name' },
+    }, Identity)
+    expect(first.epoch).toBe(1)
+    expect(first.tables[1].tableName).toBe('counters')
+    expect(#first.tables[2].generations).toBe(1)
+
+    -- Only `events` changed: `counters` keeps its list, and the epoch is the database's.
+    local other = catalog.identity({ events = 'JQLM1|z', counters = 'JQLM1|b' })
+    local second = catalog.next(first, 2, other, { events = { { epoch = 1, deleted = false }, { epoch = 2, deleted = true } } })
+    expect(second.epoch).toBe(2)
+    expect(#(catalog.table(second, 'counters') :: catalog.Table).generations).toBe(1)
+    expect(#(catalog.table(second, 'events') :: catalog.Table).generations).toBe(2)
+    expect(#first.tables[2].generations).toBe(1)
+    expect(catalog.table(second, 'absent')).toBe(nil)
+
+    -- A publication that names no table moves the epoch alone: a new log over the same cold set.
+    local rotated = catalog.next(second, 3, other, {})
+    expect(rotated.epoch).toBe(3)
+    expect(#(catalog.table(rotated, 'events') :: catalog.Table).generations).toBe(2)
+    expect(catalog.decode(catalog.encode(rotated)).epoch).toBe(3)
+
+    -- Not two epochs at once, and not an unknown table.
+    for _, attempt in {
+      function() catalog.next(first, 3, other, { events = { { epoch = 1, deleted = false }, { epoch = 3, deleted = false } } }) end,
+      function() catalog.next(first, 2, other, { absent = { { epoch = 2, deleted = false } } }) end,
+    } do
+      -- A refusal is an error.
+      local ok = pcall(attempt)
+      expect(ok).toBe(false)
+    end
+
+    catalog.sameSchema(second, {
+      { tableName = 'counters', columns = { 'name', 'value' }, primaryKey = 'name' },
+      { tableName = 'events', columns = { 'id', 'room', 'body' }, primaryKey = 'id' },
+    })
+
+    for _, schemas in {
+      { { tableName = 'events', columns = { 'id', 'room', 'body' }, primaryKey = 'id' } },
+      { { tableName = 'counters', columns = { 'name', 'value' }, primaryKey = 'name' },
+        { tableName = 'events', columns = { 'id', 'body', 'room' }, primaryKey = 'id' } },
+      { { tableName = 'counters', columns = { 'name', 'value' }, primaryKey = 'value' },
+        { tableName = 'events', columns = { 'id', 'room', 'body' }, primaryKey = 'id' } },
+      { { tableName = 'counters', columns = { 'name', 'value' }, primaryKey = 'name' },
+        { tableName = 'outbox', columns = { 'id', 'room', 'body' }, primaryKey = 'id' } },
+    } do
+      -- A refusal is an error.
+      local ok = pcall(catalog.sameSchema, second, schemas :: { catalog.TableSchema })
+      expect(ok).toBe(false)
+    end
+  end)
+end)
+
+return suite

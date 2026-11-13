@@ -1,0 +1,364 @@
+--!strict
+-- Addresses into cold data kept as a set of segment files (#20): prototype and boundary rules.
+--
+-- Today a cold file is addressed by one byte offset. This is the address that replaces it when
+-- the data is more than one file: a segment id and an offset inside that segment, each an
+-- unsigned 32-bit integer, eight bytes on disk. Nothing here converts silently through a
+-- number that cannot hold it:
+--
+--   * every segment of a set has the same capacity, `segmentBytes`, a power of two from 4 KiB
+--     to 2 GiB, so an offset inside one always fits 31 bits and is exact;
+--   * a logical offset (segment * segmentBytes + offset) is a convenience for callers and is
+--     only ever produced when it is exact, that is at most 2^53 - 1. Past that `join` refuses;
+--     the pair itself goes on to 2^32 segments, which callers must then carry as a pair;
+--   * anything out of range, not whole, or not a number is refused with a reason, never
+--     clamped or wrapped.
+--
+-- `reader` and `writer` are the prototype: raw segment files, a set record the caller keeps
+-- (in a database, the manifest would), and a CRC-32 a segment. Neither holds a segment: the
+-- writer hands bytes to the file as they come, and `verify` reads a piece at a time.
+local bytes = require('@dream/bytes')
+local vfs = require('@jessql/vfs')
+
+export type Address = { segment: number, offset: number }
+export type Span = { segment: number, offset: number, length: number }
+-- One sealed segment of a set: how many bytes it holds and their CRC-32.
+export type Segment = { id: number, length: number, crc: number }
+export type Set = { segmentBytes: number, segments: { Segment } }
+export type Reader = {
+  -- `length` bytes at a logical offset, across segments if need be; or nil and why.
+  read: (logical: number, length: number) -> (string?, string?),
+  -- The same at a pair, for a set too large for logical offsets.
+  readAt: (address: Address, length: number) -> (string?, string?),
+  -- Reads a whole segment against its length and CRC.
+  verify: (segment: number) -> (boolean, string?),
+}
+export type Writer = {
+  -- Appends, splitting across segments; the logical offset the data starts at, or nil and why.
+  append: (data: string) -> (number?, string?),
+  -- Seals what is open and returns the set.
+  finish: () -> (Set?, string?),
+}
+
+local address = {}
+
+address.MaxSegment = 2 ^ 32 - 1
+address.MinSegmentBytes = 4096
+address.MaxSegmentBytes = 2 ^ 31
+-- The largest logical offset a Luau number holds exactly.
+address.MaxLogical = 2 ^ 53 - 1
+-- The most segments one read or one set may touch here.
+address.MaxSpans = 4096
+address.EncodedBytes = 8
+-- How much of a segment `verify` holds at once.
+address.VerifyPieceBytes = 1024 * 1024
+
+local function whole(value: unknown, least: number, most: number): boolean
+  return type(value) == 'number' and value == value and value == math.floor(value :: number)
+    and (value :: number) >= least and (value :: number) <= most
+end
+
+-- A power of two between the limits.
+function address.validSegmentBytes(segmentBytes: unknown): boolean
+  if not whole(segmentBytes, address.MinSegmentBytes, address.MaxSegmentBytes) then return false end
+
+  local size = segmentBytes :: number
+  while size > 1 do
+    if size % 2 ~= 0 then return false end
+
+    size /= 2
+  end
+
+  return true
+end
+
+function address.valid(candidate: unknown, segmentBytes: number): boolean
+  if type(candidate) ~= 'table' or not address.validSegmentBytes(segmentBytes) then return false end
+
+  local pair = candidate :: { [string]: unknown }
+  return whole(pair.segment, 0, address.MaxSegment) and whole(pair.offset, 0, segmentBytes - 1)
+end
+
+-- The pair a logical offset names, or nil and why.
+function address.split(logical: unknown, segmentBytes: number): (Address?, string?)
+  if not address.validSegmentBytes(segmentBytes) then return nil, 'not a segment size' end
+  if not whole(logical, 0, address.MaxLogical) then return nil, 'not a whole logical offset an exact number holds' end
+
+  local segment = (logical :: number) // segmentBytes
+  if segment > address.MaxSegment then return nil, 'past the last segment' end
+
+  return { segment = segment, offset = (logical :: number) % segmentBytes }, nil
+end
+
+-- The logical offset of a pair, or nil and why: a pair past 2^53 - 1 has none.
+function address.join(pair: Address, segmentBytes: number): (number?, string?)
+  if not address.valid(pair, segmentBytes) then return nil, 'not an address of this set' end
+  -- Compared before it is multiplied: the product of a pair that does not fit is not exact.
+  if pair.segment > (address.MaxLogical - pair.offset) // segmentBytes then return nil, 'no exact logical offset: carry the pair' end
+
+  return pair.segment * segmentBytes + pair.offset, nil
+end
+
+-- Eight bytes: the segment and the offset, each an unsigned 32-bit integer, low byte first.
+function address.encode(pair: Address, segmentBytes: number): (string?, string?)
+  if not address.valid(pair, segmentBytes) then return nil, 'not an address of this set' end
+
+  local out = buffer.create(address.EncodedBytes)
+  buffer.writeu32(out, 0, pair.segment)
+  buffer.writeu32(out, 4, pair.offset)
+  return buffer.tostring(out), nil
+end
+
+-- The pair in the eight bytes at `at` (from 1), or nil and why. An offset the set's segments
+-- cannot hold is refused: it is damage, not a larger address.
+function address.decode(encoded: string, at: number?, segmentBytes: number): (Address?, string?)
+  if not address.validSegmentBytes(segmentBytes) then return nil, 'not a segment size' end
+
+  local from = at or 1
+  if type(encoded) ~= 'string' or not whole(from, 1, 2 ^ 31) or from + address.EncodedBytes - 1 > #encoded then return nil, 'not eight bytes' end
+
+  local raw = buffer.fromstring(string.sub(encoded, from, from + address.EncodedBytes - 1))
+  local pair: Address = { segment = buffer.readu32(raw, 0), offset = buffer.readu32(raw, 4) }
+  if pair.offset >= segmentBytes then return nil, 'offset past the end of a segment' end
+
+  return pair, nil
+end
+
+-- The pieces of `length` bytes starting at a pair, one a segment; or nil and why.
+function address.spans(start: Address, length: number, segmentBytes: number): ({ Span }?, string?)
+  if not address.valid(start, segmentBytes) then return nil, 'not an address of this set' end
+  if not whole(length, 0, address.MaxLogical) then return nil, 'not a whole length' end
+
+  local spans: { Span } = {}
+  local segment, offset, remaining = start.segment, start.offset, length
+  while remaining > 0 do
+    if segment > address.MaxSegment then return nil, 'past the last segment' end
+    if #spans >= address.MaxSpans then return nil, 'too many segments for one read' end
+
+    local take = math.min(remaining, segmentBytes - offset)
+    table.insert(spans, { segment = segment, offset = offset, length = take })
+    remaining -= take
+    segment += 1
+    offset = 0
+  end
+
+  return spans, nil
+end
+
+-- A name a segment file may be built on, on every platform this runs on: letters, digits, `_`
+-- and `-`, 48 at most, and not a name Windows keeps for a device, whatever its case.
+function address.validBase(base: unknown): boolean
+  if type(base) ~= 'string' or #(base :: string) == 0 or #(base :: string) > 48 or not string.match(base :: string, '^[%w][%w_%-]*$') then return false end
+
+  local upper = string.upper(base :: string)
+  for _, device in { 'CON', 'PRN', 'AUX', 'NUL' } do
+    if upper == device then return false end
+  end
+
+  return not (string.match(upper, '^COM%d$') or string.match(upper, '^LPT%d$'))
+end
+
+-- The file of one segment: the base, `.s`, the id as eight lower-case hex digits, `.cold`. The
+-- id is fixed-width so names sort as their ids do, and lower-case so two segments never differ
+-- by case alone.
+function address.fileName(base: string, segment: number): (string?, string?)
+  if not address.validBase(base) then return nil, 'not a base name' end
+  if not whole(segment, 0, address.MaxSegment) then return nil, 'not a segment id' end
+
+  return string.format('%s.s%08x.cold', base, segment), nil
+end
+
+-- A set that is one: a segment size, and segments with distinct ids in ascending order, each
+-- no longer than a segment holds.
+function address.validSet(set: unknown): (boolean, string?)
+  if type(set) ~= 'table' then return false, 'not a set' end
+
+  local value = set :: { [string]: unknown }
+  if not address.validSegmentBytes(value.segmentBytes) or type(value.segments) ~= 'table' then return false, 'not a set' end
+  if #(value.segments :: { unknown }) > address.MaxSpans then return false, 'too many segments' end
+
+  local before = -1
+  for _, raw in value.segments :: { unknown } do
+    if type(raw) ~= 'table' then return false, 'not a segment' end
+
+    local entry = raw :: { [string]: unknown }
+    if not whole(entry.id, before + 1, address.MaxSegment) or not whole(entry.length, 0, value.segmentBytes :: number)
+      or not whole(entry.crc, 0, 2 ^ 32 - 1) then return false, 'a segment out of order or out of range' end
+
+    before = entry.id :: number
+  end
+
+  return true, nil
+end
+
+-- A reader over the segment files of `set` in `directory`. Every read is held to the set: a
+-- segment it does not name, or bytes past a segment's recorded length, are refused.
+function address.reader(storage: vfs.Backend, directory: string, base: string, set: Set): (Reader?, string?)
+  local sound, why = address.validSet(set)
+  if not sound then return nil, why end
+  if not address.validBase(base) then return nil, 'not a base name' end
+
+  local segmentBytes = set.segmentBytes
+  local known: { [number]: Segment } = {}
+  for _, entry in set.segments do known[entry.id] = entry end
+
+  local function piece(span: Span): (string?, string?)
+    local entry = known[span.segment]
+    if not entry then return nil, `segment {span.segment} is not in the set` end
+    if span.offset + span.length > entry.length then return nil, `past the end of segment {span.segment}` end
+
+    local name = assert(address.fileName(base, span.segment))
+    local read, problem = storage.readAt(storage.join(directory, name), span.offset, span.length)
+    if not read then return nil, problem or 'unreadable' end
+    if buffer.len(read) ~= span.length then return nil, `segment {span.segment} is shorter than the set says` end
+
+    return buffer.tostring(read), nil
+  end
+
+  local self = {} :: Reader
+
+  function self.readAt(start: Address, length: number): (string?, string?)
+    local spans, problem = address.spans(start, length, segmentBytes)
+    if not spans then return nil, problem end
+
+    local parts: { string } = {}
+    for _, span in spans do
+      local part, why = piece(span)
+      if not part then return nil, why end
+
+      table.insert(parts, part)
+    end
+
+    return table.concat(parts), nil
+  end
+
+  function self.read(logical: number, length: number): (string?, string?)
+    local start, problem = address.split(logical, segmentBytes)
+    if not start then return nil, problem end
+
+    return self.readAt(start, length)
+  end
+
+  function self.verify(segment: number): (boolean, string?)
+    local entry = known[segment]
+    if not entry then return false, `segment {tostring(segment)} is not in the set` end
+
+    -- A piece at a time, the checksum carried from one to the next: a segment of 2 GiB is
+    -- checked in the memory of one piece.
+    local crc: number? = nil
+    local at = 0
+    while at < entry.length do
+      local take = math.min(address.VerifyPieceBytes, entry.length - at)
+      local body, problem = piece({ segment = segment, offset = at, length = take })
+      if not body then return false, problem end
+
+      crc = bytes.crc32(body, crc)
+      at += take
+    end
+
+    if (crc or bytes.crc32('')) ~= entry.crc then return false, `segment {segment} does not match its checksum` end
+
+    return true, nil
+  end
+
+  return self, nil
+end
+
+-- A writer that fills segment files in order from id 0, for the prototype and its tests. What
+-- it is given goes to the open segment's file as it arrives, and the checksum is carried along:
+-- it holds no more than the caller's own bytes, however large a segment is. `finish`, or the
+-- segment filling, syncs and closes the file; a set names only segments that were.
+function address.writer(storage: vfs.Backend, directory: string, base: string, segmentBytes: number): (Writer?, string?)
+  if not address.validSegmentBytes(segmentBytes) then return nil, 'not a segment size' end
+  if not address.validBase(base) then return nil, 'not a base name' end
+
+  local sealed: { Segment } = {}
+  local file: dream_fs_Writer? = nil
+  local openBytes, finished = 0, false
+  local openCrc: number? = nil
+  local broken: string? = nil
+
+  local function begin(): string?
+    local id = #sealed
+    if id > address.MaxSegment or id >= address.MaxSpans then return 'too many segments' end
+
+    local name = assert(address.fileName(base, id))
+    local opened, problem = storage.openWrite(storage.join(directory, name), { exclusive = true, append = true })
+    if not opened then return problem or 'not opened' end
+
+    file, openBytes, openCrc = opened, 0, nil
+    return nil
+  end
+
+  local function seal(): string?
+    local held = assert(file)
+    local synced, syncProblem = held:syncAll()
+    local closed, closeProblem = held:close()
+    file = nil
+    if not synced then return syncProblem or 'not synced' end
+    if not closed then return closeProblem or 'not closed' end
+
+    -- The bytes are on the disk; the name is not until its directory is.
+    local named, nameProblem = storage.syncDirectory(directory)
+    if not named then return nameProblem or 'directory not synced' end
+
+    table.insert(sealed, { id = #sealed, length = openBytes, crc = openCrc or bytes.crc32('') })
+    openBytes, openCrc = 0, nil
+    return nil
+  end
+
+  local self = {} :: Writer
+
+  function self.append(data: string): (number?, string?)
+    if finished then return nil, 'finished' end
+    -- A segment that failed part way is not appended to: its length is no longer known.
+    if broken then return nil, broken end
+    if type(data) ~= 'string' then return nil, 'not bytes' end
+
+    local start, problem = address.join({ segment = #sealed, offset = openBytes }, segmentBytes)
+    if not start then return nil, problem end
+
+    local at = 1
+    while at <= #data do
+      if not file then
+        local failure = begin()
+        if failure then broken = failure; return nil, failure end
+      end
+
+      local take = math.min(#data - at + 1, segmentBytes - openBytes)
+      local part = if take == #data then data else string.sub(data, at, at + take - 1)
+      local written, failure = assert(file):write(part)
+      if written ~= take then
+        broken = failure or 'short write'
+        return nil, broken
+      end
+
+      openCrc = bytes.crc32(part, openCrc)
+      openBytes += take
+      at += take
+      if openBytes == segmentBytes then
+        local sealFailure = seal()
+        if sealFailure then broken = sealFailure; return nil, sealFailure end
+      end
+    end
+
+    return start, nil
+  end
+
+  function self.finish(): (Set?, string?)
+    if finished then return nil, 'finished' end
+    if broken then return nil, broken end
+
+    if file then
+      local failure = seal()
+      if failure then broken = failure; return nil, failure end
+    end
+
+    finished = true
+    return { segmentBytes = segmentBytes, segments = sealed }, nil
+  end
+
+  return self, nil
+end
+
+return address

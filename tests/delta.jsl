@@ -1,6 +1,6 @@
 --!strict
 local sql = require('@jessql')
-local fs = require('@dream/fs')
+local fs = require('@jessql/vfs')
 local test = require('@jess/test')
 local suite, expect = test.new(), test.expect
 
@@ -16,8 +16,8 @@ local function expectAbsent(path: string)
 end
 
 local function clear(base: string)
-  for _, ending in { '.base', '.rows', '.deletes', '.wal', '.wal.lock',
-    '.new.wal', '.new.wal.lock', '.other', '.idx', '.base.idx', '.rows.idx' } do
+  for _, ending in { '.base', '.rows', '.deletes', '.wal', '.wal.lock', '.wal.committed',
+    '.new.wal', '.new.wal.lock', '.new.wal.committed', '.other', '.idx', '.base.idx', '.rows.idx' } do
     fs.remove(base .. ending)
   end
 end

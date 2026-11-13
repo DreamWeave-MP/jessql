@@ -10,6 +10,7 @@ if not cwd then error(tostring(cwdError)) end
 local path = fs.join(cwd, '.jessql-packed-benchmark-' .. layout .. '.wal')
 fs.remove(path)
 fs.remove(path .. '.lock')
+fs.remove(path .. '.committed')
 local function sample(phase: string)
   local data = fs.readFileString('/proc/self/status')
   local rss: number = if data then tonumber(string.match(data, 'VmRSS:%s*(%d+)')) or -1 else -1
@@ -56,3 +57,4 @@ sample('queried')
 db:close()
 fs.remove(path)
 fs.remove(path .. '.lock')
+fs.remove(path .. '.committed')

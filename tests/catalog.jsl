@@ -1,0 +1,487 @@
+--!strict
+-- #40.1, option B: a managed database of several tables. One log and one manifest epoch for all of
+-- them, cold generations for each. What is held here: reads and writes over hot and cold rows of
+-- several tables; a commit over five tables, a flush and a compaction each stopped at every storage
+-- step and found whole or absent; and the refusals that keep one database's files from being read
+-- as another's.
+local memfs = require('@jessql/memfs')
+local sql = require('@jessql')
+local test = require('@jess/test')
+local world = require('./catalogworld')
+
+local expect = test.expect
+local suite = test.new()
+
+type Row = world.Row
+
+local Path, Tables, Quiet, create, names, prepare, recover, reopen, step =
+  world.Path, world.Tables, world.Quiet, world.create, world.names, world.prepare, world.recover, world.reopen, world.step
+
+suite.describe('a managed database of several tables', function()
+  suite.it('reads and writes hot and cold rows of every table, and joins them', function()
+    local disk = memfs.new()
+    local db = create(disk)
+    for number = 1, 30 do db:transaction(function(tx) step(tx, number) end) end
+
+    expect(db:flush()).toBe(2)
+    -- Nothing is hot now: a second flush has nothing to publish.
+    expect(db:flush()).toBe(2)
+    expect(db:stats().tables.conversation.coldRows).toBe(30)
+    expect(db:stats().tables.conversation.hotRows).toBe(0)
+
+    -- Over cold rows: an update, a delete, a delete and reinsert, and new rows.
+    expect(db:update('conversation', 7, { body = 'edited' })).toBe(true)
+    expect(db:delete('conversation', 8)).toBe(true)
+    expect(db:delete('conversation', 9)).toBe(true)
+    db:insert('conversation', { id = 9, body = 'again' })
+    for number = 31, 33 do db:transaction(function(tx) step(tx, number) end) end
+
+    expect(db:delete('conversation', 999)).toBe(false)
+    expect(db:update('conversation', 8, { body = 'gone' })).toBe(false)
+
+    local function check(handle: sql.CatalogDatabase)
+      expect((handle:get('conversation', 7) :: Row).body).toBe('edited')
+      expect(handle:get('conversation', 8)).toBe(nil)
+      expect((handle:get('conversation', 9) :: Row).body).toBe('again')
+      expect((handle:get('conversation', 33) :: Row).body).toBe('event 33')
+      expect((handle:get('counters', 'total') :: Row).value).toBe(33)
+      expect(handle:query('SELECT COUNT(*) AS n FROM conversation').rows[1].n).toBe(32)
+      expect(handle:query('SELECT COUNT(*) AS n FROM outbox').rows[1].n).toBe(1)
+      -- Two tables of the database in one statement, hot and cold on both sides.
+      local joined = handle:query('SELECT c.id AS id, r.effect AS effect FROM conversation c JOIN reservations r ON r.id = c.id '
+        .. 'WHERE c.id >= ? ORDER BY c.id', { 29 }).rows
+      expect(#joined).toBe(5)
+      expect((joined[1] :: Row).effect).toBe('send-29')
+      expect((joined[5] :: Row).effect).toBe('send-33')
+    end
+
+    check(db)
+    db:close()
+    local second = reopen(disk)
+    check(second)
+
+    -- Only the tables with anything hot get a generation; every table moves to the new epoch.
+    expect(second:flush()).toBe(3)
+    check(second)
+    local stats = second:stats()
+    expect(stats.epoch).toBe(3)
+    expect(stats.tables.conversation.generations).toBe(3)
+    expect(stats.tables.conversation.tombstones).toBe(0)
+    expect(stats.tables.handled.generations).toBe(3)
+
+    -- A compaction folds each table into one generation and drops what was merged away.
+    expect(second:compact()).toBe(4)
+    check(second)
+    for _, entry in Tables do expect(second:stats().tables[entry.tableName].generations).toBe(1) end
+
+    second:close()
+    expect(names(disk)).toBe('service.g00000004.wal service.g00000004.wal.committed service.g00000004.wal.lock service.jql-lock service.jql-manifest '
+      .. 'service.t.conversation.g00000004.deleted service.t.conversation.g00000004.rows '
+      .. 'service.t.counters.g00000004.deleted service.t.counters.g00000004.rows '
+      .. 'service.t.handled.g00000004.deleted service.t.handled.g00000004.rows '
+      .. 'service.t.outbox.g00000004.deleted service.t.outbox.g00000004.rows '
+      .. 'service.t.reservations.g00000004.deleted service.t.reservations.g00000004.rows')
+    local third = reopen(disk)
+    check(third)
+    third:close()
+  end)
+
+  suite.it('leaves a table that did not change with the generations it had', function()
+    local disk = memfs.new()
+    local db = create(disk)
+    db:insert('handled', { id = 1 })
+    db:insert('counters', { id = 'total', value = 1 })
+    expect(db:flush()).toBe(2)
+    db:insert('handled', { id = 2 })
+    expect(db:flush()).toBe(3)
+    local stats = db:stats()
+    expect(stats.tables.handled.generations).toBe(3)
+    expect(stats.tables.counters.generations).toBe(2)
+    expect(stats.tables.outbox.generations).toBe(1)
+    -- Nothing to merge in a table with one generation and nothing hot; the others are folded.
+    expect(db:compact()).toBe(4)
+    expect(db:stats().tables.outbox.generations).toBe(1)
+    expect(db:stats().tables.handled.generations).toBe(1)
+    -- And then there is nothing to compact at all.
+    local again, problem = pcall(function() return db:compact() end)
+    expect(again).toBe(false)
+    expect(string.find(tostring(problem), 'nothing to compact', 1, true) ~= nil).toBe(true)
+    expect(db:query('SELECT COUNT(*) AS n FROM handled').rows[1].n).toBe(2)
+    db:close()
+  end)
+
+  suite.it('changes no table when a callback raises after touching all of them, and sees its own writes', function()
+    local disk = memfs.new()
+    local db = create(disk)
+    db:transaction(function(tx) step(tx, 1) end)
+    db:flush()
+    -- The callback raises on purpose.
+    local ok = pcall(function()
+      db:transaction(function(tx)
+        step(tx, 2)
+        expect((tx:get('conversation', 2) :: Row).body).toBe('event 2')
+        expect(tx:get('outbox', 1)).toBe(nil)
+        expect(tx:query('SELECT COUNT(*) AS n FROM handled').rows[1].n).toBe(2)
+        expect(tx:delete('reservations', 1)).toBe(true)
+        expect(tx:get('reservations', 1)).toBe(nil)
+        error('stop', 0)
+      end)
+    end)
+    expect(ok).toBe(false)
+    expect(db:query('SELECT COUNT(*) AS n FROM handled').rows[1].n).toBe(1)
+    expect((db:get('reservations', 1) :: Row).effect).toBe('send-1')
+    expect((db:get('outbox', 1) :: Row).id).toBe(1)
+    expect((db:get('counters', 'total') :: Row).value).toBe(1)
+
+    -- A duplicate key is refused against a cold row, and an unknown table by name.
+    local duplicate, duplicateProblem = pcall(function() db:insert('handled', { id = 1 }) end)
+    expect(duplicate).toBe(false)
+    expect(string.find(tostring(duplicateProblem), 'duplicate primary key', 1, true) ~= nil).toBe(true)
+    -- So is a table this database does not have.
+    local unknown, unknownProblem = pcall(function() db:insert('elsewhere', { id = 1 }) end)
+    expect(unknown).toBe(false)
+    expect(string.find(tostring(unknownProblem), 'unknown table elsewhere', 1, true) ~= nil).toBe(true)
+
+    local results = db:transactionBatch({
+      function(tx) step(tx, 2) end,
+      function(tx)
+        step(tx, 3)
+        error('stop', 0)
+      end,
+      function(tx) step(tx, 3) end,
+    })
+    expect(results[1].ok).toBe(true)
+    expect(results[2].ok).toBe(false)
+    expect(results[3].ok).toBe(true)
+    expect((db:get('counters', 'total') :: Row).value).toBe(3)
+    expect(db:query('SELECT COUNT(*) AS n FROM handled').rows[1].n).toBe(3)
+    db:close()
+  end)
+
+  suite.it('poisons the handle when the publication is uncertain, and recovers at reopen', function()
+    for _, stage in { 'after-replace', 'after-directory-sync' } do
+      local disk = memfs.new()
+      prepare(disk, Quiet)
+      local armed = true
+      local db = sql.catalog.openExisting(Path, { storage = disk.backend, testHook = function(reached: string)
+        if armed and reached == stage then
+          armed = false
+          error('injected at ' .. reached, 0)
+        end
+      end })
+      db:transaction(function(tx) step(tx, 4) end)
+      -- The publication is interrupted after the manifest was replaced.
+      local flushed = pcall(function() return db:flush() end)
+      expect(flushed).toBe(false)
+      expect(db:maintenanceStatus().poisoned).toBe(true)
+      -- A poisoned handle answers nothing and accepts nothing.
+      local read = pcall(function() return db:get('handled', 1) end)
+      expect(read).toBe(false)
+      db:close()
+      local observed = recover(disk)
+      expect(observed['4']).toBe(3)
+    end
+
+    -- Before the replacement the old epoch stays current and the handle stays usable.
+    local disk = memfs.new()
+    prepare(disk, Quiet)
+    local armed = true
+    local db = sql.catalog.openExisting(Path, { storage = disk.backend, testHook = function(reached: string)
+      if armed and reached == 'before-replace' then
+        armed = false
+        error('injected at ' .. reached, 0)
+      end
+    end })
+    -- The publication is interrupted before the manifest was replaced.
+    local flushed = pcall(function() return db:flush() end)
+    expect(flushed).toBe(false)
+    expect(db:maintenanceStatus().poisoned).toBe(false)
+    expect(db:stats().epoch).toBe(2)
+    db:transaction(function(tx) step(tx, 4) end)
+    expect(db:flush()).toBe(3)
+    db:close()
+    expect(recover(disk)['4']).toBe(3)
+  end)
+
+  suite.it('refuses to open what is not this database, and to begin again over what is left of one', function()
+    local disk = memfs.new()
+    prepare(disk, Quiet)
+
+    -- A single-table database is not a catalog, and a catalog is not a single-table database.
+    local single = sql.managed.create('/memory/single', { tableName = 'events', columns = { 'id' }, primaryKey = 'id', storage = disk.backend })
+    single:close()
+    for _, attempt in {
+      { run = function() sql.catalog.openExisting('/memory/single', { storage = disk.backend }) end, says = 'single-table managed database' },
+      { run = function() sql.managed.openExisting(Path, { storage = disk.backend }) end, says = 'invalid manifest schema' },
+      { run = function() sql.catalog.create(Path, { tables = Tables, storage = disk.backend }) end, says = 'already exists' },
+      { run = function() sql.catalog.openExisting('/memory/absent', { storage = disk.backend }) end, says = 'does not exist' },
+      { run = function() sql.catalog.open('/memory/absent', { storage = disk.backend }) end, says = 'requires tables' },
+      { run = function()
+        sql.catalog.openExisting(Path, { storage = disk.backend,
+          tables = { { tableName = 'handled', columns = { 'id' }, primaryKey = 'id' } } })
+      end, says = 'do not match the database' },
+    } do
+      -- Each of these is refused with an error.
+      local ok, problem = pcall(function(): unknown
+        attempt.run()
+        return nil
+      end)
+      expect(ok).toBe(false)
+      expect(string.find(tostring(problem), attempt.says, 1, true) ~= nil).toBe(true)
+    end
+
+    -- A second handle is refused while the first holds the lock.
+    local first = reopen(disk)
+    -- The lock is held: the open raises.
+    local second = pcall(function() return reopen(disk) end)
+    expect(second).toBe(false)
+    first:close()
+
+    -- One table's generation put in another's place: the cold identity no longer matches.
+    local files = disk.visible()
+    local swapped = memfs.new()
+    for path, body in files do
+      local target = path
+      if path == '/memory/service.t.handled.g00000002.rows' then target = '/memory/service.t.outbox.g00000002.rows' end
+      if path == '/memory/service.t.outbox.g00000002.rows' then target = '/memory/service.t.handled.g00000002.rows' end
+      assert((swapped.backend.createDurable(target, body)))
+    end
+    -- The open raises on the mismatch.
+    local swappedOpen, swappedProblem = pcall(function() return reopen(swapped) end)
+    expect(swappedOpen).toBe(false)
+    expect(string.find(tostring(swappedProblem), 'jessql catalog: open:', 1, true) ~= nil).toBe(true)
+
+    -- A lost manifest is not an empty database: nothing is created over the files that remain.
+    local lost = memfs.new()
+    for path, body in files do
+      if path ~= '/memory/service.jql-manifest' then assert((lost.backend.createDurable(path, body))) end
+    end
+    -- Creation raises over the remains.
+    local begun, begunProblem = pcall(function() return create(lost) end)
+    expect(begun).toBe(false)
+    expect(string.find(tostring(begunProblem), 'manifest missing but database artifacts remain', 1, true) ~= nil).toBe(true)
+
+    -- A lost log is not an empty log.
+    local logless = memfs.new()
+    for path, body in files do
+      if not string.find(path, '%.wal$') then assert((logless.backend.createDurable(path, body))) end
+    end
+    -- The open raises without its log.
+    local replayed, replayProblem = pcall(function() return reopen(logless) end)
+    expect(replayed).toBe(false)
+    expect(string.find(tostring(replayProblem), 'active WAL missing', 1, true) ~= nil).toBe(true)
+  end)
+
+  suite.it('removes at reopen what a stopped publication left, and nothing the manifest names', function()
+    local disk = memfs.new()
+    prepare(disk, Quiet)
+    local before = names(disk)
+    -- What an interrupted flush and an interrupted merge leave behind, and a stranger's file.
+    for _, name in { 'service.g00000003.wal', 'service.g00000003.wal.lock', 'service.t.handled.g00000003.rows',
+      'service.t.handled.g00000003.deleted', 'service.t.outbox.g00000003.hot-rows', 'service.t.unknown.g00000001.rows',
+      'service.t.handled.g00000001.deleted', 'service.notes' } do
+      assert((disk.backend.createDurable('/memory/' .. name, 'left behind')))
+    end
+    local db = reopen(disk)
+    db:close()
+    local after = names(disk)
+    expect(after).toBe((string.gsub(before, 'service.jql%-manifest', 'service.jql-manifest service.notes')))
+    expect(recover(disk)['3']).toBe(3)
+  end)
+end)
+
+local function copied(disk: memfs.Disk, change: (path: string, body: string) -> string?): memfs.Disk
+  local other = memfs.new()
+  for path, body in disk.visible() do
+    local kept = change(path, body)
+    if kept then assert((other.backend.createDurable(path, kept))) end
+  end
+
+  return other
+end
+
+local function stages(report: sql.CatalogVerifyReport): string
+  local found: { string } = {}
+  for _, issue in report.issues do table.insert(found, `{issue.stage}:{issue.tableName or '-'}`) end
+
+  table.sort(found)
+  return table.concat(found, ' ')
+end
+
+suite.describe('offline verification of a managed database of several tables', function()
+  suite.it('reads every page of every generation and changes nothing', function()
+    local disk = memfs.new()
+    prepare(disk, Quiet)
+    local before = disk.visible()
+    local report = sql.catalog.verify(Path, { storage = disk.backend })
+    expect(stages(report)).toBe('')
+    expect(report.ok).toBe(true)
+    expect(report.epoch).toBe(2)
+    expect(report.coldPagesChecked).toBe(true)
+    -- The log's frames are checked by opening the database, and the report does not claim them.
+    expect(report.walFramesChecked).toBe(false)
+    expect(report.walBytes > 0).toBe(true)
+    expect(report.tables.conversation.generations).toBe(2)
+    -- Two steps were flushed: two conversation rows, and the deletion sidecar's marker row.
+    expect(report.tables.conversation.rowsScanned).toBe(3)
+    expect(report.coldRowsScanned > 8).toBe(true)
+
+    local after = disk.visible()
+    for path, body in before do expect(after[path] == body).toBe(true) end
+
+    for path in after do
+      -- The lock file is the only name a scan may add.
+      if before[path] == nil then expect(path).toBe('/memory/service.jql-lock') end
+    end
+
+    -- And the database opens afterwards as it would have.
+    expect(recover(disk)['3']).toBe(3)
+  end)
+
+  suite.it('reports damage by stage and table instead of raising, and a held lock by raising', function()
+    local disk = memfs.new()
+    prepare(disk, Quiet)
+
+    local damaged = copied(disk, function(path: string, body: string): string?
+      if path ~= '/memory/service.t.conversation.g00000002.rows' then return body end
+      local middle = #body // 2
+      return string.sub(body, 1, middle - 1) .. string.char(bit32.bxor(string.byte(body, middle), 0xff)) .. string.sub(body, middle + 1)
+    end)
+    local damage = sql.catalog.verify(Path, { storage = damaged.backend })
+    expect(damage.ok).toBe(false)
+    expect(damage.coldPagesChecked).toBe(false)
+    expect(string.find(stages(damage), 'cold:conversation', 1, true) ~= nil).toBe(true)
+
+    local missing = copied(disk, function(path: string, body: string): string?
+      return if path == '/memory/service.t.outbox.g00000002.deleted' then nil else body
+    end)
+    expect(string.find(stages(sql.catalog.verify(Path, { storage = missing.backend })), 'cold:outbox', 1, true) ~= nil).toBe(true)
+
+    -- Whole files of the right schema in the wrong tables: every page reads, the set is wrong.
+    local files = disk.visible()
+    local swapped = copied(disk, function(path: string, body: string): string?
+      if path == '/memory/service.t.handled.g00000002.rows' then return files['/memory/service.t.outbox.g00000002.rows'] end
+      if path == '/memory/service.t.outbox.g00000002.rows' then return files['/memory/service.t.handled.g00000002.rows'] end
+      return body
+    end)
+    local swap = sql.catalog.verify(Path, { storage = swapped.backend })
+    expect(swap.ok).toBe(false)
+    expect(string.find(stages(swap), 'cold:-', 1, true) ~= nil).toBe(true)
+
+    local logless = copied(disk, function(path: string, body: string): string?
+      return if string.find(path, '%.wal$') then nil else body
+    end)
+    local lost = sql.catalog.verify(Path, { storage = logless.backend })
+    expect(stages(lost)).toBe('wal:-')
+    expect(lost.coldPagesChecked).toBe(true)
+
+    local torn = copied(disk, function(path: string, body: string): string?
+      return if path == '/memory/service.jql-manifest' then string.sub(body, 1, #body - 3) else body
+    end)
+    local unread = sql.catalog.verify(Path, { storage = torn.backend })
+    expect(stages(unread)).toBe('manifest:-')
+    expect(unread.epoch).toBe(nil)
+
+    local single = memfs.new()
+    sql.managed.create('/memory/service', { tableName = 'events', columns = { 'id' }, primaryKey = 'id', storage = single.backend }):close()
+    expect(stages(sql.catalog.verify(Path, { storage = single.backend }))).toBe('manifest:-')
+
+    local db = reopen(disk)
+    -- The database holds its lock: the scan is refused, not run beside it.
+    local scanned, problem = pcall(function() return sql.catalog.verify(Path, { storage = disk.backend }) end)
+    db:close()
+    expect(scanned).toBe(false)
+    expect(string.find(tostring(problem), 'verification locked', 1, true) ~= nil).toBe(true)
+    expect(sql.catalog.verify(Path, { storage = disk.backend }).ok).toBe(true)
+  end)
+end)
+
+-- Every step from 1 to `highest` is whole in the database at `path`, and none beyond it.
+local function holds(disk: memfs.Disk, path: string, highest: number): string
+  local db = sql.catalog.openExisting(path, { storage = disk.backend })
+  local total = (db:get('counters', 'total') :: Row).value
+  local conversation = db:query('SELECT COUNT(*) AS n FROM conversation').rows[1].n
+  local reservations = db:query('SELECT COUNT(*) AS n FROM reservations').rows[1].n
+  local outbox = db:query('SELECT id FROM outbox').rows
+  local newest = db:get('conversation', highest)
+  db:close()
+  return `{total} {conversation} {reservations} {#outbox}:{(outbox[1] :: Row).id} {if newest then newest.body else 'missing'}`
+end
+
+suite.describe('backup and restore of a managed database of several tables', function()
+  suite.it('copies a database with hot and cold rows into an empty name, on the same disk or another', function()
+    local disk = memfs.new()
+    prepare(disk, Quiet)
+    local before = disk.visible()
+    local result = sql.catalog.backup(Path, '/memory/copy', { storage = disk.backend })
+    expect(result.epoch).toBe(2)
+    -- Five tables with two generations, the second with its deletions; the log, its mark and the manifest.
+    expect(result.files).toBe(18)
+    expect(result.bytes > 1000).toBe(true)
+    expect(holds(disk, '/memory/copy', 3)).toBe('3 3 3 1:3 event 3')
+
+    -- The source was read and nothing else: every file it had is the same bytes.
+    local after = disk.visible()
+    for path, body in before do expect(after[path] == body).toBe(true) end
+
+    -- The two are separate databases from here on.
+    local source, copy = reopen(disk), sql.catalog.openExisting('/memory/copy', { storage = disk.backend })
+    source:transaction(function(tx) step(tx, 4) end)
+    copy:transaction(function(tx) step(tx, 4) end)
+    copy:transaction(function(tx) step(tx, 5) end)
+    expect(copy:flush()).toBe(3)
+    source:close()
+    copy:close()
+    expect(holds(disk, Path, 4)).toBe('4 4 4 1:4 event 4')
+    expect(holds(disk, '/memory/copy', 5)).toBe('5 5 5 1:5 event 5')
+
+    -- A restore is the same copy, here onto another disk under the same name.
+    local elsewhere = memfs.new()
+    local restored = sql.catalog.restore('/memory/copy', Path, { storage = disk.backend, destinationStorage = elsewhere.backend })
+    expect(restored.epoch).toBe(3)
+    expect(holds(elsewhere, Path, 5)).toBe('5 5 5 1:5 event 5')
+    expect(sql.catalog.verify(Path, { storage = elsewhere.backend }).ok).toBe(true)
+  end)
+
+  suite.it('refuses a destination that holds anything, a source that is damaged or open, and leaves no database behind', function()
+    local disk = memfs.new()
+    prepare(disk, Quiet)
+    local function refused(run: () -> ()): string
+      -- Each of these raises.
+      local ok, problem = pcall(run)
+      expect(ok).toBe(false)
+      return tostring(problem)
+    end
+
+    local function says(text: string, part: string) expect(string.find(text, part, 1, true) ~= nil).toBe(true) end
+
+    says(refused(function() sql.catalog.backup(Path, Path, { storage = disk.backend }) end), 'must differ')
+    says(refused(function() sql.catalog.backup('/memory/absent', '/memory/copy', { storage = disk.backend }) end), 'source verification failed at manifest')
+
+    -- Over an existing database, and over what an interrupted copy left.
+    sql.catalog.backup(Path, '/memory/copy', { storage = disk.backend })
+    says(refused(function() sql.catalog.backup(Path, '/memory/copy', { storage = disk.backend }) end), 'destination contains existing artifacts')
+    assert((disk.backend.createDurable('/memory/partial.t.handled.g00000001.rows', 'left behind')))
+    says(refused(function() sql.catalog.backup(Path, '/memory/partial', { storage = disk.backend }) end), 'destination contains existing artifacts')
+
+    -- A damaged source is not copied: the destination gets no manifest, so it is not a database.
+    local damaged = copied(disk, function(path: string, body: string): string?
+      if string.sub(path, 1, 15) ~= '/memory/service' then return nil end
+      if path ~= '/memory/service.t.conversation.g00000002.rows' then return body end
+      local middle = #body // 2
+      return string.sub(body, 1, middle - 1) .. string.char(bit32.bxor(string.byte(body, middle), 0xff)) .. string.sub(body, middle + 1)
+    end)
+    says(refused(function() sql.catalog.backup(Path, '/memory/copy', { storage = damaged.backend }) end), 'source verification failed at cold of conversation')
+    expect(damaged.visible()['/memory/copy.jql-manifest']).toBe(nil)
+
+    -- An open source holds its lock, and so does an open destination name.
+    local db = reopen(disk)
+    says(refused(function() sql.catalog.backup(Path, '/memory/other', { storage = disk.backend }) end), 'backup locked')
+    db:close()
+    -- Both locks were released by every refusal above.
+    expect(sql.catalog.backup(Path, '/memory/other', { storage = disk.backend }).epoch).toBe(2)
+    expect(holds(disk, '/memory/other', 3)).toBe('3 3 3 1:3 event 3')
+  end)
+end)
+
+return suite

@@ -1,0 +1,270 @@
+--!strict
+-- #34: a reader's pin on a published state of a managed database. While it is held, flushes and
+-- compactions publish newer states and the pinned one stays readable; when it ends, by release,
+-- by time or by closing, what it kept is removed. On a disk in memory with a clock that is set.
+local memfs = require('@jessql/memfs')
+local sql = require('@jessql')
+local test = require('@jess/test')
+
+local expect = test.expect
+local suite = test.new()
+
+local Path = '/memory/pinned'
+local Tables: { sql.CatalogTableSpec } = {
+  { tableName = 'events', columns = { 'id', 'body' }, primaryKey = 'id' },
+}
+
+type World = { disk: typeof(memfs.new()), db: sql.CatalogDatabase, clock: { now: number } }
+
+local function world(): World
+  local disk = memfs.new()
+  local clock = { now = 0 }
+  local db = sql.catalog.create(Path, { tables = Tables, storage = disk.backend, now = function(): number return clock.now end })
+  return { disk = disk, db = db, clock = clock }
+end
+
+local function fill(db: sql.CatalogDatabase, first: number, last: number)
+  db:transaction(function(tx)
+    for id = first, last do tx:insert('events', { id = id, body = `event {id}` }) end
+  end)
+end
+
+local function ids(result: sql.Result): string
+  local seen: { string } = {}
+  for _, row in result.rows do table.insert(seen, tostring(row.id)) end
+
+  return table.concat(seen, ' ')
+end
+
+-- The cold files of the database on the disk now, by name.
+local function coldFiles(disk: typeof(memfs.new())): { string }
+  local names: { string } = {}
+  for path in disk.visible() do
+    if string.find(path, Path, 1, true) == 1 and (string.find(path, '.rows', 1, true) or string.find(path, '.deleted', 1, true)) then
+      table.insert(names, path)
+    end
+  end
+
+  table.sort(names)
+  return names
+end
+
+-- The error a call raises, or 'answered'.
+local function refusal(call: () -> ()): string
+  -- A pin that is gone raises: the message is what is read.
+  local ok, problem = pcall(call)
+  -- Without the place it was raised at.
+  return if ok then 'answered' else (string.gsub(tostring(problem), '^[^ ]+:%d+: ', ''))
+end
+
+suite.describe('a pin on a published state', function()
+  suite.it('stays readable across a flush and a compaction that replace it, and sees nothing newer', function()
+    local subject = world()
+    local db = subject.db
+    fill(db, 1, 5)
+    db:flush()
+    fill(db, 6, 8)
+    local pinned = db:pin()
+    local epoch = pinned.epoch
+    -- A cursor opened before anything is replaced.
+    local cursor = pinned:prepare('SELECT id FROM events ORDER BY id').open()
+    expect(assert(cursor.next()).id).toBe(1)
+
+    -- Until the next publication the pinned view is the database: a commit is seen by both.
+    fill(db, 9, 9)
+    expect(ids(pinned:query('SELECT id FROM events ORDER BY id'))).toBe('1 2 3 4 5 6 7 8 9')
+
+    -- Flushed, written again, compacted, deleted from: three publications later.
+    db:flush()
+    fill(db, 10, 12)
+    db:delete('events', 2)
+    db:compact()
+    fill(db, 13, 13)
+    db:flush()
+    expect(db:stats().epoch > epoch + 2).toBe(true)
+    expect(ids(db:query('SELECT id FROM events ORDER BY id'))).toBe('1 3 4 5 6 7 8 9 10 11 12 13')
+
+    -- The pinned state is as it was when it was superseded: nothing since, and row 2 still there.
+    expect(pinned:held()).toBe(true)
+    expect(ids(pinned:query('SELECT id FROM events ORDER BY id'))).toBe('1 2 3 4 5 6 7 8 9')
+    expect((pinned:get('events', 2) :: { body: string }).body).toBe('event 2')
+    expect(pinned:get('events', 10)).toBe(nil)
+    -- The cursor opened before goes on over the same state.
+    local rest: { string } = {}
+    while true do
+      local row = cursor.next()
+      if not row then break end
+
+      table.insert(rest, tostring(row.id))
+    end
+
+    expect(table.concat(rest, ' ')).toBe('2 3 4 5 6 7 8')
+    expect(db:pinStatus().pins).toBe(1)
+    expect(db:pinStatus().superseded).toBe(1)
+    db:close()
+  end)
+
+  suite.it('keeps the files a pinned state names, and removes them when the pin is released', function()
+    local subject = world()
+    local db = subject.db
+    fill(db, 1, 5)
+    db:flush()
+    local before = coldFiles(subject.disk)
+    expect(#before > 0).toBe(true)
+
+    local pinned = db:pin()
+    fill(db, 6, 9)
+    db:flush()
+    db:compact()
+    -- Compaction replaced every generation; the pinned ones are all still on the disk.
+    local during = coldFiles(subject.disk)
+    for _, name in before do expect(table.find(during, name) ~= nil).toBe(true) end
+
+    expect(#during > #before).toBe(true)
+
+    -- Without a pin the same history leaves only the compacted generation.
+    local other = world()
+    fill(other.db, 1, 5)
+    other.db:flush()
+    fill(other.db, 6, 9)
+    other.db:flush()
+    other.db:compact()
+    local unpinned = #coldFiles(other.disk)
+    other.db:close()
+
+    pinned:release()
+    pinned:release()
+    expect(pinned:held()).toBe(false)
+    local after = coldFiles(subject.disk)
+    for _, name in before do expect(table.find(after, name)).toBe(nil) end
+
+    expect(#after).toBe(unpinned)
+    expect(db:pinStatus().superseded).toBe(0)
+    expect(refusal(function() pinned:query('SELECT id FROM events') end)).toBe('jessql catalog: pin released')
+    -- The database is none the worse.
+    expect(ids(db:query('SELECT id FROM events ORDER BY id'))).toBe('1 2 3 4 5 6 7 8 9')
+    db:close()
+  end)
+
+  suite.it('ends a pin when its time is up, and gives up what it kept at the next publication or use', function()
+    local subject = world()
+    local db = subject.db
+    fill(db, 1, 3)
+    db:flush()
+    local kept = coldFiles(subject.disk)
+    local pinned = db:pin(30)
+    fill(db, 4, 6)
+    db:flush()
+    db:compact()
+    subject.clock.now = 29
+    -- What was committed before the flush that superseded it is part of the pinned state.
+    expect(ids(pinned:query('SELECT id FROM events ORDER BY id'))).toBe('1 2 3 4 5 6')
+
+    subject.clock.now = 30
+    expect(pinned:held()).toBe(false)
+    expect(db:pinStatus().pins).toBe(0)
+    -- A leaked pin: nobody calls it again. The next publication reclaims what it held.
+    fill(db, 7, 7)
+    db:flush()
+    expect(db:pinStatus().superseded).toBe(0)
+    local after = coldFiles(subject.disk)
+    for _, name in kept do expect(table.find(after, name)).toBe(nil) end
+
+    expect(refusal(function() pinned:query('SELECT id FROM events') end)).toBe('jessql catalog: pin released')
+
+    -- One that is used after its time says so, and is reclaimed by that use.
+    local second = db:pin(10)
+    fill(db, 8, 8)
+    db:flush()
+    db:compact()
+    expect(db:pinStatus().superseded).toBe(1)
+    subject.clock.now = 41
+    expect(refusal(function() second:get('events', 1) end)).toBe('jessql catalog: pin expired')
+    expect(db:pinStatus().superseded).toBe(0)
+    db:close()
+  end)
+
+  suite.it('holds several states for several readers, each until its own pin ends', function()
+    local subject = world()
+    local db = subject.db
+    fill(db, 1, 2)
+    db:flush()
+    local first = db:pin()
+    fill(db, 3, 4)
+    db:flush()
+    local second = db:pin()
+    local alsoSecond = db:pin()
+    fill(db, 5, 6)
+    db:flush()
+    db:compact()
+    expect(db:pinStatus().superseded).toBe(2)
+    -- Each is the state as it stood when the next flush superseded it.
+    expect(ids(first:query('SELECT id FROM events ORDER BY id'))).toBe('1 2 3 4')
+    expect(ids(second:query('SELECT id FROM events ORDER BY id'))).toBe('1 2 3 4 5 6')
+
+    -- The older state goes; the newer one, which shares a generation with it, is whole.
+    first:release()
+    expect(db:pinStatus().superseded).toBe(1)
+    expect(ids(second:query('SELECT id FROM events ORDER BY id'))).toBe('1 2 3 4 5 6')
+    second:release()
+    -- Another reader still holds that state.
+    expect(db:pinStatus().superseded).toBe(1)
+    expect(ids(alsoSecond:query('SELECT id FROM events ORDER BY id'))).toBe('1 2 3 4 5 6')
+    alsoSecond:release()
+    expect(db:pinStatus().superseded).toBe(0)
+    expect(ids(db:query('SELECT id FROM events ORDER BY id'))).toBe('1 2 3 4 5 6')
+    db:close()
+  end)
+
+  suite.it('bounds the pins, refuses a lifetime that is not one, and ends every pin when the database closes', function()
+    local subject = world()
+    local db = subject.db
+    fill(db, 1, 2)
+    db:flush()
+    local held: { sql.CatalogPinnedView } = {}
+    for index = 1, sql.catalog.MaxPins do held[index] = db:pin() end
+
+    expect(refusal(function() db:pin() end)).toBe('jessql catalog: too many pins')
+    held[1]:release()
+    local again = db:pin()
+    for _, bad in { 0, -1, 3601, 0 / 0 } do
+      expect(refusal(function() db:pin(bad) end)).toBe('jessql catalog: a pin is held for more than 0 and at most 3600 seconds')
+    end
+
+    fill(db, 3, 3)
+    db:flush()
+    db:compact()
+    local during = #coldFiles(subject.disk)
+    db:close()
+    expect(again:held()).toBe(false)
+    expect(refusal(function() again:query('SELECT id FROM events') end)).toBe('jessql catalog: closed')
+    expect(#coldFiles(subject.disk) < during).toBe(true)
+
+    -- Reopened, it is the compacted state and nothing else.
+    local reopened = sql.catalog.open(Path, { storage = subject.disk.backend })
+    expect(ids(reopened:query('SELECT id FROM events ORDER BY id'))).toBe('1 2 3')
+    reopened:close()
+  end)
+
+  suite.it('leaves nothing behind a process that died holding a pin', function()
+    local subject = world()
+    local db = subject.db
+    fill(db, 1, 4)
+    db:flush()
+    db:pin()
+    fill(db, 5, 8)
+    db:flush()
+    db:compact()
+    local held = #coldFiles(subject.disk)
+
+    -- The process is gone: no release, no close. What is on the disk is what was synchronized.
+    subject.disk.crash()
+    local reopened = sql.catalog.open(Path, { storage = subject.disk.backend })
+    expect(ids(reopened:query('SELECT id FROM events ORDER BY id'))).toBe('1 2 3 4 5 6 7 8')
+    expect(#coldFiles(subject.disk) < held).toBe(true)
+    expect(reopened:pinStatus().pins).toBe(0)
+    reopened:close()
+  end)
+end)
+
+return suite

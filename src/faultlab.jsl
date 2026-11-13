@@ -1,0 +1,341 @@
+--!strict
+-- A fault-injection and recovery-history laboratory over the in-memory disk (`@jessql/memfs`).
+--
+-- A scenario says how to build a starting state, what operation to put under test, and how to
+-- read back what a restart finds. The laboratory runs the operation once to record its fault
+-- schedule (every storage step it takes, in order), then once more per step and per mode, stopping
+-- it there:
+--
+--   * `crash`     the process dies at that step: everything not synchronized is lost.
+--   * `fail`      that step fails once (as a full disk would), the operation carries on or gives
+--                 up as it chooses, and then the process dies.
+--   * `fail-live` that step fails once and nothing dies: the next open is by the same process.
+--
+-- and optionally once more per step of the recovery that follows a crash, crashing the recovery
+-- too. After each, the scenario recovers on what is left and the durable-sequence oracle judges it:
+--
+--   * a commit that was acknowledged is there, whole;
+--   * a commit that was begun and not acknowledged is there whole or not at all;
+--   * a commit that was never begun is not there;
+--   * recovery itself succeeds.
+--
+-- Every violation is returned as a structured artifact: where it stopped, what was acknowledged,
+-- what was found, the last storage steps and a digest of every surviving file.
+--
+-- This is a simulation on a model disk. It finds protocol errors (an acknowledgment before a
+-- sync, a name never made durable, a file retired too early, a recovery that cannot be repeated).
+-- It certifies nothing about a physical power loss, a torn sector or a lying device.
+
+local bytes = require('@dream/bytes')
+local memfs = require('@jessql/memfs')
+
+-- `torn` is a crash where what was being written is torn rather than lost: a file keeps the size
+-- it had and zeros where its unsynchronized bytes were, and a `createDurable` it stops leaves its
+-- name with no bytes. Not among the defaults: a scenario asks for it.
+export type Mode = 'crash' | 'fail' | 'fail-live' | 'torn'
+
+-- Kept by the laboratory across one run. A scenario calls `begin` before it attempts a commit,
+-- with how many rows that commit carries, and `acknowledge` once the commit call has returned.
+export type Ledger = {
+  begin: (id: string, rows: number) -> (),
+  acknowledge: (id: string) -> (),
+}
+
+-- What a recovery found: rows present, by commit id.
+export type Observed = { [string]: number }
+
+export type Scenario = {
+  name: string,
+  -- Builds the starting state. No fault is injected here; every commit it acknowledges counts.
+  prepare: (disk: memfs.Disk, ledger: Ledger) -> (),
+  -- The operation under test. It may raise; it must leave nothing open when it returns or raises.
+  exercise: (disk: memfs.Disk, ledger: Ledger) -> (),
+  -- Opens what is on the disk as a restarted process would, reads it back, closes it. It raises
+  -- if the database cannot be opened or fails its own verification.
+  recover: (disk: memfs.Disk) -> Observed,
+  -- Makes a step comparable between runs when the operation names scratch files at random:
+  -- given `name path`, returns it with the volatile part replaced. Optional.
+  stable: ((step: string) -> string)?,
+}
+
+export type Options = {
+  modes: { Mode }?,
+  -- Also crash the recovery after each crash, at each of its steps. Costs steps x steps runs.
+  crashRecovery: boolean?,
+  -- An upper bound on runs, baseline included. Reaching it is reported, never silent.
+  maxRuns: number?,
+}
+
+export type Violation = 'acknowledged-lost' | 'acknowledged-torn' | 'uncertain-torn' | 'phantom'
+  | 'recovery-failed' | 'schedule-diverged' | 'baseline-failed'
+
+export type Artifact = {
+  scenario: string,
+  violation: Violation,
+  detail: string,
+  mode: Mode | 'baseline',
+  -- The ordinal of the step the operation was stopped at, and that step (`name path`).
+  step: number,
+  at: string,
+  -- When the recovery was crashed too: the ordinal and step within the recovery.
+  recoveryStep: number?,
+  recoveryAt: string?,
+  acknowledged: { string },
+  uncertain: { string },
+  observed: Observed,
+  -- The last storage steps before the judgment, oldest first.
+  tail: { string },
+  -- Every file a restart would find: its size and SHA-256.
+  surviving: { [string]: { bytes: number, sha256: string } },
+}
+
+export type Report = {
+  scenario: string,
+  -- The fault schedule: every storage step of the operation, in order.
+  schedule: { string },
+  recoverySteps: number,
+  runs: number,
+  truncated: boolean,
+  violations: { Artifact },
+}
+
+type Commit = { rows: number, acknowledged: boolean }
+type Book = { ledger: Ledger, commits: { [string]: Commit }, order: { string } }
+
+local DefaultModes: { Mode } = { 'crash', 'fail', 'fail-live' }
+local TailSteps = 16
+local lab = {}
+
+local function newBook(): Book
+  local commits: { [string]: Commit } = {}
+  local order: { string } = {}
+  return {
+    commits = commits, order = order,
+    ledger = {
+      begin = function(id: string, rows: number)
+        if commits[id] then error(`faultlab: commit {id} was begun twice`, 2) end
+        if rows < 1 or rows % 1 ~= 0 then error('faultlab: a commit carries at least one row', 2) end
+
+        commits[id] = { rows = rows, acknowledged = false }
+        table.insert(order, id)
+      end,
+      acknowledge = function(id: string)
+        local commit = commits[id]
+        if not commit then error(`faultlab: commit {id} was acknowledged without being begun`, 2) end
+        commit.acknowledged = true
+      end,
+    },
+  }
+end
+
+-- The durable-sequence oracle: the first rule a recovery breaks, or nil.
+local function judge(book: Book, observed: Observed): (Violation?, string)
+  for _, id in book.order do
+    local commit = book.commits[id]
+    local found = observed[id] or 0
+    if commit.acknowledged and found == 0 then
+      return 'acknowledged-lost', `commit {id} was acknowledged and none of its {commit.rows} row(s) survived`
+    end
+
+    if found ~= 0 and found ~= commit.rows then
+      return if commit.acknowledged then 'acknowledged-torn' else 'uncertain-torn',
+        `commit {id} has {found} of {commit.rows} row(s)`
+    end
+  end
+
+  for id, found in observed do
+    if not book.commits[id] and found > 0 then return 'phantom', `{found} row(s) of commit {id}, which was never begun` end
+  end
+
+  return nil, ''
+end
+
+local function snapshot(disk: memfs.Disk): { [string]: { bytes: number, sha256: string } }
+  local files: { [string]: { bytes: number, sha256: string } } = {}
+  for path, body in disk.surviving() do files[path] = { bytes = #body, sha256 = bytes.sha256(body) } end
+
+  return files
+end
+
+local function tail(disk: memfs.Disk): { string }
+  local steps = disk.steps()
+  local kept: { string } = {}
+  for index = math.max(1, #steps - TailSteps + 1), #steps do table.insert(kept, steps[index]) end
+
+  return kept
+end
+
+-- Runs `body` with the disk stopped at its `stop`th storage step from here, in `mode`. Returns
+-- the steps taken (up to the stop for a crash) and whether the stop was reached.
+local function stopped(disk: memfs.Disk, stop: number?, mode: Mode, body: () -> ()): ({ string }, boolean)
+  local taken: { string } = {}
+  local reached, dead = false, false
+  disk.inject(function(step: string, path: string, _occurrence: number): memfs.Fault?
+    -- A process that died takes no further step: whatever its code goes on to try, fails.
+    if dead then return { message = 'faultlab: the process is gone', kind = 'other' } end
+
+    table.insert(taken, `{step} {path}`)
+    if not stop or #taken ~= stop then return nil end
+
+    reached = true
+    if mode == 'crash' then
+      dead = true
+      disk.crash()
+      return { message = 'faultlab: the process is gone', kind = 'other' }
+    end
+
+    if mode == 'torn' then
+      dead = true
+      disk.crash({ torn = true })
+      return { message = 'faultlab: the process is gone', kind = if string.sub(step, 1, 13) == 'createDurable' then 'torn' else 'other' }
+    end
+
+    return { message = 'faultlab: no space left on device', kind = 'other' }
+  end)
+  -- The operation may raise at the fault; that is one of the outcomes under test.
+  pcall(body)
+  disk.inject(nil)
+  return taken, reached
+end
+
+-- One scenario through every step of its schedule.
+function lab.run(scenario: Scenario, options: Options?): Report
+  local modes = if options and options.modes then options.modes else DefaultModes
+  local maxRuns = if options and options.maxRuns then options.maxRuns else 20000
+  local crashRecovery = options ~= nil and options.crashRecovery == true
+  local function stable(step: string?): string?
+    return if step and scenario.stable then scenario.stable(step) else step
+  end
+
+  local report: Report = { scenario = scenario.name, schedule = {}, recoverySteps = 0, runs = 0, truncated = false, violations = {} }
+
+  local function record(violation: Violation, detail: string, mode: Mode | 'baseline', step: number, book: Book,
+    observed: Observed, disk: memfs.Disk, recoveryStep: number?, recoveryAt: string?)
+    local acknowledged: { string }, uncertain: { string } = {}, {}
+    for _, id in book.order do table.insert(if book.commits[id].acknowledged then acknowledged else uncertain, id) end
+
+    table.insert(report.violations, {
+      scenario = scenario.name, violation = violation, detail = detail, mode = mode, step = step,
+      at = report.schedule[step] or '', recoveryStep = recoveryStep, recoveryAt = recoveryAt,
+      acknowledged = acknowledged, uncertain = uncertain, observed = observed, tail = tail(disk), surviving = snapshot(disk),
+    })
+  end
+
+  -- Recovers and judges. Returns false when a violation was recorded.
+  local function settle(disk: memfs.Disk, book: Book, mode: Mode | 'baseline', step: number, recoveryStep: number?,
+    recoveryAt: string?): boolean
+    -- Recovery raising is itself a finding, recorded with what it said.
+    local ok, found = pcall(scenario.recover, disk)
+    if not ok then
+      record('recovery-failed', tostring(found), mode, step, book, {}, disk, recoveryStep, recoveryAt)
+      return false
+    end
+
+    local observed = found :: Observed
+    local violation, detail = judge(book, observed)
+    if violation then
+      record(violation, detail, mode, step, book, observed, disk, recoveryStep, recoveryAt)
+      return false
+    end
+
+    return true
+  end
+
+  local function fresh(): (memfs.Disk, Book)
+    local disk, book = memfs.new(), newBook()
+    scenario.prepare(disk, book.ledger)
+    return disk, book
+  end
+
+  -- The baseline: no fault. It records the schedule, and must itself recover, both as it was
+  -- left and after a crash once the operation has returned.
+  local disk, book = fresh()
+  report.schedule = stopped(disk, nil, 'crash', function() scenario.exercise(disk, book.ledger) end)
+  report.runs = 1
+  if not settle(disk, book, 'baseline', 0) then return report end
+
+  disk.crash()
+  if not settle(disk, book, 'baseline', 0) then return report end
+
+  for step = 1, #report.schedule do
+    for _, mode in modes do
+      if report.runs >= maxRuns then
+        report.truncated = true
+        return report
+      end
+
+      report.runs += 1
+      local runDisk, runBook = fresh()
+      local taken, reached = stopped(runDisk, step, mode, function() scenario.exercise(runDisk, runBook.ledger) end)
+      -- The same scenario must take the same steps, or a step number means nothing.
+      if not reached or stable(taken[step]) ~= stable(report.schedule[step]) then
+        record('schedule-diverged', `expected {report.schedule[step]}, took {tostring(taken[step])}`, mode, step, runBook, {}, runDisk)
+        continue
+      end
+
+      if mode == 'fail' then runDisk.crash() end
+
+      if mode == 'crash' and crashRecovery then
+        -- How many steps this recovery takes, measured on a copy of the same history.
+        local probeDisk, probeBook = fresh()
+        stopped(probeDisk, step, mode, function() scenario.exercise(probeDisk, probeBook.ledger) end)
+        local recovery = stopped(probeDisk, nil, 'crash', function() scenario.recover(probeDisk) end)
+        report.recoverySteps = math.max(report.recoverySteps, #recovery)
+        for recoveryStep = 1, #recovery do
+          if report.runs >= maxRuns then
+            report.truncated = true
+            return report
+          end
+
+          report.runs += 1
+          local againDisk, againBook = fresh()
+          stopped(againDisk, step, mode, function() scenario.exercise(againDisk, againBook.ledger) end)
+          stopped(againDisk, recoveryStep, 'crash', function() scenario.recover(againDisk) end)
+          settle(againDisk, againBook, mode, step, recoveryStep, recovery[recoveryStep])
+        end
+      end
+
+      if settle(runDisk, runBook, mode, step) and mode ~= 'fail-live' then
+        -- What recovery left must survive a further crash and recover again to the same verdict.
+        runDisk.crash()
+        settle(runDisk, runBook, mode, step)
+      end
+    end
+  end
+
+  return report
+end
+
+-- One artifact as text, for a failing test's message or a log.
+function lab.describe(artifact: Artifact): string
+  local lines = {
+    `{artifact.scenario}: {artifact.violation}: {artifact.detail}`,
+    `  stopped ({artifact.mode}) at step {artifact.step}: {artifact.at}`,
+  }
+
+  if artifact.recoveryStep then table.insert(lines, `  recovery crashed at its step {artifact.recoveryStep}: {artifact.recoveryAt or ''}`) end
+
+  table.insert(lines, `  acknowledged: {table.concat(artifact.acknowledged, ' ')}`)
+  table.insert(lines, `  uncertain: {table.concat(artifact.uncertain, ' ')}`)
+  local found: { string } = {}
+  for id, rows in artifact.observed do table.insert(found, `{id}={rows}`) end
+
+  table.sort(found)
+  table.insert(lines, `  observed: {table.concat(found, ' ')}`)
+  table.insert(lines, '  last steps:')
+  for _, step in artifact.tail do table.insert(lines, `    {step}`) end
+
+  local paths: { string } = {}
+  for path in artifact.surviving do table.insert(paths, path) end
+
+  table.sort(paths)
+  table.insert(lines, '  surviving files:')
+  for _, path in paths do
+    local file = artifact.surviving[path]
+    table.insert(lines, `    {path} {file.bytes} bytes sha256:{string.sub(file.sha256, 1, 16)}`)
+  end
+
+  return table.concat(lines, '\n')
+end
+
+return lab

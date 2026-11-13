@@ -4,7 +4,7 @@
 -- The existing checksummed JQLP2 page format is reused for this sidecar.
 local paged = require('@jessql/paged')
 local compact = require('@jessql/compactsecondary')
-local fs = require('@dream/fs')
+local vfs = require('@jessql/vfs')
 
 export type Row = { [string]: unknown }
 export type Index = {
@@ -16,7 +16,7 @@ export type Index = {
   stats: (self: Index) -> paged.Metrics,
 }
 
-export type BuildOptions = { pageBytes: number?, cachePages: number?, runRows: number?, mergeFanIn: number?, format: string? }
+export type BuildOptions = { pageBytes: number?, cachePages: number?, runRows: number?, mergeFanIn: number?, format: string?, storage: vfs.Backend? }
 export type BuildMetrics = { rows: number, entries: number, spilledRuns: number,
   mergeOperations: number, maxBufferedEntries: number, maxOpenReaders: number }
 
@@ -76,6 +76,7 @@ end
 
 local function mergeRuns(path: string, paths: { string }, options: paged.Options?,
   metrics: BuildMetrics, markers: { Row }?, compressed: boolean?)
+  local fs = vfs.resolve(if options then options.storage else nil)
   local readers: { paged.Snapshot } = {}
   local iterators: { () -> Row? } = {}
   local heap: { { row: Row, source: number } } = {}
@@ -118,7 +119,7 @@ local function mergeRuns(path: string, paths: { string }, options: paged.Options
   -- Reader opening, page decoding, and paged.create can throw; close every opened source.
   local ok, failure = pcall(function()
     for index, sourcePath in paths do
-      local reader = paged.open(sourcePath, { cachePages = 1 })
+      local reader = paged.open(sourcePath, { cachePages = 1, storage = fs })
       readers[#readers + 1] = reader
       local iterator = reader:iterateRows()
       iterators[index] = iterator
@@ -161,6 +162,7 @@ end
 -- incrementally, not retained in an O(total rows) run list.
 function secondary.create(path: string, snapshotPath: string, partitionColumn: string,
   orderColumn: string, options: BuildOptions?): BuildMetrics
+  local fs = vfs.resolve(if options then options.storage else nil)
   local compressed = options ~= nil and options.format == 'compact'
   if options and options.format ~= nil and options.format ~= 'paged'
     and options.format ~= 'compact' then error('jessql secondary: unsupported format', 2) end
@@ -172,9 +174,10 @@ function secondary.create(path: string, snapshotPath: string, partitionColumn: s
   end
 
   -- The index-builder tuning options are not part of the snapshot I/O API.
-  local pageOptions: paged.Options? = if options then {
-    pageBytes = options.pageBytes, cachePages = options.cachePages,
-  } else nil
+  local pageOptions: paged.Options = {
+    pageBytes = if options then options.pageBytes else nil,
+    cachePages = if options then options.cachePages else nil, storage = fs,
+  }
 
   local snapshot = paged.open(snapshotPath, pageOptions)
   local metrics: BuildMetrics = { rows = 0, entries = 0, spilledRuns = 0,
@@ -344,6 +347,7 @@ function secondary.create(path: string, snapshotPath: string, partitionColumn: s
 end
 
 function secondary.open(path: string, snapshot: paged.Snapshot, options: paged.Options?): Index
+  local fs = vfs.resolve(if options then options.storage else nil)
   -- The legacy JQLP2 reader remains available for previously built sidecars.
   -- Dispatch by magic without mapping even six bytes of a potentially
   -- truncated sidecar; positional mode should never depend on mmap.

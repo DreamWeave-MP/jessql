@@ -19,7 +19,7 @@ local function clean()
 
   for epoch = 1, 6 do
     local prefix = base .. string.format('.g%08d', epoch)
-    for _, ending in { '.rows', '.deleted', '.wal', '.wal.lock' } do
+    for _, ending in { '.rows', '.deleted', '.wal', '.wal.lock', '.wal.committed' } do
       fs.remove(prefix .. ending)
     end
   end

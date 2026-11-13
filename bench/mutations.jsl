@@ -7,6 +7,7 @@ local total = tonumber((...)) or 5000
 local path = fs.join(assert((fs.cwd())), '.jessql-mutation-bench.wal')
 fs.remove(path)
 fs.remove(path .. '.lock')
+fs.remove(path .. '.committed')
 local db = sql.open(path)
 db:createTable('values', { 'id', 'value' }, 'id')
 db:transaction(function(tx)
@@ -31,3 +32,4 @@ print(string.format('updates_per_mode=%d parse_each_s=%.4f prepared_s=%.4f speed
 db:close()
 fs.remove(path)
 fs.remove(path .. '.lock')
+fs.remove(path .. '.committed')

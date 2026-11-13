@@ -1,0 +1,124 @@
+--!strict
+-- A durable ledger of request ids, and what to do about an outcome nobody saw (#33).
+--
+-- The writer answers `unknown` when it cannot say whether a request is durable, and a caller
+-- whose worker died never gets an answer at all. Asking again is only safe if a request that
+-- did commit cannot be applied twice. The ledger makes that so with nothing but the database's
+-- own atomicity: a request's id is written as a row **in the same frame as the request**, in a
+-- table of the same database. So the id is there exactly when the request's changes are, a
+-- crash at any moment leaves both or neither, and there is no second store to disagree with.
+--
+--   * A request whose id is already in the ledger is refused with `ledger: already committed`
+--     and changes nothing. That refusal is the answer to a retry: it committed the first time.
+--     The entry keeps a digest of what the request said: only the same request is a retry. The
+--     same id with anything else is refused with `ledger: id reused with different content`,
+--     which says nothing about whether *this* request ever ran, and is never read as committed.
+--     Which of the two it was is answered by `ledger.claim` as a value, and a writer carries it
+--     as a field of its ack (`alreadyCommitted`): an error's text is never read for it, since a
+--     request's own table names and values can say anything (J-FINAL-02).
+--   * `ledger.lookup` answers, for ids, `committed` or `absent`, from the database alone: what
+--     a caller or an operator asks after a reopen.
+--   * A scope (a tenant, a client) is part of the key, length-framed, so the same id under two
+--     scopes is two requests and no scope can spell another's key.
+--   * `ledger.prune` removes entries older than a time, a bounded number a call. Retention is
+--     the caller's choice and it is a real limit: **after an id has been pruned, a retry of
+--     that request is applied again**. Retries must stop before retention does.
+--
+-- This is exactly-once application of a request to this database. It is not exactly-once
+-- delivery of anything to anyone.
+local catalog = require('@jessql/catalog')
+
+export type Options = {
+  -- The ledger's table: one made with `ledger.table`.
+  table: string,
+  -- Whose requests these are (default the empty scope). At most 200 bytes.
+  scope: string?,
+  -- Seconds, for the entry's time (default `os.time`).
+  now: (() -> number)?,
+}
+export type State = 'committed' | 'absent'
+export type Claim = 'entered' | 'committed'
+
+local ledger = {}
+
+ledger.AlreadyCommitted = 'ledger: already committed'
+ledger.Reused = 'ledger: id reused with different content'
+ledger.MaxScopeBytes = 200
+ledger.MaxIdBytes = 512
+ledger.MaxPrune = 10000
+
+-- The table a ledger lives in. Give it to `sql.catalog.create` beside the application's own.
+function ledger.table(name: string): catalog.TableSpec
+  return { tableName = name, columns = { 'key', 'scope', 'id', 'at', 'digest' }, primaryKey = 'key' }
+end
+
+-- The row key of `id` under `scope`: the scope's length frames it, so no id can reach into
+-- another scope and no scope can be a prefix of another's key.
+function ledger.key(scope: string, id: string): string
+  return `{#scope}:{scope}{id}`
+end
+
+-- Why `options` cannot be a ledger's, or nil.
+function ledger.problem(options: unknown): string?
+  if type(options) ~= 'table' then return 'ledger options are a table' end
+  local given = options :: { [string]: unknown }
+  if type(given.table) ~= 'string' or #(given.table :: string) == 0 then return 'a ledger names its table' end
+  if given.scope ~= nil and (type(given.scope) ~= 'string' or #(given.scope :: string) > ledger.MaxScopeBytes) then return 'a scope is at most 200 bytes' end
+  if given.now ~= nil and type(given.now) ~= 'function' then return 'now is a function' end
+  return nil
+end
+
+-- Inside the request's own transaction, before its operations: writes its id and `digest` (what
+-- the request says) beside what it is about to change, and answers `entered`. The same id with
+-- the same digest already there is this request, committed before: nothing is written and the
+-- answer is `committed`, for the caller to refuse the request with. The same id with another
+-- digest is not this request: raised as reused.
+function ledger.claim(tx: catalog.Transaction, options: Options, id: string, digest: string): Claim
+  if #id > ledger.MaxIdBytes then error('ledger: a request id is at most 512 bytes', 0) end
+  local scope = options.scope or ''
+  local key = ledger.key(scope, id)
+  local found = tx:get(options.table, key)
+  if found ~= nil then
+    if found.digest == digest then return 'committed' end
+    error(ledger.Reused, 0)
+  end
+
+  local now = options.now or os.time
+  tx:insert(options.table, { key = key, scope = scope, id = id, at = now(), digest = digest })
+  return 'entered'
+end
+
+-- `ledger.claim`, with a request committed before refused by raising `ledger.AlreadyCommitted`.
+-- The text is for people: whoever must tell a retry from a failure asks `claim`.
+function ledger.enter(tx: catalog.Transaction, options: Options, id: string, digest: string)
+  if ledger.claim(tx, options, id, digest) == 'committed' then error(ledger.AlreadyCommitted, 0) end
+end
+
+-- For each id: whether the database holds it. Read from the database as it is now.
+function ledger.lookup(db: catalog.Database, options: Options, ids: { string }): { [string]: State }
+  local scope = options.scope or ''
+  local found: { [string]: State } = {}
+  for _, id in ids do
+    found[id] = if db:get(options.table, ledger.key(scope, id)) ~= nil then 'committed' else 'absent'
+  end
+
+  return found
+end
+
+-- Removes entries of every scope older than `before` (seconds), at most `limit` a call, in one
+-- transaction. Answers how many went; call again while it answers `limit`.
+function ledger.prune(db: catalog.Database, options: Options, before: number, limit: number?): number
+  local most = math.clamp(math.floor(limit or 1000), 1, ledger.MaxPrune)
+  if type(before) ~= 'number' or before ~= before then error('ledger: prune needs a time', 2) end
+
+  -- The table's name was validated when the database was made; the numbers are numbers.
+  local old = db:query(string.format('SELECT key FROM %s WHERE at < %d LIMIT %d', options.table, math.floor(before), most)).rows
+  if #old == 0 then return 0 end
+
+  db:transaction(function(tx)
+    for _, row in old do tx:delete(options.table, row.key) end
+  end)
+  return #old
+end
+
+return ledger
