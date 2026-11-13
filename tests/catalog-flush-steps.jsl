@@ -1,0 +1,39 @@
+--!strict
+-- #40.1: a flush of every table of a managed database, stopped at every storage step and found
+-- whole or not at all. In a file of its own because it is long.
+local lab = require('@jessql/faultlab')
+local test = require('@jess/test')
+local world = require('./catalogworld')
+
+local expect = test.expect
+local suite = test.new()
+
+local commit, exercised, findings, prepare, recover =
+  world.commit, world.exercised, world.findings, world.prepare, world.recover
+
+suite.describe('a managed database of several tables', function()
+  suite.it('publishes a flush of every table whole or not at all, with commits before and after', function()
+    local report = lab.run({
+      name = 'catalog flush between service steps',
+      prepare = prepare,
+      exercise = exercised(function(db, ledger)
+        commit(db, ledger, 4)
+        db:flush()
+        commit(db, ledger, 5)
+      end),
+      recover = recover,
+    }, { crashRecovery = true })
+    expect(findings(report)).toBe('')
+    expect(report.truncated).toBe(false)
+    -- One publication: one manifest replacement, however many tables it moved.
+    local replacements = 0
+    for _, taken in report.schedule do
+      if string.match(taken, '^replace ') then replacements += 1 end
+    end
+
+    expect(replacements).toBe(1)
+    print(`catalog flush: {#report.schedule} storage steps, {report.runs} stopped runs, {#report.violations} violations`)
+  end)
+end)
+
+return suite

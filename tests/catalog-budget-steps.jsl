@@ -1,0 +1,52 @@
+--!strict
+-- #40.1: the flushes and compactions a managed database's commits set off, stopped at every storage
+-- step. In a file of its own because it is long.
+local lab = require('@jessql/faultlab')
+local memfs = require('@jessql/memfs')
+local test = require('@jess/test')
+local world = require('./catalogworld')
+
+local expect = test.expect
+local suite = test.new()
+
+local budgeted, commit, findings, prepare, recover, step =
+  world.budgeted, world.commit, world.findings, world.prepare, world.recover, world.step
+
+suite.describe('a managed database of several tables under budgets', function()
+  suite.it('is whole at every storage step of the flushes and compactions its commits set off', function()
+    local report = lab.run({
+      name = 'catalog commits under budgets',
+      prepare = function(disk: memfs.Disk, ledger: lab.Ledger)
+        local db = budgeted(disk, nil)
+        for number = 1, 3 do commit(db, ledger, number) end
+
+        db:close()
+      end,
+      exercise = function(disk: memfs.Disk, ledger: lab.Ledger)
+        local db = budgeted(disk, nil)
+        -- A step may raise at the fault; the database is closed either way.
+        local ok, problem = pcall(function()
+          for number = 4, 12 do commit(db, ledger, number) end
+        end)
+        -- close can raise on a handle the fault has poisoned; it is closed as far as it can be.
+        pcall(function() db:close() end)
+        if not ok then error(problem, 0) end
+      end,
+      recover = recover,
+    })
+    expect(findings(report)).toBe('')
+    expect(report.truncated).toBe(false)
+    local replacements = 0
+    for _, taken in report.schedule do
+      if string.match(taken, '^replace ') then replacements += 1 end
+    end
+
+    -- Several publications happened inside the commits, a compaction among them.
+    expect(replacements >= 3).toBe(true)
+    print(`catalog budgets: {#report.schedule} storage steps, {report.runs} stopped runs, {replacements} publications, {#report.violations} violations`)
+  end)
+end)
+
+-- A copy of `disk`'s files on a new disk, each passed through `change` (nil drops the file).
+
+return suite
