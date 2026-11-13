@@ -39,3 +39,40 @@ known_issues = [
   "Managed persistence supports one writer; replication, distributed transactions, and online backups are not implemented.",
   "Physical power-loss guarantees and Windows/macOS durability remain unverified; operational resource thresholds are soft watermarks.",
 ]
+
+  [[releases]]
+version = "0.3.0"
+date = 2026-11-13
+summary = "JessQL Hyperscale: multi-table transactional storage, supervised writer services, fair admission, bounded query execution, scalable cold storage, and extensively hardened crash recovery. A major expansion of JessQL's native, strictly typed Luau database architecture."
+
+added = [
+  "Multi-table managed catalogs with atomic cross-table transactions, shared WAL epochs, immutable generations, selective compaction, offline verification, and backup/restore.",
+  "Bounded asynchronous writer infrastructure with worker-service protocol, restart supervision, backpressure, request acknowledgment, and configurable queue limits.",
+  "Transactional request ledger with content digests, replay reconciliation, and retained-request idempotency across worker failures.",
+  "Fair multi-tenant writer admission with per-tenant accounting, starvation prevention, expiring claims, and bounded reservation capacity.",
+  "Configurable query execution budgets for joins, aggregates, sorting, and retained result rows, plus streaming result cursors for eligible queries.",
+  "Experimental segment-and-offset cold addressing and two-level page directories with bounded leaf caching for very large datasets.",
+  "Storage abstraction layer, in-memory filesystem, deterministic fault-injection laboratory, and simulated crash, power-loss, torn-write, and disk-full testing.",
+  "Persistent format registry, golden compatibility fixtures, corruption fuzzing, and deterministic benchmark laboratory with workload fingerprints and correctness oracles.",
+  "Storage amplification instrumentation, compaction planning, reader generation pins, and expanded operational diagnostics."
+]
+
+changed = [
+  "Strengthened WAL recovery with committed-length witnesses, atomic witness creation, corruption detection, and conservative handling of ambiguous or damaged frames.",
+  "Hardened durable publication, manifest replacement, directory synchronization, and recovery after interrupted storage operations.",
+  "Improved writer correctness with typed commit acknowledgments, protected ledger tables, tenant-scoped request identities, and bounded supervisor bookkeeping.",
+  "Introduced byte-aware writer admission and more realistic heap accounting to reduce memory amplification under large or hostile requests.",
+  "Improved cold-storage scalability with streaming segment processing, packed page-directory metadata, and constant-time cache eviction.",
+  "Expanded query planning explanations and bounded execution behavior while preserving existing SQL semantics and storage compatibility.",
+  "Updated filesystem option types for Jess runtimes using l3i 2.11.0 or later, with expanded strict-check and regression coverage."
+]
+
+known_issues = [
+  "Physical power-loss durability is not certified. Recovery assumes the underlying filesystem honors successful synchronization operations; lying or damaged storage can violate acknowledged-commit guarantees.",
+  "Windows and macOS durability and performance remain unqualified. The final hardening campaign was validated primarily on Linux.",
+  "The writer service uses an application-local transport without built-in authentication. Applications must enforce authorization, directory confinement, and exclusive ownership of ledger writes.",
+  "Request idempotency is guaranteed only while the corresponding ledger entries are retained. Pruning entries permits older request identifiers to be applied again.",
+  "Cold segment addressing and two-level page directories remain experimental and are not universally integrated into managed storage paths.",
+  "Resource limits bound specific queues, caches, and query operations; they do not impose a hard process-wide resident-memory ceiling.",
+  "Replication, distributed transactions, concurrent independent writers, and online backups are not implemented."
+]
