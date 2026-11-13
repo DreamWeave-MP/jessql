@@ -130,6 +130,9 @@ type DatabaseState = {
   walWriter: dream_fs_Writer?,
   -- The log's committed-length mark, and how long the log is now. See `@jessql/walmark`.
   mark: walmark.Writer?,
+  -- A record of the mark could not be written: it is behind, still true, and the store no longer
+  -- says it is witnessed. The writer is kept, to withdraw the mark before a checkpoint.
+  markLapsed: boolean,
   walLength: number,
 }
 
@@ -1584,9 +1587,10 @@ local function load(state: DatabaseState, recoverTail: boolean)
 
   -- A frame that cannot be read is a torn tail, to be cut, only when it lies wholly past what
   -- the mark says was committed, no further from the end than one append can reach, and every
-  -- byte from `zerosFrom` on is zero: blocks a power cut left allocated and never written. The
-  -- mark is synchronized with every commit, so nothing past it was acknowledged. Anything else
-  -- is refused as before (review of 2026-11-13: such a tail made a sound store refuse to open).
+  -- byte from `zerosFrom` on is zero: blocks a power cut left allocated and never written. A
+  -- synchronization reported done is trusted (decided 2026-11-13, see `@jessql/walmark`), so
+  -- zeros after the last whole frame were never acknowledged. Anything else is refused as before
+  -- (review of 2026-11-13: such a tail made a sound store refuse to open).
   local function tornTail(zerosFrom: number): boolean
     return recoverTail and committed ~= nil and offset >= committed.length and state.sequence >= committed.sequence
       and size - offset <= inFlight and zeroFrom(zerosFrom)
@@ -1655,18 +1659,14 @@ local function load(state: DatabaseState, recoverTail: boolean)
   end
 end
 
--- Records the commits synchronized so far in the mark. A record that does not reach storage
--- leaves the mark behind: the store is then no longer witnessed, and takes no commit until it is
--- opened again, as after a log synchronization that failed (re-review of #99).
+-- Records the commits synchronized so far in the mark. A record that cannot be written leaves the
+-- mark behind, still true: the store goes on unwitnessed, and says so (re-review of #99: it went
+-- on saying it was witnessed). The writer is not let go: the file is still there, and a
+-- checkpoint must still withdraw it before the log it describes is replaced by a shorter one.
 local function recordMark(state: DatabaseState)
   local mark = state.mark
-  if not mark or mark.record(state.sequence, state.walLength) then return end
-
-  state.poisoned = true
-  state.mark = nil
-  -- Closing a handle whose synchronization failed can raise; the store is poisoned either way.
-  pcall(mark.close)
-  error('jessql storage: committed-length mark could not be synchronized (reopen required)', 3)
+  if not mark or state.markLapsed then return end
+  if not mark.record(state.sequence, state.walLength) then state.markLapsed = true end
 end
 
 local function write(state: DatabaseState, ops: { Operation }, deferSync: boolean?)
@@ -1746,7 +1746,7 @@ function storage.open(path: string, options: Options?): Store
     path = path, fs = fs, lock = lock, engine = queryEngine.new(), tables = {}, sequence = 0, schemaVersion = 0,
     maxFrameBytes = max or DefaultMaxFrame, closed = false, busy = false, poisoned = false,
     rowLayout = rowLayout or 'row', trackPayloadBytes = options ~= nil and options.trackPayloadBytes == true,
-    durability = durability, walWriter = nil, mark = nil, walLength = 0,
+    durability = durability, walWriter = nil, mark = nil, markLapsed = false, walLength = 0,
   }
 
   -- Opening can fail on invalid frames; release the advisory lock on failure.
@@ -2151,7 +2151,7 @@ function storage.open(path: string, options: Options?): Store
   function db.witness(_self: Store): string
     if state.durability ~= 'sync' then return 'not-synchronized' end
 
-    return if state.mark then 'witnessed' else 'unwitnessed'
+    return if state.mark and not state.markLapsed then 'witnessed' else 'unwitnessed'
   end
 
   function db.stats(_self: Store): { [string]: TableMetrics }
@@ -2418,7 +2418,7 @@ function storage.verifyReplay(path: string, backend: vfs.Backend?): number
     path = path, fs = fs, lock = lock, engine = queryEngine.new(), tables = {},
     sequence = 0, schemaVersion = 0, maxFrameBytes = DefaultMaxFrame,
     closed = false, busy = false, poisoned = false, rowLayout = 'row',
-    trackPayloadBytes = false, durability = 'buffered', walWriter = nil, mark = nil, walLength = 0,
+    trackPayloadBytes = false, durability = 'buffered', walWriter = nil, mark = nil, markLapsed = false, walLength = 0,
   }
   -- recoverTail=false prohibits the only write-capable branch in load().
   local ok, failure = pcall(function() load(state, false) end)

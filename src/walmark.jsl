@@ -10,15 +10,21 @@
 --
 -- What the mark promises, exactly: it is written only after the log's own synchronization, so
 -- it never claims more than is durable; a crash can therefore never make a sound log look
--- damaged. It is synchronized with every commit (a second synchronization per commit, or per
--- group of commits), so that after a crash it covers every commit that was acknowledged. That is
--- what tells the tail a power cut tore (past the mark: never acknowledged, cut) from acknowledged
--- frames that came back as zeros (within the mark: damage, refused). It used to be synchronized
--- only at close and before a checkpoint, and a mark that far behind made the two look the same
--- (review of 2026-11-13). A record that does not reach storage leaves the mark behind, still true,
--- and the store stops taking commits until it is opened again: a mark that stayed behind while
--- commits went on being acknowledged would let a reopen cut acknowledged frames that came back as
--- zeros as a torn tail (re-review of #99).
+-- damaged. It is not synchronized with every commit (that would add a second synchronization to
+-- each): it is synchronized when the store is closed, and before a checkpoint shortens the log.
+-- So after a clean close every commit is covered, and after a crash every commit up to whatever
+-- mark had reached storage.
+--
+-- What is trusted (decided 2026-11-13): a synchronization the operating system reports as done is
+-- done. An acknowledged commit was synchronized, so it is on the disk whole, and the zeros a
+-- power cut leaves at the end of a log, after its last whole frame, can only be an append that
+-- was never acknowledged; that tail is cut. A disk that reports a synchronization it did not do
+-- can hand back acknowledged frames as zeros past a mark that is behind, and those are cut as
+-- well: that disk is outside what this store defends against. (Holding the mark current with
+-- every commit would catch it, for about one and a half times the cost of a single commit.)
+--
+-- A record that does not reach storage leaves the mark behind, still true; the store then says it
+-- is unwitnessed (re-review of #99: it went on saying it was witnessed).
 --
 -- The file is `<log>.committed`: a magic and two slots written alternately, each with its own
 -- checksum, so a write torn by a crash leaves the other slot standing.
@@ -38,8 +44,8 @@ export type Mark = { sequence: number, length: number }
 -- What is beside a log: no mark, one that can be read, or one that is there and cannot be.
 export type Condition = 'absent' | 'sound' | 'damaged'
 export type Writer = {
-  -- Records, durably, that the log holds `sequence` transactions in `length` bytes, all
-  -- synchronized. False when the record did not reach storage: the mark is behind.
+  -- Records that the log holds `sequence` transactions in `length` bytes, all synchronized. False
+  -- when the record could not be written: the mark is behind.
   record: (sequence: number, length: number) -> boolean,
   -- Makes "nothing is committed" durable, before the log is replaced by a shorter one. Returns
   -- whether it is durable; the caller must not shorten the log if it is not.
@@ -200,7 +206,7 @@ function walmark.open(fs: vfs.Backend, log: string): Writer?
       if closed then return false end
       if sequence == latest.sequence and length == latest.length then return true end
 
-      return put(sequence, length) and handle:syncData() == true
+      return put(sequence, length)
     end,
     reset = function(): boolean
       if closed then return false end
