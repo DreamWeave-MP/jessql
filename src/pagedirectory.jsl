@@ -8,6 +8,9 @@
 -- leaf in the root, loads that one leaf (checked against its CRC-32) and finds the page in it.
 -- Leaves are kept in a cache bounded by count, least recently used out first. So what is held
 -- is the root (pages / leafEntries entries) and at most `maxLeaves` leaves, whatever the table.
+-- With `maxCacheBytes` those leaves are also bounded by what they weigh, since a leaf of long
+-- keys is many times one of short keys: the least recently used go until the next fits, and a
+-- leaf heavier than the whole budget answers its lookup and is not kept.
 --
 -- The file: the leaves one after another, then the root, then a 24-byte footer.
 --
@@ -28,14 +31,22 @@ export type Writer = {
   -- Writes the root and the footer. The number of pages, or nil and why.
   finish: () -> (number?, string?),
 }
-export type Stats = { pages: number, leaves: number, rootBytes: number, cached: number, leafReads: number, hits: number }
+export type Stats = {
+  pages: number, leaves: number, rootBytes: number, cached: number, leafReads: number, hits: number,
+  -- What the cached leaves weigh: the bytes each is on disk, which is what it holds in memory
+  -- give or take the table around its keys.
+  cachedBytes: number,
+}
 export type Reader = {
   -- The page whose range holds `key`: the last page whose first key is not after it. Nil with
   -- no reason when `key` is before every page; nil and a reason when the directory is damaged.
   find: (key: string) -> (Page?, string?),
   stats: () -> Stats,
 }
-export type Options = { leafEntries: number?, maxLeaves: number? }
+-- `maxCacheBytes` bounds the cached leaves by weight as `maxLeaves` bounds them by number: a
+-- directory of long keys has leaves many times the size of one of short keys, and a count alone
+-- does not say what a reader holds. Without it only the count applies.
+export type Options = { leafEntries: number?, maxLeaves: number?, maxCacheBytes: number? }
 
 local directory = {}
 
@@ -146,12 +157,15 @@ end
 
 -- A cached leaf is a link in a list kept in order of use, so that the one to drop is at its
 -- end and is found without looking at the others.
-type Leaf = { index: number, firsts: { string }, places: buffer, newer: Leaf?, older: Leaf? }
+type Leaf = { index: number, firsts: { string }, places: buffer, bytes: number, newer: Leaf?, older: Leaf? }
 
 -- Opens a directory file of `size` bytes: the footer and the root are read, checked, and held.
 function directory.reader(storage: vfs.Backend, path: string, size: number, options: Options?): (Reader?, string?)
   local maxLeaves = if options and options.maxLeaves then options.maxLeaves else 64
   if not whole(maxLeaves, 1, 1000000) then return nil, 'not a cache size' end
+
+  local maxCacheBytes = if options then options.maxCacheBytes else nil
+  if maxCacheBytes ~= nil and not whole(maxCacheBytes, 1, 2 ^ 40) then return nil, 'not a cache budget' end
   if not whole(size, directory.FooterBytes + 4, 2 ^ 32 - 1) then return nil, 'not a directory file' end
 
   local function read(offset: number, length: number): string?
@@ -207,6 +221,7 @@ function directory.reader(storage: vfs.Backend, path: string, size: number, opti
 
   local cache: { [number]: Leaf } = {}
   local cached, leafReads, hits = 0, 0, 0
+  local cachedBytes = 0
   local newest: Leaf?, oldest: Leaf? = nil, nil
 
   local function unlink(leaf: Leaf)
@@ -267,18 +282,26 @@ function directory.reader(storage: vfs.Backend, path: string, size: number, opti
 
     if cursor ~= leafLength or leafFirsts[1] ~= firsts[index] then return nil, `leaf {index} is not the leaf the root describes` end
 
-    -- Room is made before the leaf is kept: the least recently used goes.
+    local leaf: Leaf = { index = index, firsts = leafFirsts, places = leafPlaces, bytes = leafLength, newer = nil, older = nil }
+    -- A leaf that is over the budget by itself answers this lookup and is not kept: the budget
+    -- is what the reader holds between lookups, and one leaf cannot be let to break it.
+    if maxCacheBytes and leafLength > maxCacheBytes then return leaf, nil end
+
+    -- Room is made before the leaf is kept: the least recently used go, until it fits by number
+    -- and by weight.
     local dropped = oldest
-    if cached >= maxLeaves and dropped then
+    while dropped and (cached >= maxLeaves or (maxCacheBytes ~= nil and cachedBytes + leafLength > maxCacheBytes)) do
       unlink(dropped)
       cache[dropped.index] = nil
       cached -= 1
+      cachedBytes -= dropped.bytes
+      dropped = oldest
     end
 
-    local leaf: Leaf = { index = index, firsts = leafFirsts, places = leafPlaces, newer = nil, older = nil }
     cache[index] = leaf
     front(leaf)
     cached += 1
+    cachedBytes += leafLength
     return leaf, nil
   end
 
@@ -317,7 +340,8 @@ function directory.reader(storage: vfs.Backend, path: string, size: number, opti
   end
 
   function self.stats(): Stats
-    return { pages = pages, leaves = count, rootBytes = rootLength, cached = cached, leafReads = leafReads, hits = hits }
+    return { pages = pages, leaves = count, rootBytes = rootLength, cached = cached, leafReads = leafReads, hits = hits,
+      cachedBytes = cachedBytes }
   end
 
   return self, nil

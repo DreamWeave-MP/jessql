@@ -98,6 +98,84 @@ suite.describe('a two-level page directory', function()
     expect(reader.stats().cached).toBe(3)
   end)
 
+  suite.it('holds no more bytes of leaves than its budget, whatever their keys weigh, and still answers', function()
+    -- Ten leaves of short keys and ten of long ones: 224 bytes a leaf, then 2,144.
+    local disk = memfs.new()
+    local writer = assert(directory.writer(disk.backend, Path, { leafEntries = 10 }))
+    local function named(index: number): string
+      return if index <= 100 then string.format('a-%06d', index) else string.format('b-%06d', index) .. string.rep('x', 192)
+    end
+
+    for index = 1, 200 do
+      expect(writer.add({ first = named(index), segment = 0, offset = index * 4096, length = 4096 })).toBe(nil)
+    end
+
+    expect((writer.finish())).toBe(200)
+    local size = #assert((disk.backend.readFileString(Path)))
+    local function opened(budget: number, most: number?): directory.Reader
+      return assert(directory.reader(disk.backend, Path, size, { maxLeaves = most or 64, maxCacheBytes = budget }))
+    end
+
+    local function found(reader: directory.Reader, index: number)
+      local page = assert(reader.find(named(index)))
+      expect(page.offset).toBe(index * 4096)
+    end
+
+    -- Four short leaves fit a thousand bytes; the fifth pushes out the one used longest ago.
+    local small = opened(1000)
+    for leaf = 0, 3 do found(small, leaf * 10 + 1) end
+
+    expect(`{small.stats().cached} {small.stats().cachedBytes}`).toBe('4 896')
+    found(small, 41)
+    expect(`{small.stats().cached} {small.stats().cachedBytes} {small.stats().leafReads}`).toBe('4 896 5')
+    found(small, 1)
+    expect(small.stats().leafReads).toBe(6)
+
+    -- A leaf heavier than the whole budget answers and is not kept: asked twice, read twice,
+    -- and what was cached stays.
+    found(small, 101)
+    found(small, 105)
+    expect(`{small.stats().cached} {small.stats().cachedBytes} {small.stats().leafReads}`).toBe('4 896 8')
+
+    -- One long leaf and one short fit 2,500. A second long one needs the first gone, which was
+    -- used longest ago; the short one stays, and the first is read again when next asked for.
+    local medium = opened(2500)
+    found(medium, 101)
+    found(medium, 1)
+    expect(`{medium.stats().cached} {medium.stats().cachedBytes}`).toBe('2 2368')
+    found(medium, 111)
+    expect(`{medium.stats().cached} {medium.stats().cachedBytes} {medium.stats().leafReads}`).toBe('2 2368 3')
+    found(medium, 1)
+    expect(medium.stats().leafReads).toBe(3)
+    found(medium, 101)
+    expect(`{medium.stats().cached} {medium.stats().cachedBytes} {medium.stats().leafReads}`).toBe('2 2368 4')
+
+    -- Whatever is asked, in whatever order, the weight held never passes the budget, and the
+    -- count never passes its own limit when that is the tighter one.
+    local walked = opened(5000, 3)
+    local heaviest, most = 0, 0
+    for step = 1, 2000 do
+      found(walked, (step * 7919) % 200 + 1)
+      heaviest = math.max(heaviest, walked.stats().cachedBytes)
+      most = math.max(most, walked.stats().cached)
+    end
+
+    expect(heaviest <= 5000).toBe(true)
+    expect(heaviest > 2144).toBe(true)
+    expect(most).toBe(3)
+
+    -- Without a budget only the count applies, as before.
+    local counted = assert(directory.reader(disk.backend, Path, size, { maxLeaves = 20 }))
+    for index = 1, 200, 10 do found(counted, index) end
+
+    expect(`{counted.stats().cached} {counted.stats().cachedBytes}`).toBe(`20 {10 * 224 + 10 * 2144}`)
+
+    for _, bad in { 0, -1, 1.5, 2 ^ 41 } do
+      local refused, why = directory.reader(disk.backend, Path, size, { maxCacheBytes = bad })
+      expect(`{refused == nil} {why}`).toBe('true not a cache budget')
+    end
+  end)
+
   suite.it('loses only the lookups a damaged leaf serves, and refuses a damaged root or footer outright', function()
     local built = build(640, 64)
     local backend = built.disk.backend
