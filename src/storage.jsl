@@ -1583,7 +1583,13 @@ local function load(state: DatabaseState, recoverTail: boolean)
   reader:close()
   -- The other witness to where the log ends. A log shorter than its mark did not get that way
   -- by a crash: it was damaged or replaced, and is refused before anything is truncated.
-  local committed = walmark.read(state.fs, state.path)
+  local witness, committed = walmark.examine(state.fs, state.path)
+  if witness == 'damaged' then
+    -- Not the same as no mark: something wrote one and it cannot be read now, so whether the
+    -- log beside it is whole cannot be said. Refused, as a log found short is.
+    error(`jessql storage: the committed-length mark beside the log is damaged, so it cannot be said whether the log is whole (remove {walmark.path(state.path)} to accept the log as it is)`, 2)
+  end
+
   if committed and (committed.length > offset or committed.sequence > state.sequence) then
     error(`jessql storage: the log holds {state.sequence} transactions in {offset} bytes, fewer than the {committed.sequence} in {committed.length} bytes it was recorded to hold: it was damaged or replaced by an older copy (remove {walmark.path(state.path)} only to accept that loss)`, 2)
   end

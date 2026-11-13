@@ -76,6 +76,16 @@ refused at open, and the offline scan reports `WAL_SHORTER_THAN_COMMITTED`. Over
 the same log with its mark present, every one is read as the written rows or refused; none is
 read as an earlier state (`tests/wal-committed-length.jsl`).
 
+**A mark that is there and cannot be read is damage, not absence.** No mark at all is a log from
+before marks, or one whose loss was knowingly accepted, and is read as it always was. A mark
+that exists and is the wrong size, does not begin as one, or has no slot that checks is refused
+at open (the store says which file to remove to accept the log as it is) and is never written
+over; the offline scan reports `WAL_COMMITTED_MARK_DAMAGED`. No crash leaves such a mark: it is
+created whole or not at all, and each record goes to the slot that does not hold the latest, so a
+torn write costs the older of the two. What this does not cover: damage to the log and removal
+of the mark together, which reads as a log from before marks; and a single write torn across both
+slots by the storage itself, which would refuse a sound log until an operator accepts it.
+
 What the mark promises exactly: it is written only after the log's own synchronization, so a
 crash can never make a sound log look damaged; it is made durable when the store is closed and
 before a checkpoint shortens the log, not with every commit (that would double a commit's cost).

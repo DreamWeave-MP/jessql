@@ -188,6 +188,107 @@ suite.describe('what the mark does not claim', function()
     expect(walmark.decode(string.rep('\255', #mark))).toBe(nil)
     expect(walmark.decode('JQLC1\n')).toBe(nil)
   end)
+
+  -- Review J-03: a mark that is there and cannot be read is not the same as no mark.
+  suite.it('refuses a log whose mark is damaged, cut or not, until the mark is removed by hand', function()
+    -- A sound log beside a mark that cannot be read: whether the log is whole cannot be said.
+    local disk = closedStore(5)
+    local mark = disk.visible()[walmark.path(Log)]
+    overwrite(disk, walmark.path(Log), string.rep('\255', #mark))
+    expect((walmark.examine(disk.backend, Log))).toBe('damaged')
+    -- The open raises on the damaged mark; the refusal and what it says are the assertion.
+    local opened, refusal = pcall(open, disk)
+    expect(opened).toBe(false)
+    expect(string.find(tostring(refusal), 'committed-length mark beside the log is damaged', 1, true) ~= nil).toBe(true)
+    -- The refusal wrote nothing: the damage is still there to be looked at.
+    expect(disk.visible()[walmark.path(Log)]).toBe(string.rep('\255', #mark))
+
+    -- The same with the log cut as well, which is what a damaged mark used to let through.
+    local body = disk.visible()[Log]
+    overwrite(disk, Log, string.sub(body, 1, frameEnds(body)[4]))
+    -- The open raises again, and a second time: a refusal repairs nothing by being repeated.
+    local first = pcall(open, disk)
+    -- The same open, raising for the same reason.
+    local second = pcall(open, disk)
+    expect(`{first} {second}`).toBe('false false')
+
+    -- Accepted knowingly, as a short log is: the mark is removed, and what is there is read.
+    assert((disk.backend.remove(walmark.path(Log))))
+    expect((walmark.examine(disk.backend, Log))).toBe('absent')
+    expect(rows(disk)).toBe(3)
+    -- And from then on the log has a sound mark again.
+    expect((walmark.examine(disk.backend, Log))).toBe('sound')
+  end)
+
+  suite.it('tells a mark that is absent, sound, or damaged in any of the ways a file can be', function()
+    local disk = closedStore(4)
+    local path = walmark.path(Log)
+    local mark = disk.visible()[path]
+    local condition, held = walmark.examine(disk.backend, Log)
+    expect(`{condition} {(held :: walmark.Mark).sequence}`).toBe('sound 5')
+
+    local damaged: { [string]: string } = {
+      ['both slots'] = string.sub(mark, 1, 6) .. string.rep('\255', 48),
+      ['the magic'] = 'JQLX1\n' .. string.sub(mark, 7),
+      ['cut short'] = string.sub(mark, 1, 30),
+      ['only its magic'] = 'JQLC1\n',
+      ['empty'] = '',
+      ['too long'] = mark .. '\0',
+      ['one bit in each slot'] = string.sub(mark, 1, 6) .. string.char(bit32.bxor(string.byte(mark, 7), 1)) .. string.sub(mark, 8, 30)
+        .. string.char(bit32.bxor(string.byte(mark, 31), 1)) .. string.sub(mark, 32),
+    }
+
+    for name, body in damaged do
+      overwrite(disk, path, body)
+      expect(`{name}: {(walmark.examine(disk.backend, Log))}`).toBe(`{name}: damaged`)
+      -- The open raises on every kind of damage; the refusal is the assertion.
+      local opened = pcall(open, disk)
+      expect(`{name}: {opened}`).toBe(`{name}: false`)
+      -- A damaged mark is never written over: that would make a clean witness of it.
+      expect(`{name}: {disk.visible()[path] == body}`).toBe(`{name}: true`)
+    end
+
+    -- One slot gone is what a crash can leave: the other stands, and the store opens.
+    for _, slot in { 0, 1 } do
+      overwrite(disk, path, string.sub(mark, 1, 6 + slot * 24) .. string.rep('\255', 24) .. string.sub(mark, 6 + (slot + 1) * 24 + 1))
+      expect(`slot {slot}: {(walmark.examine(disk.backend, Log))}`).toBe(`slot {slot}: sound`)
+      expect(rows(disk)).toBe(4)
+    end
+
+    -- No mark at all is a log from before marks: read as it always was.
+    assert((disk.backend.remove(path)))
+    expect(rows(disk)).toBe(4)
+  end)
+
+  suite.it('writes each record to the slot that does not hold the latest, across a reopen', function()
+    -- Reopened again and again with one commit each time. If a reopened writer began at the
+    -- first slot whatever it held, some reopen would overwrite the latest mark, and a write torn
+    -- there would leave only the older one's neighbour: here, after every reopen, tearing the
+    -- slot just written must leave the mark of the commit before it, never anything older.
+    local disk = memfs.new()
+    local db = open(disk)
+    db:createTable('events', { 'id', 'body' }, 'id')
+    db:close()
+    local path = walmark.path(Log)
+    for index = 1, 6 do
+      local before = assert(walmark.decode(disk.visible()[path]))
+      db = open(disk)
+      db:insert('events', { id = index, body = `row {index}` })
+      db:close()
+      local body = disk.visible()[path]
+      local after = assert(walmark.decode(body))
+      expect(after.sequence).toBe(before.sequence + 1)
+      -- Exactly one slot changed, and the other still holds the mark from before.
+      local survivors: { number } = {}
+      for _, slot in { 0, 1 } do
+        local torn = string.sub(body, 1, 6 + slot * 24) .. string.rep('\255', 24) .. string.sub(body, 6 + (slot + 1) * 24 + 1)
+        table.insert(survivors, assert(walmark.decode(torn)).sequence)
+      end
+
+      table.sort(survivors)
+      expect(`{index}: {survivors[1]} {survivors[2]}`).toBe(`{index}: {before.sequence} {after.sequence}`)
+    end
+  end)
 end)
 
 suite.describe('a managed database', function()
@@ -216,6 +317,22 @@ suite.describe('a managed database', function()
     local report = sql.managed.verify('/memory/g', { storage = disk.backend })
     expect(report.ok).toBe(false)
     expect(report.issues[1].code).toBe('WAL_SHORTER_THAN_COMMITTED')
+  end)
+
+  suite.it('refuses a managed database whose log has a damaged mark, and the offline scan names it', function()
+    local disk = restored(function(path: string, body: string): string
+      return if path == walmark.path(liveLog) then string.rep('\255', #body) else body
+    end)
+    -- The open raises on the damaged mark; the refusal is the assertion.
+    expect((pcall(function() return sql.managed.openExisting('/memory/g', { storage = disk.backend }) end))).toBe(false)
+    local report = sql.managed.verify('/memory/g', { storage = disk.backend })
+    expect(report.ok).toBe(false)
+    local named = false
+    for _, issue in report.issues do
+      if issue.code == 'WAL_COMMITTED_MARK_DAMAGED' then named = true end
+    end
+
+    expect(named).toBe(true)
   end)
 
   suite.it('reads every seeded mutation of its log as the written rows or a refusal, never as an earlier state', function()

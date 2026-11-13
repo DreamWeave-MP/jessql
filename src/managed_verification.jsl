@@ -176,7 +176,11 @@ local function wal(fs: vfs.Backend, base: string, value: manifest.Manifest, iden
     end
     -- A log that ends cleanly on a frame can still be short: cut at a boundary, or an older copy.
     -- Its committed-length mark is the witness.
-    local committed = walmark.read(fs, path)
+    local witness, committed = walmark.examine(fs, path)
+    if witness == 'damaged' then
+      defect('WAL_COMMITTED_MARK_DAMAGED', 'the committed-length mark is there and cannot be read: the log cannot be vouched for')
+    end
+
     if committed and (committed.length > offset or committed.sequence > sequence) then
       defect('WAL_SHORTER_THAN_COMMITTED', `WAL holds {sequence} transactions in {offset} bytes; {committed.sequence} in {committed.length} were committed`)
     end

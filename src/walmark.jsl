@@ -16,13 +16,22 @@
 -- reached storage. The newest commits before a crash are protected as they were before: not.
 --
 -- The file is `<log>.committed`: a magic and two slots written alternately, each with its own
--- checksum, so a write torn by a crash leaves the other slot standing. A missing or unreadable
--- mark is no mark: the log is read as it always was.
+-- checksum, so a write torn by a crash leaves the other slot standing.
+--
+-- A mark that is not there is no mark: the log is read as it always was, which is how a log from
+-- before marks, or one whose loss was knowingly accepted, is read. A mark that is there and
+-- cannot be read is another thing, and is not taken for the first: no crash leaves one (the file
+-- is made whole or not at all, and a record goes to the slot that does not hold the latest), so
+-- it is damage, and a witness that was damaged cannot say the log was not. The store refuses to
+-- open until the mark is removed by hand, which is the same knowing acceptance as for a log
+-- found short.
 
 local bytes = require('@dream/bytes')
 local vfs = require('@jessql/vfs')
 
 export type Mark = { sequence: number, length: number }
+-- What is beside a log: no mark, one that can be read, or one that is there and cannot be.
+export type Condition = 'absent' | 'sound' | 'damaged'
 export type Writer = {
   -- Records that the log holds `sequence` transactions in `length` bytes, all synchronized.
   record: (sequence: number, length: number) -> (),
@@ -81,7 +90,23 @@ function walmark.decode(body: string): Mark?
   return first or second
 end
 
--- The mark recorded beside `log`, or nil when there is none that can be read.
+-- What is beside `log`, and the mark when it is sound. Damaged: a file that cannot be read, is
+-- not the size of a mark, does not begin as one, or has no slot that checks.
+function walmark.examine(fs: vfs.Backend, log: string): (Condition, Mark?)
+  local path = walmark.path(log)
+  if not fs.exists(path) then return 'absent', nil end
+
+  local body = fs.readFileString(path)
+  if not body or #body ~= #Magic + 2 * SlotBytes then return 'damaged', nil end
+
+  local mark = walmark.decode(body)
+  if not mark then return 'damaged', nil end
+
+  return 'sound', mark
+end
+
+-- The mark recorded beside `log`, or nil when there is none that can be read. It does not say
+-- which: `examine` does, and a caller that must not take damage for absence asks that.
 function walmark.read(fs: vfs.Backend, log: string): Mark?
   local path = walmark.path(log)
   if not fs.exists(path) then return nil end
@@ -98,23 +123,31 @@ function walmark.forget(fs: vfs.Backend, log: string)
 end
 
 -- Opens the mark beside `log` for writing, creating it empty of claims if it is not there. Nil
--- when it cannot be opened: the store then runs without one.
+-- when it cannot be opened, or is there and damaged: a damaged mark is never written over, since
+-- that would turn damage into a clean witness that claims nothing.
 function walmark.open(fs: vfs.Backend, log: string): Writer?
   local path = walmark.path(log)
-  local existing = walmark.read(fs, log)
-  local body = if fs.exists(path) then fs.readFileString(path) else nil
-  if not body or #body ~= #Magic + 2 * SlotBytes or string.sub(body, 1, #Magic) ~= Magic then
-    -- A fresh file: the magic and two slots that claim nothing.
+  local condition, existing = walmark.examine(fs, log)
+  if condition == 'damaged' then return nil end
+
+  if condition == 'absent' then
+    -- A fresh file: the magic and two slots that claim nothing, there whole or not at all, so
+    -- that a crash while it is made cannot leave something that reads as damage.
     local empty = Magic .. slot(0, 0) .. slot(0, 0)
-    if fs.writeFile(path, empty) ~= #empty then return nil end
+    if fs.createDurable(path, empty) ~= #empty then return nil end
   end
 
   local writer = fs.openWrite(path, { create = false, truncate = false })
   if not writer then return nil end
 
   local handle: dream_fs_Writer = writer
-  -- Which slot the next record goes to: the one that does not hold the current mark.
-  local turn = 0
+  -- Which slot the next record goes to: the one that does not hold the current mark, so that a
+  -- write torn by a crash can only cost the older of the two.
+  local held = fs.readFileString(path) or ''
+  local first, second = parse(held, #Magic), parse(held, #Magic + SlotBytes)
+  -- Two slots that say the same claim nothing over each other (a new mark, or one just reset):
+  -- the first is written, as it always was.
+  local turn = if first and (not second or first.sequence > second.sequence) then 1 else 0
   local latest: Mark = existing or { sequence = 0, length = 0 }
   local closed = false
 
