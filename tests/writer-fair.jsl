@@ -283,7 +283,10 @@ suite.describe('fair admission in front of one writer', function()
   suite.it('keeps a place for the tenant that waits, lets it go when that tenant stops asking, and is not held by one at its share', function()
     local now = 0
     local back = behind(1, 1)
-    local front = fair.new({ submit = back.submit, poll = back.poll, capacity = 1, waitSeconds = 5, now = function(): number return now end })
+    -- Claims kept as long as the wait, so that the turns are what is looked at here: how long a
+    -- claim lasts by default has a test of its own.
+    local front = fair.new({ submit = back.submit, poll = back.poll, capacity = 1, waitSeconds = 5, claimSeconds = 5,
+      now = function(): number return now end })
     expect(front.submit('holder', request()).admitted).toBe(true)
     expect(front.submit('first', request()).reason).toBe('backpressure')
     now = 1
@@ -390,6 +393,69 @@ suite.describe('fair admission in front of one writer', function()
     expect(ledger.wasCommitted(later[1].error)).toBe(false)
     expect(`{(db:get('events', 1) :: { body: string }).body} {(db:get('events', 2) :: { body: string }).body}`).toBe('A B')
     db:close()
+  end)
+
+  -- Review of 2026-11-13 (after J-02): tenants refused once and never back held places empty for
+  -- their whole wait, and a stream of them took a writer down to a few per cent.
+  suite.it('keeps a place only for a tenant that keeps asking, so tenants that gave up hold none', function()
+    local function steadyAdmitted(ghostsPerSecond: number): number
+      local now = 0
+      local queue: { string } = {}
+      local front = fair.new({ capacity = 8, waitSeconds = 5, now = function(): number return now end,
+        submit = function(sent: writer.Request): fair.Admission
+          table.insert(queue, sent.id)
+          return { admitted = true, reason = nil, outstanding = #queue }
+        end,
+        poll = function(_seconds: number?): { writer.Ack }
+          -- The writer finishes two a tick.
+          local acks: { writer.Ack } = {}
+          for _ = 1, math.min(2, #queue) do
+            table.insert(acks, { id = table.remove(queue, 1) :: string, outcome = 'committed' :: writer.Outcome })
+          end
+
+          return acks
+        end })
+      -- Six steady tenants ask every tick in an order that changes; a one-shot tenant turns up
+      -- among them at random, is refused, and is never seen again.
+      -- The same draws every run: a small linear congruential generator, seeded.
+      local state = 42
+      local function draw(): number
+        state = (state * 1103515245 + 12345) % 2147483648
+        return state / 2147483648
+      end
+
+      local admitted, ghosts = 0, 0
+      for tick = 1, 6000 do
+        now = tick * 0.01
+        front.poll(0)
+        local order: { string } = {}
+        for index = 1, 6 do table.insert(order, `steady{index}`) end
+
+        for index = #order, 2, -1 do
+          local other = 1 + math.floor(draw() * index)
+          order[index], order[other] = order[other], order[index]
+        end
+
+        if draw() < ghostsPerSecond * 0.01 then
+          ghosts += 1
+          table.insert(order, 1 + math.floor(draw() * (#order + 1)), `ghost{ghosts}`)
+        end
+
+        for _, name in order do
+          local answer = front.submit(name, request())
+          if answer.admitted and string.sub(name, 1, 6) == 'steady' then admitted += 1 end
+        end
+      end
+
+      return admitted
+    end
+
+    local alone = steadyAdmitted(0)
+    for _, rate in { 2, 5, 20 } do
+      local haunted = steadyAdmitted(rate)
+      -- Before: at 5 one-shot tenants a second, under 3% of the steady throughput was left.
+      expect(`{rate}/s: {haunted} of {alone}: {haunted >= alone * 0.9}`).toBe(`{rate}/s: {haunted} of {alone}: true`)
+    end
   end)
 
   -- Re-review of #97: the writer behind takes the tenant and the id together as its id. A

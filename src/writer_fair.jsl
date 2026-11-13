@@ -21,6 +21,11 @@
 --     it. So the tenant that has waited longest always has the next place, however quickly
 --     another asks, and however few places there are: with one place and two tenants they
 --     take turns. A tenant turned away by this rule waits too, and has its turn.
+--   * A place is kept for a waiting tenant only while it keeps asking: its claim lapses
+--     `claimSeconds` (default 1, at most `waitSeconds`) after it last asked, and its turn with
+--     it. A tenant that gave up does not hold places empty for the rest of its wait (review of
+--     2026-11-13: one-shot tenants refused once and gone took a writer down to a few per cent).
+--     It still counts towards the shares for `waitSeconds`.
 --
 -- Nothing waits in here and nothing is queued: a refusal is the caller's to retry. What is
 -- promised is that no tenant that keeps asking is shut out by another that asks more: it is
@@ -46,6 +51,9 @@ export type Options = {
   capacity: number,
   -- How long a tenant refused for want of room is counted as waiting (default 5).
   waitSeconds: number?,
+  -- How long after it last asked a waiting tenant keeps its turn and the place owed to it
+  -- (default 1, or `waitSeconds` when that is less).
+  claimSeconds: number?,
   -- The most tenants holding or waiting at once (default 1024). One more is refused.
   maxTenants: number?,
   -- Seconds, monotonic. Injected in tests.
@@ -64,13 +72,15 @@ export type Fair = {
   status: () -> Status,
 }
 
--- A waiting tenant is a link in two lists: the order waits began in, which is the order places
--- are owed in and does not change when a wait is renewed; and the order waits will end in,
--- where a renewed wait goes to the back. `turn` numbers the first order.
+-- A waiting tenant is a link in three lists: the order claims began in, which is the order
+-- places are owed in and does not change when a claim is renewed; the order claims will lapse
+-- in, where a renewed claim goes to the back; and the order waits (counting towards the shares)
+-- will end in. `turn` numbers the first order.
 type Tenant = {
   name: string, outstanding: number, waitingUntil: number, admitted: number, refused: number, counted: boolean,
   waiting: boolean, turn: number,
   owedBefore: Tenant?, owedAfter: Tenant?, endsBefore: Tenant?, endsAfter: Tenant?,
+  sharing: boolean, sharingUntil: number, shareBefore: Tenant?, shareAfter: Tenant?,
 }
 
 local fair = {}
@@ -104,6 +114,11 @@ function fair.new(options: Options): Fair
     error('jessql fair admission: invalid maxTenants', 2)
   end
 
+  local claimSeconds = if options.claimSeconds ~= nil then options.claimSeconds else math.min(1, waitSeconds)
+  if typeof(claimSeconds) ~= 'number' or claimSeconds ~= claimSeconds or claimSeconds < 0 or claimSeconds > waitSeconds then
+    error('jessql fair admission: invalid claimSeconds', 2)
+  end
+
   local now = options.now or os.clock
   local tenants: { [string]: Tenant } = {}
   local tenantCount = 0
@@ -119,6 +134,8 @@ function fair.new(options: Options): Fair
   -- end. Every wait lasts the same, so a wait begun or renewed now ends last.
   local owedFirst: Tenant?, owedLast: Tenant? = nil, nil
   local endsFirst: Tenant?, endsLast: Tenant? = nil, nil
+  -- The tenants counted towards the shares while they wait, in the order those waits end.
+  local shareFirst: Tenant?, shareLast: Tenant? = nil, nil
   local waiting = 0
   local nextTurn = 1
   local looked = 0
@@ -126,7 +143,7 @@ function fair.new(options: Options): Fair
   -- Counts or uncounts one tenant after something of it changed; one that neither holds nor
   -- waits is forgotten.
   local function settle(tenant: Tenant)
-    local active = tenant.outstanding > 0 or tenant.waiting
+    local active = tenant.outstanding > 0 or tenant.waiting or tenant.sharing
     if active ~= tenant.counted then
       tenant.counted = active
       activeCount += if active then 1 else -1
@@ -155,8 +172,21 @@ function fair.new(options: Options): Fair
     endsLast = tenant
   end
 
-  -- The tenant waits no longer: admitted, or its wait ran out.
-  local function leave(tenant: Tenant)
+  local function unshare(tenant: Tenant)
+    if not tenant.sharing then return end
+
+    local before, after = tenant.shareBefore, tenant.shareAfter
+    if before then before.shareAfter = after else shareFirst = after end
+
+    if after then after.shareBefore = before else shareLast = before end
+
+    tenant.shareBefore, tenant.shareAfter = nil, nil
+    tenant.sharing = false
+    tenant.sharingUntil = 0
+  end
+
+  -- The tenant's claim on a place lapses, and its turn with it.
+  local function unclaim(tenant: Tenant)
     if not tenant.waiting then return end
 
     leaveEnds(tenant)
@@ -171,14 +201,27 @@ function fair.new(options: Options): Fair
     waiting -= 1
   end
 
-  -- Ends the waits whose time is up. Each wait is looked at once here, when it ends.
+  -- The tenant waits no longer: admitted, or owed nothing more.
+  local function leave(tenant: Tenant)
+    unclaim(tenant)
+    unshare(tenant)
+  end
+
+  -- Ends the claims and the waits whose time is up. Each is looked at once here, when it ends.
   local function expire(at: number)
     local first = endsFirst
     while first and first.waitingUntil <= at do
-      looked += 1
-      leave(first)
+      unclaim(first)
       settle(first)
       first = endsFirst
+    end
+
+    local counted = shareFirst
+    while counted and counted.sharingUntil <= at do
+      looked += 1
+      unshare(counted)
+      settle(counted)
+      counted = shareFirst
     end
   end
 
@@ -201,8 +244,18 @@ function fair.new(options: Options): Fair
       owedLast = tenant
     end
 
-    tenant.waitingUntil = at + waitSeconds
+    tenant.waitingUntil = at + claimSeconds
     joinEnds(tenant)
+
+    -- Counted towards the shares for the whole wait, whether or not it keeps its claim.
+    unshare(tenant)
+    tenant.sharing = true
+    tenant.sharingUntil = at + waitSeconds
+    local last = shareLast
+    tenant.shareBefore = last
+    if last then last.shareAfter = tenant else shareFirst = tenant end
+
+    shareLast = tenant
     settle(tenant)
   end
 
@@ -210,11 +263,14 @@ function fair.new(options: Options): Fair
   -- waits, for one that does not; for one that does, no more than the turns given out between
   -- the first still waiting and its own. Some of those turns were taken or ran out, so this
   -- can ask for more than are truly ahead, never fewer; the first in line is always owed none.
+  -- At most half the places (at least one) are ever kept for claims: however many tenants ask and
+  -- go, the other half stay with those that are there.
+  local reserve = math.max(1, capacity // 2)
   local function owedAhead(tenant: Tenant): number
     local first = owedFirst
-    if not tenant.waiting or not first then return waiting end
+    if not tenant.waiting or not first then return math.min(waiting, reserve) end
 
-    return math.min(waiting - 1, tenant.turn - first.turn)
+    return math.min(waiting - 1, tenant.turn - first.turn, reserve)
   end
 
   local function refuse(tenant: Tenant?, reason: string): Admission
@@ -247,7 +303,9 @@ function fair.new(options: Options): Fair
     if not known and tenantCount >= maxTenants then return refuse(nil, 'too-many-tenants') end
 
     local tenant: Tenant = known
-      or { name = name, outstanding = 0, waitingUntil = 0, admitted = 0, refused = 0, counted = false, waiting = false, turn = 0 }
+      or { name = name, outstanding = 0, waitingUntil = 0, admitted = 0, refused = 0, counted = false, waiting = false, turn = 0,
+        sharing = false, sharingUntil = 0 }
+
     if not known then
       tenants[name] = tenant
       tenantCount += 1
@@ -318,7 +376,7 @@ function fair.new(options: Options): Fair
     local at = now()
     expire(at)
     for name, tenant in tenants do
-      listed[name] = { outstanding = tenant.outstanding, waiting = tenant.waiting, admitted = tenant.admitted, refused = tenant.refused }
+      listed[name] = { outstanding = tenant.outstanding, waiting = tenant.sharing, admitted = tenant.admitted, refused = tenant.refused }
     end
 
     return { outstanding = outstanding, capacity = capacity, share = math.max(1, capacity // math.max(1, activeCount)), tenants = listed,
