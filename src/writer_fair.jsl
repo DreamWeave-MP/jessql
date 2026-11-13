@@ -13,12 +13,22 @@
 --     share is refused with `fair-share`; one under it is admitted when there is room.
 --   * A tenant under its share that finds no room is refused with `backpressure` and remembered
 --     as waiting for `waitSeconds`. While it waits it counts, so the tenants over their share
---     are refused and the next places freed are left for it. If it does not come back, it is
---     forgotten and its share returns to the others.
+--     are refused. If it does not come back, it is forgotten and its share returns to the
+--     others.
+--   * The places freed are kept for those who wait, in the order they began to. A tenant that
+--     is not waiting is admitted only when a place is left after one is kept for every tenant
+--     that is; a tenant that is waiting, only when one is left after those that began before
+--     it. So the tenant that has waited longest always has the next place, however quickly
+--     another asks, and however few places there are: with one place and two tenants they
+--     take turns. A tenant turned away by this rule waits too, and has its turn.
 --
 -- Nothing waits in here and nothing is queued: a refusal is the caller's to retry. What is
 -- promised is that no tenant that keeps asking is shut out by another that asks more: it is
--- admitted within the time the tenants over their share take to drain down to it.
+-- admitted once the tenants that began waiting before it have had the places freed. The promise
+-- needs waiting to be remembered: with `waitSeconds = 0` nothing is, and none is made.
+--
+-- What is held is one record a tenant and nothing a refusal: a tenant refused a hundred
+-- thousand times is remembered once.
 local writer = require('@jessql/writer')
 
 export type Admission = { admitted: boolean, reason: string?, outstanding: number }
@@ -38,7 +48,7 @@ export type Options = {
 }
 export type TenantStatus = { outstanding: number, waiting: boolean, admitted: number, refused: number }
 -- `active` is how many tenants the queue is shared between now; `examined` how many waits have
--- been looked at to end them since the start, which is at most one a refusal.
+-- run out since the start, each looked at once, which is at most one a tenant that waited.
 export type Status = { outstanding: number, capacity: number, share: number, tenants: { [string]: TenantStatus }, active: number, examined: number }
 export type Fair = {
   submit: (tenant: string, request: writer.Request) -> Admission,
@@ -46,7 +56,14 @@ export type Fair = {
   status: () -> Status,
 }
 
-type Tenant = { outstanding: number, waitingUntil: number, admitted: number, refused: number, counted: boolean }
+-- A waiting tenant is a link in two lists: the order waits began in, which is the order places
+-- are owed in and does not change when a wait is renewed; and the order waits will end in,
+-- where a renewed wait goes to the back. `turn` numbers the first order.
+type Tenant = {
+  name: string, outstanding: number, waitingUntil: number, admitted: number, refused: number, counted: boolean,
+  waiting: boolean, turn: number,
+  owedBefore: Tenant?, owedAfter: Tenant?, endsBefore: Tenant?, endsAfter: Tenant?,
+}
 
 local fair = {}
 
@@ -79,54 +96,107 @@ function fair.new(options: Options): Fair
   -- How many tenants hold requests or are waiting, kept as each one changes and never counted
   -- by going through them: a submission costs the same however many tenants there are.
   local activeCount = 0
-  -- Waits in the order they will end. Every wait lasts the same, so that is the order they
-  -- began in, and the ones that have ended are at the front.
-  local waits: { { name: string, expires: number } } = {}
-  local waitsHead = 1
+  -- The tenants that wait, as two lists through the tenants themselves: `owedFirst` to
+  -- `owedLast` in the order their waits began, `endsFirst` to `endsLast` in the order they will
+  -- end. Every wait lasts the same, so a wait begun or renewed now ends last.
+  local owedFirst: Tenant?, owedLast: Tenant? = nil, nil
+  local endsFirst: Tenant?, endsLast: Tenant? = nil, nil
+  local waiting = 0
+  local nextTurn = 1
   local looked = 0
 
   -- Counts or uncounts one tenant after something of it changed; one that neither holds nor
   -- waits is forgotten.
-  local function settle(name: string, tenant: Tenant, at: number)
-    local active = tenant.outstanding > 0 or tenant.waitingUntil > at
+  local function settle(tenant: Tenant)
+    local active = tenant.outstanding > 0 or tenant.waiting
     if active ~= tenant.counted then
       tenant.counted = active
       activeCount += if active then 1 else -1
     end
 
-    if not active and tenants[name] == tenant then
-      tenants[name] = nil
+    if not active and tenants[tenant.name] == tenant then
+      tenants[tenant.name] = nil
       tenantCount -= 1
     end
   end
 
-  -- Ends the waits whose time is up. Each wait is looked at once here, whenever it ends.
-  local function expire(at: number)
-    while waitsHead <= #waits and waits[waitsHead].expires <= at do
-      local ended = waits[waitsHead]
-      waitsHead += 1
-      looked += 1
-      local tenant = tenants[ended.name]
-      -- A wait that was renewed, or ended by an admission, is not this one any more.
-      if tenant and tenant.waitingUntil == ended.expires then
-        tenant.waitingUntil = 0
-        settle(ended.name, tenant, at)
-      end
-    end
+  local function leaveEnds(tenant: Tenant)
+    local before, after = tenant.endsBefore, tenant.endsAfter
+    if before then before.endsAfter = after else endsFirst = after end
 
-    -- The ended ones are dropped from the front once they are most of the list.
-    if waitsHead > 1024 and waitsHead * 2 > #waits then
-      waits = table.move(waits, waitsHead, #waits, 1, {})
-      waitsHead = 1
+    if after then after.endsBefore = before else endsLast = before end
+
+    tenant.endsBefore, tenant.endsAfter = nil, nil
+  end
+
+  local function joinEnds(tenant: Tenant)
+    local last = endsLast
+    tenant.endsBefore = last
+    if last then last.endsAfter = tenant else endsFirst = tenant end
+
+    endsLast = tenant
+  end
+
+  -- The tenant waits no longer: admitted, or its wait ran out.
+  local function leave(tenant: Tenant)
+    if not tenant.waiting then return end
+
+    leaveEnds(tenant)
+    local before, after = tenant.owedBefore, tenant.owedAfter
+    if before then before.owedAfter = after else owedFirst = after end
+
+    if after then after.owedBefore = before else owedLast = before end
+
+    tenant.owedBefore, tenant.owedAfter = nil, nil
+    tenant.waiting = false
+    tenant.waitingUntil = 0
+    waiting -= 1
+  end
+
+  -- Ends the waits whose time is up. Each wait is looked at once here, when it ends.
+  local function expire(at: number)
+    local first = endsFirst
+    while first and first.waitingUntil <= at do
+      looked += 1
+      leave(first)
+      settle(first)
+      first = endsFirst
     end
   end
 
-  local function wait(name: string, tenant: Tenant, at: number)
+  -- The tenant waits from now, or goes on waiting: its place among those owed is kept, and only
+  -- when its wait will end changes.
+  local function wait(tenant: Tenant, at: number)
     if waitSeconds <= 0 then return end
 
+    if tenant.waiting then
+      leaveEnds(tenant)
+    else
+      tenant.waiting = true
+      tenant.turn = nextTurn
+      nextTurn += 1
+      waiting += 1
+      local last = owedLast
+      tenant.owedBefore = last
+      if last then last.owedAfter = tenant else owedFirst = tenant end
+
+      owedLast = tenant
+    end
+
     tenant.waitingUntil = at + waitSeconds
-    table.insert(waits, { name = name, expires = tenant.waitingUntil })
-    settle(name, tenant, at)
+    joinEnds(tenant)
+    settle(tenant)
+  end
+
+  -- How many places must be left for tenants owed one before this tenant: every tenant that
+  -- waits, for one that does not; for one that does, no more than the turns given out between
+  -- the first still waiting and its own. Some of those turns were taken or ran out, so this
+  -- can ask for more than are truly ahead, never fewer; the first in line is always owed none.
+  local function owedAhead(tenant: Tenant): number
+    local first = owedFirst
+    if not tenant.waiting or not first then return waiting end
+
+    return math.min(waiting - 1, tenant.turn - first.turn)
   end
 
   local function refuse(tenant: Tenant?, reason: string): Admission
@@ -149,7 +219,8 @@ function fair.new(options: Options): Fair
     local known = tenants[name]
     if not known and tenantCount >= maxTenants then return refuse(nil, 'too-many-tenants') end
 
-    local tenant: Tenant = known or { outstanding = 0, waitingUntil = 0, admitted = 0, refused = 0, counted = false }
+    local tenant: Tenant = known
+      or { name = name, outstanding = 0, waitingUntil = 0, admitted = 0, refused = 0, counted = false, waiting = false, turn = 0 }
     if not known then
       tenants[name] = tenant
       tenantCount += 1
@@ -159,23 +230,26 @@ function fair.new(options: Options): Fair
     local sharing = activeCount + (if tenant.counted then 0 else 1)
     local share = math.max(1, capacity // sharing)
     if tenant.outstanding >= share then
-      settle(name, tenant, at)
+      -- At its share it is owed nothing more: if it was waiting, the place kept for it is not.
+      leave(tenant)
+      settle(tenant)
       return refuse(tenant, 'fair-share')
     end
 
-    if outstanding >= capacity then
-      -- Under its share and no room: it is owed the next places freed.
-      wait(name, tenant, at)
-      settle(name, tenant, at)
+    -- Under its share. It has a place only if one is left once those owed a place before it
+    -- have theirs; otherwise it waits, and keeps the turn it had if it was waiting already.
+    if capacity - outstanding <= owedAhead(tenant) then
+      wait(tenant, at)
+      settle(tenant)
       return refuse(tenant, 'backpressure')
     end
 
     local admission = options.submit(request)
     if not admission.admitted then
       -- The writer behind is full or gone: its answer, and this tenant is still owed a place.
-      if admission.reason == 'backpressure' then wait(name, tenant, at) end
+      if admission.reason == 'backpressure' then wait(tenant, at) end
 
-      settle(name, tenant, at)
+      settle(tenant)
       return refuse(tenant, admission.reason or 'refused')
     end
 
@@ -183,8 +257,8 @@ function fair.new(options: Options): Fair
     outstanding += 1
     tenant.outstanding += 1
     tenant.admitted += 1
-    tenant.waitingUntil = 0
-    settle(name, tenant, at)
+    leave(tenant)
+    settle(tenant)
     return { admitted = true, reason = nil, outstanding = outstanding }
   end
 
@@ -200,7 +274,7 @@ function fair.new(options: Options): Fair
       local tenant = tenants[name]
       if tenant then
         tenant.outstanding -= 1
-        settle(name, tenant, at)
+        settle(tenant)
       end
     end
 
@@ -213,7 +287,7 @@ function fair.new(options: Options): Fair
     local at = now()
     expire(at)
     for name, tenant in tenants do
-      listed[name] = { outstanding = tenant.outstanding, waiting = tenant.waitingUntil > at, admitted = tenant.admitted, refused = tenant.refused }
+      listed[name] = { outstanding = tenant.outstanding, waiting = tenant.waiting, admitted = tenant.admitted, refused = tenant.refused }
     end
 
     return { outstanding = outstanding, capacity = capacity, share = math.max(1, capacity // math.max(1, activeCount)), tenants = listed,

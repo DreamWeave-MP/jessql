@@ -135,6 +135,12 @@ in front of a client or a supervisor and shares the queue out between named tena
 - a tenant under its share that finds no room is refused with `backpressure` and counted as
   waiting for `waitSeconds` (default 5): the tenants over their share are then refused and the
   next places freed are left for it. One that does not come back is forgotten.
+- The places freed are kept for those who wait, in the order they began to: a tenant that is
+  not waiting is admitted only when a place is left after one is kept for each that is, and one
+  that is waiting only after those that began before it. So with fewer places than tenants they
+  take turns, however quickly one of them asks; a tenant turned away by this rule waits too.
+  Asking again while waiting keeps the turn. What is held is one record a tenant, however many
+  times it is refused. With `waitSeconds = 0` nothing is remembered and no turn is kept.
 
 Nothing waits or is queued inside it; a refusal is the caller's to retry. In
 `tests/writer-fair.jsl`, on a virtual clock with a stand-in writer that frees two places a
