@@ -85,6 +85,47 @@
       "groups": [],
       "extensions": {},
       "critical_extensions": []
+    },
+    {
+      "version": "0.3.0",
+      "locked_from": "3517cdfe212fcc396b4e9f7a15e3e2d11a3f4399",
+      "artifacts": [
+        {
+          "id": "jpk",
+          "format": "jpk",
+          "filename": "org.dreamweave.jessql-0.3.0.jpk",
+          "media_type": "application/vnd.jess.jpk",
+          "size": 800627,
+          "digests": {
+            "sha256": "2aec02fff7e42aa3900b47bf00280fec87114164b34c8aa13630a0e8250b23c1"
+          },
+          "jess": {
+            "package": "org.dreamweave.jessql",
+            "jess_api": "1",
+            "content_digest": "e84f13c32e4efd33b4a0a9868ae8d97c57ac79287943500942b71881d5c9f050",
+            "dependencies": {}
+          }
+        }
+      ],
+      "runtimes": {},
+      "platforms": [],
+      "provides": [],
+      "relationships": [],
+      "components": [
+        {
+          "id": "main",
+          "name": "JessQL",
+          "path": ".",
+          "required": true,
+          "default": true,
+          "requires": [],
+          "conflicts": [],
+          "suggested_with": []
+        }
+      ],
+      "groups": [],
+      "extensions": {},
+      "critical_extensions": []
     }
   ]
 }
